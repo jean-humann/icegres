@@ -14,24 +14,58 @@ Here are some ideas to get you started:
 -->
 
 
-# Hey, I'm Jean Human! 👋
+# Hey, I'm Jean Humann! 👋
+
+**Technical Director** @ [Cleyrop](https://www.cleyrop.com/) | **LLM Enthusiast** | **Data Platform Builder**
+
+---
 
 ## 👨‍💻 About Me
-I'm the Technical Director at [Cleyrop](https://www.cleyrop.com/), where we're on a mission to create an end-to-end data platform that prioritizes security and sovereignty. With a background in Machine Learning and a passion for technology, I'm excited about exploring new frontiers in data, containers, and transformers.
 
-## 🌟 Professional Goals
-- 🚀 Lead a talented team to build innovative data solutions that make an impact.
-- 🌐 Create a secure and sovereign data platform that empowers businesses to harness the full potential of their data.
-- 🧠 Foster a culture of continuous learning and exploration, keeping up with the latest tech trends.
+I'm building the future of secure, sovereign data platforms at Cleyrop. My journey started in Machine Learning, but these days I'm deep in the world of **Large Language Models (LLMs)**, **AI agents**, and **cloud-native architectures**. I believe in technology that respects user privacy while pushing the boundaries of what's possible.
 
-## 🌱 Personal Goals
-- 📚 Dive deeper into cutting-edge Natural Language Processing (NLP) techniques and models.
-- 🏃‍♂️ Balance work with my passion for outdoor activities like biking and running.
-- 🍎 Explore the intersection of technology and the Apple ecosystem, finding creative ways to integrate the two.
+```python
+class Jean:
+    def __init__(self):
+        self.role = "Technical Director"
+        self.company = "Cleyrop"
+        self.interests = ["LLMs", "AI Agents", "Data Sovereignty", "Kubernetes"]
+        self.currently_exploring = "Building AI-powered data pipelines"
+```
+
+## 🚀 What I'm Working On
+
+| Area | Focus |
+|------|-------|
+| 🤖 **AI & LLMs** | Integrating LLMs into enterprise data workflows, prompt engineering, RAG systems |
+| 🔐 **Data Sovereignty** | Building platforms where your data stays yours |
+| ☁️ **Cloud Native** | Kubernetes, containers, and scalable architectures |
+| 👥 **Team Leadership** | Growing engineers who ship great products |
+
+## 🧠 Current Obsessions
+
+- 🔥 **LLM Orchestration** — Exploring frameworks like LangChain, LlamaIndex, and building custom AI agents
+- 🛠️ **MLOps & LLMOps** — Making AI systems production-ready and reliable
+- 📊 **Vector Databases** — Because RAG is the future of enterprise AI
+- 🏃‍♂️ **Running & Biking** — Clearing my head while the models train
+
+## 💡 Philosophy
+
+> *"The best data platform is one you don't have to think about — it just works, securely."*
+
+I'm passionate about building technology that empowers businesses without compromising on security. In the age of AI, data sovereignty isn't just nice-to-have — it's essential.
 
 ## 🤝 Let's Connect
-- 💬 I'm always open to engaging discussions about data, tech, and everything in between.
-- 📫 You can reach me at [jean.humann@cleyrop.com](mailto:jean.humann@cleyrop.com).
-- 🐦 Connect with me on [Twitter](https://twitter.com/HumannJean).
-- 💼 Let's connect on [LinkedIn](https://www.linkedin.com/in/jeanhumann/)
+
+I love talking about LLMs, data architecture, and the future of AI. Don't hesitate to reach out!
+
+[![Email](https://img.shields.io/badge/Email-jean.humann%40cleyrop.com-blue?style=flat-square&logo=gmail)](mailto:jean.humann@cleyrop.com)
+[![Twitter](https://img.shields.io/badge/Twitter-@HumannJean-1DA1F2?style=flat-square&logo=twitter)](https://twitter.com/HumannJean)
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-jeanhumann-0A66C2?style=flat-square&logo=linkedin)](https://www.linkedin.com/in/jeanhumann/)
+
+---
+
+<p align="center">
+  <i>Building secure AI-powered data platforms, one commit at a time.</i>
+</p>
 
