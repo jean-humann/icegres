@@ -68,10 +68,13 @@ pub async fn connect_catalog(opts: &CatalogOpts) -> Result<Arc<dyn Catalog>> {
 /// `datafusion.<section>.<key>=<value>` pairs that are applied on top of the
 /// tuned defaults (invalid entries fail startup loudly rather than being
 /// silently ignored).
-fn session_config() -> Result<SessionConfig> {
+fn session_config(target_partitions: Option<usize>) -> Result<SessionConfig> {
     let mut config = SessionConfig::new()
         .with_information_schema(true)
         .with_default_catalog_and_schema(CATALOG_NAME, DEFAULT_SCHEMA);
+    if let Some(n) = target_partitions {
+        config = config.with_target_partitions(n);
+    }
     if let Ok(spec) = std::env::var("ICEGRES_DF_OPTS") {
         for pair in spec.split(';').map(str::trim).filter(|p| !p.is_empty()) {
             let (key, value) = pair.split_once('=').with_context(|| {
@@ -95,7 +98,21 @@ fn session_config() -> Result<SessionConfig> {
 /// because `setup_pg_catalog` needs `register_schema`, which
 /// `IcebergCatalogProvider` does not implement.
 pub async fn build_session_context(catalog: Arc<dyn Catalog>) -> Result<SessionContext> {
-    let ctx = SessionContext::new_with_config(session_config()?);
+    build_session_context_with(catalog, None).await
+}
+
+/// [`build_session_context`] with an explicit `target_partitions` override.
+///
+/// iceberg-datafusion's INSERT path round-robin-repartitions the input of an
+/// unpartitioned-table write across `target_partitions` workers and writes
+/// one Parquet file per non-empty worker. Callers that want a guaranteed
+/// single data file per commit (e.g. `icegres seed`, which optimizes the
+/// demo tables for scan speed) pass `Some(1)`.
+pub async fn build_session_context_with(
+    catalog: Arc<dyn Catalog>,
+    target_partitions: Option<usize>,
+) -> Result<SessionContext> {
+    let ctx = SessionContext::new_with_config(session_config(target_partitions)?);
 
     let iceberg_provider = IcebergCatalogProvider::try_new(catalog.clone())
         .await

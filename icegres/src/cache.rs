@@ -22,6 +22,28 @@
 //! snapshot is picked up by the next scan's snapshot check. Metadata tables
 //! (`trips$snapshots` etc.) and DDL delegate to the upstream schema provider
 //! unchanged.
+//!
+//! # Time travel (`table@snapshot_id`)
+//!
+//! [`CachingSchemaProvider`] additionally resolves table references of the
+//! form `"<table>@<snapshot_id>"` (quoted, since `@` is not a plain
+//! identifier character) to a read-only provider pinned to that Iceberg
+//! snapshot via `IcebergStaticTableProvider::try_new_from_table_snapshot` —
+//! e.g.
+//!
+//! ```sql
+//! select snapshot_id from demo."trips$snapshots" order by committed_at;
+//! select count(*) from demo."trips@4436304835314641572";
+//! ```
+//!
+//! This is the serve-in-place analogue of Lakebase/Neon PITR-style reads
+//! (SPEC §1 D4): every historical snapshot retained in table metadata is
+//! queryable at full SQL strength. Snapshots are immutable, so pinned
+//! providers are cached forever once built (bounded by the number of
+//! distinct snapshot ids actually queried). Unknown snapshot ids fail with
+//! the underlying "snapshot id ... not found" error; pinned tables are
+//! read-only (INSERT into them is rejected by DataFusion's planner since the
+//! static provider does not implement `insert_into`).
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -175,6 +197,20 @@ pub struct CachingSchemaProvider {
     catalog: Arc<dyn Catalog>,
     namespace: NamespaceIdent,
     cached: RwLock<HashMap<String, Arc<CachingTableProvider>>>,
+    /// Snapshot-pinned time-travel providers, keyed by the full
+    /// `table@snapshot_id` reference. Snapshots are immutable, so entries
+    /// never need invalidation.
+    pinned: RwLock<HashMap<String, Arc<IcebergStaticTableProvider>>>,
+}
+
+/// Parse a `<table>@<snapshot_id>` time-travel reference. Returns the base
+/// table name and the snapshot id, or `None` if `name` is not of that form.
+fn parse_time_travel(name: &str) -> Option<(&str, i64)> {
+    let (base, id) = name.rsplit_once('@')?;
+    if base.is_empty() || base.contains('$') {
+        return None;
+    }
+    id.parse::<i64>().ok().map(|id| (base, id))
 }
 
 impl std::fmt::Debug for CachingSchemaProvider {
@@ -215,7 +251,48 @@ impl CachingSchemaProvider {
             catalog,
             namespace,
             cached: RwLock::new(map),
+            pinned: RwLock::new(HashMap::new()),
         })
+    }
+
+    /// Resolve a `table@snapshot_id` time-travel reference to a read-only
+    /// provider pinned to that snapshot, building (and caching) it on first
+    /// use. `Ok(None)` when the base table does not exist; an error when the
+    /// snapshot id is not in the table's metadata.
+    async fn time_travel_table(
+        &self,
+        name: &str,
+        base: &str,
+        snapshot_id: i64,
+    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        if let Some(provider) = self
+            .pinned
+            .read()
+            .expect("pinned lock poisoned")
+            .get(name)
+            .cloned()
+        {
+            return Ok(Some(provider as Arc<dyn TableProvider>));
+        }
+        if !self.inner.table_exist(base) {
+            return Ok(None);
+        }
+        let ident = TableIdent::new(self.namespace.clone(), base.to_string());
+        let table = self
+            .catalog
+            .load_table(&ident)
+            .await
+            .map_err(to_datafusion_error)?;
+        let provider = Arc::new(
+            IcebergStaticTableProvider::try_new_from_table_snapshot(table, snapshot_id)
+                .await
+                .map_err(to_datafusion_error)?,
+        );
+        self.pinned
+            .write()
+            .expect("pinned lock poisoned")
+            .insert(name.to_string(), provider.clone());
+        Ok(Some(provider as Arc<dyn TableProvider>))
     }
 }
 
@@ -230,6 +307,11 @@ impl SchemaProvider for CachingSchemaProvider {
     }
 
     fn table_exist(&self, name: &str) -> bool {
+        if let Some((base, _)) = parse_time_travel(name) {
+            // Snapshot existence needs IO; report the base table's existence
+            // and let `table()` surface an unknown-snapshot error.
+            return self.inner.table_exist(base);
+        }
         self.inner.table_exist(name)
     }
 
@@ -238,6 +320,10 @@ impl SchemaProvider for CachingSchemaProvider {
         // inner provider — they are point-in-time views by construction.
         if name.contains('$') {
             return self.inner.table(name).await;
+        }
+        // Time-travel reference: "<table>@<snapshot_id>" pins a snapshot.
+        if let Some((base, snapshot_id)) = parse_time_travel(name) {
+            return self.time_travel_table(name, base, snapshot_id).await;
         }
         if let Some(provider) = self
             .cached

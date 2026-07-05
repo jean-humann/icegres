@@ -73,8 +73,57 @@ environment variables:
 | `--s3-region` | `ICEGRES_S3_REGION` | `us-east-1` | S3 region |
 | `--host` (serve) | `ICEGRES_HOST` | `0.0.0.0` | pgwire bind address |
 | `--port` (serve) | `ICEGRES_PORT` | `5439` | pgwire bind port |
+| `--idle-shutdown-secs` (serve) | `ICEGRES_IDLE_SHUTDOWN_SECS` | off | Scale-to-zero: exit cleanly after N seconds with no client connections |
+| `--health-port` (serve) | `ICEGRES_HEALTH_PORT` | off | Serve an HTTP 200 `ok` liveness endpoint on this port |
 
 Logging uses `tracing` with an env filter: `RUST_LOG=debug icegres serve`.
+
+### Scale-to-zero (`--idle-shutdown-secs`)
+
+icegres computes are stateless — all durable state lives in the Iceberg
+catalog + object store — so an idle server can simply exit. With
+`--idle-shutdown-secs N` the server exits cleanly (code 0) once no client
+connection has been open for `N` consecutive seconds (the countdown also
+starts at boot). Pair it with a supervisor that restarts on demand to get
+the scale-from-zero half; cold start is a few hundred ms:
+
+```sh
+# simplest supervisor loop: exits when idle, next client wakes it up
+while :; do icegres serve --idle-shutdown-secs 300; done
+```
+
+```ini
+# systemd: clean idle exit (code 0) does not restart with Restart=on-failure;
+# use a socket-activated unit to respawn on the next connection.
+[Service]
+ExecStart=/usr/local/bin/icegres serve --idle-shutdown-secs 300
+Restart=on-failure
+```
+
+Health-endpoint connections (below) do not count as client activity, so
+liveness probes never keep an idle server alive.
+
+### Health checks (`--health-port`)
+
+The pgwire port itself is health-checkable with a plain TCP connect (e.g.
+Kubernetes `tcpSocket`, `nc -z host 5439`) or, for full readiness, a real
+round trip: `psql -h host -p 5439 -U postgres -d icegres -c 'select 1'` —
+this is what the bench/parity/e2e harnesses use. With `--health-port P` the
+server additionally exposes a dedicated HTTP *liveness* endpoint: any
+request to that port (e.g. `curl http://host:P/health`) is answered with
+`HTTP/1.1 200 OK` and body `ok`. It asserts the process is up and accepting
+connections; it does not probe the catalog.
+
+### Time travel (`table@snapshot_id`)
+
+Every Iceberg snapshot retained in table metadata is queryable. List
+snapshots via the `$snapshots` metadata table, then pin any query to a
+snapshot with the quoted `table@snapshot_id` form (read-only):
+
+```sql
+select snapshot_id, committed_at from demo."trips$snapshots" order by committed_at;
+select count(*) from demo."trips@4436304835314641572";  -- e.g. the seed snapshot
+```
 
 ## Demo schema
 

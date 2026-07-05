@@ -10,6 +10,23 @@
 //! Iceberg table providers, which appends real Parquet files to the object
 //! store and commits them through the REST catalog.
 //!
+//! File layout: each table is seeded with a SINGLE `INSERT` statement through
+//! a session pinned to `target_partitions = 1`, so every table's seed data
+//! lands as exactly ONE Parquet file in ONE Iceberg commit (iceberg-datafusion
+//! writes one file per non-empty output partition of the write plan). Small
+//! files dominate read latency on this stack (~1 ms per object-store GET), so
+//! the seed layout is itself a performance feature; see bench/SPEC.md §4.4.
+//!
+//! No `icegres compact` subcommand exists — deliberately. Rewriting existing
+//! small files into one would need a replace-files snapshot (add rewritten
+//! file + remove source files atomically), and the pinned iceberg-rust 0.9.1
+//! `Transaction` API only exposes `fast_append` (plus property/sort-order/
+//! statistics/location updates): there is no rewrite/replace-files or
+//! overwrite action, and hand-forging the REST commit would bypass the
+//! library's conflict detection. Recovering a compact layout is done by
+//! dropping the demo tables (Lakekeeper REST, `purgeRequested=true`) and
+//! re-running `icegres seed`.
+//!
 //! Re-seed semantics: rows are inserted only when the seeded dataset is
 //! absent (observed row count is zero), so re-running `icegres seed` never
 //! duplicates data and repairs a table left empty by an interrupted earlier
@@ -27,11 +44,10 @@ use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 use tracing::{info, warn};
 
-use crate::context::{build_session_context, connect_catalog};
+use crate::context::{build_session_context_with, connect_catalog};
 use crate::CatalogOpts;
 
 const NAMESPACE: &str = "demo";
-const INSERT_CHUNK_ROWS: usize = 100;
 
 /// (city, country, population) reference data; trips reference these cities.
 const CITIES: &[(&str, &str, i64)] = &[
@@ -86,15 +102,17 @@ pub async fn run(opts: &CatalogOpts) -> Result<()> {
     ensure_table(catalog.as_ref(), &ns, "trips", trips_schema()?).await?;
 
     // Build the session AFTER table creation: the Iceberg catalog provider
-    // snapshots the table list at construction time.
-    let ctx = build_session_context(catalog).await?;
+    // snapshots the table list at construction time. target_partitions is
+    // pinned to 1 so each table's single INSERT writes exactly one Parquet
+    // file (the write plan emits one file per non-empty output partition).
+    let ctx = build_session_context_with(catalog, Some(1)).await?;
 
     // Insert based on the observed row count (not on whether this run created
     // the table), so a table left empty by an interrupted earlier seed run is
     // repopulated instead of being skipped forever.
     let cities_count = count_rows(&ctx, "cities", "").await?;
     if cities_count == 0 {
-        insert_chunked(&ctx, "cities", "city, country, population", &cities_rows()).await?;
+        insert_all(&ctx, "cities", "city, country, population", &cities_rows()).await?;
     } else {
         info!("demo.cities already populated; leaving data as-is");
     }
@@ -103,7 +121,7 @@ pub async fn run(opts: &CatalogOpts) -> Result<()> {
     let seeded_trips_filter = format!(" WHERE trip_id BETWEEN 1 AND {TRIP_COUNT}");
     let seeded_trips = count_rows(&ctx, "trips", &seeded_trips_filter).await?;
     if seeded_trips == 0 {
-        insert_chunked(
+        insert_all(
             &ctx,
             "trips",
             "trip_id, city, distance_km, fare, ts",
@@ -207,26 +225,29 @@ fn trips_rows() -> Vec<String> {
         .collect()
 }
 
-/// Append rows through the DataFusion INSERT path in bounded-size chunks.
-async fn insert_chunked(
+/// Append all rows through the DataFusion INSERT path as ONE statement, i.e.
+/// one Iceberg commit — and, with the seed session's `target_partitions = 1`,
+/// one Parquet data file (see the module docs on file layout).
+async fn insert_all(
     ctx: &SessionContext,
     table: &str,
     columns: &str,
     rows: &[String],
 ) -> Result<()> {
-    for chunk in rows.chunks(INSERT_CHUNK_ROWS) {
-        let sql = format!(
-            "INSERT INTO {NAMESPACE}.{table} ({columns}) VALUES {}",
-            chunk.join(", ")
-        );
-        ctx.sql(&sql)
-            .await
-            .with_context(|| format!("failed to plan INSERT into {NAMESPACE}.{table}"))?
-            .collect()
-            .await
-            .with_context(|| format!("failed to execute INSERT into {NAMESPACE}.{table}"))?;
-    }
-    info!("inserted {} rows into {NAMESPACE}.{table}", rows.len());
+    let sql = format!(
+        "INSERT INTO {NAMESPACE}.{table} ({columns}) VALUES {}",
+        rows.join(", ")
+    );
+    ctx.sql(&sql)
+        .await
+        .with_context(|| format!("failed to plan INSERT into {NAMESPACE}.{table}"))?
+        .collect()
+        .await
+        .with_context(|| format!("failed to execute INSERT into {NAMESPACE}.{table}"))?;
+    info!(
+        "inserted {} rows into {NAMESPACE}.{table} (single commit)",
+        rows.len()
+    );
     Ok(())
 }
 

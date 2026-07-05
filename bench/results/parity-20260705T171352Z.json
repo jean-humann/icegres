@@ -1,10 +1,10 @@
 {
   "schema": "icegres-parity-v1",
-  "ts": "20260705T174423Z",
+  "ts": "20260705T171352Z",
   "binary": "/home/user/jean-humann/icegres/target/release/icegres",
   "summary": {
-    "PASS": 18,
-    "GAP": 6,
+    "PASS": 16,
+    "GAP": 8,
     "NA_BY_DESIGN": 1
   },
   "probes": [
@@ -41,7 +41,7 @@
       "area": "wire",
       "behavior": "multiple concurrent connections",
       "verdict": "PASS",
-      "evidence": "8 parallel psql SELECT count(*) connections all succeeded (8/8 identical results: 285)"
+      "evidence": "8 parallel psql SELECT count(*) connections all succeeded (8/8 identical results: 7344)"
     },
     {
       "id": "A6",
@@ -62,7 +62,7 @@
       "area": "oltp",
       "behavior": "INSERT via wire, durable",
       "verdict": "PASS",
-      "evidence": "INSERT trip_id=900004 returned tag 'INSERT 0 1'; row read back over a NEW connection: 900004|Parity B1"
+      "evidence": "INSERT trip_id=2007048 returned tag 'INSERT 0 1'; row read back over a NEW connection: 2007048|Parity B1"
     },
     {
       "id": "B2",
@@ -83,21 +83,21 @@
       "area": "oltp",
       "behavior": "explicit transactions BEGIN/COMMIT/ROLLBACK",
       "verdict": "GAP",
-      "evidence": "BEGIN/ROLLBACK are accepted on the wire but are non-transactional: INSERT inside BEGIN..ROLLBACK persisted (row 900005 visible after ROLLBACK, count=1). Session output: BEGIN INSERT 0 1 ROLLBACK"
+      "evidence": "BEGIN/ROLLBACK are accepted on the wire but are non-transactional: INSERT inside BEGIN..ROLLBACK persisted (row 2007049 visible after ROLLBACK, count=1). Session output: BEGIN INSERT 0 1 ROLLBACK"
     },
     {
       "id": "B5",
       "area": "oltp",
       "behavior": "PK/constraint enforcement",
       "verdict": "GAP",
-      "evidence": "no constraint enforcement: duplicate insert of trip_id=900005 accepted ('INSERT 0 1'), table now holds 2 rows with that id. Iceberg has no PK/unique constraints."
+      "evidence": "no constraint enforcement: duplicate insert of trip_id=2007049 accepted ('INSERT 0 1'), table now holds 2 rows with that id. Iceberg has no PK/unique constraints."
     },
     {
       "id": "C1",
       "area": "lakehouse",
       "behavior": "data in open format, other engines can read",
       "verdict": "PASS",
-      "evidence": "independent reader pyiceberg 0.11.1 read demo.trips via the REST catalog + S3: 288 rows == server's count(288)"
+      "evidence": "independent reader pyiceberg 0.11.1 read demo.trips via the REST catalog + S3: 7347 rows == server's count(7347)"
     },
     {
       "id": "C2",
@@ -118,28 +118,28 @@
       "area": "lakehouse",
       "behavior": "write freshness (commit -> readable elsewhere)",
       "verdict": "PASS",
-      "evidence": "row committed via conn A was readable from a new connection ~50ms after commit (coarse; includes psql startup — precise p50/p95 is bench freshness_ms). Moonlink bar: sub-second."
+      "evidence": "row committed via conn A was readable from a new connection ~266ms after commit (coarse; includes psql startup — precise p50/p95 is bench freshness_ms). Moonlink bar: sub-second."
     },
     {
       "id": "C5",
       "area": "lakehouse",
       "behavior": "Iceberg metadata surfaces",
       "verdict": "PASS",
-      "evidence": "demo.\"trips$snapshots\" queryable (9 snapshots listed; $manifests also works). Caveats: 'select *' fails on the Map-typed summary column (ERROR: Unsupported Datatype Map(\"key_value\": non-null Struct(\"key\": non-null Utf8, metadata: {\"PARQUET:field_id\": \"7\"}, \"value\": Utf8, metadata: {\"PARQUET:field_id\": \"8\"}), unsorted)) and count(*) hits a DataFusion logical/physical schema mismatch — column projections work."
+      "evidence": "demo.\"trips$snapshots\" queryable (239 snapshots listed; $manifests also works). Caveats: 'select *' fails on the Map-typed summary column (ERROR: Unsupported Datatype Map(\"key_value\": non-null Struct(\"key\": non-null Utf8, metadata: {\"PARQUET:field_id\": \"7\"}, \"value\": Utf8, metadata: {\"PARQUET:field_id\": \"8\"}), unsorted)) and count(*) hits a DataFusion logical/physical schema mismatch — column projections work."
     },
     {
       "id": "D1",
       "area": "elasticity",
       "behavior": "stateless compute: restart durability",
       "verdict": "PASS",
-      "evidence": "killed and restarted the :5440 compute: row count identical before/after (288), wire-inserted row trip_id=900004 intact — all state lives in Iceberg/RustFS, none in the process."
+      "evidence": "killed and restarted the :5440 compute: row count identical before/after (7347), wire-inserted row trip_id=2007048 intact — all state lives in Iceberg/RustFS, none in the process."
     },
     {
       "id": "D2",
       "area": "elasticity",
       "behavior": "multiple stateless computes on shared storage",
       "verdict": "PASS",
-      "evidence": "second 'icegres serve' on :5440 (same catalog, started before the write) returned identical count (288) and served row trip_id=900004 committed via :5439 after both computes started (visible on first poll, 44ms; each query reloads table metadata from the REST catalog, so no staleness window was observed)."
+      "evidence": "second 'icegres serve' on :5440 (same catalog, started before the write) returned identical count (7347) and served row trip_id=2007048 committed via :5439 after both computes started (visible on first poll, 49ms; each query reloads table metadata from the REST catalog, so no staleness window was observed)."
     },
     {
       "id": "D3",
@@ -152,29 +152,29 @@
       "id": "D4",
       "area": "elasticity",
       "behavior": "time-travel read (branching/PITR analogue)",
-      "verdict": "PASS",
-      "evidence": "snapshot-pinned read works: demo.\"trips@2846737285402141775\" (oldest snapshot from \"trips$snapshots\") returned count=280 vs current count=288 (rows appended this run are invisible in the pinned view; WHERE on the pinned table -> 280). Read-only; timestamp syntax FOR SYSTEM_TIME AS OF is not supported by datafusion 52."
+      "verdict": "GAP",
+      "evidence": "snapshots are enumerable (e.g. id 9071164875294465684 via \"trips$snapshots\") but no snapshot-pinned read exists in datafusion 52 / iceberg-datafusion 0.9: FOR SYSTEM_TIME AS OF -> 'ERROR: sql parser error: Expected: one of UPDATE or SHARE, found: SYSTEM_TIME'; table@snapshot name -> 'ERROR: Error during planning: table 'icegres.demo.trips@9071164875294465684' not found'"
     },
     {
       "id": "D5",
       "area": "elasticity",
       "behavior": "scale-to-zero",
-      "verdict": "PASS",
-      "evidence": "--idle-shutdown-secs 5: server answered queries (demo.cities count=20), then exited on its own 5045ms after the last connection with code 0 (clean); health pings on :5446 do not reset the idle clock. Scale-from-zero: fresh spawn answered 'select 1' after 38ms (supervisor pattern documented in icegres/src/ops.rs + README)."
+      "verdict": "GAP",
+      "evidence": "no idle-shutdown supervisor: 'icegres serve --help' has no idle/scale/shutdown option; the process runs until killed. Roadmap item (SPEC §4.5). Cold start of a few seconds (D3) makes this viable."
     },
     {
       "id": "E1",
       "area": "ops",
       "behavior": "structured startup logs",
       "verdict": "PASS",
-      "evidence": "serve log contains structured fields catalog_uri/warehouse/s3_endpoint/listen_addr: 2026-07-05T17:44:24.535399Z INFO icegres: connecting to Iceberg REST catalog catalog_uri=http://127.0.0.1:8181/catalog warehouse=lakehouse s3_endpoint=http://127.0.0.1:9000 2026-07-05T17:44:24.555545Z INFO icegres: starting pgwire server listen_addr=127.0.0.1:5440"
+      "evidence": "serve log contains structured fields catalog_uri/warehouse/s3_endpoint/listen_addr: 2026-07-05T17:13:53.559110Z INFO icegres: connecting to Iceberg REST catalog catalog_uri=http://127.0.0.1:8181/catalog warehouse=lakehouse s3_endpoint=http://127.0.0.1:9000 2026-07-05T17:13:53.579108Z INFO icegres: starting pgwire server listen_addr=127.0.0.1:5440"
     },
     {
       "id": "E2",
       "area": "ops",
       "behavior": "health-checkable",
       "verdict": "PASS",
-      "evidence": "two probes work: (1) pgwire connect + 'select 1' as the readiness check (what the harnesses use; plain TCP connect works for tcpSocket-style checks); (2) dedicated HTTP liveness endpoint via --health-port — curl http://127.0.0.1:5446/health during the D5 probe returned 200 'ok'."
+      "evidence": "pgwire connect + 'select 1' works as a health probe (this is what the harnesses use). No dedicated HTTP health endpoint exists (curl :5439/health -> 'connection failed')."
     },
     {
       "id": "E3",

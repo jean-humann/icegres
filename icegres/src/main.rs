@@ -6,6 +6,7 @@
 
 mod cache;
 mod context;
+mod ops;
 mod scan;
 mod seed;
 
@@ -65,6 +66,11 @@ struct Cli {
     command: Command,
 }
 
+/// Subcommands. Note there is deliberately NO `compact` subcommand: the
+/// pinned iceberg-rust 0.9.1 `Transaction` API has no replace-files/rewrite
+/// action (only `fast_append` + metadata updates), so small files cannot be
+/// rewritten safely; see the module docs in `seed.rs` for the full rationale
+/// and the drop-and-reseed alternative.
 #[derive(Subcommand)]
 enum Command {
     /// Serve the lakehouse over the Postgres wire protocol.
@@ -79,6 +85,19 @@ enum Command {
         /// Port to bind the pgwire listener on.
         #[arg(long, env = "ICEGRES_PORT", default_value_t = 5439)]
         port: u16,
+
+        /// Scale-to-zero: exit cleanly (code 0) after this many consecutive
+        /// seconds with no client connections (the countdown also starts at
+        /// boot). Run under a restarting/socket-activating supervisor to get
+        /// scale-from-zero; see the module docs in ops.rs. Off by default.
+        #[arg(long, env = "ICEGRES_IDLE_SHUTDOWN_SECS")]
+        idle_shutdown_secs: Option<u64>,
+
+        /// Serve a minimal HTTP liveness endpoint ('HTTP/1.1 200 OK', body
+        /// 'ok') on this port; plain TCP connect checks work too. Liveness
+        /// only — readiness is a pgwire 'select 1'. Off by default.
+        #[arg(long, env = "ICEGRES_HEALTH_PORT")]
+        health_port: Option<u16>,
     },
     /// Create and populate the demo namespace/tables (idempotent).
     Seed {
@@ -111,13 +130,21 @@ async fn main() -> Result<()> {
             catalog,
             host,
             port,
-        } => run_serve(&catalog, &host, port).await,
+            idle_shutdown_secs,
+            health_port,
+        } => run_serve(&catalog, &host, port, idle_shutdown_secs, health_port).await,
         Command::Seed { catalog } => seed::run(&catalog).await,
         Command::Sql { catalog, query } => run_sql(&catalog, &query).await,
     }
 }
 
-async fn run_serve(opts: &CatalogOpts, host: &str, port: u16) -> Result<()> {
+async fn run_serve(
+    opts: &CatalogOpts,
+    host: &str,
+    port: u16,
+    idle_shutdown_secs: Option<u64>,
+    health_port: Option<u16>,
+) -> Result<()> {
     info!(
         catalog_uri = %opts.catalog_uri,
         warehouse = %opts.warehouse,
@@ -134,13 +161,28 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16) -> Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("failed to set up pg_catalog emulation: {e}"))?;
 
-    let server_options = ServerOptions::new()
-        .with_host(host.to_string())
-        .with_port(port);
+    if let Some(hp) = health_port {
+        ops::spawn_health_listener(host, hp).await?;
+    }
+
     info!(listen_addr = %format!("{host}:{port}"), "starting pgwire server");
-    serve(Arc::new(ctx), &server_options)
-        .await
-        .context("pgwire server failed")?;
+    match idle_shutdown_secs {
+        // Scale-to-zero path: our own accept loop with an idle watchdog
+        // (see ops.rs). Exits cleanly after the idle window.
+        Some(idle_secs) => ops::serve_with_idle_shutdown(Arc::new(ctx), host, port, idle_secs)
+            .await
+            .context("pgwire server (idle-shutdown mode) failed")?,
+        // Default path: the stock datafusion-postgres loop, byte-for-byte
+        // unchanged behavior.
+        None => {
+            let server_options = ServerOptions::new()
+                .with_host(host.to_string())
+                .with_port(port);
+            serve(Arc::new(ctx), &server_options)
+                .await
+                .context("pgwire server failed")?;
+        }
+    }
     Ok(())
 }
 

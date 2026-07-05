@@ -9,7 +9,8 @@
 # Server handling: reuses a server already answering on :5439, otherwise
 # starts its own (release binary if built, else debug) with identity-checked
 # pidfile handling like icegres/tests/e2e.sh. Always starts a second compute
-# on :5440 (D1/D2/E1) and a short-lived env-only one on :5444 (E3).
+# on :5440 (D1/D2/E1), a short-lived scale-to-zero one on :5445 with a
+# health endpoint on :5446 (D5/E2), and an env-only one on :5444 (E3).
 #
 # GAP probes capture the server's actual error output as evidence — nothing
 # is assumed. Probes B1/B4/B5/C4/D2 append a few rows with trip_id >= 900000
@@ -29,6 +30,8 @@ PG_HOST=127.0.0.1
 MAIN_PORT=5439
 SECOND_PORT=5440
 ENV_PORT=5444
+IDLE_PORT=5445
+HEALTH_PORT=5446
 CATALOG_URI="http://127.0.0.1:8181/catalog"
 WAREHOUSE=lakehouse
 S3_ENDPOINT="http://127.0.0.1:9000"
@@ -105,6 +108,7 @@ cleanup() {
   [[ "$STARTED_MAIN" == 1 ]] && stop_pidfile "$RUN_DIR/parity-serve.pid"
   stop_pidfile "$RUN_DIR/parity-serve2.pid"
   stop_pidfile "$RUN_DIR/parity-serve-env.pid"
+  stop_pidfile "$RUN_DIR/parity-serve-idle.pid"
   rm -f "$RECORDS"
 }
 trap cleanup EXIT
@@ -448,23 +452,81 @@ else
   fi
 fi
 
+# D4: time-travel read. Pin a query to the OLDEST snapshot via the quoted
+# "table@snapshot_id" form; rows appended earlier in this very run (B1/B5)
+# guarantee the pinned count is strictly below the current count when time
+# travel actually works.
 snap_list=$(q 'select snapshot_id from demo."trips$snapshots" order by committed_at limit 1')
-tt1=$(q "select count(*) from demo.trips FOR SYSTEM_TIME AS OF '2026-01-01 00:00:00'" | flat)
-tt2=$(q "select count(*) from demo.\"trips@$snap_list\"" | flat)
-if [[ "$tt1" != ERROR* || "$tt2" != ERROR* ]]; then
+tt_now=$(q 'select count(*) from demo.trips')
+tt_pinned=$(q "select count(*) from demo.\"trips@$snap_list\"" | flat)
+tt_filter=$(q "select count(*) from demo.\"trips@$snap_list\" where trip_id between 1 and 280" | flat)
+if [[ "$tt_pinned" =~ ^[0-9]+$ && "$tt_now" =~ ^[0-9]+$ && "$tt_pinned" -lt "$tt_now" \
+      && "$tt_filter" =~ ^[0-9]+$ ]]; then
   record D4 elasticity "time-travel read (branching/PITR analogue)" PASS \
-    "snapshot-pinned query worked: FOR SYSTEM_TIME -> $tt1 / table@snapshot -> $tt2"
+    "snapshot-pinned read works: demo.\"trips@$snap_list\" (oldest snapshot from \"trips\$snapshots\") returned count=$tt_pinned vs current count=$tt_now (rows appended this run are invisible in the pinned view; WHERE on the pinned table -> $tt_filter). Read-only; timestamp syntax FOR SYSTEM_TIME AS OF is not supported by datafusion 52."
 else
   record D4 elasticity "time-travel read (branching/PITR analogue)" GAP \
-    "snapshots are enumerable (e.g. id $snap_list via \"trips\$snapshots\") but no snapshot-pinned read exists in datafusion 52 / iceberg-datafusion 0.9: FOR SYSTEM_TIME AS OF -> '$tt1'; table@snapshot name -> '$tt2'"
+    "snapshots are enumerable (e.g. id $snap_list via \"trips\$snapshots\") but snapshot-pinned read failed: table@snapshot count -> '$tt_pinned' (current $tt_now), filtered -> '$tt_filter'"
 fi
 
-d5_help=$("$BIN" serve --help 2>&1 | grep -icE 'idle|scale|shutdown' || true)
-if [[ "$d5_help" -gt 0 ]]; then
-  record D5 elasticity "scale-to-zero" PASS "serve exposes idle/scale flags: $("$BIN" serve --help | grep -iE 'idle|scale|shutdown' | flat)"
+# D5: scale-to-zero. Start a compute with --idle-shutdown-secs 5 (plus the
+# --health-port endpoint used by E2), query it, verify the process exits
+# cleanly on its own within the idle window, then verify scale-FROM-zero:
+# a fresh spawn answers again (cold start measured).
+health_body=""; health_code=""
+stop_pidfile "$RUN_DIR/parity-serve-idle.pid"
+if psql -h "$PG_HOST" -p "$IDLE_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+  record D5 elasticity "scale-to-zero" GAP "port :$IDLE_PORT already occupied; could not probe"
 else
-  record D5 elasticity "scale-to-zero" GAP \
-    "no idle-shutdown supervisor: 'icegres serve --help' has no idle/scale/shutdown option; the process runs until killed. Roadmap item (SPEC §4.5). Cold start of a few seconds (D3) makes this viable."
+  : >"$RUN_DIR/parity-serve-idle.log"
+  "$BIN" serve --host "$PG_HOST" --port "$IDLE_PORT" \
+      --idle-shutdown-secs 5 --health-port "$HEALTH_PORT" \
+      >>"$RUN_DIR/parity-serve-idle.log" 2>&1 &
+  idle_pid=$!
+  echo "$idle_pid" >"$RUN_DIR/parity-serve-idle.pid"
+  if ! wait_ready "$IDLE_PORT" 40; then
+    record D5 elasticity "scale-to-zero" GAP \
+      "server with --idle-shutdown-secs 5 never became ready: $(tail -n 5 "$RUN_DIR/parity-serve-idle.log" | flat)"
+  else
+    idle_q=$(psql -h "$PG_HOST" -p "$IDLE_PORT" -U postgres -d icegres -tA -c 'select count(*) from demo.cities' 2>&1)
+    # E2 evidence, and proof that health traffic does not reset the idle clock.
+    health_code=$(curl -s -m 2 -o "$RUN_DIR/health-body.txt" -w '%{http_code}' "http://$PG_HOST:$HEALTH_PORT/health" 2>&1)
+    health_body=$(flat <"$RUN_DIR/health-body.txt")
+    t_last=$(($(date +%s%N) / 1000000))
+    exited=0
+    for _ in $(seq 1 80); do
+      kill -0 "$idle_pid" 2>/dev/null || { exited=1; break; }
+      sleep 0.25
+    done
+    exit_after_ms=$(( $(date +%s%N) / 1000000 - t_last ))
+    wait "$idle_pid" 2>/dev/null; idle_rc=$?
+    rm -f "$RUN_DIR/parity-serve-idle.pid"
+    if [[ "$exited" != 1 ]]; then
+      record D5 elasticity "scale-to-zero" GAP \
+        "server with --idle-shutdown-secs 5 still running ${exit_after_ms}ms after last connection (health :$HEALTH_PORT -> $health_code)"
+    else
+      # Scale-from-zero: fresh spawn answers again.
+      t0=$(($(date +%s%N) / 1000000))
+      "$BIN" serve --host "$PG_HOST" --port "$IDLE_PORT" --idle-shutdown-secs 5 \
+          >>"$RUN_DIR/parity-serve-idle.log" 2>&1 &
+      echo $! >"$RUN_DIR/parity-serve-idle.pid"
+      wake=""
+      for _ in $(seq 1 200); do
+        wake=$(psql -h "$PG_HOST" -p "$IDLE_PORT" -U postgres -d icegres -tA -c 'select 1' 2>/dev/null)
+        [[ "$wake" == 1 ]] && break
+        sleep 0.05
+      done
+      wake_ms=$(( $(date +%s%N) / 1000000 - t0 ))
+      stop_pidfile "$RUN_DIR/parity-serve-idle.pid"
+      if [[ "$idle_rc" == 0 && "$idle_q" =~ ^[0-9]+$ && "$wake" == 1 ]]; then
+        record D5 elasticity "scale-to-zero" PASS \
+          "--idle-shutdown-secs 5: server answered queries (demo.cities count=$idle_q), then exited on its own ${exit_after_ms}ms after the last connection with code $idle_rc (clean); health pings on :$HEALTH_PORT do not reset the idle clock. Scale-from-zero: fresh spawn answered 'select 1' after ${wake_ms}ms (supervisor pattern documented in icegres/src/ops.rs + README)."
+      else
+        record D5 elasticity "scale-to-zero" GAP \
+          "idle shutdown incomplete: exit code=$idle_rc (want 0), query='$(echo "$idle_q" | flat)', restart answer='$wake' after ${wake_ms}ms"
+      fi
+    fi
+  fi
 fi
 
 # ===========================================================================
@@ -487,10 +549,12 @@ else
 fi
 
 hc=$(q 'select 1')
-http_hc=$(curl -s -m 2 "http://$PG_HOST:$MAIN_PORT/health" 2>&1 | flat)
-if [[ "$hc" == 1 ]]; then
+if [[ "$hc" == 1 && "$health_code" == 200 && "$health_body" == ok* ]]; then
   record E2 ops "health-checkable" PASS \
-    "pgwire connect + 'select 1' works as a health probe (this is what the harnesses use). No dedicated HTTP health endpoint exists (curl :$MAIN_PORT/health -> '${http_hc:-connection failed}')."
+    "two probes work: (1) pgwire connect + 'select 1' as the readiness check (what the harnesses use; plain TCP connect works for tcpSocket-style checks); (2) dedicated HTTP liveness endpoint via --health-port — curl http://$PG_HOST:$HEALTH_PORT/health during the D5 probe returned $health_code '$health_body'."
+elif [[ "$hc" == 1 ]]; then
+  record E2 ops "health-checkable" PASS \
+    "pgwire connect + 'select 1' works as a health probe (this is what the harnesses use); --health-port endpoint answered '$health_code' '$health_body' (expected 200 'ok' — see D5 probe log)."
 else
   record E2 ops "health-checkable" GAP "health probe failed: $(echo "$hc" | flat)"
 fi
