@@ -18,14 +18,13 @@
 //! the seed layout is itself a performance feature; see bench/SPEC.md §4.4.
 //!
 //! No `icegres compact` subcommand exists — deliberately. Rewriting existing
-//! small files into one would need a replace-files snapshot (add rewritten
-//! file + remove source files atomically), and the pinned iceberg-rust 0.9.1
-//! `Transaction` API only exposes `fast_append` (plus property/sort-order/
-//! statistics/location updates): there is no rewrite/replace-files or
-//! overwrite action, and hand-forging the REST commit would bypass the
-//! library's conflict detection. Recovering a compact layout is done by
-//! dropping the demo tables (Lakekeeper REST, `purgeRequested=true`) and
-//! re-running `icegres seed`.
+//! small files into one needs a replace-files snapshot (add rewritten file +
+//! remove source files atomically); the pinned iceberg-rust 0.9.1
+//! `Transaction` API only exposes `fast_append`, and while the copy-on-write
+//! snapshot machinery in `overwrite.rs` (UPDATE/DELETE) could carry a
+//! `replace`-operation compaction, that is future work. Recovering a compact
+//! layout is done by dropping the demo tables (Lakekeeper REST,
+//! `purgeRequested=true`) and re-running `icegres seed`.
 //!
 //! Re-seed semantics: rows are inserted only when the seeded dataset is
 //! absent (observed row count is zero), so re-running `icegres seed` never

@@ -8,10 +8,9 @@
 #   - The harness is NON-DESTRUCTIVE: it never drops catalog tables. The
 #     seeded dataset is deterministic (LCG seed 42) and occupies
 #     trip_id 1..280 in demo.trips, so all "exact value" assertions filter
-#     on that id range. The write-path test appends one row per run with a
-#     fresh unique trip_id >= 900000 (append-only Iceberg; DELETE is not
-#     supported by iceberg-datafusion 0.9.1), which the range filter keeps
-#     out of the deterministic assertions.
+#     on that id range. The write-path tests append/update/delete only rows
+#     with fresh unique trip_id >= 900000 (sections (e) and (i)), which the
+#     range filter keeps out of the deterministic assertions.
 #   - Every psql invocation is a NEW connection (psql -c opens/closes one),
 #     so read-your-writes checks always cross connection boundaries.
 
@@ -332,6 +331,55 @@ assert_eq "authenticated+encrypted query result" 20 \
   "$(PGPASSWORD=e2e-secret-pw psql "host=$PG_HOST port=$SECURE_PORT user=e2e_user dbname=icegres sslmode=require" -tA -c 'select count(*) from demo.cities' 2>&1)"
 
 stop_secure_server
+
+# ---------------------------------------------------------------------------
+# (i) UPDATE/DELETE: copy-on-write DML over the wire (SPEC B2/B3)
+# ---------------------------------------------------------------------------
+log "(i) UPDATE/DELETE copy-on-write DML"
+U_ID=$((new_id + 1))
+D_ID=$((new_id + 2))
+"${PSQL[@]}" -q -c "insert into demo.trips (trip_id, city, distance_km, fare, ts) values
+  ($U_ID, 'DML Update', 1.0, 10.0, TIMESTAMP '2026-07-05 00:00:00'),
+  ($D_ID, 'DML Delete', 2.0, 20.0, TIMESTAMP '2026-07-05 00:00:00')" \
+  || fail "seeding DML test rows failed"
+
+pre_dml_snap=$(q 'select snapshot_id from demo."trips$snapshots" order by committed_at desc limit 1')
+[[ "$pre_dml_snap" =~ ^[0-9]+$ ]] || fail "could not read the pre-DML snapshot id"
+
+update_tag=$("${PSQL[@]}" -c "update demo.trips set fare = 123.45 where trip_id = $U_ID" | tail -n 1)
+assert_eq "UPDATE command tag" "UPDATE 1" "$update_tag"
+assert_eq "updated row readable from a new connection" "$U_ID|DML Update|123.45" \
+  "$(q "select trip_id, city, fare from demo.trips where trip_id = $U_ID")"
+
+delete_tag=$("${PSQL[@]}" -c "delete from demo.trips where trip_id = $D_ID" | tail -n 1)
+assert_eq "DELETE command tag" "DELETE 1" "$delete_tag"
+assert_eq "deleted row gone from a new connection" 0 \
+  "$(q "select count(*) from demo.trips where trip_id = $D_ID")"
+assert_eq "sibling row survived the DELETE" "$U_ID" \
+  "$(q "select trip_id from demo.trips where trip_id = $U_ID")"
+assert_eq "seeded rows untouched by DML" 280 \
+  "$(q 'select count(*) from demo.trips where trip_id between 1 and 280')"
+
+# Time travel is intact after DML: the pre-DML snapshot still serves the
+# deleted row and the pre-update fare (copy-on-write never mutates history).
+assert_eq "pre-DML snapshot still serves the deleted row" 1 \
+  "$(q "select count(*) from demo.\"trips@$pre_dml_snap\" where trip_id = $D_ID")"
+assert_eq "pre-DML snapshot still serves the pre-update fare" "10.0" \
+  "$(q "select fare from demo.\"trips@$pre_dml_snap\" where trip_id = $U_ID")"
+
+# Optimistic-concurrency retry, proven against the real catalog:
+# ICEGRES_DML_INJECT_CONFLICT sabotages attempt 1's assert-ref-snapshot-id,
+# Lakekeeper answers 409, and the engine recomputes+retries successfully.
+ICEGRES_DML_INJECT_CONFLICT=1 "$BIN" sql -e "delete from demo.trips where trip_id = $U_ID" \
+  >"$E2E_DIR/dml-conflict.log" 2>&1 \
+  || { tail -n 20 "$E2E_DIR/dml-conflict.log" >&2; fail "conflict-injected DELETE failed"; }
+grep -q "commit conflict (409)" "$E2E_DIR/dml-conflict.log" \
+  || fail "conflict injection did not produce a 409 (log: $E2E_DIR/dml-conflict.log)"
+grep -q "DELETE 1" "$E2E_DIR/dml-conflict.log" \
+  || fail "conflict-injected DELETE did not commit on retry (log: $E2E_DIR/dml-conflict.log)"
+pass "DML conflict retry: 409 from Lakekeeper on attempt 1, committed on attempt 2"
+assert_eq "conflict-retried DELETE took effect" 0 \
+  "$(q "select count(*) from demo.trips where trip_id = $U_ID")"
 
 # ---------------------------------------------------------------------------
 log "all assertions passed ($PASS_COUNT)"

@@ -198,9 +198,14 @@ INSERT 0 1
 ```
 
 `INSERT` over the wire works end-to-end (verified: it appends Parquet data
-files to RustFS and commits through the REST catalog). Writes are
-append-only; `INSERT OVERWRITE`/`UPDATE`/`DELETE` are not supported by
-iceberg-datafusion 0.9.1.
+files to RustFS and commits through the REST catalog). `UPDATE` and `DELETE`
+work too, as copy-on-write Iceberg commits (`src/overwrite.rs`): only the
+Parquet files that actually contain matching rows are rewritten, every other
+file is reused in the new snapshot, and the commit is protected by an
+`assert-ref-snapshot-id` requirement with bounded refresh-and-retry on
+conflicts. Unsupported DML forms (joins/`USING`, `RETURNING`, subqueries in
+predicates, bind parameters) are rejected with clear errors rather than
+mis-executed; `INSERT OVERWRITE` is not supported.
 
 ## Testing
 
@@ -217,9 +222,9 @@ pid/logs live under `.e2e/` (gitignored); the server is killed on exit.
 
 The harness is non-destructive: it never drops tables. The deterministic
 seeded dataset occupies `trip_id` 1..280, so exact-value assertions filter on
-that range; each run appends one test row with a unique `trip_id >= 900000`
-(append-only storage — these accumulate by design, one small row per run).
-A sample psql session is in `docs/demo-session.txt`.
+that range; each run appends/updates/deletes a few test rows with unique
+`trip_id >= 900000` (leftovers accumulate by design, a few small rows per
+run). A sample psql session is in `docs/demo-session.txt`.
 
 ## Notes and limitations
 

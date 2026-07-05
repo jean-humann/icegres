@@ -13,8 +13,8 @@
 # health endpoint on :5446 (D5/E2), and an env-only one on :5444 (E3).
 #
 # GAP probes capture the server's actual error output as evidence — nothing
-# is assumed. Probes B1/B4/B5/C4/D2 append a few rows with trip_id >= 900000
-# per run (append-only Iceberg, same convention as e2e.sh; deterministic
+# is assumed. Probes B1/B3/B4/B5 append (and B2/B3 mutate/delete) a few rows
+# with trip_id >= 900000 per run (same convention as e2e.sh; deterministic
 # assertions elsewhere filter trip_id 1..280 so this is safe by design).
 
 set -uo pipefail
@@ -304,20 +304,35 @@ else
     "insert tag: $(echo "$tag" | flat); readback: $(echo "$back" | flat)"
 fi
 
-out=$(q "update demo.trips set fare = 99.9 where trip_id = $B1_ID")
-if [[ "$out" == UPDATE* ]]; then
-  record B2 oltp "UPDATE" PASS "UPDATE returned: $(echo "$out" | flat)"
+# B2: UPDATE over the wire (copy-on-write overwrite snapshot), verified by
+# reading the new value back over a NEW connection.
+b2_tag=$(psql -h "$PG_HOST" -p "$MAIN_PORT" -U postgres -d icegres -c \
+  "update demo.trips set fare = 99.9 where trip_id = $B1_ID" 2>&1 | tail -n 1)
+b2_back=$(q "select round(fare, 2) from demo.trips where trip_id = $B1_ID")
+if [[ "$b2_tag" == "UPDATE 1" && "$b2_back" == "99.9" ]]; then
+  record B2 oltp "UPDATE" PASS \
+    "UPDATE trip_id=$B1_ID returned tag '$b2_tag'; new fare read back over a NEW connection: $b2_back (copy-on-write: only the Parquet file holding the row is rewritten, all other files are reused in the new Iceberg snapshot)"
 else
   record B2 oltp "UPDATE" GAP \
-    "UPDATE rejected (iceberg-datafusion 0.9 is append-only): $(echo "$out" | flat)"
+    "UPDATE tag: $(echo "$b2_tag" | flat); readback: $(echo "$b2_back" | flat)"
 fi
 
-out=$(q "delete from demo.trips where trip_id = -12345")
-if [[ "$out" == DELETE* ]]; then
-  record B3 oltp "DELETE" PASS "DELETE returned: $(echo "$out" | flat)"
+# B3: DELETE over the wire; row gone from a NEW connection, and the
+# pre-delete snapshot still serves it (time travel intact after DML).
+B3_ID=$next_id; next_id=$((next_id + 1))
+psql -h "$PG_HOST" -p "$MAIN_PORT" -U postgres -d icegres -c \
+  "insert into demo.trips (trip_id, city, distance_km, fare, ts) values ($B3_ID, 'Parity B3', 3.0, 3.0, TIMESTAMP '2026-07-05 00:00:00')" >/dev/null 2>&1
+b3_pre_snap=$(q 'select snapshot_id from demo."trips$snapshots" order by committed_at desc limit 1')
+b3_tag=$(psql -h "$PG_HOST" -p "$MAIN_PORT" -U postgres -d icegres -c \
+  "delete from demo.trips where trip_id = $B3_ID" 2>&1 | tail -n 1)
+b3_after=$(q "select count(*) from demo.trips where trip_id = $B3_ID")
+b3_tt=$(q "select count(*) from demo.\"trips@$b3_pre_snap\" where trip_id = $B3_ID")
+if [[ "$b3_tag" == "DELETE 1" && "$b3_after" == 0 && "$b3_tt" == 1 ]]; then
+  record B3 oltp "DELETE" PASS \
+    "DELETE trip_id=$B3_ID returned tag '$b3_tag'; count over a NEW connection afterwards: $b3_after; time travel intact: pre-delete snapshot $b3_pre_snap still serves the row (count=$b3_tt)"
 else
   record B3 oltp "DELETE" GAP \
-    "DELETE rejected (iceberg-datafusion 0.9 is append-only): $(echo "$out" | flat)"
+    "DELETE tag: $(echo "$b3_tag" | flat); post-delete count: $b3_after; pre-delete snapshot readback: $(echo "$b3_tt" | flat)"
 fi
 
 B4_ID=$next_id; next_id=$((next_id + 1))

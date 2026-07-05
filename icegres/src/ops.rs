@@ -79,7 +79,7 @@ use datafusion_postgres::pgwire::error::{PgWireError, PgWireResult};
 use datafusion_postgres::pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use datafusion_postgres::pgwire::tokio::tokio_rustls::rustls;
 use datafusion_postgres::pgwire::tokio::{process_socket, TlsAcceptor};
-use datafusion_postgres::DfSessionService;
+use datafusion_postgres::{DfSessionService, QueryHook};
 use futures::Sink;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -221,6 +221,7 @@ pub async fn serve_custom(
     idle_secs: Option<u64>,
     tls: Option<TlsAcceptor>,
     auth: Option<Arc<FileAuthSource>>,
+    hooks: Vec<Arc<dyn QueryHook>>,
 ) -> Result<()> {
     let addr = format!("{host}:{port}");
     let listener = TcpListener::bind(&addr)
@@ -235,7 +236,7 @@ pub async fn serve_custom(
     );
 
     let factory = Arc::new(IcegresHandlerFactory {
-        service: Arc::new(DfSessionService::new(ctx)),
+        service: Arc::new(DfSessionService::new_with_hooks(ctx, hooks)),
         auth,
     });
     let idle_window = idle_secs.map(Duration::from_secs);

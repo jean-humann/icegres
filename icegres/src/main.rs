@@ -6,7 +6,9 @@
 
 mod cache;
 mod context;
+mod dml;
 mod ops;
+mod overwrite;
 mod pgauth;
 mod scan;
 mod seed;
@@ -18,8 +20,12 @@ use anyhow::{bail, Context as _, Result};
 use clap::{Args, Parser, Subcommand};
 use datafusion_postgres::auth::AuthManager;
 use datafusion_postgres::datafusion_pg_catalog::pg_catalog::setup_pg_catalog;
-use datafusion_postgres::{serve, ServerOptions};
+use datafusion_postgres::hooks::set_show::SetShowHook;
+use datafusion_postgres::hooks::transactions::TransactionStatementHook;
+use datafusion_postgres::{serve_with_hooks, QueryHook, ServerOptions};
 use tracing::{info, warn};
+
+use crate::overwrite::OverwriteEngine;
 
 /// Connection options for the Iceberg REST catalog and its object store.
 #[derive(Args, Clone, Debug)]
@@ -68,11 +74,12 @@ struct Cli {
     command: Command,
 }
 
-/// Subcommands. Note there is deliberately NO `compact` subcommand: the
+/// Subcommands. Note there is deliberately NO `compact` subcommand yet: the
 /// pinned iceberg-rust 0.9.1 `Transaction` API has no replace-files/rewrite
-/// action (only `fast_append` + metadata updates), so small files cannot be
-/// rewritten safely; see the module docs in `seed.rs` for the full rationale
-/// and the drop-and-reseed alternative.
+/// action (only `fast_append` + metadata updates). The copy-on-write DML
+/// machinery in `overwrite.rs` could carry a compaction (`replace`
+/// operation) in the future; until then drop-and-reseed is the documented
+/// canonicalization path (see the module docs in `seed.rs`).
 #[derive(Subcommand)]
 enum Command {
     /// Serve the lakehouse over the Postgres wire protocol.
@@ -220,7 +227,7 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
         "connecting to Iceberg REST catalog"
     );
     let catalog = context::connect_catalog(opts).await?;
-    let ctx = context::build_session_context(catalog).await?;
+    let ctx = context::build_session_context(catalog.clone()).await?;
 
     setup_pg_catalog(
         &ctx,
@@ -233,6 +240,9 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
         ops::spawn_health_listener(host, hp).await?;
     }
 
+    let engine = Arc::new(OverwriteEngine::connect(catalog, opts).await?);
+    let hooks = query_hooks(engine);
+
     info!(listen_addr = %format!("{host}:{port}"), "starting pgwire server");
     if serve_opts.idle_shutdown_secs.is_some() || tls.is_some() || auth.is_some() {
         // Custom accept loop (ops.rs): idle shutdown, TLS, and/or SCRAM auth.
@@ -243,24 +253,44 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
             serve_opts.idle_shutdown_secs,
             tls,
             auth,
+            hooks,
         )
         .await
         .context("pgwire server (custom accept loop) failed")?;
     } else {
-        // Default path: the stock datafusion-postgres loop, byte-for-byte
-        // unchanged behavior.
+        // Default path: the stock datafusion-postgres loop with the icegres
+        // hook chain (defaults + UPDATE/DELETE) attached.
         let server_options = ServerOptions::new()
             .with_host(host.to_string())
             .with_port(port);
-        serve(Arc::new(ctx), &server_options)
+        serve_with_hooks(Arc::new(ctx), &server_options, hooks)
             .await
             .context("pgwire server failed")?;
     }
     Ok(())
 }
 
+/// The datafusion-postgres query-hook chain: the two hooks its stock
+/// `DfSessionService::new` installs (SET/SHOW and BEGIN/COMMIT handling),
+/// plus the icegres copy-on-write UPDATE/DELETE hook.
+fn query_hooks(engine: Arc<OverwriteEngine>) -> Vec<Arc<dyn QueryHook>> {
+    vec![
+        Arc::new(SetShowHook),
+        Arc::new(TransactionStatementHook),
+        Arc::new(dml::DmlHook::new(engine)),
+    ]
+}
+
 async fn run_sql(opts: &CatalogOpts, query: &str) -> Result<()> {
     let catalog = context::connect_catalog(opts).await?;
+    // UPDATE/DELETE take the same copy-on-write path as the server's wire
+    // handler; everything else goes through DataFusion unchanged.
+    if let Some(dml_stmt) = dml::parse_single_dml(query)? {
+        let engine = OverwriteEngine::connect(catalog, opts).await?;
+        let outcome = engine.execute(&dml_stmt.0).await?;
+        println!("{} {}", dml_stmt.1, outcome.rows);
+        return Ok(());
+    }
     let ctx = context::build_session_context(catalog).await?;
     let df = ctx
         .sql(query)

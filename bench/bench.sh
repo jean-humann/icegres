@@ -91,14 +91,17 @@ drop_scratch() { # drop the bench-owned scratch table (created by this script)
 # compare. Before measuring, demo.trips is rewritten to its canonical
 # single-file seed layout whenever it has more than 2 data files.
 #
-# History on this stack is fast_append-only (no deletes/rewrites ever), so
-# the table's data-file count is exactly the sum of `added-data-files` over
-# its snapshots (the per-snapshot `total-*` summary fields written by
-# iceberg-rust 0.9.1 are per-commit, NOT cumulative — do not trust them).
+# The live data-file count is the sum of `added-data-files` minus the sum
+# of `deleted-data-files` over the table's snapshots: INSERTs fast_append,
+# and UPDATE/DELETE (icegres DML) produce copy-on-write overwrite snapshots
+# that record both fields exactly. (The per-snapshot `total-*` summary
+# fields written by iceberg-rust 0.9.1 fast_append are per-commit, NOT
+# cumulative — do not trust them.)
 trips_data_files() {
   local prefix; prefix=$(catalog_prefix)
   curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/trips" \
-    | jq -r '[.metadata.snapshots[]?.summary."added-data-files" // "0" | tonumber] | add // 0'
+    | jq -r '([.metadata.snapshots[]?.summary."added-data-files" // "0" | tonumber] | add // 0)
+             - ([.metadata.snapshots[]?.summary."deleted-data-files" // "0" | tonumber] | add // 0)'
 }
 
 drop_trips() {
