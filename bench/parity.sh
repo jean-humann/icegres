@@ -118,6 +118,7 @@ cleanup() {
   stop_pidfile "$RUN_DIR/parity-serve-env.pid"
   stop_pidfile "$RUN_DIR/parity-serve-idle.pid"
   stop_pidfile "$RUN_DIR/parity-serve-secure.pid"
+  stop_pidfile "$RUN_DIR/parity-serve-pk.pid"
   rm -f "$RECORDS"
 }
 trap cleanup EXIT
@@ -335,34 +336,83 @@ else
     "DELETE tag: $(echo "$b3_tag" | flat); post-delete count: $b3_after; pre-delete snapshot readback: $(echo "$b3_tt" | flat)"
 fi
 
+# B4: real transactions — ROLLBACK undoes (with read-your-own-writes inside
+# the txn), and a multi-statement COMMIT applies atomically.
 B4_ID=$next_id; next_id=$((next_id + 1))
+B4C_ID=$next_id; next_id=$((next_id + 1))
 txn_out=$(psql -h "$PG_HOST" -p "$MAIN_PORT" -U postgres -d icegres 2>&1 <<EOF | flat
 BEGIN;
 insert into demo.trips (trip_id, city, distance_km, fare, ts) values ($B4_ID, 'Parity B4', 1.0, 1.0, TIMESTAMP '2026-07-05 00:00:00');
+select count(*) from demo.trips where trip_id = $B4_ID;
 ROLLBACK;
 EOF
 )
-after=$(q "select count(*) from demo.trips where trip_id = $B4_ID")
-if [[ "$after" == 0 ]]; then
+after_rb=$(q "select count(*) from demo.trips where trip_id = $B4_ID")
+commit_out=$(psql -h "$PG_HOST" -p "$MAIN_PORT" -U postgres -d icegres 2>&1 <<EOF | flat
+BEGIN;
+insert into demo.trips (trip_id, city, distance_km, fare, ts) values ($B4C_ID, 'Parity B4c', 1.0, 1.0, TIMESTAMP '2026-07-05 00:00:00');
+update demo.trips set fare = 77.0 where trip_id = $B4C_ID;
+COMMIT;
+EOF
+)
+after_commit=$(q "select trip_id, round(fare, 1) from demo.trips where trip_id = $B4C_ID")
+if [[ "$after_rb" == 0 && "$after_commit" == "$B4C_ID|77.0" ]]; then
   record B4 oltp "explicit transactions BEGIN/COMMIT/ROLLBACK" PASS \
-    "ROLLBACK undid the INSERT (row $B4_ID absent afterwards). Session output: $txn_out"
+    "real transactions: ROLLBACK undid the INSERT (row $B4_ID absent afterwards; the row WAS visible inside the txn: '$txn_out'); a 2-statement txn (INSERT + UPDATE) COMMITted atomically as one Iceberg snapshot (row $B4C_ID|fare=77.0 from a new connection: '$commit_out'). Reads inside a txn are snapshot-pinned per table (snapshot isolation, first-committer-wins 40001 on conflict — proven in e2e (j))."
 else
   record B4 oltp "explicit transactions BEGIN/COMMIT/ROLLBACK" GAP \
-    "BEGIN/ROLLBACK are accepted on the wire but are non-transactional: INSERT inside BEGIN..ROLLBACK persisted (row $B4_ID visible after ROLLBACK, count=$after). Session output: $txn_out"
+    "transactions incomplete: post-ROLLBACK count=$after_rb (want 0; session: $txn_out); post-COMMIT readback='$after_commit' (want $B4C_ID|77.0; session: $commit_out)"
 fi
 
-dup_tag=$(psql -h "$PG_HOST" -p "$MAIN_PORT" -U postgres -d icegres -c \
-  "insert into demo.trips (trip_id, city, distance_km, fare, ts) values ($B4_ID, 'Parity B5 dup', 2.0, 2.0, TIMESTAMP '2026-07-05 00:00:00')" 2>&1 | tail -n 1)
-dup_count=$(q "select count(*) from demo.trips where trip_id = $B4_ID")
-if [[ "$dup_tag" == "INSERT 0 1" && "$dup_count" -ge 2 ]]; then
-  record B5 oltp "PK/constraint enforcement" GAP \
-    "no constraint enforcement: duplicate insert of trip_id=$B4_ID accepted ('$dup_tag'), table now holds $dup_count rows with that id. Iceberg has no PK/unique constraints."
-elif [[ "$dup_tag" != INSERT* ]]; then
-  record B5 oltp "PK/constraint enforcement" PASS \
-    "duplicate insert rejected: $(echo "$dup_tag" | flat)"
+# B5: opt-in PK enforcement — probed on a dedicated server started with
+# --enforce-pk against a parity-owned scratch table declaring
+# icegres.primary-key (the main server keeps the default: enforcement OFF).
+PK_PORT=5448
+stop_pidfile "$RUN_DIR/parity-serve-pk.pid"
+prefix=$(curl -sf "$CATALOG_URI/v1/config?warehouse=$WAREHOUSE" | jq -r '.overrides.prefix // .defaults.prefix')
+curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/parity_pk?purgeRequested=true" >/dev/null 2>&1
+b5_err=""
+if psql -h "$PG_HOST" -p "$PK_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+  b5_err="port :$PK_PORT already occupied; could not start the --enforce-pk server"
+elif ! curl -sf -X POST "$CATALOG_URI/v1/$prefix/namespaces/demo/tables" \
+    -H 'Content-Type: application/json' -d '{
+  "name": "parity_pk",
+  "schema": {"type":"struct","schema-id":0,"fields":[
+    {"id":1,"name":"id","required":false,"type":"long"},
+    {"id":2,"name":"val","required":false,"type":"string"}]},
+  "properties": {"icegres.primary-key": "id"}
+}' >/dev/null; then
+  b5_err="could not create demo.parity_pk via the REST catalog"
 else
-  record B5 oltp "PK/constraint enforcement" GAP \
-    "ambiguous: tag=$(echo "$dup_tag" | flat) count=$dup_count"
+  : >"$RUN_DIR/parity-serve-pk.log"
+  "$BIN" serve --host "$PG_HOST" --port "$PK_PORT" --enforce-pk \
+    >>"$RUN_DIR/parity-serve-pk.log" 2>&1 &
+  echo $! >"$RUN_DIR/parity-serve-pk.pid"
+  wait_ready "$PK_PORT" || b5_err="--enforce-pk server never became ready: $(tail -n 5 "$RUN_DIR/parity-serve-pk.log" | flat)"
+fi
+if [[ -z "$b5_err" ]]; then
+  first_tag=$(psql -h "$PG_HOST" -p "$PK_PORT" -U postgres -d icegres -c \
+    "insert into demo.parity_pk (id, val) values (1, 'a')" 2>&1 | tail -n 1)
+  dup_out=$(psql -h "$PG_HOST" -p "$PK_PORT" -U postgres -d icegres -c \
+    "insert into demo.parity_pk (id, val) values (1, 'dup')" 2>&1)
+  null_out=$(psql -h "$PG_HOST" -p "$PK_PORT" -U postgres -d icegres -c \
+    "insert into demo.parity_pk (id, val) values (NULL, 'n')" 2>&1)
+  pk_count=$(psql -h "$PG_HOST" -p "$PK_PORT" -U postgres -d icegres -tA -c \
+    "select count(*) from demo.parity_pk" 2>&1)
+  if [[ "$first_tag" == "INSERT 0 1" ]] \
+     && echo "$dup_out" | grep -q 'duplicate key value violates unique constraint' \
+     && echo "$null_out" | grep -q 'violates not-null constraint' \
+     && [[ "$pk_count" == 1 ]]; then
+    record B5 oltp "PK/constraint enforcement" PASS \
+      "--enforce-pk + table property icegres.primary-key=id: first insert accepted ('$first_tag'); duplicate rejected with 23505 ($(echo "$dup_out" | flat)); NULL key rejected with 23502 ($(echo "$null_out" | flat)); table holds $pk_count row. Checks run against the snapshot each commit anchors to (409 retry re-validates), so racing duplicates cannot both land. Default is OFF (documented cost: reads key columns of every live file per write)."
+  else
+    record B5 oltp "PK/constraint enforcement" GAP \
+      "enforcement incomplete: first='$first_tag' dup='$(echo "$dup_out" | flat)' null='$(echo "$null_out" | flat)' count=$pk_count"
+  fi
+  stop_pidfile "$RUN_DIR/parity-serve-pk.pid"
+  curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/parity_pk?purgeRequested=true" >/dev/null 2>&1
+else
+  record B5 oltp "PK/constraint enforcement" GAP "$b5_err"
 fi
 
 # ===========================================================================

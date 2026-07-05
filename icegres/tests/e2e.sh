@@ -28,6 +28,7 @@ BIN="$ICEGRES_DIR/target/debug/icegres"
 PG_HOST=127.0.0.1
 PG_PORT=5439
 SECURE_PORT=5443 # auth+TLS server for section (h)
+PK_PORT=5448     # --enforce-pk server for section (k)
 PSQL=(psql -h "$PG_HOST" -p "$PG_PORT" -U postgres -d icegres -v ON_ERROR_STOP=1)
 export PGCONNECT_TIMEOUT=5
 
@@ -110,6 +111,8 @@ start_server() {
 
 SECURE_PID_FILE="$E2E_DIR/serve-secure.pid"
 SECURE_LOG="$E2E_DIR/serve-secure.log"
+PK_PID_FILE="$E2E_DIR/serve-pk.pid"
+PK_LOG="$E2E_DIR/serve-pk.log"
 
 stop_secure_server() {
   if [[ -f "$SECURE_PID_FILE" ]]; then
@@ -128,7 +131,21 @@ stop_secure_server() {
   fi
 }
 
-cleanup() { stop_server; stop_secure_server; }
+stop_pidfile_generic() { # pidfile — identity-checked kill
+  local pidfile=$1 pid
+  if [[ -f "$pidfile" ]]; then
+    pid=$(cat "$pidfile")
+    if kill -0 "$pid" 2>/dev/null \
+        && [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == icegres ]]; then
+      kill "$pid" 2>/dev/null || true
+      for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.25; done
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$pidfile"
+  fi
+}
+
+cleanup() { stop_server; stop_secure_server; stop_pidfile_generic "$PK_PID_FILE"; }
 trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
@@ -380,6 +397,153 @@ grep -q "DELETE 1" "$E2E_DIR/dml-conflict.log" \
 pass "DML conflict retry: 409 from Lakekeeper on attempt 1, committed on attempt 2"
 assert_eq "conflict-retried DELETE took effect" 0 \
   "$(q "select count(*) from demo.trips where trip_id = $U_ID")"
+
+# ---------------------------------------------------------------------------
+# (j) Explicit transactions (SPEC B4): ROLLBACK undoes, COMMIT is one atomic
+#     snapshot across statements, errors abort, concurrent writers conflict.
+# ---------------------------------------------------------------------------
+log "(j) explicit transactions BEGIN/COMMIT/ROLLBACK"
+TX_A=$((new_id + 3))
+TX_B=$((new_id + 4))
+TX_C=$((new_id + 5))
+
+# The trips snapshot count is read via the REST catalog (the $snapshots
+# metadata table has a pre-existing upstream projection bug on count()).
+trips_snap_count() {
+  curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/trips" \
+    | jq '[.metadata.snapshots[]?] | length'
+}
+
+# j1: ROLLBACK undoes the INSERT; the row was visible INSIDE the txn (RYOW).
+txn_out=$("${PSQL[@]}" 2>&1 <<EOF
+BEGIN;
+insert into demo.trips (trip_id, city, distance_km, fare, ts) values ($TX_A, 'E2E Txn', 1.0, 1.0, TIMESTAMP '2026-07-05 00:00:00');
+select count(*) from demo.trips where trip_id = $TX_A;
+ROLLBACK;
+EOF
+)
+echo "$txn_out" | grep -q "INSERT 0 1" || fail "txn INSERT tag missing: $txn_out"
+echo "$txn_out" | grep -qE '^\s*1$' || fail "read-your-own-writes inside txn failed: $txn_out"
+echo "$txn_out" | grep -q "ROLLBACK" || fail "ROLLBACK tag missing: $txn_out"
+pass "txn INSERT visible inside the transaction (read-your-own-writes)"
+assert_eq "ROLLBACK undid the INSERT (new connection)" 0 \
+  "$(q "select count(*) from demo.trips where trip_id = $TX_A")"
+
+# j2: multi-statement txn (2 INSERTs + UPDATE + DELETE) commits as ONE
+#     Iceberg snapshot; final state correct from new connections.
+snaps_before=$(trips_snap_count)
+"${PSQL[@]}" -q 2>"$E2E_DIR/txn-commit.err" <<EOF || { cat "$E2E_DIR/txn-commit.err" >&2; fail "multi-statement txn failed"; }
+BEGIN;
+insert into demo.trips (trip_id, city, distance_km, fare, ts) values ($TX_A, 'E2E Txn', 1.0, 10.0, TIMESTAMP '2026-07-05 00:00:00');
+insert into demo.trips (trip_id, city, distance_km, fare, ts) values ($TX_B, 'E2E Txn', 2.0, 20.0, TIMESTAMP '2026-07-05 00:00:00');
+update demo.trips set fare = 99.0 where trip_id = $TX_A;
+delete from demo.trips where trip_id = $TX_B;
+COMMIT;
+EOF
+snaps_after=$(trips_snap_count)
+assert_eq "COMMIT produced exactly ONE new snapshot for 4 statements" \
+  "$((snaps_before + 1))" "$snaps_after"
+assert_eq "post-commit state (INSERT+UPDATE composed)" "$TX_A|99.0" \
+  "$(q "select trip_id, fare from demo.trips where trip_id = $TX_A")"
+assert_eq "post-commit state (INSERT+DELETE composed away)" 0 \
+  "$(q "select count(*) from demo.trips where trip_id = $TX_B")"
+
+# j3: a failed statement aborts the transaction: subsequent statements are
+#     rejected (25P02) and COMMIT answers ROLLBACK; nothing landed. This
+#     probe must keep the session running past the error, so it uses psql
+#     WITHOUT ON_ERROR_STOP.
+txn_out=$(psql -h "$PG_HOST" -p "$PG_PORT" -U postgres -d icegres 2>&1 <<EOF
+BEGIN;
+select 1/0;
+insert into demo.trips (trip_id, city, distance_km, fare, ts) values ($TX_C, 'E2E Abort', 1.0, 1.0, TIMESTAMP '2026-07-05 00:00:00');
+COMMIT;
+EOF
+) || true
+echo "$txn_out" | grep -q "current transaction is aborted" \
+  || fail "aborted txn did not block the follow-up statement: $txn_out"
+echo "$txn_out" | grep -q "ROLLBACK" \
+  || fail "COMMIT after a failed statement did not roll back: $txn_out"
+pass "failed statement aborts the txn; COMMIT rolls back"
+assert_eq "nothing from the aborted txn landed" 0 \
+  "$(q "select count(*) from demo.trips where trip_id = $TX_C")"
+
+# j4: snapshot isolation is first-committer-wins: a writer that commits
+#     between BEGIN and COMMIT makes the txn's COMMIT fail with 40001.
+( echo "BEGIN;"
+  echo "insert into demo.trips (trip_id, city, distance_km, fare, ts) values ($TX_A + 100, 'E2E Conflict', 1.0, 1.0, TIMESTAMP '2026-07-05 00:00:00');"
+  sleep 3
+  echo "COMMIT;" ) | "${PSQL[@]}" >"$E2E_DIR/txn-conflict.out" 2>&1 &
+TXN_PID=$!
+sleep 1.5
+"${PSQL[@]}" -q -c "insert into demo.trips (trip_id, city, distance_km, fare, ts) values ($TX_C, 'E2E Winner', 1.0, 1.0, TIMESTAMP '2026-07-05 00:00:00')" \
+  || fail "concurrent autocommit INSERT failed"
+wait "$TXN_PID" || true
+grep -q "could not serialize access due to concurrent update" "$E2E_DIR/txn-conflict.out" \
+  || { cat "$E2E_DIR/txn-conflict.out" >&2; fail "txn COMMIT did not fail with a serialization error"; }
+pass "concurrent writer -> COMMIT fails with serialization_failure (first-committer-wins)"
+assert_eq "loser txn's row absent, winner's row present" "0|1" \
+  "$(q "select count(*) from demo.trips where trip_id = $TX_A + 100")|$(q "select count(*) from demo.trips where trip_id = $TX_C")"
+
+# ---------------------------------------------------------------------------
+# (k) Opt-in PK enforcement (SPEC B5): --enforce-pk + icegres.primary-key
+# ---------------------------------------------------------------------------
+log "(k) PK enforcement (--enforce-pk) on :$PK_PORT"
+stop_pk_server() { stop_pidfile_generic "$PK_PID_FILE"; }
+drop_pk_table() {
+  curl -sf -X DELETE \
+    "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_pk?purgeRequested=true" \
+    >/dev/null 2>&1 || true
+}
+stop_pk_server
+drop_pk_table
+curl -sf -X POST "$CATALOG_URI/v1/$prefix/namespaces/demo/tables" \
+  -H 'Content-Type: application/json' -d '{
+  "name": "e2e_pk",
+  "schema": {"type":"struct","schema-id":0,"fields":[
+    {"id":1,"name":"id","required":false,"type":"long"},
+    {"id":2,"name":"val","required":false,"type":"string"}]},
+  "properties": {"icegres.primary-key": "id"}
+}' >/dev/null || fail "could not create demo.e2e_pk via REST catalog"
+
+: >"$PK_LOG"
+"$BIN" serve --host "$PG_HOST" --port "$PK_PORT" --enforce-pk >>"$PK_LOG" 2>&1 &
+echo $! >"$PK_PID_FILE"
+pk_ready=0
+for _ in $(seq 1 60); do
+  if psql -h "$PG_HOST" -p "$PK_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+    pk_ready=1; break
+  fi
+  sleep 0.5
+done
+[[ "$pk_ready" == 1 ]] || { tail -n 20 "$PK_LOG" >&2; fail "--enforce-pk server not ready on :$PK_PORT"; }
+PKQ=(psql -h "$PG_HOST" -p "$PK_PORT" -U postgres -d icegres)
+
+assert_eq "first insert accepted" "INSERT 0 1" \
+  "$("${PKQ[@]}" -c "insert into demo.e2e_pk (id, val) values (1, 'a')" 2>&1 | tail -n 1)"
+dup_out=$("${PKQ[@]}" -c "insert into demo.e2e_pk (id, val) values (1, 'dup')" 2>&1) || true
+echo "$dup_out" | grep -q 'duplicate key value violates unique constraint "e2e_pk_pkey"' \
+  || fail "duplicate insert not rejected: $dup_out"
+pass "duplicate key rejected (23505 unique violation)"
+null_out=$("${PKQ[@]}" -c "insert into demo.e2e_pk (id, val) values (NULL, 'n')" 2>&1) || true
+echo "$null_out" | grep -q "violates not-null constraint" \
+  || fail "NULL key not rejected: $null_out"
+pass "NULL key rejected (23502 not-null violation)"
+# Enforcement also applies to rows buffered in a transaction (RYOW check).
+txn_pk_out=$("${PKQ[@]}" 2>&1 <<'EOF'
+BEGIN;
+insert into demo.e2e_pk (id, val) values (2, 'b');
+insert into demo.e2e_pk (id, val) values (2, 'dup-in-txn');
+COMMIT;
+EOF
+) || true
+echo "$txn_pk_out" | grep -q "duplicate key value" \
+  || fail "in-txn duplicate not rejected: $txn_pk_out"
+pass "duplicate against the txn's own buffered rows rejected"
+assert_eq "table holds exactly the accepted rows" "1|a" \
+  "$(psql -h "$PG_HOST" -p "$PK_PORT" -U postgres -d icegres -tA -c 'select id, val from demo.e2e_pk order by id')"
+
+stop_pk_server
+drop_pk_table
 
 # ---------------------------------------------------------------------------
 log "all assertions passed ($PASS_COUNT)"

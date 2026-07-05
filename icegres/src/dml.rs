@@ -40,7 +40,9 @@ use datafusion_postgres::pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use datafusion_postgres::QueryHook;
 
 use crate::context::{CATALOG_NAME, DEFAULT_SCHEMA};
-use crate::overwrite::{DmlKind, DmlStatement, OverwriteEngine};
+use crate::overwrite::{
+    CommitConflict, ConstraintViolation, DmlKind, DmlStatement, OverwriteEngine,
+};
 
 /// Query hook translating UPDATE/DELETE into copy-on-write Iceberg commits.
 pub struct DmlHook {
@@ -61,7 +63,7 @@ impl DmlHook {
             .engine
             .execute(&dml)
             .await
-            .map_err(|e| server_error(&format!("{e:#}")))?;
+            .map_err(|e| engine_error(&e))?;
         tracing::debug!(
             rows = outcome.rows,
             attempts = outcome.attempts,
@@ -159,19 +161,25 @@ fn reject(e: anyhow::Error) -> PgWireError {
     )))
 }
 
-/// `internal_error` (XX000): the statement was valid but execution failed
-/// (catalog/object-store errors, exhausted conflict retries, ...).
-fn server_error(msg: &str) -> PgWireError {
-    PgWireError::UserError(Box::new(ErrorInfo::new(
-        "ERROR".to_string(),
-        "XX000".to_string(),
-        msg.to_string(),
-    )))
+/// Map an engine error to the wire: typed constraint violations
+/// (23502/23505) and serialization failures (40001) keep their Postgres
+/// sqlstate; everything else is `internal_error` (XX000).
+pub(crate) fn engine_error(e: &anyhow::Error) -> PgWireError {
+    let (code, msg) = if let Some(v) = e.downcast_ref::<ConstraintViolation>() {
+        (v.sqlstate.to_string(), v.message.clone())
+    } else if let Some(c) = e.downcast_ref::<CommitConflict>() {
+        ("40001".to_string(), c.message.clone())
+    } else {
+        ("XX000".to_string(), format!("{e:#}"))
+    };
+    PgWireError::UserError(Box::new(ErrorInfo::new("ERROR".to_string(), code, msg)))
 }
 
 /// Translate a parsed statement into a [`DmlStatement`] (with its command
-/// tag). `Ok(None)` when the statement is not UPDATE/DELETE.
-fn translate(stmt: &Statement) -> anyhow::Result<Option<(DmlStatement, &'static str)>> {
+/// tag). `Ok(None)` when the statement is not UPDATE/DELETE. Also used by
+/// the transaction hook (txn.rs) so buffered and autocommit DML share one
+/// translation with identical scope checks.
+pub(crate) fn translate(stmt: &Statement) -> anyhow::Result<Option<(DmlStatement, &'static str)>> {
     match stmt {
         Statement::Update {
             table,

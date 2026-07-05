@@ -35,10 +35,10 @@ pass criteria, verdict, evidence line.
 | id | behavior | probe sketch |
 |---|---|---|
 | B1 | INSERT via wire, durable | insert → new-connection readback (from e2e) |
-| B2 | UPDATE | attempt; expect GAP (iceberg-datafusion 0.9 append-only) |
-| B3 | DELETE | attempt; expect GAP |
-| B4 | explicit transactions BEGIN/COMMIT/ROLLBACK | probe actual behavior, record honestly |
-| B5 | PK/constraint enforcement | duplicate insert; expect GAP (Iceberg has no constraints) |
+| B2 | UPDATE | UPDATE over the wire commits a copy-on-write overwrite snapshot; new value read back over a NEW connection |
+| B3 | DELETE | DELETE over the wire; row gone from a new connection; pre-delete snapshot still serves it (time travel intact) |
+| B4 | explicit transactions BEGIN/COMMIT/ROLLBACK | ROLLBACK undoes a buffered INSERT (row visible inside the txn = read-your-own-writes); multi-statement COMMIT applies as ONE Iceberg snapshot; snapshot-pinned reads; concurrent writer ⇒ COMMIT fails 40001 (first-committer-wins, proven in e2e (j)) |
+| B5 | PK/constraint enforcement | opt-in: server started with `--enforce-pk` + table property `icegres.primary-key`; duplicate insert rejected 23505, NULL key 23502, checks anchored to the commit snapshot (racing duplicates cannot both land) |
 
 ### Area C — Lakehouse integration (Moonlink bar)
 | id | behavior | probe sketch |

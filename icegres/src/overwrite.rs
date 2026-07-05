@@ -1,7 +1,25 @@
-//! Copy-on-write UPDATE/DELETE over Iceberg (SPEC B2/B3), zero data
-//! replication: a DML statement becomes ONE new Iceberg snapshot that
-//! reuses every untouched data file and rewrites only the files that
-//! actually contain matching rows.
+//! Copy-on-write write engine over Iceberg (SPEC B2/B3/B4/B5), zero data
+//! replication: a sequence of buffered operations against one table becomes
+//! ONE new Iceberg snapshot that reuses every untouched data file and
+//! rewrites only the files that actually contain affected rows.
+//!
+//! Three entry points share the same snapshot-production core
+//! ([`prepare_commit`]):
+//!
+//! * [`OverwriteEngine::execute`] — one autocommit UPDATE/DELETE
+//!   (B2/B3), anchored at the current `main` snapshot with bounded
+//!   refresh-and-retry on optimistic-concurrency conflicts;
+//! * [`OverwriteEngine::insert_enforced`] — one autocommit INSERT under
+//!   `--enforce-pk` (B5): uniqueness is validated against the same snapshot
+//!   the commit is anchored to, and a 409 retry re-validates against fresh
+//!   metadata, so two racing INSERTs of the same key can never both land;
+//! * [`OverwriteEngine::commit_pinned`] — an explicit transaction's COMMIT
+//!   (B4): the whole buffered op list (appends + UPDATE/DELETE, in statement
+//!   order) is applied as one snapshot anchored at the snapshot pinned at
+//!   BEGIN. NO retry: if `main` moved since BEGIN the commit aborts with a
+//!   serialization failure (first-committer-wins snapshot isolation) —
+//!   retrying silently would invalidate the row counts already reported to
+//!   the client at statement time.
 //!
 //! # Why hand-rolled snapshot production
 //!
@@ -17,51 +35,62 @@
 //! Iceberg REST protocol (`POST /v1/{prefix}/namespaces/{ns}/tables/{tbl}`,
 //! which Lakekeeper implements in full, including snapshot refs).
 //!
-//! # Algorithm (per attempt)
+//! # Algorithm (per prepared commit)
 //!
-//! 1. `load_table` — fresh metadata; the current `main` snapshot id becomes
-//!    the optimistic-concurrency anchor.
-//! 2. For every live data file (from the manifest list): read it, evaluate
-//!    the DML predicate against its rows with DataFusion, and classify the
-//!    file as **kept** (0 matches — the common case, zero-copy), **removed**
-//!    (DELETE matched every row), or **rewritten** (matched rows deleted /
-//!    updated, survivors preserved byte-for-value).
-//! 3. Rewritten survivor rows are written to new Parquet file(s) with the
-//!    standard iceberg-rust writer stack (same one the INSERT path uses).
-//! 4. A new manifest records ADDED (new files), EXISTING (kept files, with
-//!    their original snapshot ids/sequence numbers) and DELETED (removed +
-//!    rewritten sources) entries; manifests whose files are all kept are
-//!    carried into the new manifest list untouched.
-//! 5. The new snapshot (summary operation `overwrite`, or `delete` when no
-//!    file was added) is committed with requirements
-//!    `assert-table-uuid` + `assert-ref-snapshot-id main=<anchor>`.
+//! 1. Caller supplies a freshly-loaded table; its current `main` snapshot id
+//!    becomes the optimistic-concurrency anchor.
+//! 2. If the op list contains any UPDATE/DELETE (or a PK must be enforced),
+//!    every live data file is read once and the DML ops are folded over its
+//!    rows in statement order; the file is classified **kept** (no op
+//!    matched — the common case, zero-copy), **removed** (nothing survived),
+//!    or **rewritten**. Append-only op lists skip the file scan entirely.
+//! 3. Buffered append batches are themselves folded through every DML op
+//!    that came *after* them in the transaction, then written (together with
+//!    rewritten survivors) to new Parquet file(s) with the standard
+//!    iceberg-rust writer stack.
+//! 4. A new manifest records ADDED/EXISTING/DELETED entries; manifests whose
+//!    files are all kept are carried into the new manifest list untouched.
+//! 5. The new snapshot (`append`, `overwrite`, or `delete`) is committed
+//!    with requirements `assert-table-uuid` + `assert-ref-snapshot-id
+//!    main=<anchor>`.
 //!
 //! # Atomicity, durability, concurrency
 //!
 //! The catalog commit is the *only* mutation: readers see either the old
-//! snapshot or the new one, never an intermediate state. If the commit
-//! loses an optimistic-concurrency race (HTTP 409 because another writer
-//! moved `main` — e.g. a concurrent INSERT), the whole computation is
-//! **recomputed from fresh metadata and retried** (bounded by
-//! [`MAX_COMMIT_ATTEMPTS`]). Parquet/Avro files written by a failed or
-//! abandoned attempt are unreferenced by any snapshot and therefore
-//! harmless orphans (standard Iceberg semantics; removable by any orphan
-//! file cleanup). Time travel keeps working: the pre-DML snapshot and its
-//! files are untouched — a copy-on-write rewrite never mutates or deletes
-//! committed objects.
+//! snapshot or the new one, never an intermediate state — this is what makes
+//! a multi-statement transaction's COMMIT atomic per table. Parquet/Avro
+//! files written by a failed or abandoned attempt are unreferenced by any
+//! snapshot and therefore harmless orphans (standard Iceberg semantics).
+//! Time travel keeps working: pre-commit snapshots and their files are never
+//! mutated.
 //!
 //! Setting `ICEGRES_DML_INJECT_CONFLICT=1` (test-only knob) deliberately
-//! corrupts the first attempt's `assert-ref-snapshot-id` requirement so the
-//! catalog rejects it with 409, proving the server-side check and the
-//! refresh-and-retry path end to end (used by icegres/tests/e2e.sh).
+//! corrupts the first attempt's `assert-ref-snapshot-id` requirement in
+//! [`OverwriteEngine::execute`] so the catalog rejects it with 409, proving
+//! the server-side check and the refresh-and-retry path end to end (used by
+//! icegres/tests/e2e.sh).
+//!
+//! # Primary-key enforcement (SPEC B5, opt-in via `--enforce-pk`)
+//!
+//! A table declares its key with the table property
+//! `icegres.primary-key = "col[,col...]"`. When enforcement is on and a
+//! commit appends rows or rewrites a PK column, the FINAL row set's key
+//! columns (kept files are read key-columns-only) are checked for NULLs and
+//! duplicates before the commit is posted; violations abort with Postgres
+//! sqlstates 23502/23505. Because the check runs against the very snapshot
+//! the commit is anchored to, a concurrent writer cannot sneak a duplicate
+//! past it: either the check saw their rows, or the commit 409s and the
+//! retry re-checks. Enforcement is off by default — it makes every INSERT
+//! read the key columns of every live data file.
 //!
 //! # Bounds & limitations (fail loudly, never wrong)
 //!
 //! * Format v2, unpartitioned tables, Parquet data files, no delete
 //!   manifests — anything else is rejected before any write.
-//! * Every live data file is read once per DML statement (no min/max stat
-//!   pruning yet — an optimization, not a correctness issue), one file at a
-//!   time, so peak memory is one data file's decoded batches.
+//! * With DML ops (or PK enforcement) every live data file is read once per
+//!   commit, one file at a time, so peak memory is one data file's decoded
+//!   batches (plus the buffered transaction rows and, under enforcement,
+//!   the table's key columns).
 //! * Predicates/assignment values must be self-contained row expressions:
 //!   subqueries are rejected (they would otherwise be evaluated per-file
 //!   and yield wrong answers).
@@ -99,8 +128,13 @@ use crate::context::CATALOG_NAME;
 use crate::CatalogOpts;
 
 /// Upper bound on optimistic-concurrency attempts (initial try + retries
-/// after 409 conflicts). Each retry recomputes from fresh table metadata.
+/// after 409 conflicts) for AUTOCOMMIT statements. Each retry recomputes
+/// from fresh table metadata. Explicit transactions never retry (see
+/// [`OverwriteEngine::commit_pinned`]).
 pub const MAX_COMMIT_ATTEMPTS: u32 = 3;
+
+/// Table property naming the enforced primary-key columns (comma-separated).
+pub const PK_PROPERTY: &str = "icegres.primary-key";
 
 /// What a DML statement does to matched rows.
 #[derive(Debug, Clone)]
@@ -126,6 +160,46 @@ pub struct DmlStatement {
     pub predicate: Option<String>,
 }
 
+/// One buffered operation against a table, in statement order.
+#[derive(Debug, Clone)]
+pub enum TableOp {
+    /// Rows appended by INSERT (already aligned to the table Arrow schema).
+    Append(Vec<RecordBatch>),
+    /// A buffered UPDATE/DELETE.
+    Dml(DmlStatement),
+}
+
+/// A constraint violation (opt-in PK enforcement), carrying the Postgres
+/// sqlstate the wire layer should answer with (23502/23505).
+#[derive(Debug)]
+pub struct ConstraintViolation {
+    pub sqlstate: &'static str,
+    pub message: String,
+}
+
+impl std::fmt::Display for ConstraintViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+impl std::error::Error for ConstraintViolation {}
+
+/// A transaction COMMIT lost the optimistic-concurrency race (another
+/// writer moved `main` after BEGIN). Maps to Postgres sqlstate 40001
+/// (serialization_failure) on the wire; the client should retry the whole
+/// transaction.
+#[derive(Debug)]
+pub struct CommitConflict {
+    pub message: String,
+}
+
+impl std::fmt::Display for CommitConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+impl std::error::Error for CommitConflict {}
+
 /// Result of a committed (or no-op) DML statement.
 #[derive(Debug)]
 pub struct DmlOutcome {
@@ -137,7 +211,7 @@ pub struct DmlOutcome {
     pub snapshot_id: Option<i64>,
 }
 
-/// Executes copy-on-write DML against one Iceberg REST catalog.
+/// Executes copy-on-write commits against one Iceberg REST catalog.
 pub struct OverwriteEngine {
     catalog: Arc<dyn Catalog>,
     http: reqwest::Client,
@@ -145,13 +219,20 @@ pub struct OverwriteEngine {
     catalog_uri: String,
     /// Catalog path prefix from `GET /v1/config` (may be empty).
     prefix: String,
+    /// Opt-in PK enforcement (`--enforce-pk`); when off, `pk_columns`
+    /// always answers `None` and no enforcement work happens anywhere.
+    enforce_pk: bool,
 }
 
 impl OverwriteEngine {
     /// Build an engine over an already-connected catalog, resolving the REST
     /// path prefix from `GET /v1/config?warehouse=...` (same handshake the
     /// REST catalog client performs).
-    pub async fn connect(catalog: Arc<dyn Catalog>, opts: &CatalogOpts) -> Result<Self> {
+    pub async fn connect(
+        catalog: Arc<dyn Catalog>,
+        opts: &CatalogOpts,
+        enforce_pk: bool,
+    ) -> Result<Self> {
         let http = reqwest::Client::new();
         let config_url = format!(
             "{}/v1/config?warehouse={}",
@@ -179,15 +260,32 @@ impl OverwriteEngine {
             http,
             catalog_uri: opts.catalog_uri.trim_end_matches('/').to_string(),
             prefix,
+            enforce_pk,
         })
     }
 
-    /// Execute a DML statement: classify/rewrite data files, produce an
-    /// overwrite snapshot, and commit it via the REST catalog with bounded
-    /// optimistic-concurrency retries.
+    /// Whether `--enforce-pk` is on for this engine.
+    pub fn enforce_pk(&self) -> bool {
+        self.enforce_pk
+    }
+
+    /// The enforced PK columns of `table`, or `None` when enforcement is off
+    /// or the table declares no `icegres.primary-key` property. Unknown
+    /// columns in the property are a loud error, never silently ignored.
+    pub fn pk_columns(&self, table: &Table) -> Result<Option<Vec<String>>> {
+        if !self.enforce_pk {
+            return Ok(None);
+        }
+        pk_columns_of(table)
+    }
+
+    /// Execute one AUTOCOMMIT DML statement: classify/rewrite data files,
+    /// produce an overwrite snapshot, and commit it via the REST catalog
+    /// with bounded optimistic-concurrency retries.
     pub async fn execute(&self, stmt: &DmlStatement) -> Result<DmlOutcome> {
         let ident = TableIdent::from_strs([stmt.namespace.as_str(), stmt.table.as_str()])
             .map_err(|e| anyhow!("bad table identifier: {e}"))?;
+        let ops = [TableOp::Dml(stmt.clone())];
         let mut conflicts: Vec<String> = Vec::new();
         for attempt in 1..=MAX_COMMIT_ATTEMPTS {
             let table = self
@@ -195,7 +293,8 @@ impl OverwriteEngine {
                 .load_table(&ident)
                 .await
                 .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?;
-            let prepared = prepare_overwrite(&table, stmt)
+            let pk = self.pk_columns(&table)?;
+            let prepared = prepare_commit(&table, &ops, pk.as_deref())
                 .await
                 .with_context(|| format!("DML against {ident} failed"))?;
             let Some(mut prepared) = prepared else {
@@ -217,6 +316,7 @@ impl OverwriteEngine {
                      assert-ref-snapshot-id to force a 409"
                 );
             }
+            let rows = prepared.rows_by_op[0];
             match self
                 .post_commit(&stmt.namespace, &stmt.table, &prepared.request)
                 .await?
@@ -224,13 +324,13 @@ impl OverwriteEngine {
                 CommitOutcome::Committed => {
                     tracing::info!(
                         table = %ident,
-                        rows = prepared.rows,
+                        rows,
                         snapshot_id = prepared.snapshot_id,
                         attempt,
                         "DML committed (copy-on-write overwrite snapshot)"
                     );
                     return Ok(DmlOutcome {
-                        rows: prepared.rows,
+                        rows,
                         attempts: attempt,
                         snapshot_id: Some(prepared.snapshot_id),
                     });
@@ -250,6 +350,138 @@ impl OverwriteEngine {
              giving up (no partial effects were committed). Conflicts: {}",
             conflicts.join(" | ")
         )
+    }
+
+    /// Commit one AUTOCOMMIT INSERT under PK enforcement. The uniqueness
+    /// check runs against the same snapshot the commit is anchored to; a 409
+    /// retry reloads fresh metadata and re-checks, so racing duplicate
+    /// INSERTs cannot both land (one commits, the other sees the committed
+    /// row on retry and fails with 23505).
+    pub async fn insert_enforced(
+        &self,
+        ident: &TableIdent,
+        batches: Vec<RecordBatch>,
+    ) -> Result<DmlOutcome> {
+        let rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+        let ops = [TableOp::Append(batches)];
+        let mut conflicts: Vec<String> = Vec::new();
+        for attempt in 1..=MAX_COMMIT_ATTEMPTS {
+            let table = self
+                .catalog
+                .load_table(ident)
+                .await
+                .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?;
+            let pk = self.pk_columns(&table)?;
+            let prepared = prepare_commit(&table, &ops, pk.as_deref())
+                .await
+                .with_context(|| format!("INSERT into {ident} failed"))?;
+            let Some(prepared) = prepared else {
+                return Ok(DmlOutcome {
+                    rows: 0,
+                    attempts: attempt,
+                    snapshot_id: None,
+                });
+            };
+            match self
+                .post_commit(
+                    &ident.namespace().to_url_string(),
+                    ident.name(),
+                    &prepared.request,
+                )
+                .await?
+            {
+                CommitOutcome::Committed => {
+                    return Ok(DmlOutcome {
+                        rows,
+                        attempts: attempt,
+                        snapshot_id: Some(prepared.snapshot_id),
+                    });
+                }
+                CommitOutcome::Conflict(msg) => {
+                    tracing::warn!(
+                        table = %ident,
+                        attempt,
+                        "INSERT commit conflict (409), re-validating against fresh metadata: {msg}"
+                    );
+                    conflicts.push(msg);
+                }
+            }
+        }
+        bail!(
+            "INSERT into {ident} lost the optimistic-concurrency race {MAX_COMMIT_ATTEMPTS} \
+             times; giving up (no partial effects were committed). Conflicts: {}",
+            conflicts.join(" | ")
+        )
+    }
+
+    /// Commit a transaction's buffered op list for one table as ONE snapshot
+    /// anchored at the snapshot pinned at BEGIN (`expected_main`).
+    ///
+    /// NO retry on conflict: statement-level results (row counts, reads)
+    /// were computed against the pin, so if `main` moved the only honest
+    /// outcome is a serialization failure ([`CommitConflict`], wire sqlstate
+    /// 40001) — exactly what Postgres REPEATABLE READ does. Returns the new
+    /// snapshot id, or `None` when the ops net out to no change.
+    pub async fn commit_pinned(
+        &self,
+        ident: &TableIdent,
+        expected_main: Option<i64>,
+        ops: &[TableOp],
+    ) -> Result<Option<i64>> {
+        // Fresh metadata for correct sequence numbers / uuid; the pin only
+        // anchors the ref requirement. If main already moved, abort cheaply
+        // before doing any work (the POSTed requirement is the real guard).
+        let table = self
+            .catalog
+            .load_table(ident)
+            .await
+            .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?;
+        let fresh_main = table.metadata().current_snapshot_id();
+        if fresh_main != expected_main {
+            let show = |s: Option<i64>| {
+                s.map(|id| id.to_string())
+                    .unwrap_or_else(|| "<none>".to_string())
+            };
+            return Err(anyhow!(CommitConflict {
+                message: format!(
+                    "could not serialize access due to concurrent update: table {ident} \
+                     moved from snapshot {} (pinned at BEGIN) to {}; retry the transaction",
+                    show(expected_main),
+                    show(fresh_main)
+                ),
+            }));
+        }
+        let pk = self.pk_columns(&table)?;
+        let prepared = prepare_commit(&table, ops, pk.as_deref())
+            .await
+            .with_context(|| format!("transaction COMMIT against {ident} failed"))?;
+        let Some(prepared) = prepared else {
+            return Ok(None);
+        };
+        match self
+            .post_commit(
+                &ident.namespace().to_url_string(),
+                ident.name(),
+                &prepared.request,
+            )
+            .await?
+        {
+            CommitOutcome::Committed => {
+                tracing::info!(
+                    table = %ident,
+                    snapshot_id = prepared.snapshot_id,
+                    ops = ops.len(),
+                    "transaction committed (single composed snapshot)"
+                );
+                Ok(Some(prepared.snapshot_id))
+            }
+            CommitOutcome::Conflict(msg) => Err(anyhow!(CommitConflict {
+                message: format!(
+                    "could not serialize access due to concurrent update: catalog rejected \
+                     the commit for {ident} (409): {msg}; retry the transaction"
+                ),
+            })),
+        }
     }
 
     /// POST the commit to the REST catalog. 2xx = committed, 409 = conflict
@@ -298,81 +530,160 @@ enum CommitOutcome {
 
 /// A fully-prepared commit: all data/metadata files are already durable in
 /// object storage; only the atomic catalog POST remains.
-struct PreparedCommit {
+pub struct PreparedCommit {
     request: CommitTableRequest,
-    rows: u64,
+    /// Rows affected per op (matched rows for DML ops, appended rows for
+    /// Append ops), aligned with the input op list.
+    rows_by_op: Vec<u64>,
     snapshot_id: i64,
 }
 
-/// Classification of one live data file against the DML predicate.
+/// Parse and validate the `icegres.primary-key` table property.
+pub fn pk_columns_of(table: &Table) -> Result<Option<Vec<String>>> {
+    let Some(raw) = table.metadata().properties().get(PK_PROPERTY) else {
+        return Ok(None);
+    };
+    let cols: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(str::to_string)
+        .collect();
+    if cols.is_empty() {
+        return Ok(None);
+    }
+    let schema = table.metadata().current_schema();
+    for c in &cols {
+        if !schema.as_struct().fields().iter().any(|f| &f.name == c) {
+            bail!(
+                "table property {PK_PROPERTY}={raw:?} names column {c:?} which does not \
+                 exist in table {}",
+                table.identifier()
+            );
+        }
+    }
+    Ok(Some(cols))
+}
+
+/// Apply one DML statement to in-memory rows: returns `(matched, rows_out)`.
+/// Row-accounting invariants abort (never mis-commit) on any mismatch.
+/// Shared by the per-file commit path and the transaction hook's effective-
+/// state maintenance, so statement-time answers and COMMIT-time snapshots
+/// are computed by the same code.
+pub async fn apply_dml_to_batches(
+    stmt: &DmlStatement,
+    columns: &[String],
+    batches: Vec<RecordBatch>,
+) -> Result<(u64, Vec<RecordBatch>)> {
+    let rows_in: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+    if rows_in == 0 {
+        return Ok((0, batches));
+    }
+    let sql = DmlSql::new(stmt, columns.iter().map(String::as_str))?;
+    let ctx = SessionContext::new_with_config(
+        SessionConfig::new().with_default_catalog_and_schema(CATALOG_NAME, &stmt.namespace),
+    );
+    let schema = batches[0].schema();
+    let table_ref =
+        datafusion::sql::TableReference::partial(stmt.namespace.as_str(), stmt.table.as_str());
+    let mem = MemTable::try_new(schema, vec![batches.clone()])
+        .map_err(|e| anyhow!("failed to build in-memory eval table: {e}"))?;
+    ctx.register_table(table_ref, Arc::new(mem))
+        .map_err(|e| anyhow!("failed to register eval table: {e}"))?;
+    match evaluate_rows(&ctx, &sql, rows_in).await? {
+        FileFate::Keep => Ok((0, batches)),
+        FileFate::Remove { matched } => Ok((matched, Vec::new())),
+        FileFate::Rewrite { matched, batches } => Ok((matched, batches)),
+    }
+}
+
+/// Classification of one file's (or buffered batch set's) rows against a
+/// DML statement.
 enum FileFate {
-    /// No row matched: reuse the file as-is (zero-copy).
+    /// No row matched: reuse as-is (zero-copy).
     Keep,
-    /// Every row matched a DELETE: drop the file, nothing to rewrite.
+    /// Nothing survived (DELETE matched every row).
     Remove { matched: u64 },
-    /// Some rows matched: survivors/updated rows for the replacement file.
+    /// Some rows matched: the surviving/updated row set.
     Rewrite {
         matched: u64,
         batches: Vec<RecordBatch>,
     },
 }
 
-/// Compute the overwrite snapshot for `stmt` against the table's current
-/// metadata and stage every file it needs. Returns `None` when no row
-/// matched (nothing to commit).
-async fn prepare_overwrite(table: &Table, stmt: &DmlStatement) -> Result<Option<PreparedCommit>> {
+/// Fold every DML op in `ops` (skipping ops before `first_op`) over `rows`.
+/// Returns (changed, final rows, matched counts accumulated into
+/// `rows_by_op`).
+async fn fold_dml_ops(
+    ops: &[TableOp],
+    first_op: usize,
+    columns: &[String],
+    mut rows: Vec<RecordBatch>,
+    rows_by_op: &mut [u64],
+) -> Result<(bool, Vec<RecordBatch>)> {
+    let mut changed = false;
+    for (i, op) in ops.iter().enumerate().skip(first_op) {
+        let TableOp::Dml(stmt) = op else { continue };
+        let (matched, out) = apply_dml_to_batches(stmt, columns, rows).await?;
+        if matched > 0 {
+            changed = true;
+        }
+        rows_by_op[i] += matched;
+        rows = out;
+    }
+    Ok((changed, rows))
+}
+
+/// Compute ONE snapshot applying `ops` (in order) against the table's
+/// current metadata and stage every file it needs. Returns `None` when the
+/// ops net out to no change (nothing to commit). `pk` = enforced key
+/// columns; violations return [`ConstraintViolation`] before anything is
+/// posted.
+pub async fn prepare_commit(
+    table: &Table,
+    ops: &[TableOp],
+    pk: Option<&[String]>,
+) -> Result<Option<PreparedCommit>> {
     let metadata = table.metadata();
 
     // ---- Guard rails: reject unsupported table shapes loudly. ----
     if metadata.format_version() != FormatVersion::V2 {
         bail!(
-            "UPDATE/DELETE support requires an Iceberg format v2 table (found {:?})",
+            "writes through icegres require an Iceberg format v2 table (found {:?})",
             metadata.format_version()
         );
     }
     if !metadata.default_partition_spec().is_unpartitioned() {
-        bail!("UPDATE/DELETE on partitioned tables is not supported yet");
+        bail!("writes on partitioned tables are not supported yet");
     }
-    let Some(current_snapshot) = metadata.current_snapshot() else {
-        // Empty table (no snapshot): nothing can match.
-        return Ok(None);
-    };
 
     let file_io = table.file_io();
     let schema = metadata.current_schema();
     let arrow_target: ArrowSchemaRef = Arc::new(
         schema_to_arrow_schema(schema).map_err(|e| anyhow!("schema conversion failed: {e}"))?,
     );
-    let sql = DmlSql::new(
-        stmt,
-        schema.as_struct().fields().iter().map(|f| f.name.as_str()),
-    )?;
-
-    // Ephemeral evaluation context: each data file's rows are registered
-    // under the statement's own table name so the predicate/assignment SQL
-    // evaluates unchanged, one file at a time.
-    let eval_ctx = SessionContext::new_with_config(
-        SessionConfig::new().with_default_catalog_and_schema(CATALOG_NAME, &stmt.namespace),
-    );
-
-    let manifest_list = current_snapshot
-        .load_manifest_list(file_io, &table.metadata_ref())
-        .await
-        .map_err(|e| anyhow!("failed to load manifest list: {e}"))?;
-    for mf in manifest_list.entries() {
-        if mf.content != ManifestContentType::Data {
-            bail!(
-                "table has delete manifests (merge-on-read); UPDATE/DELETE via icegres \
-                 supports copy-on-write tables only"
-            );
+    let columns: Vec<String> = schema
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|f| f.name.clone())
+        .collect();
+    // Validate every DML op eagerly (unknown assignment columns etc.).
+    for op in ops {
+        if let TableOp::Dml(stmt) = op {
+            DmlSql::new(stmt, columns.iter().map(String::as_str))?;
         }
     }
+    let has_dml = ops.iter().any(|op| matches!(op, TableOp::Dml(_)));
+    // Existing files must be scanned when DML can touch them, or when the
+    // final key set must be assembled for PK enforcement.
+    let need_file_scan = has_dml || pk.is_some();
 
-    // Lazily-built writer for replacement/updated rows.
-    let mut data_writer: Option<_> = None;
+    let mut rows_by_op = vec![0u64; ops.len()];
     let commit_uuid = Uuid::new_v4();
+    // Lazily-built writer for replacement/appended rows.
+    let mut data_writer: Option<_> = None;
 
-    let mut matched_rows: u64 = 0;
     // Manifests whose files are all kept: carried forward untouched.
     let mut carried: Vec<ManifestFile> = Vec::new();
     // (data_file, snapshot_id, data_seq, file_seq) for kept files from
@@ -380,92 +691,143 @@ async fn prepare_overwrite(table: &Table, stmt: &DmlStatement) -> Result<Option<
     let mut existing: Vec<(DataFile, i64, i64, Option<i64>)> = Vec::new();
     // Same, for files removed by this snapshot (recorded as DELETED).
     let mut deleted: Vec<(DataFile, i64, Option<i64>)> = Vec::new();
-    // Summary bookkeeping. Kept-file stats are accumulated so post-DML
-    // totals are computed exactly from the final live set (previous
-    // snapshots' summaries are not trusted: iceberg-rust 0.9.1 fast_append
-    // itself writes non-cumulative totals).
+    // Summary bookkeeping: exact totals recomputed from the final live set
+    // (previous snapshots' summaries are not trusted: iceberg-rust 0.9.1
+    // fast_append itself writes non-cumulative totals).
     let (mut removed_files, mut removed_records, mut removed_bytes) = (0u64, 0u64, 0u64);
     let (mut kept_files, mut kept_records, mut kept_bytes) = (0u64, 0u64, 0u64);
+    let mut any_file_changed = false;
+    // PK columns of every FINAL row (kept + rewritten + appended).
+    let mut pk_rows: Vec<RecordBatch> = Vec::new();
 
-    for manifest_file in manifest_list.entries() {
-        let manifest = manifest_file.load_manifest(file_io).await.map_err(|e| {
-            anyhow!(
-                "failed to load manifest {}: {e}",
-                manifest_file.manifest_path
-            )
-        })?;
-        let (entries, _meta) = manifest.into_parts();
+    if let Some(current_snapshot) = metadata.current_snapshot() {
+        let manifest_list = current_snapshot
+            .load_manifest_list(file_io, &table.metadata_ref())
+            .await
+            .map_err(|e| anyhow!("failed to load manifest list: {e}"))?;
+        for mf in manifest_list.entries() {
+            if mf.content != ManifestContentType::Data {
+                bail!(
+                    "table has delete manifests (merge-on-read); writes via icegres \
+                     support copy-on-write tables only"
+                );
+            }
+        }
 
-        let mut rewrite_manifest = false;
-        // (entry index, fate) for live entries of this manifest.
-        let mut fates: Vec<(usize, FileFate)> = Vec::new();
-        for (idx, entry) in entries.iter().enumerate() {
-            if !entry.is_alive() {
-                // Entry already deleted by an earlier snapshot: drop it from
-                // the new manifest (spec: DELETED entries live only in the
-                // snapshot that deleted them).
-                rewrite_manifest = true;
+        for manifest_file in manifest_list.entries() {
+            if !need_file_scan {
+                // Append-only commit: every existing manifest is carried.
+                carried.push(manifest_file.clone());
                 continue;
             }
-            let fate = classify_file(&eval_ctx, file_io, entry.data_file(), &sql, stmt).await?;
-            match &fate {
-                FileFate::Keep => {
-                    kept_files += 1;
-                    kept_records += entry.data_file().record_count();
-                    kept_bytes += entry.data_file().file_size_in_bytes();
-                }
-                FileFate::Remove { matched } => {
-                    matched_rows += matched;
-                    rewrite_manifest = true;
-                }
-                FileFate::Rewrite { matched, .. } => {
-                    matched_rows += matched;
-                    rewrite_manifest = true;
-                }
-            }
-            fates.push((idx, fate));
-        }
+            let manifest = manifest_file.load_manifest(file_io).await.map_err(|e| {
+                anyhow!(
+                    "failed to load manifest {}: {e}",
+                    manifest_file.manifest_path
+                )
+            })?;
+            let (entries, _meta) = manifest.into_parts();
 
-        if !rewrite_manifest {
-            carried.push(manifest_file.clone());
-            continue;
-        }
-        for (idx, fate) in fates {
-            let entry = &entries[idx];
-            let data_seq = entry
-                .sequence_number()
-                .unwrap_or(manifest_file.sequence_number);
-            let file_seq = entry.file_sequence_number;
-            match fate {
-                FileFate::Keep => {
-                    existing.push((
-                        entry.data_file().clone(),
-                        entry
-                            .snapshot_id()
-                            .unwrap_or(manifest_file.added_snapshot_id),
-                        data_seq,
-                        file_seq,
-                    ));
+            let mut rewrite_manifest = false;
+            // (entry index, fate) for live entries of this manifest.
+            let mut fates: Vec<(usize, FileFate)> = Vec::new();
+            for (idx, entry) in entries.iter().enumerate() {
+                if !entry.is_alive() {
+                    // Entry already deleted by an earlier snapshot: drop it
+                    // from the new manifest (spec: DELETED entries live only
+                    // in the snapshot that deleted them).
+                    rewrite_manifest = true;
+                    continue;
                 }
-                FileFate::Remove { .. } | FileFate::Rewrite { .. } => {
-                    removed_files += 1;
-                    removed_records += entry.data_file().record_count();
-                    removed_bytes += entry.data_file().file_size_in_bytes();
-                    deleted.push((entry.data_file().clone(), data_seq, file_seq));
-                    if let FileFate::Rewrite { batches, .. } = fate {
-                        let writer = match data_writer.as_mut() {
-                            Some(w) => w,
-                            None => {
-                                data_writer = Some(new_data_writer(table, &commit_uuid).await?);
-                                data_writer.as_mut().expect("just set")
+                let batches = read_parquet_file(file_io, entry.data_file()).await?;
+                let rows_in: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+                let fate = if has_dml {
+                    // RecordBatch clones share Arc'd buffers — cheap; the
+                    // original stays available for PK collection on Keep.
+                    let (changed, out) =
+                        fold_dml_ops(ops, 0, &columns, batches.clone(), &mut rows_by_op).await?;
+                    let rows_out: u64 = out.iter().map(|b| b.num_rows() as u64).sum();
+                    if !changed {
+                        FileFate::Keep
+                    } else if rows_out == 0 {
+                        FileFate::Remove {
+                            matched: rows_in, // informational only
+                        }
+                    } else {
+                        FileFate::Rewrite {
+                            matched: rows_in.saturating_sub(rows_out),
+                            batches: out,
+                        }
+                    }
+                } else {
+                    FileFate::Keep
+                };
+                if let Some(pk_cols) = pk {
+                    // Final rows of this file feed the PK check.
+                    match &fate {
+                        FileFate::Keep if !batches.is_empty() => {
+                            pk_rows.push(project_columns(&batches, pk_cols)?);
+                        }
+                        FileFate::Rewrite { batches, .. } if !batches.is_empty() => {
+                            pk_rows.push(project_columns(batches, pk_cols)?);
+                        }
+                        _ => {}
+                    }
+                }
+                match &fate {
+                    FileFate::Keep => {
+                        kept_files += 1;
+                        kept_records += entry.data_file().record_count();
+                        kept_bytes += entry.data_file().file_size_in_bytes();
+                    }
+                    FileFate::Remove { .. } | FileFate::Rewrite { .. } => {
+                        any_file_changed = true;
+                        rewrite_manifest = true;
+                    }
+                }
+                fates.push((idx, fate));
+            }
+
+            if !rewrite_manifest {
+                carried.push(manifest_file.clone());
+                continue;
+            }
+            for (idx, fate) in fates {
+                let entry = &entries[idx];
+                let data_seq = entry
+                    .sequence_number()
+                    .unwrap_or(manifest_file.sequence_number);
+                let file_seq = entry.file_sequence_number;
+                match fate {
+                    FileFate::Keep => {
+                        existing.push((
+                            entry.data_file().clone(),
+                            entry
+                                .snapshot_id()
+                                .unwrap_or(manifest_file.added_snapshot_id),
+                            data_seq,
+                            file_seq,
+                        ));
+                    }
+                    FileFate::Remove { .. } | FileFate::Rewrite { .. } => {
+                        removed_files += 1;
+                        removed_records += entry.data_file().record_count();
+                        removed_bytes += entry.data_file().file_size_in_bytes();
+                        deleted.push((entry.data_file().clone(), data_seq, file_seq));
+                        if let FileFate::Rewrite { batches, .. } = fate {
+                            let writer = match data_writer.as_mut() {
+                                Some(w) => w,
+                                None => {
+                                    data_writer = Some(new_data_writer(table, &commit_uuid).await?);
+                                    data_writer.as_mut().expect("just set")
+                                }
+                            };
+                            for batch in batches {
+                                let aligned = align_batch(&batch, &arrow_target)?;
+                                writer.write(aligned).await.map_err(|e| {
+                                    anyhow!("failed to write replacement rows: {e}")
+                                })?;
                             }
-                        };
-                        for batch in batches {
-                            let aligned = align_batch(&batch, &arrow_target)?;
-                            writer
-                                .write(aligned)
-                                .await
-                                .map_err(|e| anyhow!("failed to write replacement rows: {e}"))?;
                         }
                     }
                 }
@@ -473,15 +835,56 @@ async fn prepare_overwrite(table: &Table, stmt: &DmlStatement) -> Result<Option<
         }
     }
 
-    if matched_rows == 0 {
+    // ---- Buffered appends, folded through every LATER DML op. ----
+    let mut appended_rows: u64 = 0;
+    for (i, op) in ops.iter().enumerate() {
+        let TableOp::Append(batches) = op else {
+            continue;
+        };
+        rows_by_op[i] = batches.iter().map(|b| b.num_rows() as u64).sum();
+        let (_, out) = fold_dml_ops(ops, i + 1, &columns, batches.clone(), &mut rows_by_op).await?;
+        let rows_out: u64 = out.iter().map(|b| b.num_rows() as u64).sum();
+        if rows_out == 0 {
+            continue;
+        }
+        appended_rows += rows_out;
+        let aligned: Vec<RecordBatch> = out
+            .iter()
+            .map(|b| align_batch(b, &arrow_target))
+            .collect::<Result<_>>()?;
+        if let Some(pk_cols) = pk {
+            pk_rows.push(project_columns(&aligned, pk_cols)?);
+        }
+        let writer = match data_writer.as_mut() {
+            Some(w) => w,
+            None => {
+                data_writer = Some(new_data_writer(table, &commit_uuid).await?);
+                data_writer.as_mut().expect("just set")
+            }
+        };
+        for batch in aligned {
+            writer
+                .write(batch)
+                .await
+                .map_err(|e| anyhow!("failed to write appended rows: {e}"))?;
+        }
+    }
+
+    if !any_file_changed && appended_rows == 0 {
+        // Net no-op: nothing to commit.
         return Ok(None);
+    }
+
+    // ---- PK enforcement over the FINAL row set. ----
+    if let Some(pk_cols) = pk {
+        check_pk(pk_cols, &pk_rows, table.identifier().name()).await?;
     }
 
     let added_files: Vec<DataFile> = match data_writer.as_mut() {
         Some(w) => w
             .close()
             .await
-            .map_err(|e| anyhow!("failed to close replacement data file writer: {e}"))?,
+            .map_err(|e| anyhow!("failed to close data file writer: {e}"))?,
         None => Vec::new(),
     };
 
@@ -516,7 +919,7 @@ async fn prepare_overwrite(table: &Table, stmt: &DmlStatement) -> Result<Option<
                 .map_err(|e| anyhow!("failed to write rewritten manifest: {e}"))?,
         );
     }
-    // ... plus one manifest of ADDED replacement files.
+    // ... plus one manifest of ADDED files (rewritten survivors + appends).
     let (mut added_records, mut added_bytes) = (0u64, 0u64);
     if !added_files.is_empty() {
         let mut writer = new_manifest_writer(
@@ -548,7 +951,6 @@ async fn prepare_overwrite(table: &Table, stmt: &DmlStatement) -> Result<Option<
         metadata.current_snapshot_id(),
         next_seq,
     );
-    let added_manifest_count = new_manifests.len();
     list_writer
         .add_manifests(new_manifests.into_iter())
         .map_err(|e| anyhow!("failed to append manifests to manifest list: {e}"))?;
@@ -559,9 +961,14 @@ async fn prepare_overwrite(table: &Table, stmt: &DmlStatement) -> Result<Option<
 
     // Snapshot summary. added/deleted counts are file-level (Iceberg spec
     // semantics — a rewritten file counts all its records on both sides);
-    // totals are EXACT, recomputed from the final live set (kept + added),
-    // every member of which was visited above.
-    let operation = if added_files.is_empty() {
+    // totals are EXACT, recomputed from the final live set, every member of
+    // which was visited above (kept files carried in untouched manifests
+    // when !need_file_scan are counted from their manifest stats: for the
+    // append fast path kept_* stay 0 and totals fall back to file-level
+    // accounting below).
+    let operation = if !any_file_changed {
+        Operation::Append
+    } else if added_files.is_empty() {
         Operation::Delete
     } else {
         Operation::Overwrite
@@ -573,23 +980,25 @@ async fn prepare_overwrite(table: &Table, stmt: &DmlStatement) -> Result<Option<
     props.insert("deleted-data-files".into(), removed_files.to_string());
     props.insert("deleted-records".into(), removed_records.to_string());
     props.insert("removed-files-size".into(), removed_bytes.to_string());
-    props.insert(
-        "total-data-files".into(),
-        (kept_files + added_files.len() as u64).to_string(),
-    );
-    props.insert(
-        "total-records".into(),
-        (kept_records + added_records).to_string(),
-    );
-    props.insert(
-        "total-files-size".into(),
-        (kept_bytes + added_bytes).to_string(),
-    );
+    if need_file_scan {
+        // Every live file was visited: exact totals.
+        props.insert(
+            "total-data-files".into(),
+            (kept_files + added_files.len() as u64).to_string(),
+        );
+        props.insert(
+            "total-records".into(),
+            (kept_records + added_records).to_string(),
+        );
+        props.insert(
+            "total-files-size".into(),
+            (kept_bytes + added_bytes).to_string(),
+        );
+    }
     props.insert("total-delete-files".into(), "0".into());
     props.insert("total-position-deletes".into(), "0".into());
     props.insert("total-equality-deletes".into(), "0".into());
     props.insert("changed-partition-count".into(), "1".into());
-    let _ = added_manifest_count; // manifest count is derivable; not summarized
 
     let snapshot = Snapshot::builder()
         .with_snapshot_id(snapshot_id)
@@ -616,7 +1025,7 @@ async fn prepare_overwrite(table: &Table, stmt: &DmlStatement) -> Result<Option<
                 uuid: metadata.uuid(),
             },
             // Optimistic concurrency: `main` must still point where we
-            // started, otherwise the catalog answers 409 and we recompute.
+            // started, otherwise the catalog answers 409.
             TableRequirement::RefSnapshotIdMatch {
                 r#ref: MAIN_BRANCH.to_string(),
                 snapshot_id: metadata.current_snapshot_id(),
@@ -636,19 +1045,16 @@ async fn prepare_overwrite(table: &Table, stmt: &DmlStatement) -> Result<Option<
 
     Ok(Some(PreparedCommit {
         request,
-        rows: matched_rows,
+        rows_by_op,
         snapshot_id,
     }))
 }
 
-/// Read one data file and decide its fate under the DML statement.
-async fn classify_file(
-    eval_ctx: &SessionContext,
+/// Read one Parquet data file fully into record batches.
+async fn read_parquet_file(
     file_io: &iceberg::io::FileIO,
     data_file: &DataFile,
-    sql: &DmlSql,
-    stmt: &DmlStatement,
-) -> Result<FileFate> {
+) -> Result<Vec<RecordBatch>> {
     if data_file.file_format() != DataFileFormat::Parquet {
         bail!(
             "data file {} is not Parquet ({:?}); unsupported",
@@ -666,52 +1072,152 @@ async fn classify_file(
         .with_context(|| format!("failed to open Parquet file {}", data_file.file_path()))?
         .build()
         .context("failed to build Parquet reader")?;
-    let batches: Vec<RecordBatch> = reader
+    reader
         .collect::<std::result::Result<_, _>>()
-        .with_context(|| format!("failed to decode Parquet file {}", data_file.file_path()))?;
-    let file_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
-    if file_rows == 0 {
-        return Ok(FileFate::Keep);
-    }
-    let batch_schema = batches[0].schema();
-
-    // Evaluate against the file's rows registered under the real table name.
-    let table_ref =
-        datafusion::sql::TableReference::partial(stmt.namespace.as_str(), stmt.table.as_str());
-    let mem = MemTable::try_new(batch_schema, vec![batches])
-        .map_err(|e| anyhow!("failed to build in-memory eval table: {e}"))?;
-    let _ = eval_ctx.deregister_table(table_ref.clone());
-    eval_ctx
-        .register_table(table_ref.clone(), Arc::new(mem))
-        .map_err(|e| anyhow!("failed to register eval table: {e}"))?;
-    let result = evaluate_file(eval_ctx, sql, file_rows).await;
-    let _ = eval_ctx.deregister_table(table_ref);
-    result
+        .with_context(|| format!("failed to decode Parquet file {}", data_file.file_path()))
 }
 
-async fn evaluate_file(ctx: &SessionContext, sql: &DmlSql, file_rows: u64) -> Result<FileFate> {
-    let matched = match &sql.count_matched {
-        None => file_rows, // no WHERE clause: everything matches
-        Some(count_sql) => {
-            let batches = ctx
-                .sql(count_sql)
-                .await
-                .map_err(|e| anyhow!("failed to plan DML predicate ({count_sql}): {e}"))?
-                .collect()
-                .await
-                .map_err(|e| anyhow!("failed to evaluate DML predicate: {e}"))?;
-            batches
-                .first()
-                .map(|b| b.column(0).as_primitive::<Int64Type>().value(0) as u64)
-                .unwrap_or(0)
+/// Concatenate `batches` projected onto `cols` (by name) into one batch.
+/// Callers must not pass an empty batch list (no schema to project from).
+fn project_columns(batches: &[RecordBatch], cols: &[String]) -> Result<RecordBatch> {
+    let Some(first) = batches.first() else {
+        bail!("cannot project PK columns out of an empty batch set");
+    };
+    let indices: Vec<usize> = cols
+        .iter()
+        .map(|c| {
+            first
+                .schema()
+                .fields()
+                .iter()
+                .position(|f| f.name().eq_ignore_ascii_case(c))
+                .ok_or_else(|| anyhow!("PK column {c:?} missing from row batch"))
+        })
+        .collect::<Result<_>>()?;
+    let projected: Vec<RecordBatch> = batches
+        .iter()
+        .map(|b| {
+            b.project(&indices)
+                .map_err(|e| anyhow!("projection failed: {e}"))
+        })
+        .collect::<Result<_>>()?;
+    arrow::compute::concat_batches(&projected[0].schema(), &projected)
+        .map_err(|e| anyhow!("failed to concatenate PK batches: {e}"))
+}
+
+/// Enforce NOT NULL + uniqueness over the assembled final key rows.
+/// Violations return [`ConstraintViolation`] with the standard sqlstate.
+pub async fn check_pk(pk_cols: &[String], pk_rows: &[RecordBatch], table: &str) -> Result<()> {
+    let nonempty: Vec<RecordBatch> = pk_rows
+        .iter()
+        .filter(|b| b.num_rows() > 0)
+        .cloned()
+        .collect();
+    if nonempty.is_empty() {
+        return Ok(());
+    }
+    let ctx = SessionContext::new();
+    let mem = MemTable::try_new(nonempty[0].schema(), vec![nonempty])
+        .map_err(|e| anyhow!("failed to build PK check table: {e}"))?;
+    ctx.register_table("__icegres_pk", Arc::new(mem))
+        .map_err(|e| anyhow!("failed to register PK check table: {e}"))?;
+    let cols_sql = pk_cols
+        .iter()
+        .map(|c| quote_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let null_pred = pk_cols
+        .iter()
+        .map(|c| format!("{} IS NULL", quote_ident(c)))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+
+    let nulls = count_query(
+        &ctx,
+        &format!("SELECT count(*) FROM __icegres_pk WHERE {null_pred}"),
+    )
+    .await?;
+    if nulls > 0 {
+        return Err(anyhow!(ConstraintViolation {
+            sqlstate: "23502",
+            message: format!(
+                "null value in column(s) ({}) of relation \"{table}\" violates not-null \
+                 constraint (primary key, {nulls} row(s))",
+                pk_cols.join(", ")
+            ),
+        }));
+    }
+    let dup_sql = format!(
+        "SELECT {cols_sql}, count(*) AS n FROM __icegres_pk \
+         GROUP BY {cols_sql} HAVING count(*) > 1 LIMIT 1"
+    );
+    let dups = ctx
+        .sql(&dup_sql)
+        .await
+        .map_err(|e| anyhow!("failed to plan PK duplicate check: {e}"))?
+        .collect()
+        .await
+        .map_err(|e| anyhow!("failed to run PK duplicate check: {e}"))?;
+    let dup_rows: usize = dups.iter().map(|b| b.num_rows()).sum();
+    if dup_rows > 0 {
+        let sample = format_first_row(&dups, pk_cols.len());
+        return Err(anyhow!(ConstraintViolation {
+            sqlstate: "23505",
+            message: format!(
+                "duplicate key value violates unique constraint \"{table}_pkey\": \
+                 key ({}) = ({sample}) is not unique",
+                pk_cols.join(", ")
+            ),
+        }));
+    }
+    Ok(())
+}
+
+async fn count_query(ctx: &SessionContext, sql: &str) -> Result<u64> {
+    let batches = ctx
+        .sql(sql)
+        .await
+        .map_err(|e| anyhow!("failed to plan ({sql}): {e}"))?
+        .collect()
+        .await
+        .map_err(|e| anyhow!("failed to evaluate ({sql}): {e}"))?;
+    Ok(batches
+        .first()
+        .map(|b| b.column(0).as_primitive::<Int64Type>().value(0) as u64)
+        .unwrap_or(0))
+}
+
+/// Render the first `ncols` columns of the first row for error messages.
+fn format_first_row(batches: &[RecordBatch], ncols: usize) -> String {
+    for b in batches {
+        if b.num_rows() == 0 {
+            continue;
         }
+        let mut parts = Vec::with_capacity(ncols);
+        for c in 0..ncols.min(b.num_columns()) {
+            let col = b.column(c);
+            let display = arrow::util::display::array_value_to_string(col, 0)
+                .unwrap_or_else(|_| "?".to_string());
+            parts.push(display);
+        }
+        return parts.join(", ");
+    }
+    "?".to_string()
+}
+
+async fn evaluate_rows(ctx: &SessionContext, sql: &DmlSql, rows_in: u64) -> Result<FileFate> {
+    let matched = match &sql.count_matched {
+        None => rows_in, // no WHERE clause: everything matches
+        Some(count_sql) => count_query(ctx, count_sql)
+            .await
+            .context("failed to evaluate DML predicate")?,
     };
     if matched == 0 {
         return Ok(FileFate::Keep);
     }
     match &sql.rewrite {
-        // DELETE matching the whole file: drop it, no replacement rows.
-        None if matched == file_rows => Ok(FileFate::Remove { matched }),
+        // DELETE matching every row: drop it, no replacement rows.
+        None if matched == rows_in => Ok(FileFate::Remove { matched }),
         None => {
             // DELETE: survivors are rows where the predicate is not TRUE.
             let survivors_sql = sql
@@ -726,11 +1232,14 @@ async fn evaluate_file(ctx: &SessionContext, sql: &DmlSql, file_rows: u64) -> Re
                 .await
                 .map_err(|e| anyhow!("failed to compute DELETE survivors: {e}"))?;
             let survivor_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
-            if survivor_rows + matched != file_rows {
+            if survivor_rows + matched != rows_in {
                 bail!(
-                    "DELETE row accounting mismatch: {file_rows} rows, {matched} matched, \
+                    "DELETE row accounting mismatch: {rows_in} rows, {matched} matched, \
                      {survivor_rows} survivors — refusing to commit"
                 );
+            }
+            if survivor_rows == 0 {
+                return Ok(FileFate::Remove { matched });
             }
             Ok(FileFate::Rewrite { matched, batches })
         }
@@ -744,9 +1253,9 @@ async fn evaluate_file(ctx: &SessionContext, sql: &DmlSql, file_rows: u64) -> Re
                 .await
                 .map_err(|e| anyhow!("failed to compute UPDATE rewrite: {e}"))?;
             let rewritten_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
-            if rewritten_rows != file_rows {
+            if rewritten_rows != rows_in {
                 bail!(
-                    "UPDATE row accounting mismatch: {file_rows} rows in, {rewritten_rows} out \
+                    "UPDATE row accounting mismatch: {rows_in} rows in, {rewritten_rows} out \
                      — refusing to commit"
                 );
             }
@@ -755,7 +1264,7 @@ async fn evaluate_file(ctx: &SessionContext, sql: &DmlSql, file_rows: u64) -> Re
     }
 }
 
-/// Pre-rendered SQL for per-file evaluation.
+/// Pre-rendered SQL for per-batch-set evaluation.
 #[derive(Debug)]
 struct DmlSql {
     /// `SELECT count(*) ... WHERE (pred)`; `None` when there is no WHERE.
@@ -844,10 +1353,10 @@ impl DmlSql {
 /// (field-id annotated, exact Iceberg types) so the Parquet writer receives
 /// exactly what an INSERT would produce. Fails loudly on any incompatible
 /// column (no silent coercion to a wrong shape).
-fn align_batch(batch: &RecordBatch, target: &ArrowSchemaRef) -> Result<RecordBatch> {
+pub fn align_batch(batch: &RecordBatch, target: &ArrowSchemaRef) -> Result<RecordBatch> {
     if batch.num_columns() != target.fields().len() {
         bail!(
-            "rewritten batch has {} columns, table has {}",
+            "row batch has {} columns, table has {}",
             batch.num_columns(),
             target.fields().len()
         );
@@ -858,7 +1367,7 @@ fn align_batch(batch: &RecordBatch, target: &ArrowSchemaRef) -> Result<RecordBat
         let src_name = batch.schema().field(i).name().clone();
         if !src_name.eq_ignore_ascii_case(field.name()) {
             bail!(
-                "rewritten column {i} is named {src_name:?}, expected {:?}",
+                "row batch column {i} is named {src_name:?}, expected {:?}",
                 field.name()
             );
         }
@@ -885,7 +1394,7 @@ fn align_batch(batch: &RecordBatch, target: &ArrowSchemaRef) -> Result<RecordBat
         columns.push(col);
     }
     RecordBatch::try_new(target.clone(), columns)
-        .map_err(|e| anyhow!("rewritten rows do not fit the table schema (nullability/type): {e}"))
+        .map_err(|e| anyhow!("rows do not fit the table schema (nullability/type): {e}"))
 }
 
 /// The standard iceberg-rust data-file writer stack (identical to the one
@@ -954,7 +1463,7 @@ fn corrupt_ref_requirement(request: &mut CommitTableRequest) {
 }
 
 /// Double-quote (and escape) a SQL identifier.
-fn quote_ident(ident: &str) -> String {
+pub fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
@@ -975,6 +1484,8 @@ fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{Float64Array, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
 
     fn stmt(kind: DmlKind, predicate: Option<&str>) -> DmlStatement {
         DmlStatement {
@@ -1073,5 +1584,105 @@ mod tests {
     fn urlencode_escapes_non_unreserved() {
         assert_eq!(urlencode("demo"), "demo");
         assert_eq!(urlencode("a b/c"), "a%20b%2Fc");
+    }
+
+    fn rows(ids: &[i64], fares: &[f64]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("trip_id", DataType::Int64, true),
+            Field::new("fare", DataType::Float64, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(ids.to_vec())),
+                Arc::new(Float64Array::from(fares.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn apply_dml_delete_removes_matched_rows() {
+        let cols = vec!["trip_id".to_string(), "fare".to_string()];
+        let s = stmt(DmlKind::Delete, Some("trip_id = 2"));
+        let (matched, out) =
+            apply_dml_to_batches(&s, &cols, vec![rows(&[1, 2, 3], &[1.0, 2.0, 3.0])])
+                .await
+                .unwrap();
+        assert_eq!(matched, 1);
+        let n: usize = out.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(n, 2);
+    }
+
+    #[tokio::test]
+    async fn apply_dml_update_keeps_row_count_and_changes_values() {
+        let cols = vec!["trip_id".to_string(), "fare".to_string()];
+        let s = stmt(
+            DmlKind::Update {
+                assignments: vec![("fare".into(), "99.0".into())],
+            },
+            Some("trip_id = 1"),
+        );
+        let (matched, out) = apply_dml_to_batches(&s, &cols, vec![rows(&[1, 2], &[1.0, 2.0])])
+            .await
+            .unwrap();
+        assert_eq!(matched, 1);
+        let n: usize = out.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(n, 2);
+    }
+
+    #[tokio::test]
+    async fn apply_dml_no_match_keeps_batches_untouched() {
+        let cols = vec!["trip_id".to_string(), "fare".to_string()];
+        let s = stmt(DmlKind::Delete, Some("trip_id = 999"));
+        let input = vec![rows(&[1, 2], &[1.0, 2.0])];
+        let (matched, out) = apply_dml_to_batches(&s, &cols, input.clone())
+            .await
+            .unwrap();
+        assert_eq!(matched, 0);
+        assert_eq!(out.len(), input.len());
+    }
+
+    #[tokio::test]
+    async fn check_pk_rejects_duplicates_with_23505() {
+        let batch = rows(&[1, 2, 2], &[1.0, 2.0, 3.0]).project(&[0]).unwrap();
+        let err = check_pk(&["trip_id".to_string()], &[batch], "trips")
+            .await
+            .unwrap_err();
+        let v = err
+            .downcast_ref::<ConstraintViolation>()
+            .expect("typed violation");
+        assert_eq!(v.sqlstate, "23505");
+        assert!(v.message.contains("trips_pkey"));
+        assert!(v.message.contains("(2)"));
+    }
+
+    #[tokio::test]
+    async fn check_pk_rejects_nulls_with_23502() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "trip_id",
+            DataType::Int64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![Some(1), None]))],
+        )
+        .unwrap();
+        let err = check_pk(&["trip_id".to_string()], &[batch], "trips")
+            .await
+            .unwrap_err();
+        let v = err
+            .downcast_ref::<ConstraintViolation>()
+            .expect("typed violation");
+        assert_eq!(v.sqlstate, "23502");
+    }
+
+    #[tokio::test]
+    async fn check_pk_accepts_unique_keys() {
+        let batch = rows(&[1, 2, 3], &[1.0, 2.0, 3.0]).project(&[0]).unwrap();
+        check_pk(&["trip_id".to_string()], &[batch], "trips")
+            .await
+            .unwrap();
     }
 }

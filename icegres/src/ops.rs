@@ -86,6 +86,7 @@ use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 use crate::pgauth::FileAuthSource;
+use crate::txn::TxnRegistry;
 
 /// Startup handler that accepts every connection without authentication —
 /// the same behavior as datafusion-postgres's stock `serve()` path (its
@@ -222,6 +223,7 @@ pub async fn serve_custom(
     tls: Option<TlsAcceptor>,
     auth: Option<Arc<FileAuthSource>>,
     hooks: Vec<Arc<dyn QueryHook>>,
+    txn_registry: Arc<TxnRegistry>,
 ) -> Result<()> {
     let addr = format!("{host}:{port}");
     let listener = TcpListener::bind(&addr)
@@ -253,10 +255,15 @@ pub async fn serve_custom(
                     let active = active.clone();
                     let idle_since = idle_since.clone();
                     let tls = tls.clone();
+                    let txn_registry = txn_registry.clone();
                     tokio::spawn(async move {
                         if let Err(e) = process_socket(socket, tls, factory).await {
                             warn!(%peer, "error processing socket: {e}");
                         }
+                        // Disconnect = implicit ROLLBACK: drop any open
+                        // transaction buffered for this connection (nothing
+                        // was committed, so nothing needs undoing).
+                        txn_registry.disconnect(&peer);
                         // Reset the idle clock BEFORE decrementing so the
                         // watchdog can never observe (active == 0, stale
                         // idle_since).
