@@ -7,6 +7,9 @@
 # FAILS if:
 #   - any latency metric p50 worsens by more than 20% vs baseline;
 #   - qps_8conn drops by more than 10%;
+#   - resource footprint regresses: rss_peak_mb or rss_idle_mb worsens by
+#     more than 25%, or binary_size_mb by more than 10% (performance must be
+#     traded explicitly against memory and binary size);
 #   - icegres/tests/e2e.sh is not green (skippable with --skip-e2e, e.g. when
 #     the caller has just run it);
 #   - any parity verdict downgrades from PASS (when two parity JSONs given).
@@ -72,6 +75,30 @@ else
   printf '%-20s %10s %10s %8s  %s\n' "qps_8conn (qps)" "$bq" "$cq" "$delta" "$verdict"
   [[ "$verdict" == FAIL ]] && note_fail
 fi
+
+# --- resource rules (memory & binary size are first-class gated metrics) ------
+# metric:allowed-worsening-% — value may grow at most this much vs baseline.
+RESOURCE_RULES=(rss_peak_mb:25 rss_idle_mb:25 binary_size_mb:10)
+
+echo
+echo "=== resource gate (rss_peak/rss_idle +25% max, binary_size +10% max) ==="
+printf '%-20s %10s %10s %8s  %s\n' "metric (value)" "baseline" "candidate" "delta" "verdict"
+for rule in "${RESOURCE_RULES[@]}"; do
+  m=${rule%%:*}; allow=${rule##*:}
+  b=$(jq -r --arg m "$m" '.metrics[$m].value // "null"' "$BASE")
+  c=$(jq -r --arg m "$m" '.metrics[$m].value // "null"' "$CAND")
+  if [[ "$b" == null || "$c" == null ]]; then
+    printf '%-20s %10s %10s %8s  %s\n' "$m" "$b" "$c" "—" "MISSING"
+    note_fail
+    continue
+  fi
+  verdict=$(jq -rn --argjson b "$b" --argjson c "$c" --argjson a "$allow" \
+    'if $c > $b * (1 + $a / 100) then "FAIL" else "ok" end')
+  delta=$(jq -rn --argjson b "$b" --argjson c "$c" \
+    'if $b == 0 then "n/a" else ((($c - $b) / $b * 1000 | round) / 10 | tostring) + "%" end')
+  printf '%-20s %10s %10s %8s  %s (max +%s%%)\n' "$m" "$b" "$c" "$delta" "$verdict" "$allow"
+  [[ "$verdict" == FAIL ]] && note_fail
+done
 
 # --- parity no-downgrade -----------------------------------------------------
 if [[ -n "$PBASE" ]]; then

@@ -16,6 +16,9 @@
 #     demo.trips is READ-ONLY for the benchmark: append-only Iceberg means
 #     every insert adds a Parquet file + snapshot, and a growing demo.trips
 #     made read metrics drift 40-80% between consecutive runs.
+#   - Layout maintenance: e2e/parity DO append to demo.trips between bench
+#     runs, so before measuring, demo.trips is rewritten to its canonical
+#     single-file seed layout (drop + reseed) when it has >2 data files.
 #   - Ports used: 5439 (server under test), 5442 (cold-start runs).
 
 set -euo pipefail
@@ -72,6 +75,52 @@ drop_scratch() { # drop the bench-owned scratch table (created by this script)
   curl -sf -X DELETE \
     "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/$SCRATCH_TABLE?purgeRequested=true" \
     >/dev/null 2>&1 || true
+}
+
+# --- demo.trips layout maintenance (drift control) --------------------------
+# e2e/parity runs append rows to demo.trips; append-only Iceberg turns every
+# such insert into an extra small Parquet file, and full-scan metrics degrade
+# ~1 ms per extra file — baselines taken at different drift levels do not
+# compare. Before measuring, demo.trips is rewritten to its canonical
+# single-file seed layout whenever it has more than 2 data files.
+#
+# History on this stack is fast_append-only (no deletes/rewrites ever), so
+# the table's data-file count is exactly the sum of `added-data-files` over
+# its snapshots (the per-snapshot `total-*` summary fields written by
+# iceberg-rust 0.9.1 are per-commit, NOT cumulative — do not trust them).
+trips_data_files() {
+  local prefix; prefix=$(catalog_prefix)
+  curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/trips" \
+    | jq -r '[.metadata.snapshots[]?.summary."added-data-files" // "0" | tonumber] | add // 0'
+}
+
+drop_trips() {
+  local prefix; prefix=$(catalog_prefix)
+  curl -sf -X DELETE \
+    "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/trips?purgeRequested=true" \
+    >/dev/null
+}
+
+# Rewrite demo.trips to the canonical single-file layout: drop (purged) and
+# re-seed. iceberg-rust 0.9.1 has no replace-files/rewrite transaction action
+# (only fast_append), so an in-place `icegres compact` cannot be implemented
+# safely against the pinned matrix — drop + single-commit reseed is the
+# documented canonicalization path (see icegres/src/seed.rs module docs).
+# Rows appended by e2e/parity (trip_id >= 900000) are disposable test
+# artifacts and are intentionally discarded.
+canonicalize_trips() {
+  local files; files=$(trips_data_files)
+  [[ "$files" =~ ^[0-9]+$ ]] || fatal "could not determine demo.trips data-file count (got: $files)"
+  if (( files > 2 )); then
+    log "demo.trips has $files data files (layout drift from e2e/parity appends) — rewriting to canonical single-file layout"
+    drop_trips || fatal "failed to drop demo.trips via REST catalog"
+    "$BIN" seed >"$RUN_DIR/reseed.log" 2>&1 \
+      || { tail -n 20 "$RUN_DIR/reseed.log" >&2; fatal "icegres seed (canonicalize) failed"; }
+    files=$(trips_data_files)
+    (( files <= 2 )) || fatal "demo.trips still has $files data files after canonicalization"
+  fi
+  TRIPS_DATA_FILES=$files
+  log "demo.trips layout: $files data file(s) — canonical"
 }
 
 create_scratch() { # same schema as demo.trips (see icegres/src/seed.rs)
@@ -145,6 +194,10 @@ log "seeding demo data"
 "$BIN" seed >"$RUN_DIR/seed.log" 2>&1 \
   || { tail -n 20 "$RUN_DIR/seed.log" >&2; fatal "icegres seed failed"; }
 
+log "layout maintenance: canonicalizing demo.trips (drift control)"
+TRIPS_DATA_FILES=""
+canonicalize_trips
+
 log "resetting bench scratch table demo.$SCRATCH_TABLE (write-metric target)"
 drop_scratch   # remove leftover from a previous (possibly aborted) run
 create_scratch || fatal "could not create demo.$SCRATCH_TABLE via REST catalog"
@@ -176,6 +229,10 @@ log "running bench harness (this takes a few minutes: 11 metrics, warmups, 10s q
 "$HARNESS_BIN" --host "$PG_HOST" --port "$PG_PORT" \
   --server-bin "$BIN" --server-pid "$SERVER_PID" --cold-port "$COLD_PORT" \
   >"$OUT_JSON" || { rm -f "$OUT_JSON"; fatal "bench harness failed"; }
+
+# Record the measured table layout so runs are auditable for comparability.
+jq --argjson f "${TRIPS_DATA_FILES:-null}" '. + {trips_data_files: $f}' \
+  "$OUT_JSON" >"$OUT_JSON.tmp" && mv "$OUT_JSON.tmp" "$OUT_JSON"
 log "wrote $OUT_JSON"
 
 stop_pidfile
@@ -203,7 +260,7 @@ fi
   echo "### Bench $TS"
   echo
   echo "Release binary \`${BIN#"$REPO_DIR"/}\` · raw: \`bench/results/bench-$TS.json\` ·"
-  jq -r '"warmups discarded: \(.warmup_discarded), iterations: \(.iterations), cold-start runs: \(.cold_start_runs)"' "$OUT_JSON"
+  jq -r '"warmups discarded: \(.warmup_discarded), iterations: \(.iterations), cold-start runs: \(.cold_start_runs), demo.trips data files: \(.trips_data_files // "?")"' "$OUT_JSON"
   echo
   echo "| metric | p50 | p95 | n / detail |"
   echo "|--------|-----|-----|------------|"
@@ -211,13 +268,14 @@ fi
     def row(name; m):
       if m == null then empty
       elif (m | has("p50")) then "| \(name) | \(m.p50) | \(m.p95) | n=\(m.n) |"
-      elif name == "qps_8conn" then "| \(name) | \(m.value) | — | \(m.connections) conns, \(m.window_s)s window |"
+      elif name == "qps_8conn" then "| \(name) | \(m.value) | — | median of \(m.windows // [] | map(tostring) | join(", ")) (\(m.connections) conns, \(m.window_s)s windows) |"
+      elif name == "rss_peak_mb" then "| \(name) | \(m.value) | — | qps-window peak \(m.qps_window_peak_mb // "—") MB, \(m.samples // "?") samples @ \(m.interval_ms // "?")ms |"
       else "| \(name) | \(m.value) | — | |"
       end;
     .metrics as $m |
     ( ["connect_ms","point_lookup_ms","filtered_scan_ms","aggregate_ms","join_ms",
        "insert_single_ms","insert_batch100_ms","freshness_ms","qps_8conn",
-       "cold_start_ms","binary_size_mb","rss_idle_mb"][] ) as $k |
+       "cold_start_ms","binary_size_mb","rss_idle_mb","rss_peak_mb","rss_after_load_mb"][] ) as $k |
     row($k; $m[$k])
   ' "$OUT_JSON"
 } >>"$SCORECARD"

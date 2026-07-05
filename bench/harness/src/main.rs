@@ -11,12 +11,21 @@
 //!       --cold-port 5442
 //!
 //! Method: every latency metric discards 3 warmup iterations and reports
-//! p50/p95 over >= 20 measured iterations. qps_8conn is a single 10 s window
-//! after a warmup window. cold_start_ms is >= 5 spawn->ready runs of the
-//! release binary. binary_size_mb is the size of --server-bin; rss_idle_mb is
-//! VmRSS of --server-pid, sampled while the server is idle.
+//! p50/p95 over >= 20 measured iterations. qps_8conn is the MEDIAN of 3
+//! consecutive 10 s windows after a warmup window (single-window qps showed
+//! up to +/-34% run-to-run noise). cold_start_ms is >= 5 spawn->ready runs of
+//! the release binary.
+//!
+//! Resource metrics (first-class, gated — see bench/gate.sh):
+//!   binary_size_mb    size of --server-bin;
+//!   rss_idle_mb       VmRSS of --server-pid after a light warmup, idle;
+//!   rss_peak_mb       max VmRSS of --server-pid sampled every 100 ms across
+//!                     the whole benchmark (plus the qps-window-only peak);
+//!   rss_after_load_mb VmRSS after all load has finished (1 s settle).
 
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Map, Value};
@@ -27,6 +36,8 @@ const ITERS: usize = 20;
 const COLD_RUNS: usize = 5;
 const QPS_CONNS: usize = 8;
 const QPS_WINDOW_S: u64 = 10;
+const QPS_WINDOWS: usize = 3;
+const RSS_SAMPLE_MS: u64 = 100;
 
 /// Write metrics target a bench-owned scratch table (created fresh and
 /// dropped by bench.sh via the REST catalog each run) so demo.trips never
@@ -270,9 +281,11 @@ async fn measure_freshness(
     (samples, next_id)
 }
 
-/// Mixed read workload over 8 connections for QPS_WINDOW_S seconds
-/// (preceded by a 2 s warmup window that is discarded).
-async fn measure_qps(host: &str, port: u16) -> f64 {
+/// Mixed read workload over 8 connections. Runs a discarded 2 s warmup
+/// window, then QPS_WINDOWS consecutive QPS_WINDOW_S-second windows; the
+/// reported value is the MEDIAN window (single-window qps was observed to be
+/// noisy up to +/-34% run-to-run). Returns (median, per-window values).
+async fn measure_qps(host: &str, port: u16) -> (f64, Vec<f64>) {
     async fn window(host: &str, port: u16, secs: u64) -> u64 {
         let deadline = Instant::now() + Duration::from_secs(secs);
         let mut handles = Vec::new();
@@ -311,8 +324,14 @@ async fn measure_qps(host: &str, port: u16) -> f64 {
         total
     }
     let _ = window(host, port, 2).await; // warmup, discarded
-    let total = window(host, port, QPS_WINDOW_S).await;
-    total as f64 / QPS_WINDOW_S as f64
+    let mut windows = Vec::with_capacity(QPS_WINDOWS);
+    for _ in 0..QPS_WINDOWS {
+        let total = window(host, port, QPS_WINDOW_S).await;
+        windows.push(round2(total as f64 / QPS_WINDOW_S as f64));
+    }
+    let mut sorted = windows.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    (percentile(&sorted, 50.0), windows)
 }
 
 fn spawn_server(bin: &str, host: &str, port: u16) -> Child {
@@ -362,15 +381,87 @@ fn binary_size_mb(bin: &str) -> f64 {
     round2(meta.len() as f64 / (1024.0 * 1024.0))
 }
 
-fn rss_mb(pid: u32) -> Option<f64> {
+fn rss_kb(pid: u32) -> Option<u64> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     for line in status.lines() {
         if let Some(rest) = line.strip_prefix("VmRSS:") {
-            let kb: f64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
-            return Some(round2(kb / 1024.0));
+            return rest.trim().trim_end_matches("kB").trim().parse().ok();
         }
     }
     None
+}
+
+fn rss_mb(pid: u32) -> Option<f64> {
+    rss_kb(pid).map(|kb| round2(kb as f64 / 1024.0))
+}
+
+/// Background RSS sampler: reads VmRSS of the server pid every RSS_SAMPLE_MS
+/// on a dedicated OS thread (independent of the tokio runtime, so sampling
+/// keeps its cadence while the async load loops saturate the executor).
+/// Tracks the peak over the whole run and, separately, the peak inside the
+/// qps window (flagged on/off by the driver).
+struct RssSampler {
+    stop: Arc<AtomicBool>,
+    qps_active: Arc<AtomicBool>,
+    peak_kb: Arc<AtomicU64>,
+    qps_peak_kb: Arc<AtomicU64>,
+    samples: Arc<AtomicU64>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+impl RssSampler {
+    fn start(pid: u32) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let qps_active = Arc::new(AtomicBool::new(false));
+        let peak_kb = Arc::new(AtomicU64::new(0));
+        let qps_peak_kb = Arc::new(AtomicU64::new(0));
+        let samples = Arc::new(AtomicU64::new(0));
+        let handle = {
+            let (stop, qps_active, peak_kb, qps_peak_kb, samples) = (
+                stop.clone(),
+                qps_active.clone(),
+                peak_kb.clone(),
+                qps_peak_kb.clone(),
+                samples.clone(),
+            );
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if let Some(kb) = rss_kb(pid) {
+                        peak_kb.fetch_max(kb, Ordering::Relaxed);
+                        if qps_active.load(Ordering::Relaxed) {
+                            qps_peak_kb.fetch_max(kb, Ordering::Relaxed);
+                        }
+                        samples.fetch_add(1, Ordering::Relaxed);
+                    }
+                    std::thread::sleep(Duration::from_millis(RSS_SAMPLE_MS));
+                }
+            })
+        };
+        Self {
+            stop,
+            qps_active,
+            peak_kb,
+            qps_peak_kb,
+            samples,
+            handle,
+        }
+    }
+
+    fn set_qps_window(&self, active: bool) {
+        self.qps_active.store(active, Ordering::Relaxed);
+    }
+
+    /// Stop sampling; returns (peak_mb, qps_window_peak_mb, sample_count).
+    fn finish(self) -> (f64, f64, u64) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.handle.join();
+        let to_mb = |kb: u64| round2(kb as f64 / 1024.0);
+        (
+            to_mb(self.peak_kb.load(Ordering::Relaxed)),
+            to_mb(self.qps_peak_kb.load(Ordering::Relaxed)),
+            self.samples.load(Ordering::Relaxed),
+        )
+    }
 }
 
 #[tokio::main]
@@ -400,6 +491,10 @@ async fn main() {
         metrics.insert("rss_idle_mb".into(), json!({ "value": null, "note": "no --server-pid given" }));
     }
 
+    // From here on, sample the server RSS every RSS_SAMPLE_MS for the whole
+    // benchmark (rss_peak_mb) with a separate peak for the qps window.
+    let sampler = args.server_pid.map(RssSampler::start);
+
     // Latency metrics: reads first so they run against the pre-insert table.
     let s = summarize(measure_connect(&args.host, args.port).await);
     eprint_metric("connect_ms", &s);
@@ -422,8 +517,20 @@ async fn main() {
     metrics.insert("join_ms".into(), s);
 
     // QPS before the write metrics so the read mix sees the same table state.
-    let qps = round2(measure_qps(&args.host, args.port).await);
-    let v = json!({ "value": qps, "connections": QPS_CONNS, "window_s": QPS_WINDOW_S });
+    if let Some(s) = sampler.as_ref() {
+        s.set_qps_window(true);
+    }
+    let (qps, qps_windows) = measure_qps(&args.host, args.port).await;
+    if let Some(s) = sampler.as_ref() {
+        s.set_qps_window(false);
+    }
+    let v = json!({
+        "value": round2(qps),
+        "windows": qps_windows,
+        "aggregation": format!("median of {QPS_WINDOWS} consecutive windows"),
+        "connections": QPS_CONNS,
+        "window_s": QPS_WINDOW_S,
+    });
     eprint_metric("qps_8conn", &v);
     metrics.insert("qps_8conn".into(), v);
 
@@ -455,6 +562,32 @@ async fn main() {
     let s = summarize(samples);
     eprint_metric("cold_start_ms", &s);
     metrics.insert("cold_start_ms".into(), s);
+
+    // Resource wrap-up: stop the sampler, then read the settled post-load RSS.
+    match (sampler, args.server_pid) {
+        (Some(sampler), Some(pid)) => {
+            let (peak_mb, qps_peak_mb, n) = sampler.finish();
+            let v = json!({
+                "value": peak_mb,
+                "qps_window_peak_mb": qps_peak_mb,
+                "samples": n,
+                "interval_ms": RSS_SAMPLE_MS,
+            });
+            eprint_metric("rss_peak_mb", &v);
+            metrics.insert("rss_peak_mb".into(), v);
+
+            tokio::time::sleep(Duration::from_secs(1)).await; // settle
+            let after = rss_mb(pid).expect("could not read VmRSS for --server-pid");
+            let v = json!({ "value": after });
+            eprint_metric("rss_after_load_mb", &v);
+            metrics.insert("rss_after_load_mb".into(), v);
+        }
+        _ => {
+            let note = json!({ "value": null, "note": "no --server-pid given" });
+            metrics.insert("rss_peak_mb".into(), note.clone());
+            metrics.insert("rss_after_load_mb".into(), note);
+        }
+    }
 
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)

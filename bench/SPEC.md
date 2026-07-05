@@ -83,18 +83,30 @@ Metrics (all against the live local stack, table demo.trips ~280+ rows):
 | insert_single_ms | 1-row INSERT (full Iceberg commit — expect 100s of ms; honest number) |
 | insert_batch100_ms | 100-row multi-VALUES INSERT |
 | freshness_ms | commit in conn A → first successful readback of that row in conn B (poll 10ms) |
-| qps_8conn | mixed read queries, 8 connections, 10 s, total queries/s |
+| qps_8conn | mixed read queries, 8 connections: MEDIAN of 3 consecutive 10 s windows (all three reported) |
 | cold_start_ms | `serve` spawn → first successful `select 1` |
 | binary_size_mb, rss_idle_mb | footprint |
+| rss_peak_mb | peak server VmRSS, sampled every 100 ms across the whole benchmark (qps-window peak reported separately) |
+| rss_after_load_mb | server VmRSS after all load finished (1 s settle) |
+
+Resource metrics are first-class: performance improvements must be traded
+explicitly against memory and binary size (see §3 gate rules).
 
 Noise control: pin release build, quiesce stack, 3 warmup iterations discarded,
 report p50/p95, run the full suite twice and require the two baselines to agree
-within 25% on every metric before accepting a baseline.
+within 25% on every metric before accepting a baseline. Layout drift control:
+e2e/parity append small files to demo.trips, so `bench/bench.sh` rewrites
+demo.trips to its canonical single-file seed layout (drop + reseed — the pinned
+iceberg-rust 0.9.1 transaction API has no replace-files/compaction action)
+before measuring whenever the table has >2 data files, and records
+`trips_data_files` in the result JSON.
 
 ## 3. Regression gate
 
 `bench/gate.sh <baseline.json> <candidate.json>`:
 - FAIL if any latency metric p50 worsens >20% or qps drops >10%;
+- FAIL if `rss_peak_mb` or `rss_idle_mb` worsens >25%, or `binary_size_mb` >10%
+  (resource footprint is a first-class gated metric);
 - FAIL if `icegres/tests/e2e.sh` not green;
 - FAIL if any parity verdict downgrades (PASS → GAP).
 Every improvement lands only through this gate.

@@ -364,3 +364,25 @@ warmups discarded: 3, iterations: 20, cold-start runs: 5
 | cold_start_ms | 45.38 | 45.74 | n=5 |
 | binary_size_mb | 151.61 | — | |
 | rss_idle_mb | 80.31 | — | |
+
+### Bench 20260705T180705Z
+
+Release binary `icegres/target/release/icegres` · raw: `bench/results/bench-20260705T180705Z.json` ·
+warmups discarded: 3, iterations: 20, cold-start runs: 5, demo.trips data files: 1
+
+| metric | p50 | p95 | n / detail |
+|--------|-----|-----|------------|
+| connect_ms | 0.21 | 0.29 | n=20 |
+| point_lookup_ms | 6.45 | 6.97 | n=20 |
+| filtered_scan_ms | 6.06 | 6.28 | n=20 |
+| aggregate_ms | 6.52 | 6.83 | n=20 |
+| join_ms | 9.5 | 10.49 | n=20 |
+| insert_single_ms | 44.72 | 55.35 | n=20 |
+| insert_batch100_ms | 80.12 | 91.22 | n=20 |
+| freshness_ms | 58.9 | 62.93 | n=20 |
+| qps_8conn | 448.0 | — | median of 448.0, 452.0, 446.2 (8 conns, 10s windows) |
+| cold_start_ms | 45.1 | 45.45 | n=5 |
+| binary_size_mb | 151.61 | — | |
+| rss_idle_mb | 77.92 | — | |
+| rss_peak_mb | 93.05 | — | qps-window peak 91.32 MB, 399 samples @ 100ms |
+| rss_after_load_mb | 93.05 | — | |
