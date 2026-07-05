@@ -25,10 +25,24 @@ datafusion-postgres = "=0.15.0"
 # Arrow — must stay on 57.x to match datafusion 52 / iceberg 0.9.1
 arrow = "=57.3.1"
 
-tokio = { version = "1.52", features = ["full"] }
-clap = { version = "4.6", features = ["derive", "env"] }
+# Trimmed from "full" to exactly what icegres uses: #[tokio::main] +
+# select!/spawn (rt-multi-thread, macros), TcpListener (net), Async{Read,Write}Ext
+# (io-util), time::sleep (time). Transitive deps (pgwire, datafusion, opendal)
+# enable their own tokio features via unification — do not re-add "full".
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+# default features minus "color" (anstream/anstyle) and "suggestions" (strsim):
+# icegres is a server binary, fancy CLI error rendering is not worth the bytes.
+clap = { version = "4.6", default-features = false, features = ["std", "help", "usage", "error-context", "derive", "env"] }
 futures = "0.3"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
+
+# Resource hygiene: symbols stripped from the release binary (rust symbol tables
+# on the datafusion+iceberg graph are enormous) and thin LTO for cross-crate
+# inlining + dead-code elimination. Costs one full rebuild + slower links;
+# binary_size_mb and rss are gated metrics (bench/gate.sh).
+[profile.release]
+strip = "symbols"
+lto = "thin"
