@@ -28,6 +28,13 @@ const COLD_RUNS: usize = 5;
 const QPS_CONNS: usize = 8;
 const QPS_WINDOW_S: u64 = 10;
 
+/// Write metrics target a bench-owned scratch table (created fresh and
+/// dropped by bench.sh via the REST catalog each run) so demo.trips never
+/// grows during a benchmark: append-only Iceberg means every insert adds a
+/// Parquet file + snapshot, and a growing demo.trips makes read metrics
+/// drift monotonically between runs (baseline runs could never agree).
+const SCRATCH: &str = "demo.bench_scratch";
+
 const Q_POINT: &str = "select trip_id, city, distance_km, fare, ts from demo.trips where trip_id = $1";
 const Q_FILTER: &str =
     "select count(*) from demo.trips where city = 'Paris' and distance_km > 20";
@@ -168,9 +175,12 @@ async fn measure_query(client: &Client, sql: &str, param: Option<i64>) -> Vec<f6
 
 async fn max_trip_id(client: &Client) -> i64 {
     let rows = client
-        .query("select max(trip_id) from demo.trips", &[])
+        .query(
+            &format!("select max(trip_id) from {SCRATCH}"),
+            &[],
+        )
         .await
-        .expect("max(trip_id) failed");
+        .expect("max(trip_id) on scratch table failed");
     rows[0].get::<_, Option<i64>>(0).unwrap_or(0)
 }
 
@@ -183,7 +193,7 @@ fn insert_sql(base_id: i64, n: i64) -> String {
         ));
     }
     format!(
-        "insert into demo.trips (trip_id, city, distance_km, fare, ts) values {}",
+        "insert into {SCRATCH} (trip_id, city, distance_km, fare, ts) values {}",
         vals.join(", ")
     )
 }
@@ -238,7 +248,10 @@ async fn measure_freshness(
         let t0 = Instant::now();
         loop {
             let rows = reader
-                .query("select trip_id from demo.trips where trip_id = $1", &[&id])
+                .query(
+                    &format!("select trip_id from {SCRATCH} where trip_id = $1"),
+                    &[&id],
+                )
                 .await
                 .expect("freshness readback failed");
             if !rows.is_empty() {
@@ -414,9 +427,9 @@ async fn main() {
     eprint_metric("qps_8conn", &v);
     metrics.insert("qps_8conn".into(), v);
 
-    // Writes: unique trip_ids in the bench range (>= 2_000_000), appended
-    // permanently (Iceberg is append-only here; e2e exact-value assertions
-    // filter trip_id 1..280 so this is safe by design).
+    // Writes go to the bench-owned scratch table (fresh each run, dropped by
+    // bench.sh afterwards) so demo.trips stays byte-identical across runs.
+    // Unique ids >= 2_000_000 guard against a leftover scratch table.
     let max_id = max_trip_id(&client).await;
     let next_id = std::cmp::max(max_id + 1, 2_000_000);
 

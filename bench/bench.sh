@@ -11,9 +11,11 @@
 #
 # Notes:
 #   - Only one benchmark should run at a time on this box (CPU-noise).
-#   - The harness appends rows to demo.trips with trip_id >= 2_000_000
-#     (append-only Iceberg; e2e's exact-value assertions filter trip_id
-#     1..280, so this is safe by design).
+#   - Write metrics target demo.bench_scratch, a bench-owned table this
+#     script creates fresh (REST catalog) before each run and drops after.
+#     demo.trips is READ-ONLY for the benchmark: append-only Iceberg means
+#     every insert adds a Parquet file + snapshot, and a growing demo.trips
+#     made read metrics drift 40-80% between consecutive runs.
 #   - Ports used: 5439 (server under test), 5442 (cold-start runs).
 
 set -euo pipefail
@@ -51,6 +53,48 @@ port_answers() { # port
   psql -h "$PG_HOST" -p "$1" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1
 }
 
+# --- bench-owned scratch table (write-metric target) -----------------------
+SCRATCH_TABLE=bench_scratch
+CATALOG_PREFIX=""
+
+catalog_prefix() {
+  if [[ -z "$CATALOG_PREFIX" ]]; then
+    CATALOG_PREFIX=$(curl -sf "$CATALOG_URI/v1/config?warehouse=$WAREHOUSE" \
+      | jq -r '.defaults.prefix')
+    [[ -n "$CATALOG_PREFIX" && "$CATALOG_PREFIX" != null ]] \
+      || fatal "could not resolve catalog prefix for warehouse $WAREHOUSE"
+  fi
+  printf '%s' "$CATALOG_PREFIX"
+}
+
+drop_scratch() { # drop the bench-owned scratch table (created by this script)
+  local prefix; prefix=$(catalog_prefix) || return 0
+  curl -sf -X DELETE \
+    "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/$SCRATCH_TABLE?purgeRequested=true" \
+    >/dev/null 2>&1 || true
+}
+
+create_scratch() { # same schema as demo.trips (see icegres/src/seed.rs)
+  local prefix; prefix=$(catalog_prefix)
+  curl -sf -X POST "$CATALOG_URI/v1/$prefix/namespaces/demo/tables" \
+    -H 'Content-Type: application/json' -d @- <<'JSON' >/dev/null
+{
+  "name": "bench_scratch",
+  "schema": {
+    "type": "struct",
+    "schema-id": 0,
+    "fields": [
+      {"id": 1, "name": "trip_id",     "required": false, "type": "long"},
+      {"id": 2, "name": "city",        "required": false, "type": "string"},
+      {"id": 3, "name": "distance_km", "required": false, "type": "double"},
+      {"id": 4, "name": "fare",        "required": false, "type": "double"},
+      {"id": 5, "name": "ts",          "required": false, "type": "timestamp"}
+    ]
+  }
+}
+JSON
+}
+
 stop_pidfile() { # identity-checked, like icegres/tests/e2e.sh
   if [[ -f "$PID_FILE" ]]; then
     local pid; pid=$(cat "$PID_FILE")
@@ -66,7 +110,11 @@ stop_pidfile() { # identity-checked, like icegres/tests/e2e.sh
     rm -f "$PID_FILE"
   fi
 }
-trap stop_pidfile EXIT
+cleanup() {
+  stop_pidfile
+  drop_scratch
+}
+trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
 # 1. Stack healthy
@@ -96,6 +144,10 @@ log "building bench harness (release)"
 log "seeding demo data"
 "$BIN" seed >"$RUN_DIR/seed.log" 2>&1 \
   || { tail -n 20 "$RUN_DIR/seed.log" >&2; fatal "icegres seed failed"; }
+
+log "resetting bench scratch table demo.$SCRATCH_TABLE (write-metric target)"
+drop_scratch   # remove leftover from a previous (possibly aborted) run
+create_scratch || fatal "could not create demo.$SCRATCH_TABLE via REST catalog"
 
 stop_pidfile
 if port_answers "$PG_PORT"; then

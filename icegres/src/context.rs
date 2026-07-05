@@ -10,7 +10,7 @@ use iceberg::io::{
     S3_ACCESS_KEY_ID, S3_DISABLE_CONFIG_LOAD, S3_DISABLE_EC2_METADATA, S3_ENDPOINT,
     S3_PATH_STYLE_ACCESS, S3_REGION, S3_SECRET_ACCESS_KEY,
 };
-use iceberg::{Catalog, CatalogBuilder};
+use iceberg::{Catalog, CatalogBuilder, NamespaceIdent};
 use iceberg_catalog_rest::{
     RestCatalogBuilder, REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE,
 };
@@ -18,6 +18,7 @@ use iceberg_datafusion::IcebergCatalogProvider;
 use iceberg_storage_opendal::OpenDalStorageFactory;
 use tracing::info;
 
+use crate::cache::CachingSchemaProvider;
 use crate::CatalogOpts;
 
 /// Name under which the lakehouse is registered in the DataFusion session.
@@ -61,6 +62,30 @@ pub async fn connect_catalog(opts: &CatalogOpts) -> Result<Arc<dyn Catalog>> {
     Ok(Arc::new(catalog))
 }
 
+/// DataFusion session configuration tuned for this workload (small-batch
+/// Iceberg scans over a local S3 store on a 4-core box), with an env-var
+/// escape hatch: `ICEGRES_DF_OPTS` accepts `;`-separated
+/// `datafusion.<section>.<key>=<value>` pairs that are applied on top of the
+/// tuned defaults (invalid entries fail startup loudly rather than being
+/// silently ignored).
+fn session_config() -> Result<SessionConfig> {
+    let mut config = SessionConfig::new()
+        .with_information_schema(true)
+        .with_default_catalog_and_schema(CATALOG_NAME, DEFAULT_SCHEMA);
+    if let Ok(spec) = std::env::var("ICEGRES_DF_OPTS") {
+        for pair in spec.split(';').map(str::trim).filter(|p| !p.is_empty()) {
+            let (key, value) = pair.split_once('=').with_context(|| {
+                format!("ICEGRES_DF_OPTS entry {pair:?} is not of the form key=value")
+            })?;
+            config
+                .options_mut()
+                .set(key.trim(), value.trim())
+                .with_context(|| format!("ICEGRES_DF_OPTS: cannot set {pair:?}"))?;
+        }
+    }
+    Ok(config)
+}
+
 /// Build a DataFusion session exposing every Iceberg namespace/table under
 /// the `icegres` catalog.
 ///
@@ -70,12 +95,9 @@ pub async fn connect_catalog(opts: &CatalogOpts) -> Result<Arc<dyn Catalog>> {
 /// because `setup_pg_catalog` needs `register_schema`, which
 /// `IcebergCatalogProvider` does not implement.
 pub async fn build_session_context(catalog: Arc<dyn Catalog>) -> Result<SessionContext> {
-    let session_config = SessionConfig::new()
-        .with_information_schema(true)
-        .with_default_catalog_and_schema(CATALOG_NAME, DEFAULT_SCHEMA);
-    let ctx = SessionContext::new_with_config(session_config);
+    let ctx = SessionContext::new_with_config(session_config()?);
 
-    let iceberg_provider = IcebergCatalogProvider::try_new(catalog)
+    let iceberg_provider = IcebergCatalogProvider::try_new(catalog.clone())
         .await
         .context("failed to enumerate namespaces/tables from the Iceberg catalog")?;
 
@@ -88,7 +110,16 @@ pub async fn build_session_context(catalog: Arc<dyn Catalog>) -> Result<SessionC
                 tables = %tables.join(", "),
                 "discovered Iceberg namespace"
             );
-            mem.register_schema(&schema_name, schema)
+            // Wrap in the snapshot-aware metadata cache (see cache.rs):
+            // scans reuse warm manifest caches, refreshed on snapshot change.
+            let caching = CachingSchemaProvider::try_new(
+                schema,
+                catalog.clone(),
+                NamespaceIdent::new(schema_name.clone()),
+            )
+            .await
+            .with_context(|| format!("failed to build caching provider for {schema_name}"))?;
+            mem.register_schema(&schema_name, Arc::new(caching))
                 .with_context(|| format!("failed to register schema {schema_name}"))?;
         }
     }

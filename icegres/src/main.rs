@@ -4,7 +4,9 @@
 //! and tables through DataFusion, and serves them over the Postgres wire
 //! protocol via datafusion-postgres.
 
+mod cache;
 mod context;
+mod scan;
 mod seed;
 
 use std::sync::Arc;
