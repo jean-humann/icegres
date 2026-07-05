@@ -408,3 +408,69 @@ warmups discarded: 3, iterations: 20, cold-start runs: 5, demo.trips data files:
 | rss_idle_mb | 77.62 | — | |
 | rss_peak_mb | 95.91 | — | qps-window peak 93.94 MB, 398 samples @ 100ms |
 | rss_after_load_mb | 95.91 | — | |
+
+### Bench 20260705T192303Z
+
+Release binary `icegres/target/release/icegres` · raw: `bench/results/bench-20260705T192303Z.json` ·
+warmups discarded: 3, iterations: 20, cold-start runs: 5, demo.trips data files: 1
+
+| metric | p50 | p95 | n / detail |
+|--------|-----|-----|------------|
+| connect_ms | 0.24 | 0.3 | n=20 |
+| point_lookup_ms | 6.74 | 7.28 | n=20 |
+| filtered_scan_ms | 6.43 | 6.86 | n=20 |
+| aggregate_ms | 6.58 | 7.13 | n=20 |
+| join_ms | 9.85 | 10.37 | n=20 |
+| insert_single_ms | 48.36 | 58.75 | n=20 |
+| insert_batch100_ms | 82.23 | 99.01 | n=20 |
+| freshness_ms | 56.94 | 64.69 | n=20 |
+| qps_8conn | 445.4 | — | median of 452.0, 444.8, 445.4 (8 conns, 10s windows) |
+| cold_start_ms | 45.23 | 45.87 | n=5 |
+| binary_size_mb | 120.0 | — | |
+| rss_idle_mb | 75.74 | — | |
+| rss_peak_mb | 90.6 | — | qps-window peak 88.82 MB, 401 samples @ 100ms |
+| rss_after_load_mb | 90.15 | — | |
+
+### Bench 20260705T192646Z
+
+Release binary `icegres/target/release/icegres` · raw: `bench/results/bench-20260705T192646Z.json` ·
+warmups discarded: 3, iterations: 20, cold-start runs: 5, demo.trips data files: 2
+
+| metric | p50 | p95 | n / detail |
+|--------|-----|-----|------------|
+| connect_ms | 0.19 | 0.26 | n=20 |
+| point_lookup_ms | 6.17 | 6.51 | n=20 |
+| filtered_scan_ms | 6.11 | 6.7 | n=20 |
+| aggregate_ms | 6.45 | 7.19 | n=20 |
+| join_ms | 8.79 | 9.16 | n=20 |
+| insert_single_ms | 49.63 | 58.13 | n=20 |
+| insert_batch100_ms | 85.42 | 98.43 | n=20 |
+| freshness_ms | 57.52 | 66.69 | n=20 |
+| qps_8conn | 413.0 | — | median of 413.0, 402.8, 414.9 (8 conns, 10s windows) |
+| cold_start_ms | 45.27 | 45.5 | n=5 |
+| binary_size_mb | 120.0 | — | |
+| rss_idle_mb | 75.91 | — | |
+| rss_peak_mb | 92.24 | — | qps-window peak 89.53 MB, 401 samples @ 100ms |
+| rss_after_load_mb | 92.1 | — | |
+
+### Bench 20260705T192828Z
+
+Release binary `icegres/target/release/icegres` · raw: `bench/results/bench-20260705T192828Z.json` ·
+warmups discarded: 3, iterations: 20, cold-start runs: 5, demo.trips data files: 2
+
+| metric | p50 | p95 | n / detail |
+|--------|-----|-----|------------|
+| connect_ms | 0.21 | 0.26 | n=20 |
+| point_lookup_ms | 6.23 | 6.64 | n=20 |
+| filtered_scan_ms | 6.17 | 6.75 | n=20 |
+| aggregate_ms | 7.05 | 7.51 | n=20 |
+| join_ms | 9.65 | 10.24 | n=20 |
+| insert_single_ms | 48.32 | 61.48 | n=20 |
+| insert_batch100_ms | 85.55 | 97.75 | n=20 |
+| freshness_ms | 62.3 | 76.93 | n=20 |
+| qps_8conn | 419.9 | — | median of 419.9, 422.5, 419.9 (8 conns, 10s windows) |
+| cold_start_ms | 45.49 | 46.0 | n=5 |
+| binary_size_mb | 120.0 | — | |
+| rss_idle_mb | 76.23 | — | |
+| rss_peak_mb | 91.65 | — | qps-window peak 90.5 MB, 405 samples @ 100ms |
+| rss_after_load_mb | 91.6 | — | |
