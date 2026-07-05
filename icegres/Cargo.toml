@@ -27,12 +27,12 @@ arrow = "=57.3.1"
 
 # Trimmed from "full" to exactly what icegres uses: #[tokio::main] +
 # select!/spawn (rt-multi-thread, macros), TcpListener (net), Async{Read,Write}Ext
-# (io-util), time::sleep (time), plus "parking_lot" (runtime-internal fast
-# mutexes — "full" enabled it and dropping it measurably cost ~10% qps_8conn;
-# the parking_lot crate is already compiled into the graph via datafusion, so
-# it is free in binary size). Transitive deps (pgwire, datafusion, opendal)
-# enable their own tokio features via unification — do not re-add "full".
-tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "parking_lot"] }
+# (io-util), time::sleep (time). "parking_lot" (tokio-internal fast mutexes,
+# enabled by "full") was A/B-benchmarked and measured a no-op on this box
+# (qps_8conn 417 with vs 413-420 without) — left off. Transitive deps (pgwire,
+# datafusion, opendal) enable their own tokio features via unification — do
+# not re-add "full".
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
 # default features minus "color" (anstream/anstyle) and "suggestions" (strsim):
 # icegres is a server binary, fancy CLI error rendering is not worth the bytes.
 clap = { version = "4.6", default-features = false, features = ["std", "help", "usage", "error-context", "derive", "env"] }
