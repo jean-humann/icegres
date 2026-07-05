@@ -1,0 +1,4 @@
+# Runtime state (pidfiles, serve logs) — never committed.
+# NOTE: bench/results/ *is* committed by design; harness/target/ is ignored
+# via bench/harness/.gitignore.
+/.run/

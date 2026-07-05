@@ -1,0 +1,16 @@
+[package]
+name = "icegres-bench"
+version = "0.1.0"
+edition = "2021"
+
+# Deliberately tiny: tokio-postgres + serde/serde_json only (plus the tokio
+# runtime tokio-postgres requires). Must build in well under 2 minutes —
+# do NOT add datafusion/iceberg/arrow dependencies here.
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }
+tokio-postgres = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 2
