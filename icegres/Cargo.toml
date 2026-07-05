@@ -1,0 +1,34 @@
+[package]
+name = "icegres"
+version = "0.1.0"
+edition = "2021"
+description = "Postgres wire endpoint over an Iceberg lakehouse (Lakekeeper + RustFS)"
+license = "Apache-2.0"
+
+[[bin]]
+name = "icegres"
+path = "src/main.rs"
+
+[dependencies]
+# Iceberg stack (all pinned to the same 0.9.1 — do not bump independently)
+iceberg = "=0.9.1"
+iceberg-catalog-rest = "=0.9.1"
+iceberg-datafusion = "=0.9.1"
+iceberg-storage-opendal = "=0.9.1"
+
+# Query engine — 52.5.0 satisfies iceberg-datafusion (^52.2) AND datafusion-postgres (^52)
+datafusion = "=52.5.0"
+
+# Postgres wire front-end (re-exports pgwire, arrow_pg, datafusion_pg_catalog)
+datafusion-postgres = "=0.15.0"
+
+# Arrow — must stay on 57.x to match datafusion 52 / iceberg 0.9.1
+arrow = "=57.3.1"
+
+tokio = { version = "1.52", features = ["full"] }
+clap = { version = "4.6", features = ["derive", "env"] }
+futures = "0.3"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
