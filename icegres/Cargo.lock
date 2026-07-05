@@ -2598,6 +2598,7 @@ dependencies = [
  "iceberg-catalog-rest",
  "iceberg-datafusion",
  "iceberg-storage-opendal",
+ "rustls-pemfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

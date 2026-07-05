@@ -7,17 +7,19 @@
 mod cache;
 mod context;
 mod ops;
+mod pgauth;
 mod scan;
 mod seed;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context as _, Result};
+use anyhow::{bail, Context as _, Result};
 use clap::{Args, Parser, Subcommand};
 use datafusion_postgres::auth::AuthManager;
 use datafusion_postgres::datafusion_pg_catalog::pg_catalog::setup_pg_catalog;
 use datafusion_postgres::{serve, ServerOptions};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Connection options for the Iceberg REST catalog and its object store.
 #[derive(Args, Clone, Debug)]
@@ -98,6 +100,25 @@ enum Command {
         /// only — readiness is a pgwire 'select 1'. Off by default.
         #[arg(long, env = "ICEGRES_HEALTH_PORT")]
         health_port: Option<u16>,
+
+        /// PEM certificate (chain) enabling TLS on the pgwire listener.
+        /// Requires --tls-key. Any TLS setup error aborts startup (no silent
+        /// plaintext fallback). Like stock Postgres, plaintext startup is
+        /// still accepted — clients opt in with sslmode=require/verify-full.
+        /// Dev certs: infra/scripts/gen-dev-cert.sh.
+        #[arg(long, env = "ICEGRES_TLS_CERT", requires = "tls_key")]
+        tls_cert: Option<String>,
+
+        /// PEM private key (PKCS#8/RSA/SEC1) for --tls-cert.
+        #[arg(long, env = "ICEGRES_TLS_KEY", requires = "tls_cert")]
+        tls_key: Option<String>,
+
+        /// Require SCRAM-SHA-256 authentication against this credentials
+        /// file ('user:password' per line, '#' comments; protect it like
+        /// .pgpass). Wrong password or unknown user is rejected (28P01).
+        /// Without this flag the server stays permissive and logs a WARN.
+        #[arg(long, env = "ICEGRES_AUTH_FILE")]
+        auth_file: Option<PathBuf>,
     },
     /// Create and populate the demo namespace/tables (idempotent).
     Seed {
@@ -132,19 +153,66 @@ async fn main() -> Result<()> {
             port,
             idle_shutdown_secs,
             health_port,
-        } => run_serve(&catalog, &host, port, idle_shutdown_secs, health_port).await,
+            tls_cert,
+            tls_key,
+            auth_file,
+        } => {
+            let serve_opts = ServeOpts {
+                idle_shutdown_secs,
+                health_port,
+                tls_cert,
+                tls_key,
+                auth_file,
+            };
+            run_serve(&catalog, &host, port, serve_opts).await
+        }
         Command::Seed { catalog } => seed::run(&catalog).await,
         Command::Sql { catalog, query } => run_sql(&catalog, &query).await,
     }
 }
 
-async fn run_serve(
-    opts: &CatalogOpts,
-    host: &str,
-    port: u16,
+/// Server-only options for `icegres serve` (kept separate from `CatalogOpts`).
+struct ServeOpts {
     idle_shutdown_secs: Option<u64>,
     health_port: Option<u16>,
-) -> Result<()> {
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+    auth_file: Option<PathBuf>,
+}
+
+async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeOpts) -> Result<()> {
+    // Fail fast on TLS/auth misconfiguration BEFORE touching the catalog:
+    // a server asked to be secure must never come up insecure.
+    let tls = match (&serve_opts.tls_cert, &serve_opts.tls_key) {
+        (Some(cert), Some(key)) => {
+            let acceptor = ops::build_tls_acceptor(cert, key)?;
+            info!(cert = %cert, key = %key, "TLS enabled on the pgwire listener (plaintext startup still accepted; clients enforce with sslmode=require)");
+            Some(acceptor)
+        }
+        (None, None) => None,
+        // clap `requires` already enforces this; keep a hard error for
+        // programmatic callers.
+        _ => bail!("--tls-cert and --tls-key must be provided together"),
+    };
+    let auth = match &serve_opts.auth_file {
+        Some(path) => {
+            let source = Arc::new(pgauth::FileAuthSource::load(path)?);
+            info!(
+                auth_file = %path.display(),
+                users = source.user_count(),
+                "SCRAM-SHA-256 authentication enabled"
+            );
+            Some(source)
+        }
+        None => {
+            warn!(
+                "authentication is DISABLED — any user/password is accepted; \
+                 pass --auth-file (env ICEGRES_AUTH_FILE) to require SCRAM-SHA-256 credentials"
+            );
+            None
+        }
+    };
+
     info!(
         catalog_uri = %opts.catalog_uri,
         warehouse = %opts.warehouse,
@@ -161,27 +229,32 @@ async fn run_serve(
     )
     .map_err(|e| anyhow::anyhow!("failed to set up pg_catalog emulation: {e}"))?;
 
-    if let Some(hp) = health_port {
+    if let Some(hp) = serve_opts.health_port {
         ops::spawn_health_listener(host, hp).await?;
     }
 
     info!(listen_addr = %format!("{host}:{port}"), "starting pgwire server");
-    match idle_shutdown_secs {
-        // Scale-to-zero path: our own accept loop with an idle watchdog
-        // (see ops.rs). Exits cleanly after the idle window.
-        Some(idle_secs) => ops::serve_with_idle_shutdown(Arc::new(ctx), host, port, idle_secs)
-            .await
-            .context("pgwire server (idle-shutdown mode) failed")?,
+    if serve_opts.idle_shutdown_secs.is_some() || tls.is_some() || auth.is_some() {
+        // Custom accept loop (ops.rs): idle shutdown, TLS, and/or SCRAM auth.
+        ops::serve_custom(
+            Arc::new(ctx),
+            host,
+            port,
+            serve_opts.idle_shutdown_secs,
+            tls,
+            auth,
+        )
+        .await
+        .context("pgwire server (custom accept loop) failed")?;
+    } else {
         // Default path: the stock datafusion-postgres loop, byte-for-byte
         // unchanged behavior.
-        None => {
-            let server_options = ServerOptions::new()
-                .with_host(host.to_string())
-                .with_port(port);
-            serve(Arc::new(ctx), &server_options)
-                .await
-                .context("pgwire server failed")?;
-        }
+        let server_options = ServerOptions::new()
+            .with_host(host.to_string())
+            .with_port(port);
+        serve(Arc::new(ctx), &server_options)
+            .await
+            .context("pgwire server failed")?;
     }
     Ok(())
 }

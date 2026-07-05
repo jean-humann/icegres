@@ -37,6 +37,10 @@ tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "net", "io-
 # icegres is a server binary, fancy CLI error rendering is not worth the bytes.
 clap = { version = "4.6", default-features = false, features = ["std", "help", "usage", "error-context", "derive", "env"] }
 futures = "0.3"
+# PEM parsing for --tls-cert/--tls-key. Already in the tree transitively via
+# datafusion-postgres; rustls itself is reached through pgwire's re-export of
+# tokio_rustls so no second rustls version can drift in.
+rustls-pemfile = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

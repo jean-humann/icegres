@@ -40,6 +40,13 @@ export AWS_SECRET_ACCESS_KEY=rustfssecret
 export AWS_DEFAULT_REGION=us-east-1
 export PGCONNECT_TIMEOUT=5
 
+# The server under test is started by this script and must be permissive and
+# plaintext — the benchmark measures the default wire path, and a stray
+# ICEGRES_AUTH_FILE/ICEGRES_TLS_* in the caller's environment would silently
+# change what is being measured. (Clients would still pass credentials when
+# configured: psql/tokio-postgres read PGPASSWORD from the environment.)
+unset ICEGRES_AUTH_FILE ICEGRES_TLS_CERT ICEGRES_TLS_KEY
+
 BIN="$ICEGRES_DIR/target/release/icegres"
 HARNESS_BIN="$SCRIPT_DIR/harness/target/release/icegres-bench"
 PID_FILE="$RUN_DIR/bench-serve.pid"

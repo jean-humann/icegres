@@ -28,8 +28,8 @@ pass criteria, verdict, evidence line.
 | A3 | `\dt` / pg_catalog introspection | `psql -c '\dt demo.*'` lists tables |
 | A4 | information_schema | `select * from information_schema.tables where table_schema='demo'` |
 | A5 | multiple concurrent connections | 8 parallel psql SELECTs all succeed |
-| A6 | server-side auth | connect with/without password — expect GAP (noop auth), documented |
-| A7 | TLS | expect GAP, documented |
+| A6 | server-side auth | against a server started with `--auth-file`: right password accepted, wrong password AND unknown user rejected (SCRAM-SHA-256) |
+| A7 | TLS | against a server started with `--tls-cert/--tls-key`: `sslmode=require` + `verify-full` succeed AND `openssl s_client -starttls postgres` proves the handshake (listener also accepts plaintext, like stock Postgres — clients enforce via sslmode) |
 
 ### Area B — OLTP semantics (Lakebase bar: real Postgres OLTP)
 | id | behavior | probe sketch |

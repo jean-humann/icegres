@@ -32,6 +32,14 @@ SECOND_PORT=5440
 ENV_PORT=5444
 IDLE_PORT=5445
 HEALTH_PORT=5446
+SECURE_PORT=5447 # auth+TLS server for the A6/A7 probes
+
+# Harness-owned servers are permissive/plaintext by design (except the
+# dedicated A6/A7 secure server, configured explicitly): a stray
+# ICEGRES_AUTH_FILE/ICEGRES_TLS_* in the caller's environment must not flip
+# them. Clients still pass credentials when configured: every psql below
+# reads PGPASSWORD from the inherited environment.
+unset ICEGRES_AUTH_FILE ICEGRES_TLS_CERT ICEGRES_TLS_KEY
 CATALOG_URI="http://127.0.0.1:8181/catalog"
 WAREHOUSE=lakehouse
 S3_ENDPOINT="http://127.0.0.1:9000"
@@ -109,6 +117,7 @@ cleanup() {
   stop_pidfile "$RUN_DIR/parity-serve2.pid"
   stop_pidfile "$RUN_DIR/parity-serve-env.pid"
   stop_pidfile "$RUN_DIR/parity-serve-idle.pid"
+  stop_pidfile "$RUN_DIR/parity-serve-secure.pid"
   rm -f "$RECORDS"
 }
 trap cleanup EXIT
@@ -201,24 +210,67 @@ else
     "only $ok/8 parallel connections succeeded: $(flat <"$RUN_DIR/a5.out")"
 fi
 
-out_badpass=$(PGPASSWORD=definitely-wrong psql -h "$PG_HOST" -p "$MAIN_PORT" -U postgres -d icegres -tA -c 'select 1' 2>&1)
-out_baduser=$(psql -h "$PG_HOST" -p "$MAIN_PORT" -U not_a_real_user -d icegres -tA -c 'select 1' 2>&1)
-if [[ "$out_badpass" == 1 && "$out_baduser" == 1 ]]; then
-  record A6 wire "server-side auth" GAP \
-    "no auth enforcement: connections with a wrong password and with nonexistent user 'not_a_real_user' both succeeded (select 1 -> 1). AuthManager::default() is a noop."
-elif [[ "$out_badpass" != 1 && "$out_baduser" != 1 ]]; then
-  record A6 wire "server-side auth" PASS \
-    "bad credentials rejected: $(echo "$out_badpass" | flat)"
+# A6/A7 probe a dedicated server started WITH --auth-file + --tls-cert/key
+# (the icegres security posture is opt-in per server; other probes use the
+# permissive main server, which logs a startup WARN saying auth is off).
+stop_pidfile "$RUN_DIR/parity-serve-secure.pid"
+SECURE_LOG="$RUN_DIR/parity-serve-secure.log"
+AUTH_FILE="$RUN_DIR/parity-auth.conf"
+TLS_CRT="$REPO_DIR/infra/.data/tls/dev.crt"
+TLS_KEY="$REPO_DIR/infra/.data/tls/dev.key"
+secure_up=0
+if psql -h "$PG_HOST" -p "$SECURE_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+  secure_err="port :$SECURE_PORT already occupied; could not start the auth+TLS server"
+elif ! bash "$REPO_DIR/infra/scripts/gen-dev-cert.sh" >/dev/null 2>&1; then
+  secure_err="infra/scripts/gen-dev-cert.sh failed"
 else
-  record A6 wire "server-side auth" GAP \
-    "partial auth: wrong-password -> $(echo "$out_badpass" | flat); bad-user -> $(echo "$out_baduser" | flat)"
+  printf 'parity_user:parity-secret-pw\n' >"$AUTH_FILE"
+  chmod 600 "$AUTH_FILE"
+  : >"$SECURE_LOG"
+  "$BIN" serve --host "$PG_HOST" --port "$SECURE_PORT" \
+      --auth-file "$AUTH_FILE" --tls-cert "$TLS_CRT" --tls-key "$TLS_KEY" \
+      >>"$SECURE_LOG" 2>&1 &
+  echo $! >"$RUN_DIR/parity-serve-secure.pid"
+  for _ in $(seq 1 60); do
+    if PGPASSWORD=parity-secret-pw psql "host=$PG_HOST port=$SECURE_PORT user=parity_user dbname=icegres sslmode=require" \
+         -tA -c 'select 1' >/dev/null 2>&1; then
+      secure_up=1; break
+    fi
+    sleep 0.5
+  done
+  [[ "$secure_up" == 1 ]] || secure_err="auth+TLS server never became ready: $(tail -n 5 "$SECURE_LOG" | flat)"
 fi
 
-out=$(psql "host=$PG_HOST port=$MAIN_PORT user=postgres dbname=icegres sslmode=require" -tA -c 'select 1' 2>&1)
-if [[ "$out" == 1 ]]; then
-  record A7 wire "TLS" PASS "sslmode=require connection succeeded"
+if [[ "$secure_up" == 1 ]]; then
+  ok_goodpass=$(PGPASSWORD=parity-secret-pw psql "host=$PG_HOST port=$SECURE_PORT user=parity_user dbname=icegres sslmode=require" -tA -c 'select 1' 2>&1)
+  out_badpass=$(PGPASSWORD=definitely-wrong psql "host=$PG_HOST port=$SECURE_PORT user=parity_user dbname=icegres" -tA -c 'select 1' 2>&1)
+  out_baduser=$(PGPASSWORD=parity-secret-pw psql "host=$PG_HOST port=$SECURE_PORT user=not_a_real_user dbname=icegres" -tA -c 'select 1' 2>&1)
+  if [[ "$ok_goodpass" == 1 && "$out_badpass" != 1 && "$out_baduser" != 1 ]]; then
+    record A6 wire "server-side auth" PASS \
+      "--auth-file (SCRAM-SHA-256, hashed-at-rest): right password accepted (select 1 -> $ok_goodpass); wrong password rejected ($(echo "$out_badpass" | flat)); unknown user rejected ($(echo "$out_baduser" | flat)). Servers without --auth-file stay permissive and log a startup WARN."
+  else
+    record A6 wire "server-side auth" GAP \
+      "auth-enabled server misbehaved: good-pass -> $(echo "$ok_goodpass" | flat); wrong-pass -> $(echo "$out_badpass" | flat); bad-user -> $(echo "$out_baduser" | flat)"
+  fi
+
+  # A7: upstream pgwire serves BOTH TLS and plaintext startup on one listener
+  # (like stock Postgres without hostssl rules), so a bare sslmode=require
+  # success is not enough — prove the handshake with openssl s_client too.
+  out_tls=$(PGPASSWORD=parity-secret-pw psql "host=$PG_HOST port=$SECURE_PORT user=parity_user dbname=icegres sslmode=require" -tA -c 'select 1' 2>&1)
+  tls_line=$(echo | openssl s_client -starttls postgres -connect "$PG_HOST:$SECURE_PORT" 2>/dev/null \
+    | grep -Eo 'TLSv1\.[23], Cipher is [A-Z0-9_]+' | head -n 1)
+  out_vfull=$(PGPASSWORD=parity-secret-pw psql "host=localhost port=$SECURE_PORT user=parity_user dbname=icegres sslmode=verify-full sslrootcert=$TLS_CRT" -tA -c 'select 1' 2>&1)
+  if [[ "$out_tls" == 1 && -n "$tls_line" && "$out_vfull" == 1 ]]; then
+    record A7 wire "TLS" PASS \
+      "--tls-cert/--tls-key (rustls; boot fails hard on bad cert/key, no plaintext fallback): sslmode=require -> $out_tls; openssl s_client -starttls postgres handshake: $tls_line; sslmode=verify-full against the pinned dev cert -> $out_vfull. Plaintext startup is still accepted on the same listener (upstream/stock-Postgres behavior) — clients enforce encryption via sslmode."
+  else
+    record A7 wire "TLS" GAP \
+      "TLS incomplete: sslmode=require -> $(echo "$out_tls" | flat); s_client -> '${tls_line:-no handshake}'; verify-full -> $(echo "$out_vfull" | flat)"
+  fi
+  stop_pidfile "$RUN_DIR/parity-serve-secure.pid"
 else
-  record A7 wire "TLS" GAP "no TLS support: $(echo "$out" | flat)"
+  record A6 wire "server-side auth" GAP "$secure_err"
+  record A7 wire "TLS" GAP "$secure_err"
 fi
 
 # ===========================================================================

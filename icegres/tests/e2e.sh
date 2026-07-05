@@ -28,8 +28,16 @@ BIN="$ICEGRES_DIR/target/debug/icegres"
 
 PG_HOST=127.0.0.1
 PG_PORT=5439
+SECURE_PORT=5443 # auth+TLS server for section (h)
 PSQL=(psql -h "$PG_HOST" -p "$PG_PORT" -U postgres -d icegres -v ON_ERROR_STOP=1)
 export PGCONNECT_TIMEOUT=5
+
+# Harness-owned servers are permissive/plaintext by design (except the
+# dedicated auth+TLS server in section (h), configured explicitly): a stray
+# ICEGRES_AUTH_FILE/ICEGRES_TLS_* in the caller's environment must not flip
+# them. Clients still pass credentials when configured: psql reads PGPASSWORD
+# from the (inherited) environment on every invocation below.
+unset ICEGRES_AUTH_FILE ICEGRES_TLS_CERT ICEGRES_TLS_KEY
 
 CATALOG_URI="http://127.0.0.1:8181/catalog"
 WAREHOUSE=lakehouse
@@ -101,7 +109,27 @@ start_server() {
   fail "icegres serve did not become ready on port $PG_PORT within 30s"
 }
 
-cleanup() { stop_server; }
+SECURE_PID_FILE="$E2E_DIR/serve-secure.pid"
+SECURE_LOG="$E2E_DIR/serve-secure.log"
+
+stop_secure_server() {
+  if [[ -f "$SECURE_PID_FILE" ]]; then
+    local pid
+    pid=$(cat "$SECURE_PID_FILE")
+    if kill -0 "$pid" 2>/dev/null \
+        && [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == icegres ]]; then
+      kill "$pid" 2>/dev/null || true
+      for _ in $(seq 1 20); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.25
+      done
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$SECURE_PID_FILE"
+  fi
+}
+
+cleanup() { stop_server; stop_secure_server; }
 trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
@@ -238,6 +266,72 @@ assert_eq "seeded rows intact after restart" 280 \
   "$(q 'select count(*) from demo.trips where trip_id between 1 and 280')"
 assert_eq "wire-inserted row survived restart" "$new_id" \
   "$(q "select trip_id from demo.trips where trip_id = $new_id")"
+
+# ---------------------------------------------------------------------------
+# (h) Auth (--auth-file, SCRAM-SHA-256) + TLS (--tls-cert/--tls-key)
+# ---------------------------------------------------------------------------
+log "(h) auth + TLS on :$SECURE_PORT"
+stop_secure_server
+if psql -h "$PG_HOST" -p "$SECURE_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+  fail "something is already listening on :$SECURE_PORT — stop it first"
+fi
+
+bash "$REPO_DIR/infra/scripts/gen-dev-cert.sh" >/dev/null \
+  || fail "gen-dev-cert.sh failed"
+TLS_CRT="$REPO_DIR/infra/.data/tls/dev.crt"
+TLS_KEY="$REPO_DIR/infra/.data/tls/dev.key"
+AUTH_FILE="$E2E_DIR/auth.conf"
+printf '# e2e credentials\ne2e_user:e2e-secret-pw\n' >"$AUTH_FILE"
+chmod 600 "$AUTH_FILE"
+
+: >"$SECURE_LOG"
+"$BIN" serve --host "$PG_HOST" --port "$SECURE_PORT" \
+  --auth-file "$AUTH_FILE" --tls-cert "$TLS_CRT" --tls-key "$TLS_KEY" \
+  >>"$SECURE_LOG" 2>&1 &
+echo $! >"$SECURE_PID_FILE"
+secure_ready=0
+for _ in $(seq 1 60); do
+  if PGPASSWORD=e2e-secret-pw psql "host=$PG_HOST port=$SECURE_PORT user=e2e_user dbname=icegres sslmode=require" \
+       -tA -c 'select 1' >/dev/null 2>&1; then
+    secure_ready=1; break
+  fi
+  if ! kill -0 "$(cat "$SECURE_PID_FILE")" 2>/dev/null; then
+    tail -n 30 "$SECURE_LOG" >&2
+    fail "auth+TLS server exited during startup (log: $SECURE_LOG)"
+  fi
+  sleep 0.5
+done
+[[ "$secure_ready" == 1 ]] || { tail -n 30 "$SECURE_LOG" >&2; fail "auth+TLS server not ready on :$SECURE_PORT"; }
+pass "auth+TLS server ready on :$SECURE_PORT"
+
+assert_eq "right password over sslmode=require" 1 \
+  "$(PGPASSWORD=e2e-secret-pw psql "host=$PG_HOST port=$SECURE_PORT user=e2e_user dbname=icegres sslmode=require" -tA -c 'select 1' 2>&1)"
+
+assert_eq "right password + sslmode=verify-full (pinned dev cert)" 1 \
+  "$(PGPASSWORD=e2e-secret-pw psql "host=localhost port=$SECURE_PORT user=e2e_user dbname=icegres sslmode=verify-full sslrootcert=$TLS_CRT" -tA -c 'select 1' 2>&1)"
+
+if PGPASSWORD=totally-wrong psql "host=$PG_HOST port=$SECURE_PORT user=e2e_user dbname=icegres" \
+     -tA -c 'select 1' >/dev/null 2>&1; then
+  fail "wrong password was ACCEPTED on the auth-enabled server"
+fi
+pass "wrong password rejected"
+
+if PGPASSWORD=e2e-secret-pw psql "host=$PG_HOST port=$SECURE_PORT user=no_such_user dbname=icegres" \
+     -tA -c 'select 1' >/dev/null 2>&1; then
+  fail "unknown user was ACCEPTED on the auth-enabled server"
+fi
+pass "unknown user rejected"
+
+tls_line=$(echo | openssl s_client -starttls postgres -connect "$PG_HOST:$SECURE_PORT" 2>/dev/null \
+  | grep -Eo 'TLSv1\.[23], Cipher is [A-Z0-9_]+' | head -n 1)
+[[ -n "$tls_line" ]] || fail "openssl s_client -starttls postgres saw no TLS handshake on :$SECURE_PORT"
+pass "TLS handshake proven by openssl s_client ($tls_line)"
+
+# The data path works authenticated + encrypted end to end.
+assert_eq "authenticated+encrypted query result" 20 \
+  "$(PGPASSWORD=e2e-secret-pw psql "host=$PG_HOST port=$SECURE_PORT user=e2e_user dbname=icegres sslmode=require" -tA -c 'select count(*) from demo.cities' 2>&1)"
+
+stop_secure_server
 
 # ---------------------------------------------------------------------------
 log "all assertions passed ($PASS_COUNT)"

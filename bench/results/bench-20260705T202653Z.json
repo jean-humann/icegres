@@ -4,99 +4,99 @@
   "iterations": 20,
   "metrics": {
     "aggregate_ms": {
-      "max": 8.53,
-      "min": 6.37,
+      "max": 7.09,
+      "min": 6.44,
       "n": 20,
-      "p50": 6.93,
-      "p95": 7.55
+      "p50": 6.79,
+      "p95": 7.05
     },
     "binary_size_mb": {
       "value": 120.31
     },
     "cold_start_ms": {
-      "max": 46.96,
-      "min": 23.58,
+      "max": 46.85,
+      "min": 23.81,
       "n": 5,
-      "p50": 45.9,
-      "p95": 46.82
+      "p50": 46.1,
+      "p95": 46.73
     },
     "connect_ms": {
-      "max": 0.3,
-      "min": 0.17,
+      "max": 0.51,
+      "min": 0.21,
       "n": 20,
-      "p50": 0.21,
-      "p95": 0.26
+      "p50": 0.3,
+      "p95": 0.42
     },
     "filtered_scan_ms": {
-      "max": 6.74,
-      "min": 5.82,
+      "max": 6.44,
+      "min": 5.85,
       "n": 20,
-      "p50": 6.27,
-      "p95": 6.7
+      "p50": 6.19,
+      "p95": 6.41
     },
     "freshness_ms": {
-      "max": 74.33,
-      "min": 49.75,
+      "max": 84.96,
+      "min": 50.64,
       "n": 20,
-      "p50": 60.66,
-      "p95": 72.17
+      "p50": 62.69,
+      "p95": 76.52
     },
     "insert_batch100_ms": {
-      "max": 149.28,
-      "min": 75.2,
+      "max": 147.36,
+      "min": 69.33,
       "n": 20,
-      "p50": 91.13,
-      "p95": 137.95
+      "p50": 90.86,
+      "p95": 130.28
     },
     "insert_single_ms": {
-      "max": 75.74,
-      "min": 42.05,
+      "max": 97.36,
+      "min": 38.91,
       "n": 20,
-      "p50": 51.41,
-      "p95": 66.07
+      "p50": 53.92,
+      "p95": 95.99
     },
     "join_ms": {
-      "max": 10.37,
-      "min": 8.91,
+      "max": 10.2,
+      "min": 9.11,
       "n": 20,
-      "p50": 9.31,
-      "p95": 10.29
+      "p50": 9.4,
+      "p95": 9.94
     },
     "point_lookup_ms": {
-      "max": 13.85,
-      "min": 8.51,
+      "max": 10.35,
+      "min": 6.05,
       "n": 20,
-      "p50": 12.34,
-      "p95": 13.75
+      "p50": 6.63,
+      "p95": 9.09
     },
     "qps_8conn": {
       "aggregation": "median of 3 consecutive windows",
       "connections": 8,
-      "value": 383.9,
+      "value": 387.4,
       "window_s": 10,
       "windows": [
-        379.5,
-        383.9,
-        385.4
+        394.6,
+        387.4,
+        387.4
       ]
     },
     "rss_after_load_mb": {
-      "value": 94.94
+      "value": 94.2
     },
     "rss_idle_mb": {
-      "value": 79.17
+      "value": 78.14
     },
     "rss_peak_mb": {
       "interval_ms": 100,
-      "qps_window_peak_mb": 93.83,
-      "samples": 409,
-      "value": 95.39
+      "qps_window_peak_mb": 91.29,
+      "samples": 410,
+      "value": 94.2
     }
   },
   "port": 5439,
   "schema": "icegres-bench-v1",
   "server_bin": "/home/user/jean-humann/icegres/target/release/icegres",
-  "unix_ts": 1783283480,
+  "unix_ts": 1783283257,
   "warmup_discarded": 3,
-  "trips_data_files": 2
+  "trips_data_files": 1
 }

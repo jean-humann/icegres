@@ -46,7 +46,8 @@ additionally needs `jq`.
 # 2. Serve on the Postgres wire protocol
 ./target/debug/icegres serve
 
-# 3. Query from any Postgres client (no auth; any user/password accepted)
+# 3. Query from any Postgres client (permissive by default — any
+#    user/password accepted; see "Authentication" below to require SCRAM)
 psql -h 127.0.0.1 -p 5439 -U postgres -d icegres
 ```
 
@@ -75,8 +76,53 @@ environment variables:
 | `--port` (serve) | `ICEGRES_PORT` | `5439` | pgwire bind port |
 | `--idle-shutdown-secs` (serve) | `ICEGRES_IDLE_SHUTDOWN_SECS` | off | Scale-to-zero: exit cleanly after N seconds with no client connections |
 | `--health-port` (serve) | `ICEGRES_HEALTH_PORT` | off | Serve an HTTP 200 `ok` liveness endpoint on this port |
+| `--tls-cert` (serve) | `ICEGRES_TLS_CERT` | off | PEM certificate (chain) enabling TLS on the pgwire listener (requires `--tls-key`) |
+| `--tls-key` (serve) | `ICEGRES_TLS_KEY` | off | PEM private key for `--tls-cert` (PKCS#8/RSA/SEC1) |
+| `--auth-file` (serve) | `ICEGRES_AUTH_FILE` | off | Require SCRAM-SHA-256 auth against a `user:password` credentials file |
 
 Logging uses `tracing` with an env filter: `RUST_LOG=debug icegres serve`.
+
+### Authentication (`--auth-file`)
+
+Without `--auth-file` the server is **permissive** (any user/password
+accepted — the historical behavior) and logs a startup `WARN` saying so.
+With it, every connection must complete a SCRAM-SHA-256 exchange
+(RFC 5802/7677 — the password never crosses the wire in cleartext, even
+without TLS); a wrong password or unknown user is rejected with the standard
+Postgres `28P01` error. The file holds one `user:password` per line (`#`
+comments and blank lines ignored; the username must not contain `:`, the
+password may):
+
+```sh
+printf 'app_user:s3cret\n' > auth.conf && chmod 600 auth.conf   # protect like .pgpass
+icegres serve --auth-file auth.conf
+PGPASSWORD=s3cret psql -h 127.0.0.1 -p 5439 -U app_user -d icegres
+```
+
+In memory the server keeps only the SCRAM salted hash (random per-user
+16-byte salt from `/dev/urandom`, 4096 iterations), never the cleartext.
+The file itself is cleartext on disk — `chmod 600` it. Clients too old for
+SCRAM (pre-libpq-10) are rejected, not downgraded.
+
+### TLS (`--tls-cert` / `--tls-key`)
+
+```sh
+bash ../infra/scripts/gen-dev-cert.sh   # self-signed dev cert -> infra/.data/tls/
+icegres serve --tls-cert ../infra/.data/tls/dev.crt --tls-key ../infra/.data/tls/dev.key
+
+psql "host=127.0.0.1 port=5439 user=postgres dbname=icegres sslmode=require"
+# full verification against the pinned dev cert (SAN covers localhost):
+psql "host=localhost port=5439 dbname=icegres sslmode=verify-full sslrootcert=../infra/.data/tls/dev.crt"
+```
+
+Any TLS setup error (missing file, bad PEM, mismatched pair) **aborts
+startup** — icegres never falls back to plaintext when asked to serve TLS
+(upstream datafusion-postgres's `serve_with_handlers` would only warn).
+Like stock Postgres without `hostssl` rules, a TLS-enabled listener still
+*accepts* plaintext startup: encryption is enforced from the client side
+with `sslmode=require`/`verify-full`. Combine with `--auth-file` for
+encrypted + authenticated serving; TLS protects the SCRAM exchange against
+active MITM downgrade in addition to encrypting query traffic.
 
 ### Scale-to-zero (`--idle-shutdown-secs`)
 
