@@ -8,7 +8,14 @@ A self-contained, source-built lakehouse running entirely on localhost:
 | RustFS     | S3-compatible object store        | `http://127.0.0.1:9000`       |
 | Lakekeeper v0.13.1 | Apache Iceberg REST catalog | `http://127.0.0.1:8181`     |
 
-Reserved for later: icegres on port `5439`.
+On top of this stack, **icegres** serves the lakehouse over the Postgres wire
+protocol on `127.0.0.1:5439` — see [`../icegres/README.md`](../icegres/README.md).
+
+## Prerequisites
+
+The scripts and test harness rely on these CLI tools being on `PATH`:
+`curl`, `psql`, `aws` (awscli — bucket creation in `up.sh`; `up.sh` fails
+loudly if it is missing), and `jq` (used by `icegres/tests/e2e.sh`).
 
 ## Quick start
 
@@ -33,7 +40,8 @@ Individual services: `pg-start.sh`/`pg-stop.sh`, `rustfs-start.sh`/`rustfs-stop.
 - Endpoint: `http://127.0.0.1:9000` — **path-style addressing required**
   (`force_path_style=true` / `s3.path-style-access=true`); virtual-hosted style is not routed.
 - Credentials: access key `rustfsadmin`, secret `rustfssecret`, region `us-east-1`.
-- Bucket: `lakehouse` (created automatically by `up.sh` if missing).
+- Bucket: `lakehouse` (created automatically by `up.sh` if missing; requires
+  the AWS CLI — `up.sh` errors out when `aws` is not installed).
 - Binary (built from source, gitignored): `infra/.data/bin/rustfs`.
 
 ### Lakekeeper — Iceberg REST catalog (port 8181)
@@ -106,8 +114,12 @@ infra/scripts/up.sh    # re-inits postgres, re-bootstraps lakekeeper, recreates 
 
 (Keep `infra/.data/bin/rustfs` unless you want to rebuild RustFS from source, ~20 min.)
 
-To wipe only the catalog: stop lakekeeper, `dropdb`/`createdb lakekeeper` via the
-superuser on port 5433, then re-run `up.sh`.
+To wipe only the catalog: stop lakekeeper, then `dropdb lakekeeper` via the
+superuser on port 5433 and re-run `up.sh` — `pg-start.sh` recreates the
+database with `OWNER lakekeeper`, which the migrations need on PostgreSQL 16.
+(If you recreate it manually instead, use `createdb -O lakekeeper lakekeeper`;
+a database owned by `postgres` makes `lakekeeper migrate` fail with
+"permission denied for schema public".)
 
 ## Rebuild notes
 

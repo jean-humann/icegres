@@ -69,7 +69,10 @@ stop_server() {
   if [[ -f "$SERVE_PID_FILE" ]]; then
     local pid
     pid=$(cat "$SERVE_PID_FILE")
-    if kill -0 "$pid" 2>/dev/null; then
+    # Only signal the PID if it is actually an icegres process: a pidfile left
+    # behind by a crashed run may name a PID recycled by an unrelated process.
+    if kill -0 "$pid" 2>/dev/null \
+        && [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == icegres ]]; then
       kill "$pid" 2>/dev/null || true
       for _ in $(seq 1 20); do
         kill -0 "$pid" 2>/dev/null || break

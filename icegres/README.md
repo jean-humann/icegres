@@ -34,6 +34,9 @@ The local lakehouse stack must be running:
 bash ../infra/scripts/up.sh   # Postgres + RustFS + Lakekeeper (idempotent)
 ```
 
+CLI tools: `up.sh` needs `curl`, `psql` and `aws` (awscli); the e2e harness
+additionally needs `jq`.
+
 ## Usage
 
 ```sh
@@ -52,7 +55,7 @@ psql -h 127.0.0.1 -p 5439 -U postgres -d icegres
 | Command | Description |
 |---|---|
 | `icegres serve` | Serve the lakehouse over pgwire (default `0.0.0.0:5439`). |
-| `icegres seed`  | Create namespace `demo` + tables `trips`/`cities` and insert demo rows. Existing tables are left untouched (rows are only inserted into tables created by that run, so re-seeding never duplicates data). |
+| `icegres seed`  | Create namespace `demo` + tables `trips`/`cities` and insert demo rows. Rows are inserted only when the seeded data is absent (row count 0), so re-seeding never duplicates data and repairs a table left empty by an interrupted earlier run. |
 | `icegres sql -e '<query>'` | One-shot local execution against the catalog (debugging aid; no server involved). |
 
 ### Configuration
@@ -107,7 +110,7 @@ iceberg-datafusion 0.9.1.
 ## Testing
 
 ```sh
-bash tests/e2e.sh   # self-contained end-to-end test (idempotent)
+bash tests/e2e.sh   # end-to-end test (idempotent; needs psql, curl, jq, aws)
 ```
 
 The harness starts the stack (`infra/scripts/up.sh`), builds, seeds, serves,

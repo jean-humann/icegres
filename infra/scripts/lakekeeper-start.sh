@@ -19,8 +19,12 @@ if [[ ! -x "$BIN" ]]; then
   exit 1
 fi
 
-# Already running?
-if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+# Already running? Trust the pidfile only if the PID is a live lakekeeper
+# process AND the server answers on :8181 (a pidfile surviving a reboot/crash
+# may name a PID recycled by an unrelated process).
+if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null \
+    && [[ "$(ps -o comm= -p "$(cat "$PID_FILE")" 2>/dev/null)" == lakekeeper ]] \
+    && curl -sf -o /dev/null http://127.0.0.1:8181/health; then
   echo "lakekeeper already running (pid $(cat "$PID_FILE"))"
   exit 0
 fi
@@ -39,12 +43,21 @@ export RUST_LOG="${RUST_LOG:-info}"
 "$BIN" migrate >>"$LOG_FILE" 2>&1
 
 nohup "$BIN" serve >>"$LOG_FILE" 2>&1 &
-echo $! > "$PID_FILE"
+CHILD=$!
+echo "$CHILD" > "$PID_FILE"
 
-# Wait for health.
+# Wait for health. Check the spawned server is still alive first, so an
+# instant crash fails fast and a foreign listener on :8181 can't make the
+# loop report success for a dead child.
 for i in $(seq 1 30); do
+  if ! kill -0 "$CHILD" 2>/dev/null; then
+    echo "ERROR: lakekeeper exited during startup; see $LOG_FILE" >&2
+    tail -20 "$LOG_FILE" >&2 || true
+    rm -f "$PID_FILE"
+    exit 1
+  fi
   if curl -sf -o /dev/null http://127.0.0.1:8181/health; then
-    echo "lakekeeper running (pid $(cat "$PID_FILE")) on http://127.0.0.1:8181"
+    echo "lakekeeper running (pid $CHILD) on http://127.0.0.1:8181"
     exit 0
   fi
   sleep 1

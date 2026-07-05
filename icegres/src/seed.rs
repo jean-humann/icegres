@@ -10,9 +10,12 @@
 //! Iceberg table providers, which appends real Parquet files to the object
 //! store and commits them through the REST catalog.
 //!
-//! Re-seed semantics: if a table already exists, its data is left untouched
-//! and the current row count is reported. Rows are only inserted into tables
-//! created by this run, so re-running `icegres seed` never duplicates data.
+//! Re-seed semantics: rows are inserted only when the seeded dataset is
+//! absent (observed row count is zero), so re-running `icegres seed` never
+//! duplicates data and repairs a table left empty by an interrupted earlier
+//! run. Existing rows are left untouched; for `demo.trips` the check counts
+//! only `trip_id` 1..280 so rows appended by the e2e harness don't mask a
+//! missing seed.
 
 use std::collections::HashMap;
 
@@ -22,7 +25,7 @@ use arrow::datatypes::Int64Type;
 use datafusion::prelude::SessionContext;
 use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::context::{build_session_context, connect_catalog};
 use crate::CatalogOpts;
@@ -79,17 +82,27 @@ pub async fn run(opts: &CatalogOpts) -> Result<()> {
         info!("created namespace {NAMESPACE}");
     }
 
-    let cities_created = ensure_table(catalog.as_ref(), &ns, "cities", cities_schema()?).await?;
-    let trips_created = ensure_table(catalog.as_ref(), &ns, "trips", trips_schema()?).await?;
+    ensure_table(catalog.as_ref(), &ns, "cities", cities_schema()?).await?;
+    ensure_table(catalog.as_ref(), &ns, "trips", trips_schema()?).await?;
 
     // Build the session AFTER table creation: the Iceberg catalog provider
     // snapshots the table list at construction time.
     let ctx = build_session_context(catalog).await?;
 
-    if cities_created {
+    // Insert based on the observed row count (not on whether this run created
+    // the table), so a table left empty by an interrupted earlier seed run is
+    // repopulated instead of being skipped forever.
+    let cities_count = count_rows(&ctx, "cities", "").await?;
+    if cities_count == 0 {
         insert_chunked(&ctx, "cities", "city, country, population", &cities_rows()).await?;
+    } else {
+        info!("demo.cities already populated; leaving data as-is");
     }
-    if trips_created {
+    // Count only the deterministic seed range: the e2e harness appends extra
+    // rows with trip_id >= 900000 that must not mask a missing seed.
+    let seeded_trips_filter = format!(" WHERE trip_id BETWEEN 1 AND {TRIP_COUNT}");
+    let seeded_trips = count_rows(&ctx, "trips", &seeded_trips_filter).await?;
+    if seeded_trips == 0 {
         insert_chunked(
             &ctx,
             "trips",
@@ -97,10 +110,17 @@ pub async fn run(opts: &CatalogOpts) -> Result<()> {
             &trips_rows(),
         )
         .await?;
+    } else if seeded_trips < TRIP_COUNT as i64 {
+        warn!(
+            "demo.trips holds a partial seed ({seeded_trips} of {TRIP_COUNT} seeded rows); \
+             leaving data as-is — drop the table and re-run seed to repair"
+        );
+    } else {
+        info!("demo.trips already populated; leaving data as-is");
     }
 
     for table in ["cities", "trips"] {
-        let count = count_rows(&ctx, table).await?;
+        let count = count_rows(&ctx, table, "").await?;
         info!("demo.{table}: {count} rows");
     }
     info!("seed complete");
@@ -108,21 +128,20 @@ pub async fn run(opts: &CatalogOpts) -> Result<()> {
 }
 
 /// Create the table via the raw catalog API unless it already exists.
-/// Returns true when the table was created by this call.
 async fn ensure_table(
     catalog: &dyn Catalog,
     ns: &NamespaceIdent,
     name: &str,
     schema: Schema,
-) -> Result<bool> {
+) -> Result<()> {
     let ident = TableIdent::new(ns.clone(), name.to_string());
     if catalog
         .table_exists(&ident)
         .await
         .with_context(|| format!("failed to check existence of table {NAMESPACE}.{name}"))?
     {
-        info!("table {NAMESPACE}.{name} already exists; leaving data as-is");
-        return Ok(false);
+        info!("table {NAMESPACE}.{name} already exists");
+        return Ok(());
     }
     let creation = TableCreation::builder()
         .name(name.to_string())
@@ -133,7 +152,7 @@ async fn ensure_table(
         .await
         .with_context(|| format!("failed to create table {NAMESPACE}.{name}"))?;
     info!("created table {NAMESPACE}.{name}");
-    Ok(true)
+    Ok(())
 }
 
 fn cities_schema() -> Result<Schema> {
@@ -211,9 +230,10 @@ async fn insert_chunked(
     Ok(())
 }
 
-async fn count_rows(ctx: &SessionContext, table: &str) -> Result<i64> {
+/// Count rows in a table; `filter` is either empty or a ` WHERE ...` clause.
+async fn count_rows(ctx: &SessionContext, table: &str, filter: &str) -> Result<i64> {
     let batches = ctx
-        .sql(&format!("SELECT count(*) FROM {NAMESPACE}.{table}"))
+        .sql(&format!("SELECT count(*) FROM {NAMESPACE}.{table}{filter}"))
         .await
         .with_context(|| format!("failed to plan count for {NAMESPACE}.{table}"))?
         .collect()

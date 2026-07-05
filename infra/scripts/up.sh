@@ -17,6 +17,9 @@ if command -v aws >/dev/null 2>&1; then
     aws --endpoint-url http://127.0.0.1:9000 s3api head-bucket --bucket lakehouse 2>/dev/null || \
   AWS_ACCESS_KEY_ID=rustfsadmin AWS_SECRET_ACCESS_KEY=rustfssecret AWS_DEFAULT_REGION=us-east-1 \
     aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://lakehouse
+else
+  echo "ERROR: aws CLI not found — required to ensure the 'lakehouse' bucket exists (install awscli)" >&2
+  exit 1
 fi
 
 echo "==> Starting Lakekeeper (127.0.0.1:8181)"
@@ -30,7 +33,7 @@ curl -sf -X POST http://127.0.0.1:8181/management/v1/bootstrap \
 # Create warehouse "lakehouse" if it does not exist yet.
 if ! curl -sf "http://127.0.0.1:8181/catalog/v1/config?warehouse=lakehouse" >/dev/null 2>&1; then
   echo "==> Creating warehouse 'lakehouse'"
-  curl -sf -X POST http://127.0.0.1:8181/management/v1/warehouse \
+  resp=$(curl -s -w '\n%{http_code}' -X POST http://127.0.0.1:8181/management/v1/warehouse \
     -H 'Content-Type: application/json' -d '{
       "warehouse-name": "lakehouse",
       "project-id": "00000000-0000-0000-0000-000000000000",
@@ -50,7 +53,15 @@ if ! curl -sf "http://127.0.0.1:8181/catalog/v1/config?warehouse=lakehouse" >/de
         "access-key-id": "rustfsadmin",
         "secret-access-key": "rustfssecret"
       }
-    }' >/dev/null
+    }') || true
+  http_code=${resp##*$'\n'}
+  case "$http_code" in
+    2*) ;;
+    *)
+      echo "ERROR: warehouse creation failed (HTTP ${http_code:-none}): ${resp%$'\n'*}" >&2
+      exit 1
+      ;;
+  esac
 fi
 
 echo "==> Health checks"
