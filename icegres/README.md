@@ -6,8 +6,27 @@ A Postgres wire endpoint over an Iceberg lakehouse — the Phase-0
 `icegres` connects to an Iceberg REST catalog (Lakekeeper), mounts every
 namespace/table into a DataFusion session, and serves that session over the
 Postgres wire protocol with `datafusion-postgres`. Any Postgres client
-(`psql`, drivers, BI tools) can then query — and `INSERT INTO` — Iceberg
-tables whose data lives as Parquet on S3-compatible storage (RustFS).
+(`psql`, drivers, BI tools) can then query — and modify — Iceberg tables
+whose data lives as Parquet on S3-compatible storage (RustFS). There is
+exactly **one copy of the data**, in open Iceberg format on the lake;
+every feature below is zero-copy on top of it.
+
+### Features
+
+| feature | mechanism | flag / syntax |
+|---|---|---|
+| SELECT (full SQL via DataFusion) | snapshot-aware metadata cache, exact freshness (no TTL) | default |
+| INSERT | Iceberg `fast_append` commit per statement | default |
+| UPDATE / DELETE | copy-on-write overwrite snapshots — only files containing matched rows are rewritten (`src/overwrite.rs`) | default |
+| Transactions | BEGIN/COMMIT/ROLLBACK; snapshot-pinned reads, read-your-own-writes, COMMIT = ONE Iceberg snapshot, first-committer-wins (40001) (`src/txn.rs`) | default |
+| Primary-key enforcement | opt-in NOT NULL + uniqueness checks (23502/23505) anchored to the commit snapshot | `--enforce-pk` + table property `icegres.primary-key` |
+| Authentication | SCRAM-SHA-256 (salted hashes in memory, 28P01 on failure) | `--auth-file` |
+| TLS | rustls on the pgwire listener; misconfig aborts boot | `--tls-cert`/`--tls-key` |
+| Time travel | read-only snapshot-pinned queries | `demo."trips@<snapshot_id>"` |
+| Zero-copy branches | Neon-style branch-per-endpoint over Iceberg snapshot refs (`src/branch.rs`) | `icegres branch create/list/drop`, `serve --branch` |
+| Buffered writes (opt-in) | Moonlink-style group commit: ~1.5 ms INSERT ack, union reads, ≤N ms durability window, WARN on enable (`src/buffer.rs`) | `--write-buffer-ms N` (default 0 = synchronous) |
+| Scale-to-zero | clean exit after N idle seconds; stateless compute | `--idle-shutdown-secs` |
+| Health endpoint | HTTP 200 liveness | `--health-port` |
 
 ```
 psql ──pgwire──▶ icegres (DataFusion) ──REST──▶ Lakekeeper ──▶ Postgres (metadata)
@@ -57,7 +76,10 @@ psql -h 127.0.0.1 -p 5439 -U postgres -d icegres
 |---|---|
 | `icegres serve` | Serve the lakehouse over pgwire (default `0.0.0.0:5439`). |
 | `icegres seed`  | Create namespace `demo` + tables `trips`/`cities` and insert demo rows. Rows are inserted only when the seeded data is absent (row count 0), so re-seeding never duplicates data and repairs a table left empty by an interrupted earlier run. |
-| `icegres sql -e '<query>'` | One-shot local execution against the catalog (debugging aid; no server involved). |
+| `icegres branch create <table> <name> [--at-snapshot <id>]` | Create a zero-copy branch: ONE metadata commit adding a snapshot ref at main's head (or `--at-snapshot`); no data copied. Fails if the branch exists (atomic via `assert-ref-snapshot-id = null`). |
+| `icegres branch list <table>` | List all snapshot refs (branches/tags) of a table with their head snapshot ids. |
+| `icegres branch drop <table> <name>` | Remove the ref only (`main` is refused); the branch's snapshots stay time-travel-readable until expiry. |
+| `icegres sql -e '<query>'` | One-shot local execution against the catalog (debugging aid; no server involved). Honors `--enforce-pk`. |
 
 ### Configuration
 
@@ -79,6 +101,10 @@ environment variables:
 | `--tls-cert` (serve) | `ICEGRES_TLS_CERT` | off | PEM certificate (chain) enabling TLS on the pgwire listener (requires `--tls-key`) |
 | `--tls-key` (serve) | `ICEGRES_TLS_KEY` | off | PEM private key for `--tls-cert` (PKCS#8/RSA/SEC1) |
 | `--auth-file` (serve) | `ICEGRES_AUTH_FILE` | off | Require SCRAM-SHA-256 auth against a `user:password` credentials file |
+| `--enforce-pk` (serve, sql) | `ICEGRES_ENFORCE_PK` | off | Enforce `icegres.primary-key` table properties: NOT NULL (23502) + uniqueness (23505) checks on INSERT and PK-assigning UPDATE, anchored to the commit snapshot |
+| `--branch` (serve) | `ICEGRES_BRANCH` | `main` | Serve a zero-copy branch: reads pin to the ref's head, all writes commit to the ref with `assert-ref-snapshot-id` (never touching other branches) |
+| `--write-buffer-ms` (serve) | `ICEGRES_WRITE_BUFFER_MS` | `0` (sync) | Opt-in buffered writes: INSERTs ack from an in-memory buffer, group-committed every N ms; unclean kill loses ≤N ms of acked writes (WARN on enable) |
+|  | `ICEGRES_WRITE_BUFFER_MAX_ROWS` | `50000` | Row threshold that forces an early flush in buffered mode |
 
 Logging uses `tracing` with an env filter: `RUST_LOG=debug icegres serve`.
 
@@ -171,6 +197,70 @@ select snapshot_id, committed_at from demo."trips$snapshots" order by committed_
 select count(*) from demo."trips@4436304835314641572";  -- e.g. the seed snapshot
 ```
 
+### Transactions
+
+`BEGIN` / `COMMIT` / `ROLLBACK` are real (`src/txn.rs`): reads inside a
+transaction are snapshot-pinned per table (snapshot isolation), writes are
+buffered in the session with read-your-own-writes overlays, and `COMMIT`
+composes everything into **one** Iceberg snapshot anchored at the pinned
+snapshot. Concurrency is first-committer-wins: if another writer committed
+to a touched table since the pin, `COMMIT` fails with SQLSTATE `40001`
+(retry the transaction). A statement error inside a transaction poisons it
+(`25P02`) and `COMMIT` then rolls back, like stock Postgres.
+
+```sql
+begin;
+insert into demo.trips values (900001, 'Ghent', 12.5, 21.0, now());
+update demo.trips set fare = 22.0 where trip_id = 900001;  -- sees the insert
+commit;  -- exactly one new Iceberg snapshot
+```
+
+### Primary keys (`--enforce-pk`)
+
+Iceberg has no constraint concept; icegres adds opt-in enforcement. Declare
+a key as a table property (`icegres.primary-key = "col1[,col2…]"`), serve
+with `--enforce-pk`, and every INSERT (and PK-assigning UPDATE) gets
+NOT NULL (`23502`) and uniqueness (`23505`) checks validated against the
+very snapshot the commit anchors to — including a transaction's own
+buffered rows. Off by default because enforcement reads the key columns of
+every live data file per write; it is racy-free per commit but adds a
+read-before-write cost.
+
+### Buffered writes (`--write-buffer-ms N`, opt-in)
+
+Moonlink-style group commit. With `N > 0`, INSERTs acknowledge after
+appending to an in-memory buffer (~1.5 ms p50 vs ~50–60 ms synchronous)
+and a background task commits the buffer to Iceberg every `N` ms (or at
+`ICEGRES_WRITE_BUFFER_MAX_ROWS`). Every read on the same server unions the
+committed table with the buffer, so read-your-writes holds across all
+local connections instantly; other servers/readers see rows at the commit
+cadence (≤ N ms after ack). UPDATE/DELETE/BEGIN/DDL/PK-checked INSERTs
+flush first (ordering fences). **Trade-off, stated plainly:** an unclean
+kill (SIGKILL, power loss) loses up to N ms of acked-but-uncommitted
+writes. That is why the default is `0` — fully synchronous, semantics
+identical to not having the feature — and enabling it logs a WARN.
+
+### Zero-copy branches (`icegres branch`, `serve --branch`)
+
+Neon's branch-per-endpoint model on Iceberg snapshot refs: a branch is a
+named ref in table metadata, so creating one is a single metadata commit —
+zero data copied, however large the table.
+
+```sh
+icegres branch create demo.trips dev        # fork main's head (or --at-snapshot <id>)
+icegres serve --branch dev --port 5440 &    # a second endpoint on the branch
+psql -h 127.0.0.1 -p 5440 -c "insert into demo.trips values (…)"  # commits to 'dev'
+icegres branch list demo.trips              # main + dev, diverged heads
+icegres branch drop demo.trips dev          # removes the ref only
+```
+
+Reads on a `--branch` server pin to the branch head; all writes (INSERT,
+UPDATE, DELETE, transactions) commit with `assert-ref-snapshot-id` on the
+branch ref, so endpoints on different branches never conflict and nothing
+can leak onto `main`. A table without the ref fails loudly — no silent
+fallback. Both branches share every file below the fork point; only new
+commits diverge.
+
 ## Demo schema
 
 - `demo.cities` — `city STRING, country STRING, population BIGINT` (20 rows)
@@ -214,11 +304,19 @@ bash tests/e2e.sh   # end-to-end test (idempotent; needs psql, curl, jq, aws)
 ```
 
 The harness starts the stack (`infra/scripts/up.sh`), builds, seeds, serves,
-and asserts exact results over psql: seeded row counts, a WHERE filter, a
-GROUP BY aggregate, a JOIN, an `INSERT` over the wire (verified from new
-connections), Parquet files on RustFS + catalog registration for both tables
-via the Lakekeeper REST API, and durability across a server restart. Server
-pid/logs live under `.e2e/` (gitignored); the server is killed on exit.
+and asserts exact results over psql — **77 assertions** across sections
+(a)–(m): seeded row counts, filters/aggregates/joins, `INSERT` over the wire
+(verified from new connections), Parquet files on RustFS + catalog
+registration via the Lakekeeper REST API, durability across a server
+restart, auth + TLS (wrong password/unknown user rejected,
+`sslmode=require`/`verify-full`, `openssl s_client` handshake),
+UPDATE/DELETE copy-on-write (incl. a 409-conflict retry proven by fault
+injection and time-travel-after-DML), transactions (read-your-own-writes,
+ROLLBACK, one-snapshot COMMIT, 25P02, live 40001 conflict), PK enforcement
+(23505/23502), buffered-write mode (union reads, group commit, SIGKILL
+survival of committed rows, flush fences) and zero-copy branches (write
+isolation both directions, ref-only drop). Server pid/logs live under
+`.e2e/` (gitignored); the server is killed on exit.
 
 The harness is non-destructive: it never drops tables. The deterministic
 seeded dataset occupies `trip_id` 1..280, so exact-value assertions filter on
@@ -233,5 +331,9 @@ run). A sample psql session is in `docs/demo-session.txt`.
   appear. Table *data* is refreshed from the catalog on every query.
 - `information_schema` and a `pg_catalog` emulation are registered, so
   `\d`, `\dt` and most introspection in psql work.
-- No TLS and no authentication (any user/password accepted) — local demo
-  configuration.
+- Auth and TLS are **off by default** (permissive local-demo configuration,
+  announced by a startup WARN); production serving should set
+  `--auth-file` + `--tls-cert`/`--tls-key` — see the sections above.
+- Unsupported DML forms (joins/`USING` in UPDATE/DELETE, `RETURNING`,
+  subqueries in predicates, bind parameters in DML, `INSERT OVERWRITE`)
+  are rejected with clear errors rather than mis-executed.
