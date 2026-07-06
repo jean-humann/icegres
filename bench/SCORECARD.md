@@ -327,6 +327,53 @@ path (per-scan snapshot check, no TTL, zero staleness window); cold start
 ~46 ms is ~10–40× inside the Neon bar; sync freshness ~72 ms — and
 buffered ~10 ms — are well inside Moonlink's sub-second bar.
 
+## Cross-engine comparison — icegres vs Trino vs Spark Thrift vs Flight SQL (R9)
+
+Round 9 measured icegres against real alternative SQL front-ends on the
+**same** Iceberg tables (same Lakekeeper REST catalog, same RustFS S3
+store), one engine at a time on a quiesced box, with one harness and
+identical SQL: Trino 446 (single node, -Xmx3g), Spark 3.5.8 Thrift server
+(iceberg-spark-runtime 1.11.0, 2 GB driver), and a Flight SQL endpoint
+that wraps icegres's own DataFusion engine behind gRPC/Arrow (a transport
+experiment, not an independent engine). Full method, per-query p50/p95,
+run-to-run stability check and honest caveats: **`bench/COMPARISON.md`**;
+raw JSON: `bench/results/compare-20260706-042733.json`.
+
+Headline p50s (small table = 280 rows; big = 5M rows / 71 MB):
+
+| metric (p50) | icegres | trino 446 | spark 3.5.8 | flightsql* |
+|---|---|---|---|---|
+| connect_ms | **1.1** | 91.8 | 110.4 | 48.9 |
+| point lookup (small) | **7.2** | 138.1 | 158.0 | 48.0 |
+| join+group (small) | **10.2** | 210.9 | 436.2 | 48.1 |
+| big scan+agg (5M) | 404.2 | **335.9** | 732.7 | 390.3 |
+| big filter count (5M) | **238.0** | 315.3 | 542.4 | 261.9 |
+| big selective slice (5M→101 rows) | **49.0** | 120.5 | 318.7 | 92.0 |
+| qps (8 conn, mixed) | **51.7** | 12.2 | 7.9 | 38.2 |
+| startup_ms | 329 | 14,116 | 9,944 | 643 |
+| rss_peak_mb | 225.9 | 2,162.3 | 1,802.6 | **164.9** |
+
+\* flightsql = the same DataFusion+iceberg-rust engine as icegres behind
+Arrow Flight SQL; it isolates transport cost only (flat ~48 ms small-query
+floor = the protocol's two-round-trip GetFlightInfo/DoGet flow + ADBC/gRPC
+overhead; near-parity with pgwire on big results).
+
+Read plainly: on this single small box icegres wins every interactive
+metric — 16–43× lower small-query latency, 4–7× the concurrent qps,
+30–43× faster startup, 8–10× less peak memory — because it pays no JVM,
+no coordinator/worker hop, and no per-query task scheduling. Where it
+**loses**: Trino takes the largest full-table aggregation (Q5: 335.9 vs
+404.2 ms, ~17% faster) — once per-query fixed costs are amortized over a
+big enough scan, Trino's parallelized vectorized readers out-scan
+DataFusion-over-iceberg-rust here, and that advantage would grow with
+data size (see COMPARISON.md caveats: 71 MB fits in page cache; a
+100×-bigger dataset or a real cluster plays to the JVM engines'
+architecture). Spark Thrift was slowest on every metric measured here —
+it is built for large batch jobs, not sub-second interactive SQL on small
+single-node data. Same-box, same-data conclusion: icegres for
+interactive/OLTP-ish serving on one box; Trino/Spark remain the right
+tools for large-scale distributed analytics.
+
 ## Trade-off ledger — what every millisecond cost in memory
 
 USER CONSTRAINT for round 5, applied retroactively to the whole session:

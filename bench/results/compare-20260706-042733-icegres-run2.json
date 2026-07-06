@@ -1,0 +1,94 @@
+{
+  "meta": {
+    "engine": "icegres",
+    "engine_version": "PostgreSQL 16.6 (icegres 0.1.0) on x86_64-pc-linux-gnu, Apache DataFusion 52.5.0",
+    "footprint": "123M",
+    "iterations": 15,
+    "result_row_counts": {
+      "q1_point_lookup_ms": 1,
+      "q2_filtered_scan_ms": 3,
+      "q3_aggregate_ms": 20,
+      "q4_join_ms": 15,
+      "q5_big_scan_agg_ms": 20,
+      "q6_big_filter_count_ms": 1,
+      "q7_big_selective_ms": 101
+    },
+    "table_prefix": "demo",
+    "timestamp": "2026-07-06T04:28:29+00:00",
+    "warmup": 3
+  },
+  "metrics": {
+    "connect_ms": {
+      "max": 18.83,
+      "min": 0.94,
+      "n": 10,
+      "p50": 1.04,
+      "p95": 18.83
+    },
+    "q1_point_lookup_ms": {
+      "max": 8.68,
+      "min": 6.41,
+      "n": 15,
+      "p50": 6.68,
+      "p95": 7.09
+    },
+    "q2_filtered_scan_ms": {
+      "max": 7.39,
+      "min": 6.09,
+      "n": 15,
+      "p50": 6.41,
+      "p95": 7.22
+    },
+    "q3_aggregate_ms": {
+      "max": 9.4,
+      "min": 6.94,
+      "n": 15,
+      "p50": 7.82,
+      "p95": 9.39
+    },
+    "q4_join_ms": {
+      "max": 19.88,
+      "min": 9.96,
+      "n": 15,
+      "p50": 11.29,
+      "p95": 14.27
+    },
+    "q5_big_scan_agg_ms": {
+      "max": 372.68,
+      "min": 334.89,
+      "n": 15,
+      "p50": 345.32,
+      "p95": 354.18
+    },
+    "q6_big_filter_count_ms": {
+      "max": 258.24,
+      "min": 233.49,
+      "n": 15,
+      "p50": 243.23,
+      "p95": 251.25
+    },
+    "q7_big_selective_ms": {
+      "max": 70.77,
+      "min": 48.06,
+      "n": 15,
+      "p50": 52.41,
+      "p95": 57.81
+    },
+    "qps_8way": {
+      "elapsed_s": 10.34,
+      "errors": [],
+      "qps": 51.2,
+      "threads": 8,
+      "total_queries": 529
+    },
+    "rss_idle_mb": {
+      "value": 64.5
+    },
+    "rss_peak_mb": {
+      "value": 227.4
+    },
+    "startup_ms": {
+      "value": 59
+    }
+  }
+}

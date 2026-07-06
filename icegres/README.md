@@ -16,6 +16,20 @@ vs API vs BI, with the measured latencies and the honest anti-patterns —
 see the CQRS reference topology: **`../docs/cqrs-topology.md`**. All
 measurements live in `../bench/SCORECARD.md`.
 
+**Where it stands vs real engines** (measured, not marketed — full matrix
+and caveats in `../bench/COMPARISON.md`): on a single 4-core box against
+Trino 446 and Spark 3.5.8 Thrift reading the *same* Iceberg tables through
+the same REST catalog, icegres is the clear interactive-serving winner —
+7–10 ms small-query p50s vs 115–436 ms (16–43× faster), 51.7 qps at 8
+connections vs 12.2/7.9, ~0.3 s startup vs 10–14 s, and 8–10× less peak
+RSS — because it pays no JVM, coordinator, or per-query task-scheduling
+overhead. It is **not** a distributed analytics engine: Trino already
+beats it on the largest full-table aggregation measured (5M rows: 336 vs
+404 ms p50), and that gap would widen with data volume or a real cluster.
+Honest fit: sub-second point/filtered/join queries, Postgres-protocol
+compatibility, and scale-to-zero economics on lakehouse data — leave
+100 GB+ distributed scans to Trino/Spark.
+
 ### Features
 
 | feature | mechanism | flag / syntax |
