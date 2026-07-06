@@ -1,0 +1,117 @@
+{
+  "cold_start_runs": 5,
+  "host": "127.0.0.1",
+  "iterations": 20,
+  "metrics": {
+    "aggregate_ms": {
+      "max": 8.68,
+      "min": 7.02,
+      "n": 20,
+      "p50": 7.51,
+      "p95": 8.21
+    },
+    "binary_size_mb": {
+      "value": 122.45
+    },
+    "cold_start_ms": {
+      "max": 45.77,
+      "min": 44.54,
+      "n": 5,
+      "p50": 45.68,
+      "p95": 45.75
+    },
+    "connect_ms": {
+      "max": 0.34,
+      "min": 0.22,
+      "n": 20,
+      "p50": 0.27,
+      "p95": 0.32
+    },
+    "filtered_scan_ms": {
+      "max": 7.99,
+      "min": 6.31,
+      "n": 20,
+      "p50": 6.64,
+      "p95": 7.03
+    },
+    "freshness_ms": {
+      "max": 81.64,
+      "min": 60.52,
+      "n": 20,
+      "p50": 72.09,
+      "p95": 81.05
+    },
+    "insert_batch100_ms": {
+      "max": 125.7,
+      "min": 83.91,
+      "n": 20,
+      "p50": 98.44,
+      "p95": 116.95
+    },
+    "insert_single_ms": {
+      "max": 74.82,
+      "min": 45.77,
+      "n": 20,
+      "p50": 55.39,
+      "p95": 70.9
+    },
+    "join_ms": {
+      "max": 12.09,
+      "min": 9.79,
+      "n": 20,
+      "p50": 10.05,
+      "p95": 11.31
+    },
+    "point_lookup_ms": {
+      "max": 8.18,
+      "min": 6.55,
+      "n": 20,
+      "p50": 7.03,
+      "p95": 8.16
+    },
+    "qps_8conn": {
+      "aggregation": "median of 3 consecutive windows",
+      "connections": 8,
+      "value": 382.7,
+      "window_s": 10,
+      "windows": [
+        373.8,
+        388.7,
+        382.7
+      ]
+    },
+    "rss_after_load_mb": {
+      "value": 92.88
+    },
+    "rss_idle_mb": {
+      "value": 78.04
+    },
+    "rss_peak_mb": {
+      "interval_ms": 100,
+      "qps_window_peak_mb": 90.85,
+      "samples": 415,
+      "value": 93.34
+    },
+    "freshness_buffered_ms": {
+      "max": 91.97,
+      "min": 8.04,
+      "n": 20,
+      "p50": 10.04,
+      "p95": 85.44
+    },
+    "insert_single_buffered_ms": {
+      "max": 1.51,
+      "min": 1.25,
+      "n": 20,
+      "p50": 1.32,
+      "p95": 1.43
+    }
+  },
+  "port": 5439,
+  "schema": "icegres-bench-v1",
+  "server_bin": "/home/user/jean-humann/icegres/target/release/icegres",
+  "unix_ts": 1783299578,
+  "warmup_discarded": 3,
+  "trips_data_files": 1,
+  "write_buffer_ms_buffered_run": 100
+}
