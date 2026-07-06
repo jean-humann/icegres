@@ -168,13 +168,14 @@ BIN="$ICEGRES_DIR/target/release/icegres"
 log "using binary: $BIN"
 DBIN="${BIN%/*}/icegresd" # control plane sibling (same build profile)
 
-# start_icegresd <public_port> <compute_port> <idle_secs> <pidfile> <logfile> <statusfile>
+# start_icegresd <public_port> <compute_port> <idle_secs> <pidfile> <logfile> <statusfile> [extra flags...]
 start_icegresd() {
   local port=$1 cport=$2 idle=$3 pidfile=$4 logfile=$5 statusfile=$6
+  shift 6
   rm -f "$statusfile"
   "$DBIN" serve --host "$PG_HOST" --port "$port" --main-port "$cport" \
     --icegres-bin "$BIN" --idle-shutdown-secs "$idle" --status-file "$statusfile" \
-    >>"$logfile" 2>&1 &
+    "$@" >>"$logfile" 2>&1 &
   echo $! >"$pidfile"
   for _ in $(seq 1 40); do
     if (exec 3<>"/dev/tcp/$PG_HOST/$port") 2>/dev/null; then exec 3>&- 3<&-; return 0; fi
@@ -726,8 +727,13 @@ elif [[ ! -x "$DBIN" ]]; then
   record D5 elasticity "scale-to-zero" GAP "icegresd binary not found at $DBIN"
 else
   : >"$RUN_DIR/parity-icegresd-d5.log"
+  # --pool-idle-secs 2: keep the default warm session pool ON but let it
+  # idle-drain inside the probe's 20 s window — warm conns hold sessions on
+  # the compute, so the drain is a REQUIRED step of the pooled sleep cycle
+  # (pool drains after 2 s idle, then the compute's own 5 s idle clock runs).
   if ! ICEGRES_HEALTH_PORT="$HEALTH_PORT" start_icegresd "$IDLE_PORT" "$D5_COMPUTE_PORT" 5 \
-       "$RUN_DIR/parity-icegresd-d5.pid" "$RUN_DIR/parity-icegresd-d5.log" "$D5_STATUS"; then
+       "$RUN_DIR/parity-icegresd-d5.pid" "$RUN_DIR/parity-icegresd-d5.log" "$D5_STATUS" \
+       --pool-idle-secs 2; then
     record D5 elasticity "scale-to-zero" GAP \
       "icegresd never listened on :$IDLE_PORT: $(tail -n 5 "$RUN_DIR/parity-icegresd-d5.log" | flat)"
   else
@@ -758,7 +764,7 @@ else
     stop_icegresd_pidfile "$RUN_DIR/parity-icegresd-d5.pid"
     if [[ "$exited" == 1 && "$idle_q" =~ ^[0-9]+$ && "$wake" == 1 && "$d5_last_exit" == *"clean idle exit"* ]]; then
       record D5 elasticity "scale-to-zero" PASS \
-        "FULL sleep/wake cycle via icegresd (shipped control plane): first connection to :$IDLE_PORT woke a compute in ${wake1_ms}ms (demo.cities count=$idle_q); compute exited on its own ${exit_after_ms}ms after the last connection ($d5_last_exit; health pings on :$HEALTH_PORT do not reset the idle clock); NEXT connection to the same port auto-re-woke it: 'select 1' in ${wake_ms}ms (= cold start + splice setup). No external supervisor needed."
+        "FULL sleep/wake cycle via icegresd (shipped control plane) WITH the warm session pool active: first connection to :$IDLE_PORT woke a compute in ${wake1_ms}ms (demo.cities count=$idle_q); the pool idle-drained its warm conns, then the compute exited on its own ${exit_after_ms}ms after the last connection ($d5_last_exit; health pings on :$HEALTH_PORT do not reset the idle clock); NEXT connection to the same port auto-re-woke it AND re-warmed the pool: 'select 1' in ${wake_ms}ms (= cold start + splice setup). No external supervisor needed."
     else
       record D5 elasticity "scale-to-zero" GAP \
         "icegresd sleep/wake cycle incomplete: wake1='$(echo "$idle_q" | flat)' (${wake1_ms}ms), idle-exit=$exited (last_exit='$(echo "$d5_last_exit" | flat)'), rewake='$(echo "$wake" | flat)' after ${wake_ms}ms — log: $(tail -n 5 "$RUN_DIR/parity-icegresd-d5.log" | flat)"

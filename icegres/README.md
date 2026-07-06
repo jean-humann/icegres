@@ -11,6 +11,11 @@ whose data lives as Parquet on S3-compatible storage (RustFS). There is
 exactly **one copy of the data**, in open Iceberg format on the lake;
 every feature below is zero-copy on top of it.
 
+For how to assemble these pieces in production — which tier serves OLTP
+vs API vs BI, with the measured latencies and the honest anti-patterns —
+see the CQRS reference topology: **`../docs/cqrs-topology.md`**. All
+measurements live in `../bench/SCORECARD.md`.
+
 ### Features
 
 | feature | mechanism | flag / syntax |
@@ -26,7 +31,7 @@ every feature below is zero-copy on top of it.
 | Zero-copy branches | Neon-style branch-per-endpoint over Iceberg snapshot refs (`src/branch.rs`) | `icegres branch create/list/drop`, `serve --branch` |
 | Buffered writes (opt-in) | Moonlink-style group commit: ~1.5 ms INSERT ack, union reads, ≤N ms durability window, WARN on enable (`src/buffer.rs`) | `--write-buffer-ms N` (default 0 = synchronous) |
 | Scale-to-zero | clean exit after N idle seconds; stateless compute | `--idle-shutdown-secs` |
-| Wake-on-connect control plane | `icegresd`: pgwire-aware proxy that spawns computes on connect, routes `icegres@<branch>` dbnames to per-branch computes, supervises crashes with capped backoff | `icegresd serve` / `icegresd status` |
+| Wake-on-connect control plane | `icegresd`: pgwire-aware proxy that spawns computes on connect, routes `icegres@<branch>` dbnames to per-branch computes, supervises crashes with capped backoff, keeps a warm session pool (`--pool-size`, sub-ms connects; session pooling only — no transaction pooling, no cross-client reuse) | `icegresd serve` / `icegresd status` |
 | Health endpoint | HTTP 200 liveness | `--health-port` |
 | ORM/BI compatibility | pg_catalog shims: coherent oids, `version()`, ORM introspection rewrites (`src/compat.rs`) — SQLAlchemy/psycopg2/pg8000/pandas verified | default |
 
@@ -214,6 +219,43 @@ psql -h 127.0.0.1 -p 5432 -U postgres -d 'icegres@dev'
   `icegres@<branch>` → that branch's compute (`[A-Za-z0-9_-]+`). Create the
   branch first (`icegres branch create`), or queries fail loudly on the
   branch endpoint.
+* **Session pooling (warm backend connections).** icegresd keeps up to
+  `--pool-size` (default 8) warm, pre-handshaked pgwire connections per
+  compute. A client whose startup matches the pool identity
+  (`user == --pool-user` (default `postgres`), `database` == the compute's
+  canonical name (`icegres` / `icegres@<branch>`), no `options` parameter)
+  is handed a warm connection: icegresd replays the cached backend greeting
+  and the client reaches ReadyForQuery in well under a millisecond, even
+  though its session is a brand-new backend session. Everything else —
+  pool empty (overflow), different user/database, `options` present, or
+  `ICEGRES_AUTH_FILE` set (SCRAM cannot be pre-answered; pooling disables
+  itself) — falls through to a direct compute connection with the client's
+  original startup forwarded verbatim. Non-identity startup parameters of
+  pooled clients (e.g. `application_name`) are ignored, like PgBouncer's
+  `ignore_startup_parameters`.
+
+  **One client per backend connection — no reuse, and no transaction
+  pooling.** icegres sessions carry real state (transaction buffers, `SET`
+  variables, prepared statements) and there is no `DISCARD ALL`-style
+  reset in datafusion-postgres, so a returned connection could leak one
+  client's state into the next. Every warm connection therefore serves
+  exactly ONE client session and is closed with it; the pool is a
+  warm-SPARE pool, refilled in the background (correctness over reuse).
+  Transaction pooling (PgBouncer `pool_mode=transaction`) is deliberately
+  NOT implemented: it would hop statements across backend sessions between
+  transactions and silently lose `SET` state, prepared statements, and
+  buffered-write ordering — session state makes it unsafe here by
+  construction.
+
+  Pooling coexists with scale-to-zero: warm conns are active sessions on
+  the compute, so after `--pool-idle-secs` (default 60) with zero client
+  sessions the pool drains itself, the compute's `--idle-shutdown-secs`
+  clock runs, and the next connection re-wakes and re-warms. The pool is
+  also cleared/re-warmed around compute crashes and restarts.
+  `icegresd status` shows per-compute `pool` stats (warm spares, pooled vs
+  direct sessions). Bench evidence: `connect_via_proxy_ms` (client connect
+  -> ReadyForQuery via a warm handout) vs `cold_start_via_proxy_ms` in
+  `bench/SCORECARD.md`; `--pool-size 0` disables pooling entirely.
 * **Supervision.** Clean idle exits are scale-to-zero; UNCLEAN compute
   exits (crash, `kill -9`) are restarted with capped exponential backoff
   (0.5 s/1 s/2 s, max 3 per crash episode) and logged loudly.
@@ -230,8 +272,9 @@ psql -h 127.0.0.1 -p 5432 -U postgres -d 'icegres@dev'
   win over env. Flags: `--port` (public, default 5432), `--main-port`
   (default 5439), `--icegres-bin` (default: sibling binary), `--compute-host`
   (default 127.0.0.1), `--wake-timeout-ms` (default 10000), `--status-file`
-  (default `<tmpdir>/icegresd-status.json`); env `ICEGRESD_*` equivalents
-  exist for all.
+  (default `<tmpdir>/icegresd-status.json`), `--pool-size` (default 8, 0 =
+  off), `--pool-user` (default `postgres`), `--pool-idle-secs` (default
+  60); env `ICEGRESD_*` equivalents exist for all.
 
 ### Health checks (`--health-port`)
 
@@ -390,7 +433,7 @@ bash tests/e2e.sh   # end-to-end test (idempotent; needs psql, curl, jq, aws)
 ```
 
 The harness starts the stack (`infra/scripts/up.sh`), builds, seeds, serves,
-and asserts exact results over psql — **92 assertions** across sections
+and asserts exact results over psql — **104 assertions** across sections
 (a)–(o): seeded row counts, filters/aggregates/joins, `INSERT` over the wire
 (verified from new connections), Parquet files on RustFS + catalog
 registration via the Lakekeeper REST API, durability across a server
@@ -400,8 +443,13 @@ UPDATE/DELETE copy-on-write (incl. a 409-conflict retry proven by fault
 injection and time-travel-after-DML), transactions (read-your-own-writes,
 ROLLBACK, one-snapshot COMMIT, 25P02, live 40001 conflict), PK enforcement
 (23505/23502), buffered-write mode (union reads, group commit, SIGKILL
-survival of committed rows, flush fences) and zero-copy branches (write
-isolation both directions, ref-only drop). Server pid/logs live under
+survival of committed rows, flush fences), zero-copy branches (write
+isolation both directions, ref-only drop), the icegresd control plane
+(wake-on-connect, idle-exit + re-wake, branch routing, kill -9 →
+supervised restart) with its warm session pool (sequential API-pattern
+connections, SET/txn isolation across pooled sessions, drain →
+scale-to-zero → re-warm), and ORM/driver clients (SQLAlchemy reflection,
+psycopg2/pg8000 transactions, pandas). Server pid/logs live under
 `.e2e/` (gitignored); the server is killed on exit.
 
 The harness is non-destructive: it never drops tables. The deterministic

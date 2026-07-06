@@ -88,6 +88,8 @@ Metrics (all against the live local stack, table demo.trips ~280+ rows):
 | qps_8conn | mixed read queries, 8 connections: MEDIAN of 3 consecutive 10 s windows (all three reported) |
 | cold_start_ms | `serve` spawn → first successful `select 1` |
 | cold_start_via_proxy_ms | UNGATED extra: first-connection-after-idle latency through `icegresd` (compute cold start + proxy wake + splice setup; timed psql, so ~a few ms client overhead included) |
+| connect_via_proxy_ms | UNGATED extra: TCP connect → ReadyForQuery through `icegresd` with a WARM session pool (pooled handout replays the cached backend greeting — no compute-side handshake) |
+| qps_via_proxy_8conn | UNGATED extra: the qps_8conn workload pointed at the pooled `icegresd` endpoint (splice-overhead evidence vs direct qps_8conn) |
 | binary_size_mb, rss_idle_mb | footprint |
 | rss_peak_mb | peak server VmRSS, sampled every 100 ms across the whole benchmark (qps-window peak reported separately) |
 | rss_after_load_mb | server VmRSS after all load finished (1 s settle) |

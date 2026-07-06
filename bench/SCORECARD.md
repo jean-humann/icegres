@@ -11,25 +11,29 @@ every improvement landed through the regression gate `bench/gate.sh`
 binary grows >10%, e2e not green, or any parity verdict downgrades —
 memory and binary size are first-class gated metrics as of round 5).
 
-**Bottom line (2026-07-06, R7): 26 PASS / 0 GAP / 1 N/A-BY-DESIGN.**
+**Bottom line (2026-07-06, R8+R9): 27 PASS / 0 GAP / 1 N/A-BY-DESIGN.**
 Every behavioral gap to the bar is closed — auth, TLS, UPDATE, DELETE,
 transactions, PK enforcement, plus opt-in Moonlink-style buffered writes,
-Neon-style writable zero-copy branches, and the `icegresd` control plane
+Neon-style writable zero-copy branches, the `icegresd` control plane
 (wake-on-connect scale-to-zero, one-port branch-endpoint routing,
-supervised computes: D5 upgraded + new D7) — with a single copy of the
+supervised computes: D5 upgraded + new D7), verified ORM/driver
+compatibility (new A8: SQLAlchemy/psycopg2/pg8000/pandas), and icegresd
+warm session pooling (connect → ReadyForQuery 0.44 ms p50 via the proxy,
+~165× faster than a 73 ms wake-after-idle) — with a single copy of the
 data in open Iceberg format, no replication, no compromise on default
 durability/atomicity, on the pinned crate matrix, and with reads
-−67…−72% p50 / qps +357% / binary −18.8% vs the session's original state.
-Confirmed by a round-7 fresh verification pass from a cold stack:
-e2e 91/91, parity `020703Z` 26/0/1, bench `020801Z` gate PASS on all 13
-rules vs `baseline.json`, wake-after-idle through icegresd 96 ms manual /
-73 ms p50 harness.
+−67…−72% p50 / qps +357% / binary −18.5% vs the session's original state.
+Confirmed by the round-8 wrap fresh verification pass: e2e **104/104**,
+parity `035002Z` **27/0/1**, bench `035052Z` gate **PASS on all 13 rules**
+vs `baseline.json` (= `033809Z`). Recommended production topology
+(OLTP + API + BI tiers, when-to-use table, anti-patterns):
+**`docs/cqrs-topology.md`**.
 
 ## Reproduction (3 commands)
 
 ```bash
 bash infra/scripts/up.sh    # 1. start/health-check the stack (Postgres :5433, RustFS S3 :9000, Lakekeeper REST :8181)
-bash bench/parity.sh        # 2. all 27 parity probes -> bench/results/parity-<ts>.json + regenerates the matrix below
+bash bench/parity.sh        # 2. all 28 parity probes -> bench/results/parity-<ts>.json + regenerates the matrix below
 bash bench/bench.sh         # 3. full benchmark      -> bench/results/bench-<ts>.json  + table appended below
 ```
 
@@ -39,7 +43,7 @@ parity no-downgrade). Memory-bound micro-check for the time-travel cache:
 `bash icegres/tests/pinned_bound.sh`.
 
 Correctness suite (also enforced by `bench/gate.sh`):
-`bash icegres/tests/e2e.sh` — **91 assertions** across sections (a)–(n):
+`bash icegres/tests/e2e.sh` — **104 assertions** across sections (a)–(o):
 core wire/SQL + INSERT + restart durability, auth+TLS (wrong
 password/unknown user rejected, `sslmode=require`/`verify-full`,
 `openssl s_client` handshake), UPDATE/DELETE (command tags, new-connection
@@ -48,10 +52,15 @@ transactions (read-your-own-writes, ROLLBACK-undoes, multi-statement
 COMMIT = exactly one snapshot, 25P02 poisoning, live 40001 conflict), PK
 enforcement (23505/23502), buffered-write mode (union reads, group commit,
 SIGKILL survival of committed rows, flush fences), zero-copy branches
-(write isolation both directions, diverged heads, ref-only drop), and the
+(write isolation both directions, diverged heads, ref-only drop), the
 icegresd control plane (wake-on-connect from cold, idle-exit + auto
 re-wake with measured latency, dbname-routed branch endpoint through one
-public port, kill -9 -> supervised restart, clean shutdown). Note:
+public port, kill -9 -> supervised restart, clean shutdown), the icegresd
+warm session pool (15/15 sequential API-pattern connections from the warm
+pool, SET + abandoned-txn isolation across pooled sessions, different-user
+direct bypass, pool drain → compute idle-exit → re-wake re-warms), and
+ORM/driver clients (SQLAlchemy reflection + ORM queries, psycopg2/pg8000
+transactions + prepared-statement reuse, pandas `read_sql`). Note:
 every e2e/parity run appends/mutates a few rows (= small Parquet files and
 overwrite snapshots) in `demo.trips`; see **Layout drift** at the bottom
 before comparing full-scan numbers across runs.
@@ -83,13 +92,20 @@ icegres branch drop demo.trips dev            # removes only the ref
 icegresd serve --port 5432 --idle-shutdown-secs 300 &  # computes spawn on connect, idle-exit to zero
 psql -h 127.0.0.1 -p 5432 -d icegres -c 'select 1'     # wakes the main compute (~73 ms after idle)
 psql -h 127.0.0.1 -p 5432 -d 'icegres@dev'             # routes to a per-branch compute
-icegresd status                                        # computes, ports, PIDs, restart counts
+icegresd status                                        # computes, ports, PIDs, restart counts, pool stats
+
+# icegresd session pooling (default --pool-size 8): warm pre-handshaked backend
+# conns; matching clients reach ReadyForQuery in <1 ms (connect_via_proxy_ms).
+# SESSION pooling only — one client per backend conn, never reused, and no
+# transaction pooling (session state: txn buffers/SET/prepared statements).
+# The pool idle-drains after --pool-idle-secs so scale-to-zero still works.
+for i in 1 2 3; do psql -h 127.0.0.1 -p 5432 -d icegres -c 'select 1'; done  # warm handouts
 ```
 
 <!-- parity:begin — generated by bench/parity.sh, do not edit by hand -->
 ## Parity matrix — icegres vs the Lakebase/Neon/Moonlink bar
 
-Run: `20260706T031339Z` · binary: `icegres/target/release/icegres` · result: **27 PASS / 0 GAP / 1 N/A-BY-DESIGN** · raw: `bench/results/parity-20260706T031339Z.json`
+Run: `20260706T035002Z` · binary: `icegres/target/release/icegres` · result: **27 PASS / 0 GAP / 1 N/A-BY-DESIGN** · raw: `bench/results/parity-20260706T035002Z.json`
 
 | id | area | behavior | verdict | evidence |
 |----|------|----------|---------|----------|
@@ -97,34 +113,34 @@ Run: `20260706T031339Z` · binary: `icegres/target/release/icegres` · result: *
 | A2 | wire | extended protocol / parameterized statements | ✅ PASS | psql \bind 42 + 'where trip_id = $1' (extended query protocol) returned: 42\|Brussels |
 | A3 | wire | \dt / pg_catalog introspection | ✅ PASS | \dt demo.* lists trips and cities (plus $snapshots/$manifests metadata tables): demo\|cities\|table\|postgres demo\|cities$manifests\|table\|postgres demo\|cities$snapshots\|table\|postgres demo\|trips\|table\|postgres demo\|trips$manifests\|table\|postgres demo\|trips$snapshots\|table\|postgres |
 | A4 | wire | information_schema | ✅ PASS | information_schema.tables for schema demo returned: cities cities$manifests cities$snapshots trips trips$manifests trips$snapshots |
-| A5 | wire | multiple concurrent connections | ✅ PASS | 8 parallel psql SELECT count(*) connections all succeeded (8/8 identical results: 280) |
+| A5 | wire | multiple concurrent connections | ✅ PASS | 8 parallel psql SELECT count(*) connections all succeeded (8/8 identical results: 346) |
 | A6 | wire | server-side auth | ✅ PASS | --auth-file (SCRAM-SHA-256, hashed-at-rest): right password accepted (select 1 -> 1); wrong password rejected (psql: error: connection to server at "127.0.0.1", port 5447 failed: FATAL: Password authentication failed for user "" connection to server at "127.0.0.1", port 5447 failed: FATAL: Password authentication failed for user ""); unknown user rejected (psql: error: connection to server at "127 |
 | A7 | wire | TLS | ✅ PASS | --tls-cert/--tls-key (rustls; boot fails hard on bad cert/key, no plaintext fallback): sslmode=require -> 1; openssl s_client -starttls postgres handshake: TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384; sslmode=verify-full against the pinned dev cert -> 1. Plaintext startup is still accepted on the same listener (upstream/stock-Postgres behavior) — clients enforce encryption via sslmode. |
 | A8 | wire | ORM/driver compatibility (SQLAlchemy+psycopg2+pg8000) | ✅ PASS | bench/clients/a8_orm_probe.py all green (A8 RESULT: pass=15 fail=0 xfail=1 skip=0; secure variants: with_secure): psycopg2+pg8000 connect, SCRAM+TLS connect, SQLAlchemy inspect()/reflection of demo.trips (correct column types), ORM filter+GROUP BY, pandas read_sql join, prepared-statement reuse, BEGIN/ROLLBACK + BEGIN/COMMIT via the driver. Documented XFAIL: server-side (named) cursors — DECLARE C |
-| B1 | oltp | INSERT via wire, durable | ✅ PASS | INSERT trip_id=900000 returned tag 'INSERT 0 1'; row read back over a NEW connection: 900000\|Parity B1 |
-| B2 | oltp | UPDATE | ✅ PASS | UPDATE trip_id=900000 returned tag 'UPDATE 1'; new fare read back over a NEW connection: 99.9 (copy-on-write: only the Parquet file holding the row is rewritten, all other files are reused in the new Iceberg snapshot) |
-| B3 | oltp | DELETE | ✅ PASS | DELETE trip_id=900001 returned tag 'DELETE 1'; count over a NEW connection afterwards: 0; time travel intact: pre-delete snapshot 3334555637320858440 still serves the row (count=1) |
-| B4 | oltp | explicit transactions BEGIN/COMMIT/ROLLBACK | ✅ PASS | real transactions: ROLLBACK undid the INSERT (row 900002 absent afterwards; the row WAS visible inside the txn: 'BEGIN INSERT 0 1 count(*) ---------- 1 (1 row) ROLLBACK'); a 2-statement txn (INSERT + UPDATE) COMMITted atomically as one Iceberg snapshot (row 900003\|fare=77.0 from a new connection: 'BEGIN INSERT 0 1 UPDATE 1 COMMIT'). Reads inside a txn are snapshot-pinned per table (snapshot isola |
+| B1 | oltp | INSERT via wire, durable | ✅ PASS | INSERT trip_id=900276 returned tag 'INSERT 0 1'; row read back over a NEW connection: 900276\|Parity B1 |
+| B2 | oltp | UPDATE | ✅ PASS | UPDATE trip_id=900276 returned tag 'UPDATE 1'; new fare read back over a NEW connection: 99.9 (copy-on-write: only the Parquet file holding the row is rewritten, all other files are reused in the new Iceberg snapshot) |
+| B3 | oltp | DELETE | ✅ PASS | DELETE trip_id=900277 returned tag 'DELETE 1'; count over a NEW connection afterwards: 0; time travel intact: pre-delete snapshot 508166455052953239 still serves the row (count=1) |
+| B4 | oltp | explicit transactions BEGIN/COMMIT/ROLLBACK | ✅ PASS | real transactions: ROLLBACK undid the INSERT (row 900278 absent afterwards; the row WAS visible inside the txn: 'BEGIN INSERT 0 1 count(*) ---------- 1 (1 row) ROLLBACK'); a 2-statement txn (INSERT + UPDATE) COMMITted atomically as one Iceberg snapshot (row 900279\|fare=77.0 from a new connection: 'BEGIN INSERT 0 1 UPDATE 1 COMMIT'). Reads inside a txn are snapshot-pinned per table (snapshot isola |
 | B5 | oltp | PK/constraint enforcement | ✅ PASS | --enforce-pk + table property icegres.primary-key=id: first insert accepted ('INSERT 0 1'); duplicate rejected with 23505 (ERROR: duplicate key value violates unique constraint "parity_pk_pkey": key (id) = (1) is not unique); NULL key rejected with 23502 (ERROR: null value in column(s) (id) of relation "parity_pk" violates not-null constraint (primary key, 1 row(s))); table holds 1 row. Checks run |
-| C1 | lakehouse | data in open format, other engines can read | ✅ PASS | independent reader pyiceberg 0.11.1 read demo.trips via the REST catalog + S3: 282 rows == server's count(282) |
+| C1 | lakehouse | data in open format, other engines can read | ✅ PASS | independent reader pyiceberg 0.11.1 read demo.trips via the REST catalog + S3: 348 rows == server's count(348) |
 | C2 | lakehouse | catalog registration (REST) | ✅ PASS | Lakekeeper GET /v1/563d3f92-7884-11f1-ab2a-cba89bbcc662/namespaces/demo/tables lists: ["cities","trips"] |
 | C3 | lakehouse | CDC Postgres->Iceberg | ➖ N/A-BY-DESIGN | Moonlink exists to replicate Postgres heap data into Iceberg; icegres data is born in Iceberg (INSERT via wire commits an Iceberg snapshot directly, verified by B1+C1) — there is no second copy to synchronize. |
-| C4 | lakehouse | write freshness (commit -> readable elsewhere) | ✅ PASS | row committed via conn A was readable from a new connection ~56ms after commit (coarse; includes psql startup — precise p50/p95 is bench freshness_ms). Moonlink bar: sub-second. Additionally: buffered mode (--write-buffer-ms 100, opt-in; default 0 = synchronous): INSERT acked from the in-memory buffer was readable from a NEW connection on the same server after ~54ms (union read — no wait for the I |
-| C5 | lakehouse | Iceberg metadata surfaces | ✅ PASS | demo."trips$snapshots" queryable (9 snapshots listed; $manifests also works). Caveats: 'select *' fails on the Map-typed summary column (ERROR: Unsupported Datatype Map("key_value": non-null Struct("key": non-null Utf8, metadata: {"PARQUET:field_id": "7"}, "value": Utf8, metadata: {"PARQUET:field_id": "8"}), unsorted)) and count(*) hits a DataFusion logical/physical schema mismatch — column projec |
-| D1 | elasticity | stateless compute: restart durability | ✅ PASS | killed and restarted the :5440 compute: row count identical before/after (283), wire-inserted row trip_id=900000 intact — all state lives in Iceberg/RustFS, none in the process. |
-| D2 | elasticity | multiple stateless computes on shared storage | ✅ PASS | second 'icegres serve' on :5440 (same catalog, started before the write) returned identical count (283) and served row trip_id=900000 committed via :5439 after both computes started (visible on first poll, 52ms; each query reloads table metadata from the REST catalog, so no staleness window was observed). |
-| D3 | elasticity | cold start | ✅ PASS | serve spawn -> first successful 'select 1': 46ms (single run, 50ms poll; p50/p95 over >=5 runs is bench cold_start_ms). Neon bar: ~500ms-few s. |
-| D4 | elasticity | time-travel read (branching/PITR analogue) | ✅ PASS | snapshot-pinned read works: demo."trips@8645957575634131546" (oldest snapshot from "trips$snapshots") returned count=280 vs current count=283 (rows appended this run are invisible in the pinned view; WHERE on the pinned table -> 280). Read-only; timestamp syntax FOR SYSTEM_TIME AS OF is not supported by datafusion 52. |
-| D5 | elasticity | scale-to-zero | ✅ PASS | FULL sleep/wake cycle via icegresd (shipped control plane): first connection to :5445 woke a compute in 89ms (demo.cities count=20); compute exited on its own 5054ms after the last connection (clean idle exit (exit status: 0); health pings on :5446 do not reset the idle clock); NEXT connection to the same port auto-re-woke it: 'select 1' in 74ms (= cold start + splice setup). No external superviso |
-| D6 | elasticity | writable zero-copy branches | ✅ PASS | Neon branch-per-endpoint over Iceberg snapshot refs: 'icegres branch create demo.trips parity_dev' forked main's head with zero data copied; a second server (icegres serve --branch parity_dev on :5450) took INSERT trip_id=99018301 + UPDATE (fare -> 123.0) committed to the branch ref with assert-ref-snapshot-id; main endpoint on :5439 stayed untouched (row count for the id 0 -> 0, total 283 -> 283) |
-| D7 | elasticity | endpoint routing + supervised computes | ✅ PASS | ONE public port (:5452) served two endpoints routed by the pgwire startup database param: dbname 'icegres' -> main compute on :5453 (count=283), dbname 'icegres@parity_d7' -> per-branch compute auto-spawned on ephemeral :42723 with --branch (INSERT 'INSERT 0 1' visible on the branch endpoint (1), INVISIBLE on main (0)); then kill -9 of the main compute was auto-restarted by icegresd (capped backof |
-| E1 | ops | structured startup logs | ✅ PASS | serve log contains structured fields catalog_uri/warehouse/s3_endpoint/listen_addr: 2026-07-06T03:13:41.537940Z INFO icegres: connecting to Iceberg REST catalog catalog_uri=http://127.0.0.1:8181/catalog warehouse=lakehouse s3_endpoint=http://127.0.0.1:9000 2026-07-06T03:13:41.571864Z INFO icegres: starting pgwire server listen_addr=127.0.0.1:5440 |
+| C4 | lakehouse | write freshness (commit -> readable elsewhere) | ✅ PASS | row committed via conn A was readable from a new connection ~78ms after commit (coarse; includes psql startup — precise p50/p95 is bench freshness_ms). Moonlink bar: sub-second. Additionally: buffered mode (--write-buffer-ms 100, opt-in; default 0 = synchronous): INSERT acked from the in-memory buffer was readable from a NEW connection on the same server after ~68ms (union read — no wait for the I |
+| C5 | lakehouse | Iceberg metadata surfaces | ✅ PASS | demo."trips$snapshots" queryable (65 snapshots listed; $manifests also works). Caveats: 'select *' fails on the Map-typed summary column (ERROR: Unsupported Datatype Map("key_value": non-null Struct("key": non-null Utf8, metadata: {"PARQUET:field_id": "7"}, "value": Utf8, metadata: {"PARQUET:field_id": "8"}), unsorted)) and count(*) hits a DataFusion logical/physical schema mismatch — column proje |
+| D1 | elasticity | stateless compute: restart durability | ✅ PASS | killed and restarted the :5440 compute: row count identical before/after (349), wire-inserted row trip_id=900276 intact — all state lives in Iceberg/RustFS, none in the process. |
+| D2 | elasticity | multiple stateless computes on shared storage | ✅ PASS | second 'icegres serve' on :5440 (same catalog, started before the write) returned identical count (349) and served row trip_id=900276 committed via :5439 after both computes started (visible on first poll, 51ms; each query reloads table metadata from the REST catalog, so no staleness window was observed). |
+| D3 | elasticity | cold start | ✅ PASS | serve spawn -> first successful 'select 1': 48ms (single run, 50ms poll; p50/p95 over >=5 runs is bench cold_start_ms). Neon bar: ~500ms-few s. |
+| D4 | elasticity | time-travel read (branching/PITR analogue) | ✅ PASS | snapshot-pinned read works: demo."trips@2216238337045485312" (oldest snapshot from "trips$snapshots") returned count=280 vs current count=349 (rows appended this run are invisible in the pinned view; WHERE on the pinned table -> 280). Read-only; timestamp syntax FOR SYSTEM_TIME AS OF is not supported by datafusion 52. |
+| D5 | elasticity | scale-to-zero | ✅ PASS | FULL sleep/wake cycle via icegresd (shipped control plane) WITH the warm session pool active: first connection to :5445 woke a compute in 86ms (demo.cities count=20); the pool idle-drained its warm conns, then the compute exited on its own 8838ms after the last connection (clean idle exit (exit status: 0); health pings on :5446 do not reset the idle clock); NEXT connection to the same port auto-re |
+| D6 | elasticity | writable zero-copy branches | ✅ PASS | Neon branch-per-endpoint over Iceberg snapshot refs: 'icegres branch create demo.trips parity_dev' forked main's head with zero data copied; a second server (icegres serve --branch parity_dev on :5450) took INSERT trip_id=99028336 + UPDATE (fare -> 123.0) committed to the branch ref with assert-ref-snapshot-id; main endpoint on :5439 stayed untouched (row count for the id 0 -> 0, total 349 -> 349) |
+| D7 | elasticity | endpoint routing + supervised computes | ✅ PASS | ONE public port (:5452) served two endpoints routed by the pgwire startup database param: dbname 'icegres' -> main compute on :5453 (count=349), dbname 'icegres@parity_d7' -> per-branch compute auto-spawned on ephemeral :42745 with --branch (INSERT 'INSERT 0 1' visible on the branch endpoint (1), INVISIBLE on main (0)); then kill -9 of the main compute was auto-restarted by icegresd (capped backof |
+| E1 | ops | structured startup logs | ✅ PASS | serve log contains structured fields catalog_uri/warehouse/s3_endpoint/listen_addr: 2026-07-06T03:50:04.539106Z INFO icegres: connecting to Iceberg REST catalog catalog_uri=http://127.0.0.1:8181/catalog warehouse=lakehouse s3_endpoint=http://127.0.0.1:9000 2026-07-06T03:50:04.568693Z INFO icegres: starting pgwire server listen_addr=127.0.0.1:5440 |
 | E2 | ops | health-checkable | ✅ PASS | two probes work: (1) pgwire connect + 'select 1' as the readiness check (what the harnesses use; plain TCP connect works for tcpSocket-style checks); (2) dedicated HTTP liveness endpoint via --health-port — curl http://127.0.0.1:5446/health during the D5 probe returned 200 'ok'. |
 | E3 | ops | full config via env vars | ✅ PASS | 'icegres serve' booted with ZERO flags — all config from ICEGRES_* env vars (host/port/catalog/warehouse/S3) — and answered on :5444 (demo.cities count=20) |
 <!-- parity:end -->
 
 
-## Parity verdict history — baseline → R8 (zero gaps left)
+## Parity verdict history — baseline → R9 (zero gaps left)
 
 Every probe that ever scored GAP, per round (R1–R3 changed no verdicts;
 R6 landed in five phases, each accepted through the full gate protocol).
@@ -134,21 +150,34 @@ throughout (see below). R8 added a NEW probe **A8 “ORM/driver
 compatibility (SQLAlchemy+psycopg2+pg8000)”** which entered the matrix as
 PASS (`bench/clients/a8_orm_probe.py`: 15 pass / 0 fail / 1 documented
 XFAIL — server-side cursors), taking the matrix to **27 PASS / 0 GAP /
-1 N/A-BY-DESIGN**.
+1 N/A-BY-DESIGN**; R9 (icegresd session pooling) changed no verdicts and
+UPGRADED D5's evidence to the sleep/wake cycle WITH the warm pool active.
 
-| probe | baseline `162239Z` | R4 parity-features `174423Z` | R5 resources `200300Z` | R6.1 auth-tls `203811Z` | R6.2 dml `213309Z` | R6.3 txn+pk `234602Z` | R6.4 buffer `001322Z` | R6.5 branches `005122Z` | R6 fresh pass `005652Z` | R7 icegresd `015738Z` | R7 fresh pass `020703Z` |
-|-------|------|------|------|------|------|------|------|------|------|------|------|
-| A6 server-side auth | GAP | GAP | GAP | **PASS** | PASS | PASS | PASS | PASS | PASS | PASS | PASS |
-| A7 TLS | GAP | GAP | GAP | **PASS** | PASS | PASS | PASS | PASS | PASS | PASS | PASS |
-| B2 UPDATE | GAP | GAP | GAP | GAP | **PASS** | PASS | PASS | PASS | PASS | PASS | PASS |
-| B3 DELETE | GAP | GAP | GAP | GAP | **PASS** | PASS | PASS | PASS | PASS | PASS | PASS |
-| B4 transactions | GAP | GAP | GAP | GAP | GAP | **PASS** | PASS | PASS | PASS | PASS | PASS |
-| B5 PK/constraints | GAP | GAP | GAP | GAP | GAP | **PASS** | PASS | PASS | PASS | PASS | PASS |
-| D4 time travel | GAP | **PASS** | PASS | PASS | PASS | PASS | PASS | PASS | PASS | PASS | PASS |
-| D5 scale-to-zero | GAP | **PASS** | PASS | PASS | PASS | PASS | PASS | PASS | PASS | **PASS** (upgraded¹) | PASS |
-| D6 zero-copy branches | — (no probe) | — | — | — | — | — | — | **PASS** (new row) | PASS | PASS | PASS |
-| D7 routing + supervision | — (no probe) | — | — | — | — | — | — | — | — | **PASS** (new row) | PASS |
-| **totals (PASS/GAP/NA)** | 16/8/1 | 18/6/1 | 18/6/1 | 20/4/1 | 22/2/1 | 24/0/1 | 24/0/1 | **25/0/1** | **25/0/1** | **26/0/1** | **26/0/1** |
+| probe | baseline `162239Z` | R4 parity-features `174423Z` | R5 resources `200300Z` | R6.1 auth-tls `203811Z` | R6.2 dml `213309Z` | R6.3 txn+pk `234602Z` | R6.4 buffer `001322Z` | R6.5 branches `005122Z` | R6 fresh pass `005652Z` | R7 icegresd `015738Z` | R7 fresh pass `020703Z` | R8 orm-compat `031339Z` | R9 pooling `034317Z` | R8/9 fresh pass `035002Z` |
+|-------|------|------|------|------|------|------|------|------|------|------|------|------|------|------|
+| A6 server-side auth | GAP | GAP | GAP | **PASS** | PASS | PASS | PASS | PASS | PASS | PASS | PASS | PASS | PASS | PASS |
+| A7 TLS | GAP | GAP | GAP | **PASS** | PASS | PASS | PASS | PASS | PASS | PASS | PASS | PASS | PASS | PASS |
+| A8 ORM/driver compat | — (no probe) | — | — | — | — | — | — | — | — | — | — | **PASS** (new row) | PASS | PASS |
+| B2 UPDATE | GAP | GAP | GAP | GAP | **PASS** | PASS | PASS | PASS | PASS | PASS | PASS | PASS | PASS | PASS |
+| B3 DELETE | GAP | GAP | GAP | GAP | **PASS** | PASS | PASS | PASS | PASS | PASS | PASS | PASS | PASS | PASS |
+| B4 transactions | GAP | GAP | GAP | GAP | GAP | **PASS** | PASS | PASS | PASS | PASS | PASS | PASS | PASS | PASS |
+| B5 PK/constraints | GAP | GAP | GAP | GAP | GAP | **PASS** | PASS | PASS | PASS | PASS | PASS | PASS | PASS | PASS |
+| D4 time travel | GAP | **PASS** | PASS | PASS | PASS | PASS | PASS | PASS | PASS | PASS | PASS | PASS | PASS | PASS |
+| D5 scale-to-zero | GAP | **PASS** | PASS | PASS | PASS | PASS | PASS | PASS | PASS | **PASS** (upgraded¹) | PASS | PASS | **PASS** (upgraded²) | PASS |
+| D6 zero-copy branches | — (no probe) | — | — | — | — | — | — | **PASS** (new row) | PASS | PASS | PASS | PASS | PASS | PASS |
+| D7 routing + supervision | — (no probe) | — | — | — | — | — | — | — | — | **PASS** (new row) | PASS | PASS | PASS | PASS |
+| **totals (PASS/GAP/NA)** | 16/8/1 | 18/6/1 | 18/6/1 | 20/4/1 | 22/2/1 | 24/0/1 | 24/0/1 | **25/0/1** | **25/0/1** | **26/0/1** | **26/0/1** | **27/0/1** | **27/0/1** | **27/0/1** |
+
+R8 (orm-compat, `031339Z`): new probe **A8 PASS**, totals **27/0/1**.
+R9 (icegresd session pooling, `034317Z` = current `parity-baseline.json`):
+totals **27/0/1**, no verdict changes; ²D5's evidence upgraded again to
+the full sleep/wake cycle WITH the warm session pool active (warm handout
+→ pool idle-drain → compute idle-exit → re-wake + re-warm). Honest note:
+R9's *first* parity run (`034049Z`, kept in `bench/results/` as evidence)
+scored D5 GAP because the probe's 20 s observation window never outlives
+the default 60 s pool drain — the probe now passes `--pool-idle-secs 2`;
+the pooled D5 cycle then passes cleanly. The round-8 wrap fresh pass
+(`035002Z`) re-confirmed **27/0/1** from a live stack.
 
 R7 (icegresd, `015738Z`; independently confirmed by the round-7 fresh
 verification pass `020703Z`): totals **26/0/1**. ¹D5's evidence was UPGRADED
@@ -338,7 +367,7 @@ DELETE, transactions, PK enforcement, buffered writes and zero-copy
 branches. No kept millisecond cost more than ~4.3 MB of peak RSS; the two
 largest memory line items of the session are both negative.
 
-## Round history (13 kept, 1 reverted, 1 no-op, 0 skipped)
+## Round history (14 kept, 1 reverted, 1 no-op, 0 skipped)
 
 Session rounds and their outcomes. Every kept entry passed `bench/gate.sh`
 (latency p50 +20% / qps −10% / rss +25% / binary +10% rules, e2e green,
@@ -359,6 +388,7 @@ parity no-downgrade) before its candidate run became the new
 | R6.5 | elasticity | #12 zero-copy branches (Neon branch-per-endpoint on snapshot refs) | kept — parity 24→**25 PASS** (new D6 row), main provably untouched by branch writes |
 | R7 | elasticity | #13 icegresd control plane (wake-on-connect scale-to-zero proxy, branch-endpoint routing, compute supervision) | kept — parity 25→**26 PASS** (D5 upgraded to the full autonomous sleep/wake cycle, new D7 row); e2e 77→**91 assertions**; serve path untouched (gate PASS on all 13 rules) |
 | R8 | client compatibility | #14 orm-compat (`icegres/src/compat.rs`: coherent-oid pg_class/pg_namespace/pg_attribute snapshot fixing upstream per-scan oid drift; Postgres-parseable `version()`; `pg_get_indexdef`/`pg_type_is_visible` stubs; CompatHook AST rewrites for `unnest(indkey)`, `generate_subscripts`, nested correlated subqueries, `reloptions`, regclass-classoid; placeholder-type strip defusing upstream's lexicographic `$10<$2` param-ordering bug for intercepted statements) + `bench/clients/a8_orm_probe.py` | kept — parity 26→**27 PASS** (new **A8 “ORM/driver compatibility” PASS**: SQLAlchemy 2.0 inspect()/full reflection with correct types, ORM filter/GROUP BY over psycopg2 AND pg8000, pandas read_sql join, prepared-stmt reuse, driver txn commit/rollback, SCRAM+TLS variants; documented XFAILs: DECLARE CURSOR, extended-protocol SELECT in explicit txn); e2e 92 assertions (new section (o)); gate PASS on all 13 rules (qps −0.8%, binary +0.4%) |
+| R9 | connection latency | #15 icegresd session pooling (`--pool-size` warm pre-handshaked backend conns per compute, default 8; identity-matched clients (`user` == `--pool-user`, canonical `database`, no `options`) get a cached-greeting handout — connect → ReadyForQuery with ZERO compute-side handshake; one client per backend conn, NEVER reused (no `DISCARD ALL` in datafusion-postgres ⇒ warm-SPARE pool with background refill — correctness over reuse); pool empty/mismatch/`options`/SCRAM ⇒ direct verbatim-startup path (overflow); `--pool-idle-secs` drain (default 60) preserves scale-to-zero, pool cleared+re-warmed around crashes/restarts; NO transaction pooling by design — session state (txn buffers, SET, prepared stmts) makes statement-hopping across backend sessions unsafe) | kept — new UNGATED metrics **connect_via_proxy_ms 0.44 ms p50 / 0.66 p95** (vs 73 ms p50 wake-after-idle `cold_start_via_proxy_ms` through the same proxy — ~165× for the API reconnect pattern; all 55 harness sessions were warm-pool handouts) and **qps_via_proxy_8conn 359.2** (vs 381.9 direct = −5.9% splice tax); e2e 92→**104 assertions** (new section n7: 15/15 sequential API-pattern conns from the warm pool, SET + abandoned-txn isolation across pooled sessions, different-user direct bypass, pool drain → compute idle-exit → re-wake re-warms; n1–n6 pinned to `--pool-size 0` to keep testing the bare path); parity **27 PASS / 0 GAP** with **D5 evidence upgraded** (full sleep/wake cycle WITH the pool active: warm → drain → idle-exit 8.8 s → re-wake+re-warm; the first parity run scored D5 GAP because the probe's 20 s window never outlives the default 60 s pool drain — probe now passes `--pool-idle-secs 2`, kept as `parity-20260706T034049Z.json` evidence); gate PASS on all 13 rules (`033809Z` vs R8 baseline: worst latency delta connect_ms +10.5% = +0.02 ms at sub-ms scale; qps +1.6%; rss_peak −0.1%; binary +0.0%; direct-serve path contains zero pooling code) |
 
 Nothing was skipped: every gap in the matrix was either closed (A6, A7,
 B2, B3, B4, B5, D4, D5, + new D6/D7) or established as N/A-by-design (C3).
@@ -433,6 +463,27 @@ Rejected along the way (measured or principled, with why):
   (parity-features, first run) was proven environmental by a
   control-binary A/B — see "Layout drift" below — and passed cleanly at
   matched layout.
+
+## R8/R9 wrap verification (2026-07-06, round-8 close-out fresh pass)
+
+Order: `up.sh` (all 4 health checks ok) → `icegres/tests/e2e.sh`
+(**green, 104/104 assertions** — all sections (a)–(o) incl. the pooled
+proxy section n7 and ORM clients (o)) → `parity.sh` (**27 PASS / 0 GAP /
+1 N/A-BY-DESIGN**, run `035002Z` — verdict-identical to
+`parity-baseline.json` = `034317Z`, zero downgrades; this is the matrix
+rendered above) → `bench.sh` (`035052Z`) → `gate.sh` **PASS on all 13
+rules** vs `baseline.json` (= `033809Z`, the accepted R9 candidate):
+worst latency delta filtered_scan +16.1% / join +15.7% (read-latency
+drift from the e2e+parity appends earlier in the same pass — see "Layout
+drift" below; insert_single −0.5%, freshness −0.3%, cold_start −0.7% are
+all flat), qps +0.4%, rss_peak +1.1%, rss_idle +0.5%, binary ±0. Pooled
+extras reproduced: `connect_via_proxy_ms` 0.54 ms p50 / 0.72 p95 (55/55
+harness sessions from the warm pool), `qps_via_proxy_8conn` 368.0 (−4.0%
+splice tax), `cold_start_via_proxy_ms` 74 ms p50. No baselines were
+re-promoted — this pass verified the accepted R9 state, it did not land a
+change. The round also shipped the CQRS production-topology reference
+(`docs/cqrs-topology.md`), which turns these numbers into tier
+recommendations.
 
 ## R7 verification (2026-07-06, icegresd acceptance pass)
 
@@ -1519,3 +1570,57 @@ warmups discarded: 3, iterations: 20, cold-start runs: 5, demo.trips data files:
 | insert_single_buffered_ms | 1.53 | 2.49 | n=20 |
 | freshness_buffered_ms | 9.55 | 83.43 | n=20 |
 | cold_start_via_proxy_ms | 74 | 76 | n=5 |
+
+### Bench 20260706T033809Z
+
+Release binary `icegres/target/release/icegres` · raw: `bench/results/bench-20260706T033809Z.json` ·
+warmups discarded: 3, iterations: 20, cold-start runs: 5, demo.trips data files: 1
+
+| metric | p50 | p95 | n / detail |
+|--------|-----|-----|------------|
+| connect_ms | 0.21 | 0.28 | n=20 |
+| point_lookup_ms | 6.93 | 7.42 | n=20 |
+| filtered_scan_ms | 6.75 | 7.13 | n=20 |
+| aggregate_ms | 7.21 | 7.59 | n=20 |
+| join_ms | 9.93 | 10.38 | n=20 |
+| insert_single_ms | 56.08 | 72.14 | n=20 |
+| insert_batch100_ms | 98.95 | 111.79 | n=20 |
+| freshness_ms | 73.2 | 78.58 | n=20 |
+| qps_8conn | 381.9 | — | median of 387.9, 373.9, 381.9 (8 conns, 10s windows) |
+| cold_start_ms | 45.62 | 46.1 | n=5 |
+| binary_size_mb | 122.9 | — | |
+| rss_idle_mb | 79.54 | — | |
+| rss_peak_mb | 94.73 | — | qps-window peak 93.52 MB, 415 samples @ 100ms |
+| rss_after_load_mb | 94.73 | — | |
+| insert_single_buffered_ms | 1.25 | 1.32 | n=20 |
+| freshness_buffered_ms | 8.37 | 79.58 | n=20 |
+| cold_start_via_proxy_ms | 73 | 85 | n=5 |
+| connect_via_proxy_ms | 0.44 | 0.66 | n=20 |
+| qps_via_proxy_8conn | 359.2 | — | median of 359.2, 356.3, 370.5 (8 conns, 10s windows) |
+
+### Bench 20260706T035052Z
+
+Release binary `icegres/target/release/icegres` · raw: `bench/results/bench-20260706T035052Z.json` ·
+warmups discarded: 3, iterations: 20, cold-start runs: 5, demo.trips data files: 1
+
+| metric | p50 | p95 | n / detail |
+|--------|-----|-----|------------|
+| connect_ms | 0.23 | 0.27 | n=20 |
+| point_lookup_ms | 7.91 | 8.36 | n=20 |
+| filtered_scan_ms | 7.84 | 8.16 | n=20 |
+| aggregate_ms | 8.01 | 8.38 | n=20 |
+| join_ms | 11.49 | 12.79 | n=20 |
+| insert_single_ms | 55.82 | 68.68 | n=20 |
+| insert_batch100_ms | 102.27 | 116.77 | n=20 |
+| freshness_ms | 72.99 | 82.18 | n=20 |
+| qps_8conn | 383.3 | — | median of 378.6, 401.8, 383.3 (8 conns, 10s windows) |
+| cold_start_ms | 45.32 | 45.54 | n=5 |
+| binary_size_mb | 122.9 | — | |
+| rss_idle_mb | 79.91 | — | |
+| rss_peak_mb | 95.78 | — | qps-window peak 93.89 MB, 417 samples @ 100ms |
+| rss_after_load_mb | 95.21 | — | |
+| insert_single_buffered_ms | 1.33 | 1.43 | n=20 |
+| freshness_buffered_ms | 9.58 | 85.5 | n=20 |
+| cold_start_via_proxy_ms | 74 | 77 | n=5 |
+| connect_via_proxy_ms | 0.54 | 0.72 | n=20 |
+| qps_via_proxy_8conn | 368.0 | — | median of 368.0, 374.5, 356.6 (8 conns, 10s windows) |

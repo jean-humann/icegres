@@ -99,10 +99,10 @@
 //!   --idle-shutdown-secs` are passed explicitly as flags and therefore
 //!   always win over stray env.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -187,6 +187,26 @@ struct ServeArgs {
     /// (default: <tmpdir>/icegresd-status.json).
     #[arg(long, env = "ICEGRESD_STATUS_FILE")]
     status_file: Option<PathBuf>,
+
+    /// Warm, pre-handshaked backend connections kept per compute (SESSION
+    /// pooling: each warm connection serves exactly one client session and
+    /// is never reused — see the module docs). 0 disables pooling; clients
+    /// that do not match the pool identity overflow to direct connections.
+    #[arg(long, env = "ICEGRESD_POOL_SIZE", default_value_t = 8)]
+    pool_size: usize,
+
+    /// `user` startup parameter the pool warms sessions with. Clients whose
+    /// startup `user` differs bypass the pool (direct compute connection).
+    #[arg(long, env = "ICEGRESD_POOL_USER", default_value = "postgres")]
+    pool_user: String,
+
+    /// Drain the warm pool after this many seconds with zero CLIENT
+    /// sessions on a compute, so the compute's own --idle-shutdown-secs
+    /// clock can run (warm conns count as active sessions on the compute;
+    /// without the drain, pooling would defeat scale-to-zero). The pool
+    /// re-warms on the next wake.
+    #[arg(long, env = "ICEGRESD_POOL_IDLE_SECS", default_value_t = 60)]
+    pool_idle_secs: u64,
 }
 
 fn default_status_file() -> PathBuf {
@@ -257,6 +277,70 @@ struct SlotState {
     last_exit: Option<String>,
 }
 
+/// One WARM backend connection: TCP established, pgwire startup handshake
+/// already completed by icegresd (as `--pool-user`), backend greeting
+/// (AuthenticationOk .. ReadyForQuery) cached for replay to the client it
+/// is eventually handed to. Serves EXACTLY ONE client session, then dies
+/// with it (no cross-session reuse — see the module docs).
+struct WarmConn {
+    stream: TcpStream,
+    greeting: Vec<u8>,
+    /// Slot generation at warm time; a conn from a superseded compute
+    /// process is discarded at handout.
+    generation: u64,
+}
+
+/// Why warming a connection failed — auth-required disables pooling for
+/// good (icegresd cannot pre-authenticate on a client's behalf), anything
+/// else is transient (compute just idle-exited, mid-restart, ...).
+enum WarmError {
+    AuthRequired,
+    Other(anyhow::Error),
+}
+
+/// Warm-spare connection pool of one compute slot.
+struct Pool {
+    conns: tokio::sync::Mutex<VecDeque<WarmConn>>,
+    /// Mirrors `conns.len()` so the sync status writer never touches the
+    /// async lock.
+    warm: AtomicUsize,
+    /// Client sessions served from a warm conn / via a direct (overflow or
+    /// identity-mismatch) connection.
+    handouts: AtomicU64,
+    direct: AtomicU64,
+    /// Instant of the last client-session start or end on this slot; the
+    /// idle-drain loop compares it against --pool-idle-secs.
+    last_client: Mutex<Instant>,
+    /// Serializes background refills (one warm loop per slot at a time).
+    warm_lock: tokio::sync::Mutex<()>,
+    /// Set once if the compute demands authentication: pooling is then off
+    /// for this slot and every session goes direct.
+    disabled: AtomicBool,
+}
+
+impl Pool {
+    fn new() -> Self {
+        Pool {
+            conns: tokio::sync::Mutex::new(VecDeque::new()),
+            warm: AtomicUsize::new(0),
+            handouts: AtomicU64::new(0),
+            direct: AtomicU64::new(0),
+            last_client: Mutex::new(Instant::now()),
+            warm_lock: tokio::sync::Mutex::new(()),
+            disabled: AtomicBool::new(false),
+        }
+    }
+
+    fn touch(&self) {
+        *self.last_client.lock().expect("pool clock lock poisoned") = Instant::now();
+    }
+
+    async fn clear(&self) {
+        self.conns.lock().await.clear();
+        self.warm.store(0, Ordering::SeqCst);
+    }
+}
+
 /// One compute endpoint: the main one (`branch == None`, fixed port) or a
 /// per-branch one (ephemeral port, `icegres serve --branch <name>`).
 struct ComputeSlot {
@@ -270,6 +354,19 @@ struct ComputeSlot {
     generation: AtomicU64,
     active: AtomicUsize,
     restarts: AtomicU64,
+    pool: Pool,
+}
+
+impl ComputeSlot {
+    /// The database name the pool warms sessions with — and the ONLY
+    /// database a pooled handout is allowed for (anything else goes
+    /// direct): `icegres` on main, `icegres@<branch>` on a branch slot.
+    fn canonical_db(&self) -> String {
+        match &self.branch {
+            None => "icegres".to_string(),
+            Some(b) => format!("icegres@{b}"),
+        }
+    }
 }
 
 struct Daemon {
@@ -277,6 +374,10 @@ struct Daemon {
     bin: PathBuf,
     status_file: PathBuf,
     slots: Mutex<HashMap<String, Arc<ComputeSlot>>>,
+    /// Pooling is configured on (--pool-size > 0) and possible (computes
+    /// run without SCRAM — with ICEGRES_AUTH_FILE in the environment the
+    /// spawned computes demand credentials icegresd does not have).
+    pool_enabled: bool,
     /// Flipped to `true` exactly once, on daemon shutdown: monitor tasks
     /// then terminate AND REAP their computes (see `monitor_compute`).
     shutdown: tokio::sync::watch::Sender<bool>,
@@ -312,6 +413,7 @@ impl Daemon {
                     generation: AtomicU64::new(0),
                     active: AtomicUsize::new(0),
                     restarts: AtomicU64::new(0),
+                    pool: Pool::new(),
                 })
             })
             .clone()
@@ -326,6 +428,7 @@ impl Daemon {
             v.iter()
                 .map(|s| {
                     let st = s.state.lock().expect("slot state lock poisoned");
+                    let pool_on = self.pool_enabled && !s.pool.disabled.load(Ordering::SeqCst);
                     serde_json::json!({
                         "key": s.key,
                         "branch": s.branch,
@@ -337,6 +440,12 @@ impl Daemon {
                         "spawned_at_epoch_ms": st.spawned_at.map(epoch_ms),
                         "last_exit": st.last_exit,
                         "idle_shutdown_secs": self.args.idle_shutdown_secs,
+                        "pool": {
+                            "size": if pool_on { self.args.pool_size } else { 0 },
+                            "warm": s.pool.warm.load(Ordering::SeqCst),
+                            "pooled_sessions": s.pool.handouts.load(Ordering::SeqCst),
+                            "direct_sessions": s.pool.direct.load(Ordering::SeqCst),
+                        },
                     })
                 })
                 .collect()
@@ -392,14 +501,39 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         "icegresd control plane listening (wake-on-connect; database 'icegres' -> main compute, '<db>@<branch>' -> per-branch compute)"
     );
 
+    // Session pooling needs computes that accept the warm handshake without
+    // credentials; with ICEGRES_AUTH_FILE the spawned computes demand SCRAM
+    // and icegresd cannot answer a client's SCRAM exchange from a cached
+    // greeting — pooling turns itself off (every session goes direct).
+    let auth_env = std::env::var_os("ICEGRES_AUTH_FILE").is_some();
+    let pool_enabled = args.pool_size > 0 && !auth_env;
+    if args.pool_size > 0 && auth_env {
+        warn!(
+            "ICEGRES_AUTH_FILE is set: computes require SCRAM, which icegresd cannot \
+             pre-authenticate — session pooling is DISABLED (all sessions direct)"
+        );
+    } else if pool_enabled {
+        info!(
+            pool_size = args.pool_size,
+            pool_user = %args.pool_user,
+            pool_idle_secs = args.pool_idle_secs,
+            "session pooling enabled (warm spare conns; one client per backend conn, never reused)"
+        );
+    }
+
     let daemon = Arc::new(Daemon {
         args,
         bin,
         status_file,
         slots: Mutex::new(HashMap::new()),
+        pool_enabled,
         shutdown: tokio::sync::watch::channel(false).0,
     });
     daemon.write_status();
+
+    if daemon.pool_enabled {
+        tokio::spawn(pool_idle_drain_loop(daemon.clone()));
+    }
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("failed to install SIGTERM handler")?;
@@ -446,11 +580,13 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 }
 
 /// One client connection end to end: read the startup preamble, route by
-/// database name, wake the target compute if needed, forward the original
-/// startup bytes, splice.
+/// database name, wake the target compute if needed, then either hand out a
+/// WARM pooled backend connection (identity match: replay the cached
+/// greeting, no compute-side handshake) or fall through to a DIRECT compute
+/// connection with the original startup bytes forwarded verbatim; splice.
 async fn handle_client(daemon: Arc<Daemon>, mut client: TcpStream) -> Result<()> {
     let _ = client.set_nodelay(true);
-    let (startup_raw, database) =
+    let startup =
         match tokio::time::timeout(Duration::from_secs(10), read_startup(&mut client)).await {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => {
@@ -460,7 +596,7 @@ async fn handle_client(daemon: Arc<Daemon>, mut client: TcpStream) -> Result<()>
             Err(_) => bail!("timed out waiting for the client startup message"),
         };
 
-    let branch = match route_branch(database.as_deref()) {
+    let branch = match route_branch(startup.database.as_deref()) {
         Ok(b) => b,
         Err(e) => {
             send_pg_error(&mut client, "3D000", &format!("icegresd: {e}")).await;
@@ -483,26 +619,64 @@ async fn handle_client(daemon: Arc<Daemon>, mut client: TcpStream) -> Result<()>
         }
     };
 
-    let compute_addr = format!("{}:{}", daemon.args.compute_host, port);
-    let mut compute = match TcpStream::connect(&compute_addr).await {
-        Ok(c) => c,
-        Err(first_err) => {
-            // The compute may have idle-exited in the instant between the
-            // readiness check and the dial: wake once more.
-            warn!(key = %slot.key, "compute dial failed ({first_err}); re-waking once");
-            let (port, _) = ensure_running(&daemon, &slot).await?;
-            TcpStream::connect(format!("{}:{}", daemon.args.compute_host, port))
+    // Pooled handout requires an exact identity match: same user the pool
+    // warmed with, the slot's canonical database, and no session-shaping
+    // startup parameters (`options`/`replication` change backend behavior
+    // and must reach the compute in the real startup message). Everything
+    // else — including pool exhaustion — overflows to a direct connection.
+    let pool_on = daemon.pool_enabled && !slot.pool.disabled.load(Ordering::SeqCst);
+    let identity_ok = pool_on
+        && startup.user.as_deref() == Some(daemon.args.pool_user.as_str())
+        && startup.database.as_deref() == Some(slot.canonical_db().as_str())
+        && !startup.has_options;
+    let warm = if identity_ok {
+        take_warm(&slot).await
+    } else {
+        None
+    };
+    if pool_on {
+        // Refill in the background: after a handout (replace the spare),
+        // and right after a wake (fill the pool for the sessions to come).
+        tokio::spawn(warm_pool(daemon.clone(), slot.clone()));
+    }
+    slot.pool.touch();
+
+    let (mut compute, pooled) = match warm {
+        Some(w) => {
+            // Warm path: the backend session already exists; bring the
+            // client to ReadyForQuery by replaying the cached greeting.
+            client
+                .write_all(&w.greeting)
                 .await
-                .with_context(|| {
-                    format!("could not dial compute for {} on {compute_addr}", slot.key)
-                })?
+                .context("failed to replay the cached backend greeting to the client")?;
+            slot.pool.handouts.fetch_add(1, Ordering::SeqCst);
+            (w.stream, true)
+        }
+        None => {
+            let compute_addr = format!("{}:{}", daemon.args.compute_host, port);
+            let mut compute = match TcpStream::connect(&compute_addr).await {
+                Ok(c) => c,
+                Err(first_err) => {
+                    // The compute may have idle-exited in the instant between
+                    // the readiness check and the dial: wake once more.
+                    warn!(key = %slot.key, "compute dial failed ({first_err}); re-waking once");
+                    let (port, _) = ensure_running(&daemon, &slot).await?;
+                    TcpStream::connect(format!("{}:{}", daemon.args.compute_host, port))
+                        .await
+                        .with_context(|| {
+                            format!("could not dial compute for {} on {compute_addr}", slot.key)
+                        })?
+                }
+            };
+            let _ = compute.set_nodelay(true);
+            compute
+                .write_all(&startup.raw)
+                .await
+                .context("failed to forward the startup message to the compute")?;
+            slot.pool.direct.fetch_add(1, Ordering::SeqCst);
+            (compute, false)
         }
     };
-    let _ = compute.set_nodelay(true);
-    compute
-        .write_all(&startup_raw)
-        .await
-        .context("failed to forward the startup message to the compute")?;
 
     if woke {
         info!(
@@ -516,20 +690,33 @@ async fn handle_client(daemon: Arc<Daemon>, mut client: TcpStream) -> Result<()>
     daemon.write_status();
     let res = tokio::io::copy_bidirectional(&mut client, &mut compute).await;
     slot.active.fetch_sub(1, Ordering::SeqCst);
+    // A backend connection is NEVER returned to the pool: this client's
+    // session state (SET, prepared statements, transactions) dies with it.
+    slot.pool.touch();
     daemon.write_status();
     // EOF/reset at either end just ends the session; not an icegresd error.
     if let Err(e) = res {
-        info!(key = %slot.key, "splice ended: {e}");
+        info!(key = %slot.key, pooled, "splice ended: {e}");
     }
     Ok(())
 }
 
+/// A parsed client StartupMessage: the raw bytes (length prefix included,
+/// forwarded verbatim on the direct path) plus the parameters the router
+/// and the pool identity check need.
+struct Startup {
+    raw: Vec<u8>,
+    database: Option<String>,
+    user: Option<String>,
+    /// `options` or `replication` present: these shape the backend session
+    /// and must reach the compute in a real startup — never pooled.
+    has_options: bool,
+}
+
 /// Read the pgwire preamble from a fresh client connection, answering
 /// SSLRequest/GSSENCRequest with `N` (plaintext only at the proxy), until
-/// the protocol-3 StartupMessage arrives. Returns the raw startup bytes
-/// (length prefix included, forwarded verbatim to the compute) and the
-/// `database` parameter.
-async fn read_startup(client: &mut TcpStream) -> Result<(Vec<u8>, Option<String>)> {
+/// the protocol-3 StartupMessage arrives.
+async fn read_startup(client: &mut TcpStream) -> Result<Startup> {
     loop {
         let mut lenb = [0u8; 4];
         client
@@ -557,20 +744,30 @@ async fn read_startup(client: &mut TcpStream) -> Result<(Vec<u8>, Option<String>
             }
             _ if code >> 16 == 3 => {
                 let mut database = None;
+                let mut user = None;
+                let mut has_options = false;
                 let mut it = payload[4..].split(|&b| b == 0);
                 while let Some(k) = it.next() {
                     if k.is_empty() {
                         break;
                     }
                     let v = it.next().unwrap_or(&[]);
-                    if k == b"database" {
-                        database = Some(String::from_utf8_lossy(v).into_owned());
+                    match k {
+                        b"database" => database = Some(String::from_utf8_lossy(v).into_owned()),
+                        b"user" => user = Some(String::from_utf8_lossy(v).into_owned()),
+                        b"options" | b"replication" => has_options = true,
+                        _ => {}
                     }
                 }
                 let mut raw = Vec::with_capacity(len);
                 raw.extend_from_slice(&lenb);
                 raw.extend_from_slice(&payload);
-                return Ok((raw, database));
+                return Ok(Startup {
+                    raw,
+                    database,
+                    user,
+                    has_options,
+                });
             }
             _ => bail!("unsupported protocol version {code} (icegresd speaks pgwire 3.x)"),
         }
@@ -759,6 +956,9 @@ async fn monitor_compute(
             Ok(s) => s.to_string(),
             Err(e) => format!("wait error: {e}"),
         };
+        // Whatever the exit was, every pooled conn to this process is dead:
+        // drop them now so no handout has to trip over a corpse.
+        slot.pool.clear().await;
         if matches!(&status, Ok(s) if s.code() == Some(0)) {
             info!(
                 key = %slot.key,
@@ -827,11 +1027,266 @@ async fn monitor_compute(
                     slot.restarts.fetch_add(1, Ordering::SeqCst);
                     daemon.write_status();
                     info!(key = %slot.key, port, restarts = slot.restarts.load(Ordering::SeqCst), "supervised restart succeeded");
+                    if daemon.pool_enabled {
+                        // Re-warm the pool for the fresh process.
+                        tokio::spawn(warm_pool(daemon.clone(), slot.clone()));
+                    }
                     break; // back to waiting on the new child
                 }
                 Err(e) => {
                     error!(key = %slot.key, "supervised restart attempt {attempts} failed: {e:#}");
                 }
+            }
+        }
+    }
+}
+
+/// Pop a live, current-generation warm connection from the slot's pool.
+/// Dead conns (compute exited: EOF/err on a zero-length peek) and stale
+/// conns (older compute generation) are silently discarded.
+async fn take_warm(slot: &Arc<ComputeSlot>) -> Option<WarmConn> {
+    let gen_now = slot.generation.load(Ordering::SeqCst);
+    {
+        let st = slot.state.lock().expect("slot state lock poisoned");
+        if st.phase != Phase::Running {
+            return None;
+        }
+    }
+    let mut conns = slot.pool.conns.lock().await;
+    while let Some(w) = conns.pop_front() {
+        slot.pool.warm.store(conns.len(), Ordering::SeqCst);
+        if w.generation != gen_now {
+            continue;
+        }
+        // Liveness: an idle warm conn must have NOTHING to read. EOF or
+        // stray bytes (e.g. a dying compute's error) mean it is unusable.
+        let mut b = [0u8; 1];
+        match w.stream.try_read(&mut b) {
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => return Some(w),
+            _ => continue,
+        }
+    }
+    None
+}
+
+/// Refill the slot's pool to --pool-size in the background (serialized per
+/// slot). Stops quietly when the compute is not Running, the pool is
+/// idle-eligible for drain, or warming fails transiently; disables pooling
+/// for good if the compute demands authentication.
+async fn warm_pool(daemon: Arc<Daemon>, slot: Arc<ComputeSlot>) {
+    let _guard = slot.pool.warm_lock.lock().await;
+    let mut added = false;
+    loop {
+        if *daemon.shutdown.borrow() || slot.pool.disabled.load(Ordering::SeqCst) {
+            break;
+        }
+        let gen_now = slot.generation.load(Ordering::SeqCst);
+        let port = {
+            let st = slot.state.lock().expect("slot state lock poisoned");
+            if st.phase != Phase::Running {
+                break;
+            }
+            st.port
+        };
+        // Don't refill a pool the idle-drain loop is about to empty.
+        let idle_for = slot
+            .pool
+            .last_client
+            .lock()
+            .expect("pool clock lock poisoned")
+            .elapsed();
+        if slot.active.load(Ordering::SeqCst) == 0
+            && idle_for >= Duration::from_secs(daemon.args.pool_idle_secs)
+        {
+            break;
+        }
+        if slot.pool.conns.lock().await.len() >= daemon.args.pool_size {
+            break;
+        }
+        match tokio::time::timeout(
+            Duration::from_secs(10),
+            warm_one(&daemon, &slot, port, gen_now),
+        )
+        .await
+        {
+            Ok(Ok(w)) => {
+                let mut conns = slot.pool.conns.lock().await;
+                conns.push_back(w);
+                slot.pool.warm.store(conns.len(), Ordering::SeqCst);
+                added = true;
+            }
+            Ok(Err(WarmError::AuthRequired)) => {
+                slot.pool.disabled.store(true, Ordering::SeqCst);
+                warn!(
+                    key = %slot.key,
+                    "compute requires authentication — session pooling DISABLED for this \
+                     compute (icegresd cannot pre-authenticate on a client's behalf); all \
+                     sessions go direct"
+                );
+                break;
+            }
+            Ok(Err(WarmError::Other(e))) => {
+                // Transient (compute idle-exited mid-warm, restarting, ...):
+                // the next wake or handout re-triggers warming.
+                info!(key = %slot.key, "pool warm attempt stopped: {e:#}");
+                break;
+            }
+            Err(_) => {
+                warn!(key = %slot.key, "pool warm handshake timed out");
+                break;
+            }
+        }
+    }
+    if added {
+        daemon.write_status();
+    }
+}
+
+/// Open ONE warm backend connection: TCP connect, send a StartupMessage as
+/// `--pool-user` on the slot's canonical database, and cache the backend's
+/// greeting (AuthenticationOk .. ReadyForQuery) for later replay to the
+/// client this connection is handed to.
+async fn warm_one(
+    daemon: &Arc<Daemon>,
+    slot: &Arc<ComputeSlot>,
+    port: u16,
+    generation: u64,
+) -> Result<WarmConn, WarmError> {
+    let addr = format!("{}:{}", daemon.args.compute_host, port);
+    let mut stream = TcpStream::connect(&addr)
+        .await
+        .with_context(|| format!("pool warm dial to {addr} failed"))
+        .map_err(WarmError::Other)?;
+    let _ = stream.set_nodelay(true);
+
+    // StartupMessage: protocol 3.0 + user/database/application_name.
+    let db = slot.canonical_db();
+    let mut body: Vec<u8> = Vec::with_capacity(64);
+    body.extend_from_slice(&196_608u32.to_be_bytes());
+    for (k, v) in [
+        ("user", daemon.args.pool_user.as_str()),
+        ("database", db.as_str()),
+        ("application_name", "icegresd-pool"),
+    ] {
+        body.extend_from_slice(k.as_bytes());
+        body.push(0);
+        body.extend_from_slice(v.as_bytes());
+        body.push(0);
+    }
+    body.push(0);
+    let mut msg = ((body.len() as u32 + 4).to_be_bytes()).to_vec();
+    msg.extend_from_slice(&body);
+    stream
+        .write_all(&msg)
+        .await
+        .context("pool warm startup write failed")
+        .map_err(WarmError::Other)?;
+
+    // Read backend messages until ReadyForQuery, caching the raw bytes.
+    // First message MUST be AuthenticationOk (type 'R', code 0) — anything
+    // else means the compute wants an auth exchange we cannot cache.
+    let mut greeting: Vec<u8> = Vec::with_capacity(512);
+    let mut first = true;
+    loop {
+        let mut hdr = [0u8; 5];
+        stream
+            .read_exact(&mut hdr)
+            .await
+            .context("compute closed during the pool warm handshake")
+            .map_err(WarmError::Other)?;
+        let ty = hdr[0];
+        let len = u32::from_be_bytes(hdr[1..5].try_into().expect("4-byte slice")) as usize;
+        if !(4..=256 * 1024).contains(&len) {
+            return Err(WarmError::Other(anyhow::anyhow!(
+                "implausible backend message length {len} during warm handshake"
+            )));
+        }
+        let mut payload = vec![0u8; len - 4];
+        stream
+            .read_exact(&mut payload)
+            .await
+            .context("compute closed mid-message during the pool warm handshake")
+            .map_err(WarmError::Other)?;
+        if first {
+            if ty != b'R' || payload.len() < 4 {
+                return Err(WarmError::Other(anyhow::anyhow!(
+                    "warm handshake: expected an Authentication message, got type {:?}",
+                    ty as char
+                )));
+            }
+            let code = u32::from_be_bytes(payload[0..4].try_into().expect("4-byte slice"));
+            if code != 0 {
+                return Err(WarmError::AuthRequired);
+            }
+            first = false;
+        }
+        if ty == b'E' {
+            return Err(WarmError::Other(anyhow::anyhow!(
+                "compute rejected the warm session: {}",
+                String::from_utf8_lossy(&payload)
+            )));
+        }
+        greeting.extend_from_slice(&hdr);
+        greeting.extend_from_slice(&payload);
+        if greeting.len() > 256 * 1024 {
+            return Err(WarmError::Other(anyhow::anyhow!(
+                "warm handshake greeting exceeded 256 KiB without ReadyForQuery"
+            )));
+        }
+        if ty == b'Z' {
+            break;
+        }
+    }
+    Ok(WarmConn {
+        stream,
+        greeting,
+        generation,
+    })
+}
+
+/// Every 2 s: drain the warm pool of any compute that has had zero CLIENT
+/// sessions for --pool-idle-secs. Warm conns are active sessions from the
+/// compute's point of view, so the drain is what re-arms the compute's own
+/// --idle-shutdown-secs scale-to-zero clock; the next wake re-warms.
+async fn pool_idle_drain_loop(daemon: Arc<Daemon>) {
+    let mut shutdown = daemon.shutdown.subscribe();
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+            _ = shutdown.changed() => return,
+        }
+        let slots: Vec<Arc<ComputeSlot>> = {
+            let slots = daemon.slots.lock().expect("slots lock poisoned");
+            slots.values().cloned().collect()
+        };
+        for slot in slots {
+            if slot.active.load(Ordering::SeqCst) != 0 {
+                continue;
+            }
+            let idle_for = slot
+                .pool
+                .last_client
+                .lock()
+                .expect("pool clock lock poisoned")
+                .elapsed();
+            if idle_for < Duration::from_secs(daemon.args.pool_idle_secs) {
+                continue;
+            }
+            let drained = {
+                let mut conns = slot.pool.conns.lock().await;
+                let n = conns.len();
+                conns.clear();
+                slot.pool.warm.store(0, Ordering::SeqCst);
+                n
+            };
+            if drained > 0 {
+                info!(
+                    key = %slot.key,
+                    drained,
+                    idle_secs = idle_for.as_secs(),
+                    "pool idle-drained; the compute's idle-shutdown clock can now run"
+                );
+                daemon.write_status();
             }
         }
     }

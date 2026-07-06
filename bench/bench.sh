@@ -328,8 +328,11 @@ if [[ -x "$DBIN" ]]; then
   stop_icegresd_pidfile
   rm -f "$PROXY_STATUS"
   : >"$RUN_DIR/bench-icegresd.log"
+  # --pool-size 0: this section measures the BARE wake-after-idle path; a
+  # warm pool would hold sessions on the compute and block the idle exit
+  # each iteration waits for (the pooled path is section 4d).
   "$DBIN" serve --host "$PG_HOST" --port "$PROXY_PORT" --main-port "$PROXY_COMPUTE" \
-    --icegres-bin "$BIN" --idle-shutdown-secs 1 --status-file "$PROXY_STATUS" \
+    --icegres-bin "$BIN" --idle-shutdown-secs 1 --pool-size 0 --status-file "$PROXY_STATUS" \
     >>"$RUN_DIR/bench-icegresd.log" 2>&1 &
   echo $! >"$RUN_DIR/bench-icegresd.pid"
   proxy_up=0
@@ -365,6 +368,59 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 4d. Session-pooled proxy metrics (ADDITIONAL, ungated): a fresh icegresd
+#     with the DEFAULT warm session pool (--pool-size 8). One priming
+#     connection wakes the compute and triggers pool warming, then the
+#     harness --proxy subset measures:
+#       connect_via_proxy_ms  — client connect -> ReadyForQuery via a WARM
+#                               pooled handout (the API-workload connect;
+#                               compare cold_start_via_proxy_ms above)
+#       qps_via_proxy_8conn   — the qps_8conn workload through the proxy
+#                               (splice overhead evidence vs direct qps_8conn)
+#     The gated direct-serve metrics are unaffected.
+# ---------------------------------------------------------------------------
+if [[ -x "$DBIN" ]]; then
+  log "measuring pooled-proxy metrics (icegresd on :$PROXY_PORT, warm pool, compute :$PROXY_COMPUTE)"
+  if port_answers "$PROXY_PORT" || port_answers "$PROXY_COMPUTE"; then
+    fatal "port :$PROXY_PORT or :$PROXY_COMPUTE is occupied — free it first"
+  fi
+  stop_icegresd_pidfile
+  rm -f "$PROXY_STATUS"
+  "$DBIN" serve --host "$PG_HOST" --port "$PROXY_PORT" --main-port "$PROXY_COMPUTE" \
+    --icegres-bin "$BIN" --idle-shutdown-secs 300 --pool-size 8 --pool-idle-secs 300 \
+    --status-file "$PROXY_STATUS" \
+    >>"$RUN_DIR/bench-icegresd.log" 2>&1 &
+  echo $! >"$RUN_DIR/bench-icegresd.pid"
+  proxy_up=0
+  for _ in $(seq 1 40); do
+    if (exec 3<>"/dev/tcp/$PG_HOST/$PROXY_PORT") 2>/dev/null; then exec 3>&- 3<&-; proxy_up=1; break; fi
+    sleep 0.25
+  done
+  [[ "$proxy_up" == 1 ]] || fatal "icegresd (pooled) not listening on :$PROXY_PORT"
+  # Prime: first connection wakes the compute and kicks off pool warming.
+  port_answers "$PROXY_PORT" || fatal "priming connection through the pooled proxy failed"
+  pool_warm=0
+  for _ in $(seq 1 40); do
+    w=$(jq -r '.computes[] | select(.key=="main") | .pool.warm' "$PROXY_STATUS" 2>/dev/null)
+    if [[ "$w" == 8 ]]; then pool_warm=1; break; fi
+    sleep 0.25
+  done
+  [[ "$pool_warm" == 1 ]] || fatal "pool did not warm to 8 conns (warm=$w)"
+
+  PROXY_JSON="$RUN_DIR/bench-proxy.json"
+  "$HARNESS_BIN" --host "$PG_HOST" --port "$PROXY_PORT" --proxy >"$PROXY_JSON" \
+    || { tail -n 20 "$RUN_DIR/bench-icegresd.log" >&2; fatal "proxy bench harness failed"; }
+  pooled_sessions=$(jq -r '.computes[] | select(.key=="main") | .pool.pooled_sessions' "$PROXY_STATUS")
+  stop_icegresd_pidfile
+  jq -s --argjson ps "${pooled_sessions:-null}" \
+    '.[0] * {metrics: (.[0].metrics + .[1].metrics), proxy_pooled_sessions: $ps}' \
+    "$OUT_JSON" "$PROXY_JSON" >"$OUT_JSON.tmp" && mv "$OUT_JSON.tmp" "$OUT_JSON"
+  log "pooled-proxy metrics merged (pooled sessions served: ${pooled_sessions:-?})"
+else
+  log "icegresd release binary not found at $DBIN — skipping pooled-proxy metrics"
+fi
+
+# ---------------------------------------------------------------------------
 # 5. Append human table to SCORECARD.md
 # ---------------------------------------------------------------------------
 if [[ ! -f "$SCORECARD" ]]; then
@@ -395,7 +451,7 @@ fi
     def row(name; m):
       if m == null then empty
       elif (m | has("p50")) then "| \(name) | \(m.p50) | \(m.p95) | n=\(m.n) |"
-      elif name == "qps_8conn" then "| \(name) | \(m.value) | — | median of \(m.windows // [] | map(tostring) | join(", ")) (\(m.connections) conns, \(m.window_s)s windows) |"
+      elif (name == "qps_8conn" or name == "qps_via_proxy_8conn") then "| \(name) | \(m.value) | — | median of \(m.windows // [] | map(tostring) | join(", ")) (\(m.connections) conns, \(m.window_s)s windows) |"
       elif name == "rss_peak_mb" then "| \(name) | \(m.value) | — | qps-window peak \(m.qps_window_peak_mb // "—") MB, \(m.samples // "?") samples @ \(m.interval_ms // "?")ms |"
       else "| \(name) | \(m.value) | — | |"
       end;
@@ -403,7 +459,8 @@ fi
     ( ["connect_ms","point_lookup_ms","filtered_scan_ms","aggregate_ms","join_ms",
        "insert_single_ms","insert_batch100_ms","freshness_ms","qps_8conn",
        "cold_start_ms","binary_size_mb","rss_idle_mb","rss_peak_mb","rss_after_load_mb",
-       "insert_single_buffered_ms","freshness_buffered_ms","cold_start_via_proxy_ms"][] ) as $k |
+       "insert_single_buffered_ms","freshness_buffered_ms","cold_start_via_proxy_ms",
+       "connect_via_proxy_ms","qps_via_proxy_8conn"][] ) as $k |
     row($k; $m[$k])
   ' "$OUT_JSON"
 } >>"$SCORECARD"

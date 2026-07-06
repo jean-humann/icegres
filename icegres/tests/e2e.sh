@@ -851,8 +851,11 @@ done
 
 : >"$PXY_LOG"
 rm -f "$PXY_STATUS"
+# --pool-size 0: n1-n6 test the BARE wake/splice/supervision path (a warm
+# pool would hold sessions on the compute and mask the idle exits n2/n3
+# assert on); the session pool gets its own section n7 below.
 "$DBIN" serve --host "$PG_HOST" --port "$PXY_PORT" --main-port "$PXY_MAIN" \
-  --icegres-bin "$BIN" --idle-shutdown-secs 2 --status-file "$PXY_STATUS" \
+  --icegres-bin "$BIN" --idle-shutdown-secs 2 --pool-size 0 --status-file "$PXY_STATUS" \
   >>"$PXY_LOG" 2>&1 &
 echo $! >"$E2E_DIR/icegresd.pid"
 pxy_up=0
@@ -966,6 +969,113 @@ if psql -h "$PG_HOST" -p "$PXY_MAIN" -U postgres -d icegres -tA -c 'select 1' >/
 fi
 pass "icegresd shutdown terminated its computes (no leftovers)"
 "$BIN" branch drop demo.trips "$PXY_BRANCH" >/dev/null 2>&1 || true
+
+# n7: SESSION POOLING — a fresh icegresd with a warm pool (--pool-size 4,
+#     --pool-idle-secs 3). Contract under test:
+#       * many short-lived sequential client connections (the API pattern)
+#         are all served, most from WARM pooled conns (no compute-side
+#         handshake);
+#       * session state does NOT leak between clients — every warm conn
+#         serves exactly ONE client session and dies with it (SET and an
+#         abandoned transaction from one session are invisible to the next);
+#       * overflow: identity-mismatched clients (different user) go DIRECT
+#         and still work;
+#       * scale-to-zero survives pooling: with no clients the pool
+#         idle-drains, the compute idle-exits, and the next connection
+#         re-wakes AND re-warms.
+log "(n7) icegresd session pooling on :$PXY_PORT (pool 4, pool-idle 3s, compute idle 2s)"
+: >"$PXY_LOG"
+rm -f "$PXY_STATUS"
+"$DBIN" serve --host "$PG_HOST" --port "$PXY_PORT" --main-port "$PXY_MAIN" \
+  --icegres-bin "$BIN" --idle-shutdown-secs 2 --pool-size 4 --pool-idle-secs 3 \
+  --status-file "$PXY_STATUS" >>"$PXY_LOG" 2>&1 &
+echo $! >"$E2E_DIR/icegresd.pid"
+pxy_up=0
+for _ in $(seq 1 40); do
+  if (exec 3<>"/dev/tcp/$PG_HOST/$PXY_PORT") 2>/dev/null; then exec 3>&- 3<&-; pxy_up=1; break; fi
+  sleep 0.25
+done
+[[ "$pxy_up" == 1 ]] || { tail -n 20 "$PXY_LOG" >&2; fail "pooled icegresd not listening on :$PXY_PORT"; }
+
+# n7a: the first connection wakes the compute (direct — pool still empty)
+#      and triggers background warming to --pool-size.
+assert_eq "first pooled-proxy connection wakes the compute and answers" 1 \
+  "$("${PXQ[@]}" -c 'select 1')"
+pool_warm=0
+for _ in $(seq 1 40); do
+  if [[ "$(pxy_status main .pool.warm)" == 4 ]]; then pool_warm=1; break; fi
+  sleep 0.25
+done
+[[ "$pool_warm" == 1 ]] || { tail -n 20 "$PXY_LOG" >&2; fail "pool did not warm to 4 (warm=$(pxy_status main .pool.warm))"; }
+pass "pool warmed to 4 spare backend conns after the wake"
+
+# n7b: API pattern — 15 short-lived sequential client connections, all
+#      served; the bulk must have come from warm pooled handouts.
+pooled_before=$(pxy_status main .pool.pooled_sessions)
+for i in $(seq 1 15); do
+  r=$("${PXQ[@]}" -c 'select 1' 2>&1)
+  [[ "$r" == 1 ]] || fail "pooled sequential connection $i failed: $r"
+done
+pooled_after=$(pxy_status main .pool.pooled_sessions)
+(( pooled_after - pooled_before >= 10 )) \
+  || fail "expected >=10 of 15 sequential sessions to be pooled handouts (got $((pooled_after - pooled_before)); status: $(cat "$PXY_STATUS"))"
+pass "15 sequential short-lived connections served ($((pooled_after - pooled_before)) from the warm pool, rest direct overflow)"
+
+# n7c: session isolation — SET in one client session is invisible to the
+#      next (a warm conn serves exactly one client; no reuse).
+assert_eq "SET applies inside its own pooled session" "5555ms" \
+  "$("${PXQ[@]}" -c 'SET statement_timeout = 5555' -c 'SHOW statement_timeout' | tail -n 1)"
+assert_eq "SET does NOT leak into the next pooled session" "0" \
+  "$("${PXQ[@]}" -c 'SHOW statement_timeout')"
+
+# n7d: session isolation — an abandoned transaction (BEGIN + INSERT, then
+#      disconnect without COMMIT) is rolled back with its session and its
+#      row is invisible to the next client.
+N7_ID=956789
+"${PXQ[@]}" -c 'BEGIN' -c "insert into demo.trips (trip_id, city, distance_km, fare, ts)
+  values ($N7_ID, 'E2E PoolIso', 1.0, 5.0, TIMESTAMP '2026-07-06 00:00:00')" >/dev/null 2>&1 \
+  || fail "BEGIN+INSERT in pooled session failed"
+assert_eq "abandoned txn from the previous pooled session is invisible (implicit rollback)" 0 \
+  "$("${PXQ[@]}" -c "select count(*) from demo.trips where trip_id = $N7_ID")"
+
+# n7e: identity mismatch overflows to a direct connection and still works.
+direct_before=$(pxy_status main .pool.direct_sessions)
+assert_eq "client with a different user bypasses the pool and answers" 1 \
+  "$(psql -h "$PG_HOST" -p "$PXY_PORT" -U pool_bypass_user -d icegres -tA -c 'select 1')"
+direct_after=$(pxy_status main .pool.direct_sessions)
+(( direct_after > direct_before )) \
+  || fail "different-user session was not counted as direct ($direct_before -> $direct_after)"
+pass "different-user client served via direct (non-pooled) connection"
+
+# n7f: scale-to-zero with pooling — no clients for --pool-idle-secs drains
+#      the warm pool, which frees the compute to idle-exit as usual.
+drained=0
+for _ in $(seq 1 60); do
+  if [[ "$(pxy_status main .pool.warm)" == 0 && "$(pxy_status main .state)" == "stopped" ]]; then
+    drained=1; break
+  fi
+  sleep 0.25
+done
+[[ "$drained" == 1 ]] \
+  || fail "pool did not drain / compute did not idle-exit (warm=$(pxy_status main .pool.warm), state=$(pxy_status main .state))"
+pass "pool idle-drained and the compute idle-exited (scale-to-zero preserved under pooling)"
+
+# n7g: the next connection re-wakes the compute and re-warms the pool.
+assert_eq "connection after drain re-wakes the compute" 1 "$("${PXQ[@]}" -c 'select 1')"
+rewarmed=0
+for _ in $(seq 1 40); do
+  if [[ "$(pxy_status main .pool.warm)" == 4 ]]; then rewarmed=1; break; fi
+  sleep 0.25
+done
+[[ "$rewarmed" == 1 ]] || fail "pool did not re-warm after the wake (warm=$(pxy_status main .pool.warm))"
+pass "wake after drain re-warmed the pool"
+
+stop_icegresd
+sleep 0.5
+if psql -h "$PG_HOST" -p "$PXY_MAIN" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+  fail "compute port :$PXY_MAIN still answering after pooled icegresd shutdown"
+fi
+pass "pooled icegresd shutdown terminated its computes (no leftovers)"
 
 # ---------------------------------------------------------------------------
 # (o) real ORM/driver clients — SPEC A8 (bench/clients/a8_orm_probe.py)

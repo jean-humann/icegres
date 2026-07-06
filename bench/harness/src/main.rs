@@ -64,6 +64,11 @@ struct Args {
     /// --write-buffer-ms > 0 (bench.sh runs this as a SEPARATE server run;
     /// the gated default-mode metrics are untouched).
     buffered: bool,
+    /// Proxy-mode subset: measure ONLY connect_via_proxy_ms and
+    /// qps_via_proxy_8conn against an icegresd endpoint with a WARM session
+    /// pool (bench.sh section 4d runs this against its own icegresd; the
+    /// gated direct-serve metrics are untouched).
+    proxy: bool,
 }
 
 fn parse_args() -> Args {
@@ -73,6 +78,7 @@ fn parse_args() -> Args {
     let mut server_pid = None;
     let mut cold_port = 5442u16;
     let mut buffered = false;
+    let mut proxy = false;
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < argv.len() {
@@ -90,11 +96,15 @@ fn parse_args() -> Args {
                 buffered = true;
                 i -= 1; // flag takes no value
             }
+            "--proxy" => {
+                proxy = true;
+                i -= 1; // flag takes no value
+            }
             other => panic!("unknown argument: {other}"),
         }
         i += 2;
     }
-    if server_bin.is_empty() && !buffered {
+    if server_bin.is_empty() && !buffered && !proxy {
         panic!("--server-bin is required (release icegres binary path)");
     }
     Args {
@@ -104,6 +114,7 @@ fn parse_args() -> Args {
         server_pid,
         cold_port,
         buffered,
+        proxy,
     }
 }
 
@@ -514,11 +525,56 @@ async fn run_buffered(args: &Args) {
     println!("{}", serde_json::to_string_pretty(&out).unwrap());
 }
 
+/// Proxy-mode subset (ADDITIONAL, ungated): the API-workload story through
+/// icegresd with a WARM session pool. connect_via_proxy_ms is client TCP
+/// connect -> ReadyForQuery through the proxy (a warm pooled handout skips
+/// the compute-side handshake entirely; compare cold_start_via_proxy_ms for
+/// the same connect after an idle-exit). qps_via_proxy_8conn is the direct
+/// qps_8conn workload pointed at the proxy — evidence the splice does not
+/// tax steady-state throughput.
+async fn run_proxy(args: &Args) {
+    let mut metrics = Map::new();
+
+    let s = summarize(measure_connect(&args.host, args.port).await);
+    eprint_metric("connect_via_proxy_ms", &s);
+    metrics.insert("connect_via_proxy_ms".into(), s);
+
+    let (qps, windows) = measure_qps(&args.host, args.port).await;
+    let s = json!({
+        "value": round2(qps),
+        "windows": windows,
+        "window_s": QPS_WINDOW_S,
+        "connections": QPS_CONNS,
+        "aggregation": "median of 3 consecutive windows",
+    });
+    eprint_metric("qps_via_proxy_8conn", &s);
+    metrics.insert("qps_via_proxy_8conn".into(), s);
+
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let out = json!({
+        "schema": "icegres-bench-proxy-v1",
+        "unix_ts": ts,
+        "host": args.host,
+        "port": args.port,
+        "warmup_discarded": WARMUP,
+        "iterations": ITERS,
+        "metrics": Value::Object(metrics),
+    });
+    println!("{}", serde_json::to_string_pretty(&out).unwrap());
+}
+
 #[tokio::main]
 async fn main() {
     let args = parse_args();
     if args.buffered {
         run_buffered(&args).await;
+        return;
+    }
+    if args.proxy {
+        run_proxy(&args).await;
         return;
     }
     let mut metrics = Map::new();
