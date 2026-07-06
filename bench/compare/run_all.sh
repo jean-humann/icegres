@@ -38,12 +38,15 @@ engine_procs() {  # $1 = cmdline regex
   for pid in $(pgrep -f "$1" 2>/dev/null); do
     comm=$(cat "/proc/$pid/comm" 2>/dev/null) || continue
     case "$comm" in
-      java|trino-server|flightsql-serve*|icegres) echo "$pid $comm" ;;
+      java|trino-server|icegres) echo "$pid $comm" ;;
     esac
   done
 }
 
-ANY_ENGINE='trino-server|HiveThriftServer2|flightsql-server|icegres serve'
+# NOTE the flightsql engine is `icegres flight-serve` (same binary as the
+# icegres engine, different wire protocol); "icegres serve" does NOT match
+# its cmdline ("icegres flight-serve") so the two stay distinguishable.
+ANY_ENGINE='trino-server|HiveThriftServer2|icegres flight-serve|icegres serve'
 SCRATCH_ENGINES="${SCRATCH_ENGINES:-/tmp/claude-0/-home-user-jean-humann/917b2dd2-1f49-560f-8a42-71e5677bbc01/scratchpad/engines}"
 
 # Poll until the engine answers a real client query (SELECT 1 over its own
@@ -68,7 +71,7 @@ rss_now_mb() {  # $1 = pid -> current VmRSS in MB
 footprint() {
   case "$1" in
     icegres)   du -h "$ICEGRES_BIN" | cut -f1 ;;
-    flightsql) du -h "$REPO_DIR/icegres/target/release/flightsql-server" | cut -f1 ;;
+    flightsql) du -h "$ICEGRES_BIN" | cut -f1 ;;  # same binary, flight-serve subcommand
     trino)     du -sh "$SCRATCH_ENGINES/trino" 2>/dev/null | cut -f1 ;;
     spark)     du -sh "$SCRATCH_ENGINES/spark" 2>/dev/null | cut -f1 ;;
   esac
@@ -132,7 +135,7 @@ stop_engine() {
     icegres)   pat='icegres serve' ;;
     trino)     pat='trino-server' ;;
     spark)     pat='HiveThriftServer2' ;;
-    flightsql) pat='flightsql-server' ;;
+    flightsql) pat='icegres flight-serve' ;;
   esac
   for _ in $(seq 1 30); do
     [ -z "$(engine_procs "$pat")" ] && return 0

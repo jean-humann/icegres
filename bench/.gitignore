@@ -2,3 +2,7 @@
 # NOTE: bench/results/ *is* committed by design; harness/target/ is ignored
 # via bench/harness/.gitignore.
 /.run/
+# JDBC driver jars + compiled probe classes (downloaded/built on demand by
+# bench/clients/a9_jdbc_probe.sh) — never committed (the Flight SQL driver
+# alone is ~47 MB).
+/clients/jars/

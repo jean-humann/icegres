@@ -30,6 +30,9 @@ pass criteria, verdict, evidence line.
 | A5 | multiple concurrent connections | 8 parallel psql SELECTs all succeed |
 | A6 | server-side auth | against a server started with `--auth-file`: right password accepted, wrong password AND unknown user rejected (SCRAM-SHA-256) |
 | A7 | TLS | against a server started with `--tls-cert/--tls-key`: `sslmode=require` + `verify-full` succeed AND `openssl s_client -starttls postgres` proves the handshake (listener also accepts plaintext, like stock Postgres — clients enforce via sslmode) |
+| A8 | ORM/driver compatibility | `bench/clients/a8_orm_probe.py`: SQLAlchemy 2.x `inspect()`/reflection, psycopg2 + pg8000 queries and transactions, pandas `read_sql` join — all `fail=0` |
+| A9 | JDBC compatibility | `bench/clients/a9_jdbc_probe.sh`: stock pgjdbc `DatabaseMetaData.getTables/getColumns`, `Statement`, `PreparedStatement` with typed parameters, `executeUpdate` INSERT (proper `INSERT 0 n` tag on the extended protocol), `setAutoCommit(false)` commit/rollback — all `fail=0` |
+| A11 | ADBC first-class | `bench/clients/a11_adbc_probe.py` against `icegres flight-serve` (Arrow Flight SQL) + `icegres serve`: adbc_driver_flightsql query/`get_objects`/prepared `$n` binds/DML affected counts/BULK INGEST landing as ONE Iceberg commit; adbc_driver_postgresql reads over `COPY ... TO STDOUT (FORMAT binary)`, params, DML — all `fail=0` |
 
 ### Area B — OLTP semantics (Lakebase bar: real Postgres OLTP)
 | id | behavior | probe sketch |

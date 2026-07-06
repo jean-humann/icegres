@@ -167,6 +167,8 @@ cleanup() {
   stop_pidfile_generic "$PK_PID_FILE"
   stop_pidfile_generic "$E2E_DIR/serve-buffered.pid"
   stop_pidfile_generic "$E2E_DIR/serve-branch.pid"
+  stop_pidfile_generic "$E2E_DIR/flight.pid"
+  stop_pidfile_generic "$E2E_DIR/flight-secure.pid"
   stop_icegresd
 }
 trap cleanup EXIT
@@ -1099,6 +1101,106 @@ else
   echo "$A8_OUT" | grep -q '^A8 RESULT: .*fail=0' \
     || fail "A8 ORM/driver probe summary is not fail=0"
   pass "ORM/driver clients green ($(echo "$A8_OUT" | grep '^A8 RESULT:'))"
+fi
+
+# ---------------------------------------------------------------------------
+# (p) ADBC first-class — SPEC A11 (bench/clients/a11_adbc_probe.py)
+# ---------------------------------------------------------------------------
+# Two lanes: (1) `icegres flight-serve` (Arrow Flight SQL, adbc_driver_
+# flightsql): query/metadata/prepared+bind/DML counts/BULK INGEST (one
+# Iceberg commit per stream, asserted via $snapshots) + basic-auth variants
+# against a second flight server with --auth-file; (2) adbc_driver_
+# postgresql against the main pgwire server (COPY ... TO STDOUT binary
+# reads, params, get_objects, DML). The probe's writes use trip_id >=
+# 940000 / demo.adbc_ingest and clean up; two documented XFAILs inside the
+# probe (pg-lane COPY FROM ingest, in-transaction extended SELECT).
+FLIGHT_PORT=50051
+FLIGHT_SECURE_PORT=50052
+FLIGHT_PID_FILE="$E2E_DIR/flight.pid"
+FLIGHT_SECURE_PID_FILE="$E2E_DIR/flight-secure.pid"
+
+flight_port_open() { # $1 = port
+  python3 -c "import socket,sys; s=socket.socket(); s.settimeout(0.3);
+sys.exit(0 if s.connect_ex(('127.0.0.1', $1))==0 else 1)" 2>/dev/null
+}
+
+log "(p) ADBC probe: flight-serve on :$FLIGHT_PORT (+auth on :$FLIGHT_SECURE_PORT), pgwire COPY lane on :$PG_PORT"
+if ! command -v python3 >/dev/null 2>&1 \
+    || ! python3 -c 'import adbc_driver_flightsql, adbc_driver_postgresql, pyarrow' 2>/dev/null; then
+  log "    SKIPPED: python3 with ADBC drivers not available" \
+      "(pip install adbc-driver-flightsql adbc-driver-postgresql pyarrow)"
+else
+  stop_pidfile_generic "$FLIGHT_PID_FILE"
+  stop_pidfile_generic "$FLIGHT_SECURE_PID_FILE"
+  if flight_port_open "$FLIGHT_PORT"; then
+    fail "something is already listening on :$FLIGHT_PORT — stop it first (not started by this harness)"
+  fi
+  "$BIN" flight-serve --host 127.0.0.1 --port "$FLIGHT_PORT" \
+    >"$E2E_DIR/flight.log" 2>&1 &
+  echo $! >"$FLIGHT_PID_FILE"
+  printf 'e2e_flight_user:e2e-flight-pw\n' >"$E2E_DIR/flight-auth.conf"
+  "$BIN" flight-serve --host 127.0.0.1 --port "$FLIGHT_SECURE_PORT" \
+    --auth-file "$E2E_DIR/flight-auth.conf" >"$E2E_DIR/flight-secure.log" 2>&1 &
+  echo $! >"$FLIGHT_SECURE_PID_FILE"
+  for _ in $(seq 1 60); do
+    flight_port_open "$FLIGHT_PORT" && flight_port_open "$FLIGHT_SECURE_PORT" && break
+    if ! kill -0 "$(cat "$FLIGHT_PID_FILE")" 2>/dev/null \
+        || ! kill -0 "$(cat "$FLIGHT_SECURE_PID_FILE")" 2>/dev/null; then
+      tail -n 20 "$E2E_DIR/flight.log" "$E2E_DIR/flight-secure.log" >&2
+      fail "icegres flight-serve exited during startup"
+    fi
+    sleep 0.5
+  done
+  flight_port_open "$FLIGHT_PORT" || fail "flight-serve did not open :$FLIGHT_PORT in 30s"
+  flight_port_open "$FLIGHT_SECURE_PORT" || fail "flight-serve (auth) did not open :$FLIGHT_SECURE_PORT in 30s"
+  pass "flight-serve up on :$FLIGHT_PORT and :$FLIGHT_SECURE_PORT (basic auth)"
+
+  A11_OUT=$(env ICEGRES_PROBE_FLIGHT_HOST=127.0.0.1 \
+      ICEGRES_PROBE_FLIGHT_PORT="$FLIGHT_PORT" \
+      ICEGRES_PROBE_FLIGHT_SECURE_PORT="$FLIGHT_SECURE_PORT" \
+      ICEGRES_PROBE_FLIGHT_SECURE_USER=e2e_flight_user \
+      ICEGRES_PROBE_FLIGHT_SECURE_PASSWORD=e2e-flight-pw \
+      ICEGRES_PROBE_PG_HOST="$PG_HOST" ICEGRES_PROBE_PG_PORT="$PG_PORT" \
+      python3 "$REPO_DIR/bench/clients/a11_adbc_probe.py" 2>&1) \
+    || { echo "$A11_OUT" | tail -n 25 >&2; fail "A11 ADBC probe reported failures"; }
+  echo "$A11_OUT" | sed 's/^/    /'
+  echo "$A11_OUT" | grep -q '^A11 RESULT: .*fail=0' \
+    || fail "A11 ADBC probe summary is not fail=0"
+  echo "$A11_OUT" | grep -q '^PASS flight: basic auth handshake' \
+    || fail "A11 basic-auth step did not run/pass (secure server env was set)"
+  pass "ADBC first-class green ($(echo "$A11_OUT" | grep '^A11 RESULT:'))"
+
+  stop_pidfile_generic "$FLIGHT_PID_FILE"
+  stop_pidfile_generic "$FLIGHT_SECURE_PID_FILE"
+  pass "flight-serve servers stopped"
+fi
+
+# ---------------------------------------------------------------------------
+# (q) JDBC client — SPEC A9 (bench/clients/a9_jdbc_probe.sh)
+# ---------------------------------------------------------------------------
+# Runs the pgjdbc compatibility probe (DriverManager connect with pgjdbc's
+# startup parameters, DatabaseMetaData getTables/getColumns of demo,
+# Statement + PreparedStatement with typed parameters, executeUpdate INSERT
+# with a proper `INSERT 0 n` tag on the extended protocol, and a
+# setAutoCommit(false) rollback/commit cycle) against the main server. The
+# probe's writes use trip_id >= 940000 and clean up after themselves. Skips
+# gracefully when no JDK is installed (exit 3 from the wrapper).
+log "(q) JDBC client probe (bench/clients/a9_jdbc_probe.sh)"
+if ! command -v java >/dev/null 2>&1 || ! command -v javac >/dev/null 2>&1; then
+  log "    SKIPPED: java/javac not available (apt install openjdk-21-jdk-headless)"
+else
+  A9_OUT=$(env ICEGRES_PROBE_HOST="$PG_HOST" ICEGRES_PROBE_PORT="$PG_PORT" \
+      bash "$REPO_DIR/bench/clients/a9_jdbc_probe.sh" 2>&1)
+  A9_RC=$?
+  if [[ $A9_RC -eq 3 ]]; then
+    log "    SKIPPED: $(echo "$A9_OUT" | tail -n 1)"
+  else
+    echo "$A9_OUT" | sed 's/^/    /'
+    [[ $A9_RC -eq 0 ]] || fail "A9 JDBC probe reported failures (exit $A9_RC)"
+    echo "$A9_OUT" | grep -q '^A9 RESULT: .*fail=0' \
+      || fail "A9 JDBC probe summary is not fail=0"
+    pass "JDBC client green ($(echo "$A9_OUT" | grep '^A9 RESULT:'))"
+  fi
 fi
 
 # ---------------------------------------------------------------------------

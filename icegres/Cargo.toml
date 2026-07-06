@@ -33,6 +33,15 @@ datafusion-postgres = "=0.15.0"
 # Arrow — must stay on 57.x to match datafusion 52 / iceberg 0.9.1
 arrow = "=57.3.1"
 
+# Arrow Flight SQL endpoint (`icegres flight-serve`, SPEC A11): the ADBC
+# first-class surface. arrow-flight 57.3.1 matches arrow 57.3.1 and pulls
+# tonic 0.14 / prost 0.14 (gRPC transport; both listed so flight.rs can name
+# their types). base64 decodes the Basic auth handshake header.
+arrow-flight = { version = "=57.3.1", features = ["flight-sql"] }
+tonic = "0.14"
+prost = "0.14"
+base64 = "0.22"
+
 # Trimmed from "full" to exactly what icegres uses: #[tokio::main] +
 # select!/spawn (rt-multi-thread, macros), TcpListener (net), Async{Read,Write}Ext
 # (io-util), time::sleep (time). "process" + "signal" exist for icegresd

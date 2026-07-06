@@ -421,6 +421,138 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 4e. ADBC extras (ADDITIONAL, ungated): `icegres flight-serve` on
+#     :$FLIGHT_PORT measured with adbc_driver_flightsql (the real client):
+#       adbc_bulk_ingest_100k_rows_s — cursor.adbc_ingest of 100k rows into a
+#         freshly re-created demo.adbc_ingest (ONE Iceberg commit per run;
+#         table dropped+reseeded between runs so file-count drift cannot
+#         accumulate). Honest comparison: insert_batch100_ms above pushes 100
+#         rows/commit through a multi-row INSERT on pgwire — bulk ingest
+#         streams Arrow straight into the Parquet writer.
+#       adbc_query_point_ms / adbc_query_bigfilter_ms — point lookup on
+#         demo.trips and a 5M-row filter+aggregate on demo.trips_big via
+#         GetFlightInfo→DoGet (compare point_lookup_ms/pgwire).
+#     The gated metrics above are unaffected (their server is stopped).
+# ---------------------------------------------------------------------------
+FLIGHT_PORT=50051
+drop_adbc_ingest() {
+  local prefix; prefix=$(catalog_prefix)
+  curl -sf -X DELETE \
+    "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/adbc_ingest?purgeRequested=true" \
+    >/dev/null 2>&1 || true
+}
+if ! python3 -c 'import adbc_driver_flightsql, pyarrow' 2>/dev/null; then
+  log "python ADBC flight driver not available — skipping ADBC extras"
+else
+  log "measuring ADBC extras (icegres flight-serve on :$FLIGHT_PORT)"
+  if python3 -c "import socket,sys; s=socket.socket(); s.settimeout(0.3);
+sys.exit(0 if s.connect_ex(('127.0.0.1', $FLIGHT_PORT))==0 else 1)" 2>/dev/null; then
+    fatal "port :$FLIGHT_PORT is occupied — free it first"
+  fi
+  # Fresh empty ingest target with a canonical layout (see drift note above).
+  drop_adbc_ingest
+  "$BIN" seed >>"$RUN_DIR/bench-flight.log" 2>&1 || fatal "icegres seed (adbc_ingest) failed"
+  "$BIN" flight-serve --host "$PG_HOST" --port "$FLIGHT_PORT" \
+    >>"$RUN_DIR/bench-flight.log" 2>&1 &
+  echo $! >"$RUN_DIR/bench-flight.pid"
+  flight_up=0
+  for _ in $(seq 1 60); do
+    if python3 -c "import socket,sys; s=socket.socket(); s.settimeout(0.3);
+sys.exit(0 if s.connect_ex(('127.0.0.1', $FLIGHT_PORT))==0 else 1)" 2>/dev/null; then
+      flight_up=1; break
+    fi
+    sleep 0.5
+  done
+  [[ "$flight_up" == 1 ]] || fatal "icegres flight-serve not listening on :$FLIGHT_PORT"
+
+  ADBC_JSON="$RUN_DIR/bench-adbc.json"
+  FLIGHT_PORT="$FLIGHT_PORT" OUT="$ADBC_JSON" python3 - <<'PYEOF' \
+    || { tail -n 20 "$RUN_DIR/bench-flight.log" >&2; fatal "ADBC extras failed"; }
+import json, os, statistics, time, warnings
+warnings.filterwarnings("ignore")
+import adbc_driver_flightsql.dbapi as fs
+import pyarrow as pa
+
+port = os.environ["FLIGHT_PORT"]
+conn = fs.connect(f"grpc://127.0.0.1:{port}")
+cur = conn.cursor()
+
+def pctl(xs, q):
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, int(len(xs) * q))]
+
+def timed_query(sql, n, warmup=2):
+    times = []
+    for i in range(n + warmup):
+        t0 = time.perf_counter()
+        cur.execute(sql)
+        cur.fetchall()
+        dt = (time.perf_counter() - t0) * 1000
+        if i >= warmup:
+            times.append(round(dt, 1))
+    return {"p50": pctl(times, 0.5), "p95": pctl(times, 0.95), "n": len(times)}
+
+point = timed_query("SELECT * FROM demo.trips WHERE trip_id = 7", 20)
+bigfilter = timed_query(
+    "SELECT count(*), avg(fare) FROM demo.trips_big WHERE distance_km > 25.0", 10)
+
+# Bulk ingest: 100k rows per run, 3 runs; each run appends ONE commit. The
+# per-run rows/s uses the full client-observed wall time of adbc_ingest.
+N = 100_000
+tbl = pa.table({
+    "trip_id": pa.array(range(1_000_000, 1_000_000 + N), pa.int64()),
+    "city": pa.array(["Paris", "Lyon", "Rome", "Berlin"] * (N // 4)),
+    "distance_km": pa.array([float(i % 300) / 10.0 for i in range(N)]),
+    "fare": pa.array([2.5 + (i % 200) / 7.0 for i in range(N)]),
+    "ts": pa.array([None] * N, pa.timestamp("us")),
+})
+runs = []
+for _ in range(3):
+    t0 = time.perf_counter()
+    count = cur.adbc_ingest("adbc_ingest", tbl, mode="append", db_schema_name="demo")
+    dt = time.perf_counter() - t0
+    assert count == N, count
+    runs.append(round(N / dt))
+cur.execute("SELECT count(*) FROM demo.adbc_ingest")
+total = cur.fetchone()[0]
+assert total == 3 * N, total
+cur.execute('SELECT * FROM demo."adbc_ingest$snapshots"')
+snapshots = len(cur.fetchall())
+assert snapshots == 3, f"expected 3 ingest commits, saw {snapshots} snapshots"
+
+out = {
+    "adbc_query_point_ms": point,
+    "adbc_query_bigfilter_ms": bigfilter,
+    "adbc_bulk_ingest_100k_rows_s": {
+        "value": int(statistics.median(runs)),
+        "runs": runs,
+        "rows_per_run": N,
+        "commits_per_run": 1,
+    },
+}
+with open(os.environ["OUT"], "w") as f:
+    json.dump({"metrics": out}, f)
+print("adbc extras:", json.dumps(out))
+PYEOF
+
+  # identity-checked stop of the flight server (comm=icegres)
+  fpid=$(cat "$RUN_DIR/bench-flight.pid" 2>/dev/null || true)
+  if [[ -n "$fpid" ]] && kill -0 "$fpid" 2>/dev/null \
+      && [[ "$(ps -o comm= -p "$fpid" 2>/dev/null)" == icegres ]]; then
+    kill "$fpid" 2>/dev/null || true
+    for _ in $(seq 1 20); do kill -0 "$fpid" 2>/dev/null || break; sleep 0.25; done
+    kill -9 "$fpid" 2>/dev/null || true
+  fi
+  rm -f "$RUN_DIR/bench-flight.pid"
+  # Leave demo.adbc_ingest in its canonical empty state for the next run.
+  drop_adbc_ingest
+  "$BIN" seed >>"$RUN_DIR/bench-flight.log" 2>&1 || true
+  jq -s '.[0] * {metrics: (.[0].metrics + .[1].metrics)}' \
+    "$OUT_JSON" "$ADBC_JSON" >"$OUT_JSON.tmp" && mv "$OUT_JSON.tmp" "$OUT_JSON"
+  log "ADBC extras merged (ungated): $(jq -c '.metrics | {adbc_bulk_ingest_100k_rows_s, adbc_query_point_ms}' "$OUT_JSON")"
+fi
+
+# ---------------------------------------------------------------------------
 # 5. Append human table to SCORECARD.md
 # ---------------------------------------------------------------------------
 if [[ ! -f "$SCORECARD" ]]; then
@@ -460,7 +592,8 @@ fi
        "insert_single_ms","insert_batch100_ms","freshness_ms","qps_8conn",
        "cold_start_ms","binary_size_mb","rss_idle_mb","rss_peak_mb","rss_after_load_mb",
        "insert_single_buffered_ms","freshness_buffered_ms","cold_start_via_proxy_ms",
-       "connect_via_proxy_ms","qps_via_proxy_8conn"][] ) as $k |
+       "connect_via_proxy_ms","qps_via_proxy_8conn",
+       "adbc_query_point_ms","adbc_query_bigfilter_ms","adbc_bulk_ingest_100k_rows_s"][] ) as $k |
     row($k; $m[$k])
   ' "$OUT_JSON"
 } >>"$SCORECARD"

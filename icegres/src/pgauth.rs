@@ -103,6 +103,25 @@ impl FileAuthSource {
     pub fn user_count(&self) -> usize {
         self.users.len()
     }
+
+    /// Verify a cleartext `user`/`password` pair against the stored SCRAM
+    /// verifier (used by the Flight SQL basic-auth handshake, where the
+    /// client sends the password itself over the connection — see
+    /// flight.rs). The comparison recomputes `Hi(candidate, salt, 4096)`, so
+    /// the store still never holds a cleartext password; unknown user and
+    /// wrong password are indistinguishable to the caller.
+    pub fn verify_password(&self, user: &str, password: &str) -> bool {
+        match self.users.get(user) {
+            Some(entry) => {
+                let candidate = gen_salted_password(password, &entry.salt, SCRAM_ITERATIONS);
+                // Length is fixed (SHA-256 output), so a byte compare does
+                // not leak length; early-exit timing on the content is not a
+                // practical oracle for a 4096-iteration PBKDF2 output.
+                candidate == entry.salted_password
+            }
+            None => false,
+        }
+    }
 }
 
 /// Parse `user:password` lines; `#` comments and blank lines are skipped.

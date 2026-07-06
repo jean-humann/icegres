@@ -145,6 +145,7 @@ cleanup() {
   stop_pidfile "$RUN_DIR/parity-serve-pk.pid"
   stop_pidfile "$RUN_DIR/parity-serve-buffered.pid"
   stop_pidfile "$RUN_DIR/parity-serve-branch.pid"
+  stop_pidfile "$RUN_DIR/parity-flight.pid"
   stop_icegresd_pidfile "$RUN_DIR/parity-icegresd-d5.pid"
   stop_icegresd_pidfile "$RUN_DIR/parity-icegresd-d7.pid"
   rm -f "$RECORDS"
@@ -358,6 +359,83 @@ else
   record A6 wire "server-side auth" GAP "$secure_err"
   record A7 wire "TLS" GAP "$secure_err"
   run_a8_probe plain
+fi
+
+# A9: JDBC compatibility — runs bench/clients/a9_jdbc_probe.sh (stock pgjdbc
+# driver: DatabaseMetaData.getTables/getColumns, Statement, PreparedStatement
+# with typed parameters, executeUpdate INSERT + readback, autoCommit(false)
+# commit/rollback) against the main server. PASS requires exit 0 AND fail=0
+# in the probe summary. NA_BY_DESIGN is never used here; a missing JDK
+# records a GAP in evidence terms (environment, not server).
+A9_BEHAVIOR="JDBC compatibility (pgjdbc DatabaseMetaData+PreparedStatement+txn)"
+a9_probe="$REPO_DIR/bench/clients/a9_jdbc_probe.sh"
+if ! command -v java >/dev/null 2>&1 || ! command -v javac >/dev/null 2>&1; then
+  record A9 wire "$A9_BEHAVIOR" GAP "java/javac not available to run bench/clients/a9_jdbc_probe.sh"
+else
+  a9_out=$(env ICEGRES_PROBE_HOST="$PG_HOST" ICEGRES_PROBE_PORT="$MAIN_PORT" bash "$a9_probe" 2>&1)
+  a9_rc=$?
+  a9_summary=$(echo "$a9_out" | grep '^A9 RESULT:' | tail -n 1)
+  if [[ $a9_rc -eq 0 && "$a9_summary" == *"fail=0"* ]]; then
+    record A9 wire "$A9_BEHAVIOR" PASS \
+      "bench/clients/a9_jdbc_probe.sh all green ($a9_summary): pgjdbc connect (startup params accepted), DatabaseMetaData product/getTables/getColumns of demo.trips, Statement SELECT, PreparedStatement setLong/setString x7 (crosses prepareThreshold), ResultSetMetaData, executeUpdate INSERT + readback (INSERT 0 n tag on the extended protocol), setAutoCommit(false) rollback + commit visible from a new connection."
+  else
+    record A9 wire "$A9_BEHAVIOR" GAP \
+      "probe exit=$a9_rc ($a9_summary): $(echo "$a9_out" | grep -E '^(FAIL|A9 ERROR|A9 SKIP)' | flat)"
+  fi
+fi
+
+# A11: ADBC first-class — starts `icegres flight-serve` on :$FLIGHT_PORT and
+# runs bench/clients/a11_adbc_probe.py, both lanes: (1) adbc_driver_flightsql
+# against the Arrow Flight SQL endpoint (query, get_objects, prepared+bind,
+# DML counts, BULK INGEST asserted as ONE Iceberg commit); (2) adbc_driver_
+# postgresql against the main pgwire server (COPY ... TO STDOUT binary reads,
+# params, get_objects, DML). PASS requires exit 0 AND fail=0 (the probe's two
+# pg-lane XFAILs — COPY FROM ingest, in-txn extended SELECT — are documented
+# limits, not failures). Auth variants are covered by e2e section (p).
+A11_BEHAVIOR="ADBC first-class (Flight SQL + bulk ingest; postgres-lane COPY reads)"
+a11_probe="$REPO_DIR/bench/clients/a11_adbc_probe.py"
+FLIGHT_PORT=50051
+flight_port_open() {
+  python3 -c "import socket,sys; s=socket.socket(); s.settimeout(0.3);
+sys.exit(0 if s.connect_ex(('127.0.0.1', $FLIGHT_PORT))==0 else 1)" 2>/dev/null
+}
+if ! command -v python3 >/dev/null 2>&1 \
+    || ! python3 -c 'import adbc_driver_flightsql, adbc_driver_postgresql, pyarrow' 2>/dev/null; then
+  record A11 wire "$A11_BEHAVIOR" GAP \
+    "python ADBC drivers missing (pip install adbc-driver-flightsql adbc-driver-postgresql pyarrow)"
+elif flight_port_open; then
+  record A11 wire "$A11_BEHAVIOR" GAP \
+    "port :$FLIGHT_PORT already in use — cannot start a harness-owned flight-serve"
+else
+  "$BIN" flight-serve --host 127.0.0.1 --port "$FLIGHT_PORT" \
+    >"$RUN_DIR/parity-flight.log" 2>&1 &
+  echo $! >"$RUN_DIR/parity-flight.pid"
+  a11_up=0
+  for _ in $(seq 1 60); do
+    flight_port_open && { a11_up=1; break; }
+    kill -0 "$(cat "$RUN_DIR/parity-flight.pid")" 2>/dev/null || break
+    sleep 0.5
+  done
+  if [[ "$a11_up" != 1 ]]; then
+    record A11 wire "$A11_BEHAVIOR" GAP \
+      "icegres flight-serve failed to start: $(tail -n 5 "$RUN_DIR/parity-flight.log" | flat)"
+  else
+    a11_out=$(env ICEGRES_PROBE_FLIGHT_HOST=127.0.0.1 \
+        ICEGRES_PROBE_FLIGHT_PORT="$FLIGHT_PORT" \
+        ICEGRES_PROBE_PG_HOST="$PG_HOST" ICEGRES_PROBE_PG_PORT="$MAIN_PORT" \
+        python3 "$a11_probe" 2>&1)
+    a11_rc=$?
+    a11_summary=$(echo "$a11_out" | grep '^A11 RESULT:' | tail -n 1)
+    a11_ingest=$(echo "$a11_out" | grep '^PASS flight: BULK INGEST' | flat)
+    if [[ $a11_rc -eq 0 && "$a11_summary" == *"fail=0"* ]]; then
+      record A11 wire "$A11_BEHAVIOR" PASS \
+        "bench/clients/a11_adbc_probe.py all green ($a11_summary): adbc_driver_flightsql connect+query (Arrow end to end), get_objects catalogs/schemas/tables/columns, prepared statements with \$1 binds, INSERT/UPDATE/DELETE with real affected counts via the copy-on-write engine, BULK INGEST landing as ONE Iceberg commit [$a11_ingest], statement schema metadata; adbc_driver_postgresql (libpq) reads over COPY ... TO STDOUT (FORMAT binary), params, get_objects, DML rowcounts. Documented XFAILs: pg-lane COPY FROM ingest (Flight lane owns ingest), in-transaction extended SELECT (pre-existing 0A000)."
+    else
+      record A11 wire "$A11_BEHAVIOR" GAP \
+        "probe exit=$a11_rc ($a11_summary): $(echo "$a11_out" | grep -E '^(FAIL|Traceback)' | flat)"
+    fi
+  fi
+  stop_pidfile "$RUN_DIR/parity-flight.pid"
 fi
 
 # ===========================================================================

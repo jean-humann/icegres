@@ -14,7 +14,7 @@ running throughout for all engines equally).
 | icegres | icegres 0.1.0 (DataFusion 52.5.0, iceberg-rust 0.9.1), reports "PostgreSQL 16.6" | pgwire :5439 / psycopg2 | `demo.*` |
 | trino | Trino **446** single node (not latest — see caveat 6) | HTTP :8082 / trino 0.338.0 dbapi | `iceberg.demo.*` |
 | spark | Spark 3.5.8 Thrift server + iceberg-spark-runtime 1.11.0 | HiveServer2 thrift :10000 / pyhive | `lake.demo.*` |
-| flightsql | **same engine as icegres** (DataFusion 52.5.0 + iceberg-rust 0.9.1) behind Arrow Flight SQL — a transport experiment, not an independent engine (caveat 4) | gRPC :50051 / adbc-driver-flightsql 1.11.0 | `demo.*` |
+| flightsql | **same engine as icegres** (DataFusion 52.5.0 + iceberg-rust 0.9.1) behind Arrow Flight SQL — since round 10 this is `icegres flight-serve` (the promoted first-class ADBC endpoint, icegres/src/flight.rs), not a separate crate (caveat 4) | gRPC :50051 / adbc-driver-flightsql 1.11.0 | `demo.*` |
 
 All four read the **same** Iceberg tables through the same Lakekeeper REST
 catalog (warehouse `lakehouse`) on the same RustFS S3 store. Result row

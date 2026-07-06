@@ -48,6 +48,8 @@ compatibility, and scale-to-zero economics on lakehouse data — leave
 | Wake-on-connect control plane | `icegresd`: pgwire-aware proxy that spawns computes on connect, routes `icegres@<branch>` dbnames to per-branch computes, supervises crashes with capped backoff, keeps a warm session pool (`--pool-size`, sub-ms connects; session pooling only — no transaction pooling, no cross-client reuse) | `icegresd serve` / `icegresd status` |
 | Health endpoint | HTTP 200 liveness | `--health-port` |
 | ORM/BI compatibility | pg_catalog shims: coherent oids, `version()`, ORM introspection rewrites (`src/compat.rs`) — SQLAlchemy/psycopg2/pg8000/pandas verified | default |
+| ADBC / Arrow Flight SQL | second first-class wire protocol (`src/flight.rs`): Arrow end to end, catalog metadata (`get_objects`), prepared statements with binds, DML with real affected counts, BULK INGEST (`adbc_ingest` → ONE Iceberg commit per stream), basic-auth handshake | `icegres flight-serve` (default `:50051`) |
+| ADBC postgres driver | `COPY ... TO STDOUT (FORMAT binary\|text\|csv)` on both protocols (`ops.rs::CopyOutHook`) — `adbc_driver_postgresql` reads/params/DML verified | default (`serve`) |
 
 ```
 psql ──pgwire──▶ icegres (DataFusion) ──REST──▶ Lakekeeper ──▶ Postgres (metadata)
@@ -96,6 +98,7 @@ psql -h 127.0.0.1 -p 5439 -U postgres -d icegres
 | Command | Description |
 |---|---|
 | `icegres serve` | Serve the lakehouse over pgwire (default `0.0.0.0:5439`). |
+| `icegres flight-serve` | Serve the same lakehouse over Arrow Flight SQL / gRPC (default `0.0.0.0:50051`) — the ADBC endpoint. See "ADBC (Arrow Flight SQL)" below. |
 | `icegres seed`  | Create namespace `demo` + tables `trips`/`cities` and insert demo rows. Rows are inserted only when the seeded data is absent (row count 0), so re-seeding never duplicates data and repairs a table left empty by an interrupted earlier run. |
 | `icegres branch create <table> <name> [--at-snapshot <id>]` | Create a zero-copy branch: ONE metadata commit adding a snapshot ref at main's head (or `--at-snapshot`); no data copied. Fails if the branch exists (atomic via `assert-ref-snapshot-id = null`). |
 | `icegres branch list <table>` | List all snapshot refs (branches/tags) of a table with their head snapshot ids. |
@@ -170,6 +173,65 @@ Like stock Postgres without `hostssl` rules, a TLS-enabled listener still
 with `sslmode=require`/`verify-full`. Combine with `--auth-file` for
 encrypted + authenticated serving; TLS protects the SCRAM exchange against
 active MITM downgrade in addition to encrypting query traffic.
+
+### ADBC (Arrow Flight SQL) — `icegres flight-serve`
+
+The second first-class wire protocol (SPEC A11, `src/flight.rs`): the same
+lakehouse, engine wiring (snapshot-aware caches from `cache.rs`, the
+copy-on-write DML engine from `overwrite.rs`), served over Arrow Flight SQL
+on gRPC. Everything stays Arrow end to end — no row-format round trip —
+which is exactly what ADBC clients (pandas 2.x, polars, DuckDB, Go/Rust/
+Java ADBC) consume natively.
+
+```sh
+icegres flight-serve                  # grpc://0.0.0.0:50051
+```
+
+```python
+import adbc_driver_flightsql.dbapi as fs
+import pyarrow as pa
+
+conn = fs.connect("grpc://127.0.0.1:50051")
+cur = conn.cursor()
+cur.execute("SELECT city, count(*) FROM demo.trips GROUP BY city")
+print(cur.fetch_arrow_table())                        # Arrow, zero conversion
+cur.execute("SELECT * FROM demo.trips WHERE trip_id = $1", parameters=(7,))
+conn.adbc_get_objects(depth="all")                    # catalogs/schemas/tables/columns
+
+# THE killer feature — bulk ingest: the whole Arrow stream lands as ONE
+# Iceberg fast-append commit (rolling Parquet writer, default target file
+# size). 100k rows ≈ one snapshot + a handful of properly-sized files,
+# vs. one commit per statement on the INSERT path.
+cur.adbc_ingest("adbc_ingest", arrow_table, mode="append", db_schema_name="demo")
+```
+
+Surface: queries (`CommandStatementQuery`), catalog metadata
+(GetCatalogs/GetDbSchemas/GetTables with `%`/`_` filters + Arrow schemas/
+GetTableTypes/GetSqlInfo), prepared statements with `$n` binds,
+INSERT/UPDATE/DELETE with real affected counts (UPDATE/DELETE route through
+the same copy-on-write engine and scope rules as the pgwire `DmlHook`), and
+bulk ingest (`CommandStatementIngest`, append into an existing table;
+`mode="create"`/`"replace"`, temporary tables and ingest transactions are
+rejected loudly). Verified end-to-end against `adbc_driver_flightsql`
+(bench/clients/a11_adbc_probe.py; e2e section (p); parity probe A11).
+
+Auth: `--auth-file` (same `user:password` file as `serve`) enables the
+Flight SQL basic-auth handshake — credentials are verified against the
+stored SCRAM verifier (never kept in cleartext) and exchanged for a
+per-boot bearer token. NOTE basic auth sends the password itself (unlike
+pgwire SCRAM), so front the listener with TLS: gRPC TLS termination is not
+built in; use any gRPC-aware proxy/LB (nginx `grpc_pass`, envoy) — ADBC
+clients connect with `grpc+tls://`. Without `--auth-file` the endpoint is
+permissive and logs a startup WARN, matching `serve`.
+
+The `adbc_driver_postgresql` (libpq) lane also works against plain
+`icegres serve`: reads run over `COPY (query) TO STDOUT (FORMAT binary)`
+(implemented in `ops.rs::CopyOutHook` on both wire protocols, also usable
+from psql with text/csv/binary formats), plus parameterized queries,
+`get_objects` and DML rowcounts — use `autocommit=True` (documented limit:
+extended-protocol SELECT inside an explicit transaction, 0A000). Its bulk
+ingest issues `COPY ... FROM STDIN`, which is out of scope by design —
+ingest belongs to the Flight lane.
 
 ### Scale-to-zero (`--idle-shutdown-secs`)
 
@@ -403,6 +465,45 @@ Known limits (documented failures, not silent corruption):
   use autocommit (`isolation_level="AUTOCOMMIT"` in SQLAlchemy) or psycopg2.
 - `pg_constraint`/`pg_index` never reference user tables (Iceberg has no
   PK/index objects), so ORMs correctly see “no primary key / no indexes”.
+
+### JDBC
+
+The stock PostgreSQL JDBC driver (pgjdbc 42.7) works out of the box —
+no custom driver, no URL tricks:
+
+```java
+// Standard pgjdbc connection string (any user/password unless --auth-file):
+Connection conn = DriverManager.getConnection(
+    "jdbc:postgresql://127.0.0.1:5439/icegres", "postgres", "postgres");
+// Against a --auth-file + TLS server, the usual pgjdbc SSL params apply:
+//   jdbc:postgresql://host:5439/icegres?ssl=true&sslmode=require
+```
+
+Verified end-to-end by `bench/clients/A9JdbcProbe.java` (run it via
+`bench/clients/a9_jdbc_probe.sh`; e2e section (q), parity probe A9):
+
+- `DriverManager.getConnection` — pgjdbc's startup parameters
+  (`extra_float_digits`, `application_name`, client encoding…) accepted;
+  `DatabaseMetaData` reports `PostgreSQL 16.6-pgwire-…`.
+- `DatabaseMetaData.getTables` / `getColumns` — pgjdbc's `pg_catalog`
+  metadata queries (including `select current_catalog`, which
+  `src/compat.rs` rewrites: the parenthesis-less
+  `current_catalog`/`current_schema` keywords parse to AST shapes
+  DataFusion cannot resolve).
+- `Statement` and `PreparedStatement` with typed `setLong`/`setString`
+  parameters, re-executed past pgjdbc's `prepareThreshold` (server-side
+  named statements), `ResultSetMetaData` with correct type names.
+- `executeUpdate` INSERT returns the update count — `compat.rs`'s
+  `InsertTagHook` answers extended-protocol INSERTs with a proper
+  `INSERT 0 n` command tag (upstream streamed a one-row `count` result set,
+  which JDBC rejects with "A result was returned when none was expected").
+- `setAutoCommit(false)` + `commit()` / `rollback()` cycles (verified from a
+  separate connection).
+
+JDBC-specific limit: SELECT inside an explicit transaction is
+simple-protocol only (the `0A000` above), and pgjdbc always uses the
+extended protocol — so with `autoCommit=false` keep reads on a second
+(autocommit) connection, or add `preferQueryMode=simple` to the URL.
 
 ## Demo schema
 

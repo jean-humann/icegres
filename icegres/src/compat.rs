@@ -57,7 +57,7 @@ use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 use datafusion_postgres::arrow_pg::datatypes::df as pgdf;
 use datafusion_postgres::pgwire::api::portal::Format;
-use datafusion_postgres::pgwire::api::results::Response;
+use datafusion_postgres::pgwire::api::results::{Response, Tag};
 use datafusion_postgres::pgwire::api::ClientInfo;
 use datafusion_postgres::pgwire::error::{PgWireError, PgWireResult};
 use datafusion_postgres::pgwire::types::format::FormatOptions;
@@ -518,6 +518,40 @@ impl VisitorMut for CompatRewriter {
     }
 
     fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+        // Rule 7: parenthesis-less keyword functions Postgres reserves —
+        // CURRENT_CATALOG / CURRENT_SCHEMA always mean the function, never a
+        // column. sqlparser's PostgreSqlDialect parses CURRENT_CATALOG as an
+        // argument-less `Expr::Function` and CURRENT_SCHEMA as a plain
+        // identifier; both fail DataFusion name resolution ("No field named
+        // current_catalog"). pgjdbc's Connection.getCatalog() — called by
+        // every DatabaseMetaData method — issues exactly
+        // `select current_catalog`. Both AST shapes are rewritten to the
+        // parenthesized spellings the engine resolves. (CURRENT_ROLE /
+        // CURRENT_USER are NOT mapped here: the session user lives in the
+        // wire session, not the shared SessionContext this hook executes on
+        // — upstream answers `current_user` on its own path.)
+        let keyword_fn = |name: &str| match name {
+            "current_catalog" => Some("current_database()"),
+            "current_schema" => Some("current_schema()"),
+            _ => None,
+        };
+        let replacement = match expr {
+            Expr::Identifier(id) => keyword_fn(&id.value.to_lowercase()),
+            Expr::Function(f) if matches!(f.args, FunctionArguments::None) => f
+                .name
+                .0
+                .last()
+                .and_then(|p| p.as_ident())
+                .and_then(|id| keyword_fn(&id.value.to_lowercase())),
+            _ => None,
+        };
+        if let Some(snippet) = replacement {
+            if let Some(new_expr) = parse_expr_snippet(snippet) {
+                *expr = new_expr;
+                self.changed = true;
+                return ControlFlow::Continue(());
+            }
+        }
         // Rule 6: `<...>.classoid = CAST(x AS REGCLASS)` (SQLAlchemy's
         // comment lookups against pg_description). DataFusion cannot cast
         // to REGCLASS and infers the parameter as numeric (22P02 for
@@ -606,7 +640,13 @@ impl Visitor for PgCatalogOnly {
     }
 }
 
-fn is_pg_catalog_only_query(stmt: &Statement) -> bool {
+/// True if this SELECT is eligible for compat rewriting: it references
+/// ONLY `pg_catalog` tables, or no tables at all (`select current_catalog`,
+/// `select 1`...). Either way it reads no user data, so running a rewritten
+/// copy on the shared (non-transaction-pinned) context is safe. Statements
+/// touching user tables are never intercepted, keeping transaction-pinned
+/// reads on their normal path.
+fn is_rewrite_eligible_query(stmt: &Statement) -> bool {
     if !matches!(stmt, Statement::Query(_)) {
         return false;
     }
@@ -615,12 +655,13 @@ fn is_pg_catalog_only_query(stmt: &Statement) -> bool {
         all_pg_catalog: true,
     };
     let _ = Visit::visit(stmt, &mut v);
-    v.seen > 0 && v.all_pg_catalog
+    v.seen == 0 || v.all_pg_catalog
 }
 
-/// Rewrite `stmt` if it is a pg_catalog-only SELECT that any rule changed.
+/// Rewrite `stmt` if it is a pg_catalog-only (or table-less) SELECT that any
+/// rule changed.
 fn rewrite(stmt: &Statement) -> Option<Statement> {
-    if !is_pg_catalog_only_query(stmt) {
+    if !is_rewrite_eligible_query(stmt) {
         return None;
     }
     let mut rewritten = stmt.clone();
@@ -770,6 +811,173 @@ impl QueryHook for CompatHook {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Extended-protocol INSERT command tag (SPEC A9, pgjdbc executeUpdate)
+// ---------------------------------------------------------------------------
+
+/// Give plain autocommit INSERTs a proper `INSERT 0 <n>` command tag on the
+/// extended query protocol.
+///
+/// Upstream datafusion-postgres executes the DataFusion DML plan and answers
+/// with the plan's output — a one-row `count` ROWSET (RowDescription +
+/// DataRow). The simple-protocol path converts that into a command tag, but
+/// the extended path streams it as a result set, and JDBC's
+/// `executeUpdate()` rejects any result set with "A result was returned when
+/// none was expected". This hook executes the same plan and answers with
+/// `Response::Execution(Tag INSERT 0 n)` instead.
+///
+/// Registration order (main.rs `query_hooks`) makes this a fall-through
+/// handler: BufferHook (buffered ack), TxnHook (in-transaction RYOW +
+/// PK-enforced/branched autocommit) and DmlHook all run first, so the only
+/// INSERTs reaching this hook are plain autocommit appends on the main
+/// branch — exactly the ones the upstream default path used to answer with a
+/// rowset.
+pub struct InsertTagHook;
+
+impl InsertTagHook {
+    async fn run(
+        &self,
+        stmt: &Statement,
+        ctx: &SessionContext,
+        params: &ParamValues,
+    ) -> PgWireResult<Response> {
+        let api_err = |e: DataFusionError| PgWireError::ApiError(Box::new(e));
+        let df_stmt = datafusion::sql::parser::Statement::Statement(Box::new(stmt.clone()));
+        let mut plan = ctx
+            .state()
+            .statement_to_plan(df_stmt)
+            .await
+            .map_err(api_err)?;
+        let has_params = match params {
+            ParamValues::List(l) => !l.is_empty(),
+            ParamValues::Map(m) => !m.is_empty(),
+        };
+        if has_params {
+            plan = plan.replace_params_with_values(params).map_err(api_err)?;
+        }
+        let df = ctx.execute_logical_plan(plan).await.map_err(api_err)?;
+        let batches = df.collect().await.map_err(api_err)?;
+        // A DataFusion DML plan yields a single UInt64 `count` column.
+        let mut rows: u64 = 0;
+        for batch in &batches {
+            if let Some(col) = batch.columns().first() {
+                if let Some(counts) = col
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::UInt64Array>()
+                {
+                    rows += counts.iter().flatten().sum::<u64>();
+                }
+            }
+        }
+        Ok(Response::Execution(
+            Tag::new("INSERT").with_oid(0).with_rows(rows as usize),
+        ))
+    }
+}
+
+/// Build the empty-schema stand-in plan for an INSERT (see
+/// `InsertTagHook::handle_extended_parse_query`): an `EmptyRelation`, wrapped
+/// in a `Filter` carrying every `$n` placeholder of the real plan (with its
+/// inferred type) inside a boolean no-op predicate, so
+/// `get_parameter_types()` still reports them. Falls back to the real plan
+/// (upstream describe behavior) if the wrapper cannot be built.
+fn describe_shaped_insert_plan(real: &LogicalPlan) -> LogicalPlan {
+    use datafusion::common::DFSchema;
+    use datafusion::logical_expr::expr::Placeholder;
+    use datafusion::logical_expr::{EmptyRelation, Expr as DfExpr, Filter as DfFilter};
+
+    let empty = LogicalPlan::EmptyRelation(EmptyRelation {
+        produce_one_row: false,
+        schema: Arc::new(DFSchema::empty()),
+    });
+    let Ok(param_types) = real.get_parameter_types() else {
+        return real.clone();
+    };
+    if param_types.is_empty() {
+        return empty;
+    }
+    let mut params: Vec<_> = param_types.into_iter().collect();
+    params.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut predicate: Option<DfExpr> = None;
+    for (id, data_type) in params {
+        let ph = DfExpr::Placeholder(Placeholder {
+            id,
+            field: data_type
+                .map(|dt| Arc::new(datafusion::arrow::datatypes::Field::new("", dt, true))),
+        });
+        let leaf = DfExpr::IsNull(Box::new(ph));
+        predicate = Some(match predicate {
+            Some(p) => p.and(leaf),
+            None => leaf,
+        });
+    }
+    match DfFilter::try_new(
+        predicate.expect("params is non-empty"),
+        Arc::new(empty.clone()),
+    ) {
+        Ok(filter) => LogicalPlan::Filter(filter),
+        // Extremely defensive: if the wrapper does not type-check, fall back
+        // to upstream behavior (correct Bind types, JDBC-unfriendly
+        // describe) rather than break the statement.
+        Err(_) => real.clone(),
+    }
+}
+
+#[async_trait]
+impl QueryHook for InsertTagHook {
+    async fn handle_simple_query(
+        &self,
+        _statement: &Statement,
+        _session_context: &SessionContext,
+        _client: &mut (dyn ClientInfo + Send + Sync),
+    ) -> Option<PgWireResult<Response>> {
+        // The upstream simple-query path already answers `INSERT 0 n`.
+        None
+    }
+
+    async fn handle_extended_parse_query(
+        &self,
+        sql: &Statement,
+        session_context: &SessionContext,
+        _client: &(dyn ClientInfo + Send + Sync),
+    ) -> Option<PgWireResult<LogicalPlan>> {
+        if !matches!(sql, Statement::Insert(_)) {
+            return None;
+        }
+        // Plan the real INSERT (so the $n placeholder types are inferred
+        // exactly like the default path would), then hand the framework a
+        // DESCRIBE-shaped stand-in: same placeholders, EMPTY output schema.
+        // The framework derives two things from this plan — the parameter
+        // types for Bind (must match the real INSERT) and the portal's
+        // result schema for Describe (must be empty so pgwire answers
+        // NoData: the real DML plan's one-column `count` schema makes
+        // Describe(portal) promise a RowDescription, and JDBC's
+        // executeUpdate() rejects any statement that describes as returning
+        // rows before Execute even runs). Execution never touches this
+        // stand-in — handle_extended_query re-plans from the statement.
+        let df_stmt = datafusion::sql::parser::Statement::Statement(Box::new(sql.clone()));
+        let real = match session_context.state().statement_to_plan(df_stmt).await {
+            Ok(plan) => plan,
+            Err(e) => return Some(Err(PgWireError::ApiError(Box::new(e)))),
+        };
+        Some(Ok(describe_shaped_insert_plan(&real)))
+    }
+
+    async fn handle_extended_query(
+        &self,
+        statement: &Statement,
+        _logical_plan: &LogicalPlan,
+        params: &ParamValues,
+        session_context: &SessionContext,
+        _client: &mut (dyn ClientInfo + Send + Sync),
+    ) -> Option<PgWireResult<Response>> {
+        if !matches!(statement, Statement::Insert(_)) {
+            return None;
+        }
+        Some(self.run(statement, session_context, params).await)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -862,6 +1070,51 @@ mod tests {
              FROM pg_catalog.pg_attribute",
         );
         assert!(rewrite(&stmt).is_none());
+    }
+
+    #[test]
+    fn rewrites_keyword_identifiers_without_tables() {
+        // pgjdbc Connection.getCatalog()
+        let out = rewrite(&parse("select current_catalog"))
+            .expect("should rewrite")
+            .to_string();
+        assert!(
+            out.to_lowercase().contains("current_database()"),
+            "got: {out}"
+        );
+        let out = rewrite(&parse("SELECT CURRENT_SCHEMA"))
+            .expect("should rewrite")
+            .to_string();
+        assert!(
+            out.to_lowercase().contains("current_schema()"),
+            "got: {out}"
+        );
+        // current_role / current_user are session-scoped (see rule 7 note):
+        // deliberately NOT intercepted.
+        assert!(rewrite(&parse("select current_user")).is_none());
+        assert!(rewrite(&parse("select current_role")).is_none());
+    }
+
+    #[test]
+    fn keyword_identifiers_rewritten_inside_pg_catalog_queries_only() {
+        // pg_catalog-only query: still rewritten.
+        let out = rewrite(&parse(
+            "SELECT current_catalog, relname FROM pg_catalog.pg_class",
+        ))
+        .expect("should rewrite")
+        .to_string();
+        assert!(
+            out.to_lowercase().contains("current_database()"),
+            "got: {out}"
+        );
+        // User-table query: untouched (normal read path, txn pinning intact).
+        assert!(rewrite(&parse("SELECT current_catalog FROM demo.trips")).is_none());
+    }
+
+    #[test]
+    fn table_less_select_without_keywords_untouched() {
+        assert!(rewrite(&parse("select 1")).is_none());
+        assert!(rewrite(&parse("select version()")).is_none());
     }
 
     #[test]

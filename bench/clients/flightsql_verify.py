@@ -3,7 +3,7 @@
 for count / filter / aggregate queries over demo.trips.
 
 Usage: python3 flightsql_verify.py
-Requires: flightsql-server on grpc://127.0.0.1:50051 (flightsql-start.sh)
+Requires: icegres flight-serve on grpc://127.0.0.1:50051 (flightsql-start.sh)
           icegres serve on 127.0.0.1:5439
 Exits 0 and prints PASS lines if all results match; exits 1 on mismatch.
 """

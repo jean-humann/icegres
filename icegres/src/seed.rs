@@ -99,6 +99,11 @@ pub async fn run(opts: &CatalogOpts) -> Result<()> {
 
     ensure_table(catalog.as_ref(), &ns, "cities", cities_schema()?).await?;
     ensure_table(catalog.as_ref(), &ns, "trips", trips_schema()?).await?;
+    // Deliberately left EMPTY: scratch target for ADBC bulk-ingest tests and
+    // the adbc_bulk_ingest bench extra (trips-shaped; callers clear it with
+    // an unpredicated DELETE between runs). Created here because servers
+    // snapshot the table list at boot.
+    ensure_table(catalog.as_ref(), &ns, "adbc_ingest", trips_schema()?).await?;
 
     // Build the session AFTER table creation: the Iceberg catalog provider
     // snapshots the table list at construction time. target_partitions is

@@ -10,6 +10,7 @@ mod cache;
 mod compat;
 mod context;
 mod dml;
+mod flight;
 mod ops;
 mod overwrite;
 mod pgauth;
@@ -173,6 +174,33 @@ enum Command {
         #[arg(long, env = "ICEGRES_WRITE_BUFFER_MS", default_value_t = 0)]
         write_buffer_ms: u64,
     },
+    /// Serve the lakehouse over Arrow Flight SQL (gRPC) — the ADBC
+    /// first-class endpoint (SPEC A11). Same engine wiring as `serve`
+    /// (snapshot-aware caches, copy-on-write DML engine), Arrow end to end:
+    /// queries, catalog metadata (GetObjects), prepared statements,
+    /// INSERT/UPDATE/DELETE, and bulk ingest (one Iceberg commit per
+    /// `adbc_ingest` stream). See icegres/src/flight.rs for the surface.
+    FlightServe {
+        #[command(flatten)]
+        catalog: CatalogOpts,
+
+        /// Address to bind the gRPC listener on.
+        #[arg(long, env = "ICEGRES_FLIGHT_HOST", default_value = "0.0.0.0")]
+        host: String,
+
+        /// Port to bind the gRPC listener on.
+        #[arg(long, env = "ICEGRES_FLIGHT_PORT", default_value_t = 50051)]
+        port: u16,
+
+        /// Require the Flight SQL basic-auth handshake against this
+        /// credentials file (same 'user:password' format and env var as
+        /// `icegres serve --auth-file`). Basic auth sends the password
+        /// itself — terminate TLS in front of this listener (grpc+tls) or
+        /// keep it on a trusted network. Without this flag the endpoint is
+        /// permissive and logs a WARN.
+        #[arg(long, env = "ICEGRES_AUTH_FILE")]
+        auth_file: Option<PathBuf>,
+    },
     /// Create and populate the demo namespace/tables (idempotent).
     Seed {
         #[command(flatten)]
@@ -279,6 +307,12 @@ async fn main() -> Result<()> {
             };
             run_serve(&catalog, &host, port, serve_opts).await
         }
+        Command::FlightServe {
+            catalog,
+            host,
+            port,
+            auth_file,
+        } => flight::run(&catalog, &host, port, auth_file).await,
         Command::Seed { catalog } => seed::run(&catalog).await,
         Command::Branch { cmd } => match cmd {
             BranchCmd::Create {
@@ -466,13 +500,20 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
 ///    (SPEC A8). Must run before TxnHook: ORMs reflect inside a
 ///    driver-opened transaction, and the rewritten introspection SQL reads
 ///    static catalog tables only.
-/// 3. [`TxnHook`] — BEGIN/COMMIT/ROLLBACK and, while a transaction is open,
+/// 3. [`ops::CopyOutHook`] — `COPY ... TO STDOUT` (SPEC A11 lane 2, the
+///    adbc_driver_postgresql read path). Runs before TxnHook: a COPY inside
+///    an explicit transaction reads the latest committed snapshot
+///    (statement-level consistency; see the hook's docs).
+/// 4. [`TxnHook`] — BEGIN/COMMIT/ROLLBACK and, while a transaction is open,
 ///    EVERY statement on that connection (buffered writes, pinned reads);
 ///    also PK-enforced autocommit INSERT. Replaces the upstream
 ///    `TransactionStatementHook`, whose BEGIN/COMMIT were accepted but
 ///    non-transactional.
-/// 4. `SetShowHook` — upstream SET/SHOW handling.
-/// 5. [`dml::DmlHook`] — autocommit copy-on-write UPDATE/DELETE.
+/// 5. `SetShowHook` — upstream SET/SHOW handling.
+/// 6. [`dml::DmlHook`] — autocommit copy-on-write UPDATE/DELETE.
+/// 7. [`compat::InsertTagHook`] — fall-through: plain autocommit INSERTs get
+///    a proper `INSERT 0 n` command tag on the extended protocol (SPEC A9,
+///    JDBC `executeUpdate()`); every specialized INSERT path above ran first.
 fn query_hooks(
     engine: Arc<OverwriteEngine>,
     registry: Arc<TxnRegistry>,
@@ -489,9 +530,11 @@ fn query_hooks(
         )));
     }
     hooks.push(Arc::new(compat::CompatHook));
+    hooks.push(Arc::new(ops::CopyOutHook));
     hooks.push(Arc::new(TxnHook::new(registry, engine.clone(), catalog)));
     hooks.push(Arc::new(SetShowHook));
     hooks.push(Arc::new(dml::DmlHook::new(engine)));
+    hooks.push(Arc::new(compat::InsertTagHook));
     hooks
 }
 
