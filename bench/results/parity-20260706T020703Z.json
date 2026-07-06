@@ -1,6 +1,6 @@
 {
   "schema": "icegres-parity-v1",
-  "ts": "20260706T015738Z",
+  "ts": "20260706T020703Z",
   "binary": "/home/user/jean-humann/icegres/target/release/icegres",
   "summary": {
     "PASS": 26,
@@ -76,7 +76,7 @@
       "area": "oltp",
       "behavior": "DELETE",
       "verdict": "PASS",
-      "evidence": "DELETE trip_id=900267 returned tag 'DELETE 1'; count over a NEW connection afterwards: 0; time travel intact: pre-delete snapshot 283038147875937361 still serves the row (count=1)"
+      "evidence": "DELETE trip_id=900267 returned tag 'DELETE 1'; count over a NEW connection afterwards: 0; time travel intact: pre-delete snapshot 6677242250785599759 still serves the row (count=1)"
     },
     {
       "id": "B4",
@@ -118,14 +118,14 @@
       "area": "lakehouse",
       "behavior": "write freshness (commit -> readable elsewhere)",
       "verdict": "PASS",
-      "evidence": "row committed via conn A was readable from a new connection ~65ms after commit (coarse; includes psql startup — precise p50/p95 is bench freshness_ms). Moonlink bar: sub-second. Additionally: buffered mode (--write-buffer-ms 100, opt-in; default 0 = synchronous): INSERT acked from the in-memory buffer was readable from a NEW connection on the same server after ~65ms (union read — no wait for the Iceberg commit; precise p50/p95 is bench insert_single_buffered_ms/freshness_buffered_ms; cross-server freshness = flush cadence, unclean-kill loss window <= 100ms, WARNed at startup)."
+      "evidence": "row committed via conn A was readable from a new connection ~65ms after commit (coarse; includes psql startup — precise p50/p95 is bench freshness_ms). Moonlink bar: sub-second. Additionally: buffered mode (--write-buffer-ms 100, opt-in; default 0 = synchronous): INSERT acked from the in-memory buffer was readable from a NEW connection on the same server after ~62ms (union read — no wait for the Iceberg commit; precise p50/p95 is bench insert_single_buffered_ms/freshness_buffered_ms; cross-server freshness = flush cadence, unclean-kill loss window <= 100ms, WARNed at startup)."
     },
     {
       "id": "C5",
       "area": "lakehouse",
       "behavior": "Iceberg metadata surfaces",
       "verdict": "PASS",
-      "evidence": "demo.\"trips$snapshots\" queryable (38 snapshots listed; $manifests also works). Caveats: 'select *' fails on the Map-typed summary column (ERROR: Unsupported Datatype Map(\"key_value\": non-null Struct(\"key\": non-null Utf8, metadata: {\"PARQUET:field_id\": \"7\"}, \"value\": Utf8, metadata: {\"PARQUET:field_id\": \"8\"}), unsorted)) and count(*) hits a DataFusion logical/physical schema mismatch — column projections work."
+      "evidence": "demo.\"trips$snapshots\" queryable (37 snapshots listed; $manifests also works). Caveats: 'select *' fails on the Map-typed summary column (ERROR: Unsupported Datatype Map(\"key_value\": non-null Struct(\"key\": non-null Utf8, metadata: {\"PARQUET:field_id\": \"7\"}, \"value\": Utf8, metadata: {\"PARQUET:field_id\": \"8\"}), unsorted)) and count(*) hits a DataFusion logical/physical schema mismatch — column projections work."
     },
     {
       "id": "D1",
@@ -139,49 +139,49 @@
       "area": "elasticity",
       "behavior": "multiple stateless computes on shared storage",
       "verdict": "PASS",
-      "evidence": "second 'icegres serve' on :5440 (same catalog, started before the write) returned identical count (343) and served row trip_id=900266 committed via :5439 after both computes started (visible on first poll, 50ms; each query reloads table metadata from the REST catalog, so no staleness window was observed)."
+      "evidence": "second 'icegres serve' on :5440 (same catalog, started before the write) returned identical count (343) and served row trip_id=900266 committed via :5439 after both computes started (visible on first poll, 48ms; each query reloads table metadata from the REST catalog, so no staleness window was observed)."
     },
     {
       "id": "D3",
       "area": "elasticity",
       "behavior": "cold start",
       "verdict": "PASS",
-      "evidence": "serve spawn -> first successful 'select 1': 39ms (single run, 50ms poll; p50/p95 over >=5 runs is bench cold_start_ms). Neon bar: ~500ms-few s."
+      "evidence": "serve spawn -> first successful 'select 1': 44ms (single run, 50ms poll; p50/p95 over >=5 runs is bench cold_start_ms). Neon bar: ~500ms-few s."
     },
     {
       "id": "D4",
       "area": "elasticity",
       "behavior": "time-travel read (branching/PITR analogue)",
       "verdict": "PASS",
-      "evidence": "snapshot-pinned read works: demo.\"trips@964510279657851836\" (oldest snapshot from \"trips$snapshots\") returned count=280 vs current count=343 (rows appended this run are invisible in the pinned view; WHERE on the pinned table -> 280). Read-only; timestamp syntax FOR SYSTEM_TIME AS OF is not supported by datafusion 52."
+      "evidence": "snapshot-pinned read works: demo.\"trips@8226009723585611779\" (oldest snapshot from \"trips$snapshots\") returned count=280 vs current count=343 (rows appended this run are invisible in the pinned view; WHERE on the pinned table -> 280). Read-only; timestamp syntax FOR SYSTEM_TIME AS OF is not supported by datafusion 52."
     },
     {
       "id": "D5",
       "area": "elasticity",
       "behavior": "scale-to-zero",
       "verdict": "PASS",
-      "evidence": "FULL sleep/wake cycle via icegresd (shipped control plane): first connection to :5445 woke a compute in 85ms (demo.cities count=20); compute exited on its own 5053ms after the last connection (clean idle exit (exit status: 0); health pings on :5446 do not reset the idle clock); NEXT connection to the same port auto-re-woke it: 'select 1' in 73ms (= cold start + splice setup). No external supervisor needed."
+      "evidence": "FULL sleep/wake cycle via icegresd (shipped control plane): first connection to :5445 woke a compute in 87ms (demo.cities count=20); compute exited on its own 5052ms after the last connection (clean idle exit (exit status: 0); health pings on :5446 do not reset the idle clock); NEXT connection to the same port auto-re-woke it: 'select 1' in 75ms (= cold start + splice setup). No external supervisor needed."
     },
     {
       "id": "D6",
       "area": "elasticity",
       "behavior": "writable zero-copy branches",
       "verdict": "PASS",
-      "evidence": "Neon branch-per-endpoint over Iceberg snapshot refs: 'icegres branch create demo.trips parity_dev' forked main's head with zero data copied; a second server (icegres serve --branch parity_dev on :5450) took INSERT trip_id=99016035 + UPDATE (fare -> 123.0) committed to the branch ref with assert-ref-snapshot-id; main endpoint on :5439 stayed untouched (row count for the id 0 -> 0, total 343 -> 343); 'branch drop' removed only the ref."
+      "evidence": "Neon branch-per-endpoint over Iceberg snapshot refs: 'icegres branch create demo.trips parity_dev' forked main's head with zero data copied; a second server (icegres serve --branch parity_dev on :5450) took INSERT trip_id=99010256 + UPDATE (fare -> 123.0) committed to the branch ref with assert-ref-snapshot-id; main endpoint on :5439 stayed untouched (row count for the id 0 -> 0, total 343 -> 343); 'branch drop' removed only the ref."
     },
     {
       "id": "D7",
       "area": "elasticity",
       "behavior": "endpoint routing + supervised computes",
       "verdict": "PASS",
-      "evidence": "ONE public port (:5452) served two endpoints routed by the pgwire startup database param: dbname 'icegres' -> main compute on :5453 (count=343), dbname 'icegres@parity_d7' -> per-branch compute auto-spawned on ephemeral :44551 with --branch (INSERT 'INSERT 0 1' visible on the branch endpoint (1), INVISIBLE on main (0)); then kill -9 of the main compute was auto-restarted by icegresd (capped backoff, restarts>=1) and the endpoint answered again (demo.cities count=20)."
+      "evidence": "ONE public port (:5452) served two endpoints routed by the pgwire startup database param: dbname 'icegres' -> main compute on :5453 (count=343), dbname 'icegres@parity_d7' -> per-branch compute auto-spawned on ephemeral :41361 with --branch (INSERT 'INSERT 0 1' visible on the branch endpoint (1), INVISIBLE on main (0)); then kill -9 of the main compute was auto-restarted by icegresd (capped backoff, restarts>=1) and the endpoint answered again (demo.cities count=20)."
     },
     {
       "id": "E1",
       "area": "ops",
       "behavior": "structured startup logs",
       "verdict": "PASS",
-      "evidence": "serve log contains structured fields catalog_uri/warehouse/s3_endpoint/listen_addr: 2026-07-06T01:57:39.377388Z INFO icegres: connecting to Iceberg REST catalog catalog_uri=http://127.0.0.1:8181/catalog warehouse=lakehouse s3_endpoint=http://127.0.0.1:9000 2026-07-06T01:57:39.397269Z INFO icegres: starting pgwire server listen_addr=127.0.0.1:5440"
+      "evidence": "serve log contains structured fields catalog_uri/warehouse/s3_endpoint/listen_addr: 2026-07-06T02:07:04.804163Z INFO icegres: connecting to Iceberg REST catalog catalog_uri=http://127.0.0.1:8181/catalog warehouse=lakehouse s3_endpoint=http://127.0.0.1:9000 2026-07-06T02:07:04.825475Z INFO icegres: starting pgwire server listen_addr=127.0.0.1:5440"
     },
     {
       "id": "E2",

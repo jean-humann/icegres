@@ -56,8 +56,9 @@ pass criteria, verdict, evidence line.
 | D2 | multiple stateless computes on shared storage (read replicas) | 2nd `icegres serve --port 5440` against same catalog answers identically **including data committed after both started** |
 | D3 | cold start | measured in §2 (cold_start_ms); Neon bar: ~500ms–few s |
 | D4 | time-travel read (branching/PITR analogue) | query an older Iceberg snapshot (metadata tables/snapshot id); record actual support level honestly |
-| D5 | scale-to-zero | expect GAP (no idle-shutdown supervisor); document as roadmap |
+| D5 | scale-to-zero | FULL sleep/wake cycle via `icegresd` (the shipped control plane): first connection to the public port wakes a compute (`--idle-shutdown-secs`), the compute exits cleanly on idle and is reaped, the NEXT connection auto-re-wakes it (wake latency measured) |
 | D6 | writable zero-copy branches | `icegres branch create` (Iceberg snapshot ref, no data copied) + `icegres serve --branch` on its own port; INSERT/UPDATE on the branch commit to the branch ref only, main endpoint provably untouched; `branch drop` removes just the ref (Neon branch-per-endpoint model) |
+| D7 | endpoint routing + supervised computes | one `icegresd` public port serves BOTH endpoints, routed by the pgwire startup `database` param (`icegres` -> main compute, `icegres@<branch>` -> per-branch compute auto-spawned with `--branch` on an ephemeral localhost port); `kill -9` of a compute is auto-restarted with capped backoff and the endpoint keeps answering |
 
 ### Area E — Ops
 | id | behavior | probe sketch |
@@ -86,6 +87,7 @@ Metrics (all against the live local stack, table demo.trips ~280+ rows):
 | freshness_ms | commit in conn A → first successful readback of that row in conn B (poll 10ms) |
 | qps_8conn | mixed read queries, 8 connections: MEDIAN of 3 consecutive 10 s windows (all three reported) |
 | cold_start_ms | `serve` spawn → first successful `select 1` |
+| cold_start_via_proxy_ms | UNGATED extra: first-connection-after-idle latency through `icegresd` (compute cold start + proxy wake + splice setup; timed psql, so ~a few ms client overhead included) |
 | binary_size_mb, rss_idle_mb | footprint |
 | rss_peak_mb | peak server VmRSS, sampled every 100 ms across the whole benchmark (qps-window peak reported separately) |
 | rss_after_load_mb | server VmRSS after all load finished (1 s settle) |

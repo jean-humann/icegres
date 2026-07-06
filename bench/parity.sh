@@ -34,6 +34,9 @@ IDLE_PORT=5445
 HEALTH_PORT=5446
 SECURE_PORT=5447 # auth+TLS server for the A6/A7 probes
 BRANCH_PORT=5450 # --branch server for the D6 probe
+D5_COMPUTE_PORT=5451 # compute behind icegresd for the D5 probe
+D7_PORT=5452         # icegresd public port for the D7 probe
+D7_COMPUTE_PORT=5453 # main compute behind icegresd for the D7 probe
 
 # Harness-owned servers are permissive/plaintext by design (except the
 # dedicated A6/A7 secure server, configured explicitly): a stray
@@ -114,6 +117,24 @@ start_server() { # port pidfile logfile
   wait_ready "$port" || { tail -n 20 "$logfile" >&2; fatal "icegres serve not ready on :$port"; }
 }
 
+stop_icegresd_pidfile() { # pidfile — identity-checked kill (comm=icegresd);
+  # SIGTERM makes icegresd terminate its computes before exiting.
+  local pidfile=$1 pid
+  if [[ -f "$pidfile" ]]; then
+    pid=$(cat "$pidfile")
+    if kill -0 "$pid" 2>/dev/null \
+        && [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == icegresd ]]; then
+      kill "$pid" 2>/dev/null || true
+      for _ in $(seq 1 40); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.25
+      done
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$pidfile"
+  fi
+}
+
 STARTED_MAIN=0
 cleanup() {
   [[ "$STARTED_MAIN" == 1 ]] && stop_pidfile "$RUN_DIR/parity-serve.pid"
@@ -124,6 +145,8 @@ cleanup() {
   stop_pidfile "$RUN_DIR/parity-serve-pk.pid"
   stop_pidfile "$RUN_DIR/parity-serve-buffered.pid"
   stop_pidfile "$RUN_DIR/parity-serve-branch.pid"
+  stop_icegresd_pidfile "$RUN_DIR/parity-icegresd-d5.pid"
+  stop_icegresd_pidfile "$RUN_DIR/parity-icegresd-d7.pid"
   rm -f "$RECORDS"
 }
 trap cleanup EXIT
@@ -143,6 +166,25 @@ BIN="$ICEGRES_DIR/target/release/icegres"
 [[ -x "$BIN" ]] || BIN="$ICEGRES_DIR/target/debug/icegres"
 [[ -x "$BIN" ]] || fatal "no icegres binary found — run: cargo build [--release] in icegres/"
 log "using binary: $BIN"
+DBIN="${BIN%/*}/icegresd" # control plane sibling (same build profile)
+
+# start_icegresd <public_port> <compute_port> <idle_secs> <pidfile> <logfile> <statusfile>
+start_icegresd() {
+  local port=$1 cport=$2 idle=$3 pidfile=$4 logfile=$5 statusfile=$6
+  rm -f "$statusfile"
+  "$DBIN" serve --host "$PG_HOST" --port "$port" --main-port "$cport" \
+    --icegres-bin "$BIN" --idle-shutdown-secs "$idle" --status-file "$statusfile" \
+    >>"$logfile" 2>&1 &
+  echo $! >"$pidfile"
+  for _ in $(seq 1 40); do
+    if (exec 3<>"/dev/tcp/$PG_HOST/$port") 2>/dev/null; then exec 3>&- 3<&-; return 0; fi
+    sleep 0.25
+  done
+  return 1
+}
+
+# istatus <statusfile> <compute-key> <jq-expr>
+istatus() { jq -r --arg k "$2" ".computes[] | select(.key == \$k) | $3" "$1" 2>/dev/null; }
 
 if wait_ready "$MAIN_PORT" 1; then
   log "reusing running server on :$MAIN_PORT"
@@ -630,62 +672,58 @@ else
     "snapshots are enumerable (e.g. id $snap_list via \"trips\$snapshots\") but snapshot-pinned read failed: table@snapshot count -> '$tt_pinned' (current $tt_now), filtered -> '$tt_filter'"
 fi
 
-# D5: scale-to-zero. Start a compute with --idle-shutdown-secs 5 (plus the
-# --health-port endpoint used by E2), query it, verify the process exits
-# cleanly on its own within the idle window, then verify scale-FROM-zero:
-# a fresh spawn answers again (cold start measured).
+# D5: scale-to-zero — the FULL sleep/wake cycle through icegresd (the
+# shipped control plane, not an external supervisor): first connection to
+# the public port wakes a compute (--idle-shutdown-secs 5, health endpoint
+# on :$HEALTH_PORT via env passthrough for E2), the compute exits cleanly on
+# its own after the idle window and is reaped, and the NEXT connection to
+# the same public port re-wakes it transparently (wake latency measured).
 health_body=""; health_code=""
-stop_pidfile "$RUN_DIR/parity-serve-idle.pid"
-if psql -h "$PG_HOST" -p "$IDLE_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
-  record D5 elasticity "scale-to-zero" GAP "port :$IDLE_PORT already occupied; could not probe"
+D5_STATUS="$RUN_DIR/parity-icegresd-d5-status.json"
+stop_icegresd_pidfile "$RUN_DIR/parity-icegresd-d5.pid"
+if psql -h "$PG_HOST" -p "$IDLE_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1 \
+   || psql -h "$PG_HOST" -p "$D5_COMPUTE_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+  record D5 elasticity "scale-to-zero" GAP "port :$IDLE_PORT or :$D5_COMPUTE_PORT already occupied; could not probe"
+elif [[ ! -x "$DBIN" ]]; then
+  record D5 elasticity "scale-to-zero" GAP "icegresd binary not found at $DBIN"
 else
-  : >"$RUN_DIR/parity-serve-idle.log"
-  "$BIN" serve --host "$PG_HOST" --port "$IDLE_PORT" \
-      --idle-shutdown-secs 5 --health-port "$HEALTH_PORT" \
-      >>"$RUN_DIR/parity-serve-idle.log" 2>&1 &
-  idle_pid=$!
-  echo "$idle_pid" >"$RUN_DIR/parity-serve-idle.pid"
-  if ! wait_ready "$IDLE_PORT" 40; then
+  : >"$RUN_DIR/parity-icegresd-d5.log"
+  if ! ICEGRES_HEALTH_PORT="$HEALTH_PORT" start_icegresd "$IDLE_PORT" "$D5_COMPUTE_PORT" 5 \
+       "$RUN_DIR/parity-icegresd-d5.pid" "$RUN_DIR/parity-icegresd-d5.log" "$D5_STATUS"; then
     record D5 elasticity "scale-to-zero" GAP \
-      "server with --idle-shutdown-secs 5 never became ready: $(tail -n 5 "$RUN_DIR/parity-serve-idle.log" | flat)"
+      "icegresd never listened on :$IDLE_PORT: $(tail -n 5 "$RUN_DIR/parity-icegresd-d5.log" | flat)"
   else
+    # Wake 1: connecting to the public port spawns the compute.
+    t0=$(($(date +%s%N) / 1000000))
     idle_q=$(psql -h "$PG_HOST" -p "$IDLE_PORT" -U postgres -d icegres -tA -c 'select count(*) from demo.cities' 2>&1)
+    wake1_ms=$(( $(date +%s%N) / 1000000 - t0 ))
+    d5_cpid=$(istatus "$D5_STATUS" main .pid)
     # E2 evidence, and proof that health traffic does not reset the idle clock.
     health_code=$(curl -s -m 2 -o "$RUN_DIR/health-body.txt" -w '%{http_code}' "http://$PG_HOST:$HEALTH_PORT/health" 2>&1)
     health_body=$(flat <"$RUN_DIR/health-body.txt")
     t_last=$(($(date +%s%N) / 1000000))
     exited=0
     for _ in $(seq 1 80); do
-      kill -0 "$idle_pid" 2>/dev/null || { exited=1; break; }
+      if [[ "$d5_cpid" =~ ^[0-9]+$ ]] && ! kill -0 "$d5_cpid" 2>/dev/null \
+          && [[ "$(istatus "$D5_STATUS" main .state)" == "stopped" ]]; then
+        exited=1; break
+      fi
       sleep 0.25
     done
     exit_after_ms=$(( $(date +%s%N) / 1000000 - t_last ))
-    wait "$idle_pid" 2>/dev/null; idle_rc=$?
-    rm -f "$RUN_DIR/parity-serve-idle.pid"
-    if [[ "$exited" != 1 ]]; then
-      record D5 elasticity "scale-to-zero" GAP \
-        "server with --idle-shutdown-secs 5 still running ${exit_after_ms}ms after last connection (health :$HEALTH_PORT -> $health_code)"
+    d5_last_exit=$(istatus "$D5_STATUS" main .last_exit)
+    # Wake 2 (scale-FROM-zero): the next connection to the SAME public port
+    # re-spawns the compute; nothing else touches the system in between.
+    t0=$(($(date +%s%N) / 1000000))
+    wake=$(psql -h "$PG_HOST" -p "$IDLE_PORT" -U postgres -d icegres -tA -c 'select 1' 2>&1)
+    wake_ms=$(( $(date +%s%N) / 1000000 - t0 ))
+    stop_icegresd_pidfile "$RUN_DIR/parity-icegresd-d5.pid"
+    if [[ "$exited" == 1 && "$idle_q" =~ ^[0-9]+$ && "$wake" == 1 && "$d5_last_exit" == *"clean idle exit"* ]]; then
+      record D5 elasticity "scale-to-zero" PASS \
+        "FULL sleep/wake cycle via icegresd (shipped control plane): first connection to :$IDLE_PORT woke a compute in ${wake1_ms}ms (demo.cities count=$idle_q); compute exited on its own ${exit_after_ms}ms after the last connection ($d5_last_exit; health pings on :$HEALTH_PORT do not reset the idle clock); NEXT connection to the same port auto-re-woke it: 'select 1' in ${wake_ms}ms (= cold start + splice setup). No external supervisor needed."
     else
-      # Scale-from-zero: fresh spawn answers again.
-      t0=$(($(date +%s%N) / 1000000))
-      "$BIN" serve --host "$PG_HOST" --port "$IDLE_PORT" --idle-shutdown-secs 5 \
-          >>"$RUN_DIR/parity-serve-idle.log" 2>&1 &
-      echo $! >"$RUN_DIR/parity-serve-idle.pid"
-      wake=""
-      for _ in $(seq 1 200); do
-        wake=$(psql -h "$PG_HOST" -p "$IDLE_PORT" -U postgres -d icegres -tA -c 'select 1' 2>/dev/null)
-        [[ "$wake" == 1 ]] && break
-        sleep 0.05
-      done
-      wake_ms=$(( $(date +%s%N) / 1000000 - t0 ))
-      stop_pidfile "$RUN_DIR/parity-serve-idle.pid"
-      if [[ "$idle_rc" == 0 && "$idle_q" =~ ^[0-9]+$ && "$wake" == 1 ]]; then
-        record D5 elasticity "scale-to-zero" PASS \
-          "--idle-shutdown-secs 5: server answered queries (demo.cities count=$idle_q), then exited on its own ${exit_after_ms}ms after the last connection with code $idle_rc (clean); health pings on :$HEALTH_PORT do not reset the idle clock. Scale-from-zero: fresh spawn answered 'select 1' after ${wake_ms}ms (supervisor pattern documented in icegres/src/ops.rs + README)."
-      else
-        record D5 elasticity "scale-to-zero" GAP \
-          "idle shutdown incomplete: exit code=$idle_rc (want 0), query='$(echo "$idle_q" | flat)', restart answer='$wake' after ${wake_ms}ms"
-      fi
+      record D5 elasticity "scale-to-zero" GAP \
+        "icegresd sleep/wake cycle incomplete: wake1='$(echo "$idle_q" | flat)' (${wake1_ms}ms), idle-exit=$exited (last_exit='$(echo "$d5_last_exit" | flat)'), rewake='$(echo "$wake" | flat)' after ${wake_ms}ms — log: $(tail -n 5 "$RUN_DIR/parity-icegresd-d5.log" | flat)"
     fi
   fi
 fi
@@ -742,6 +780,65 @@ else
         record D6 elasticity "writable zero-copy branches" GAP \
           "branch write flow incomplete: ins='$d6_ins' br_sees='$d6_br_sees' upd='$d6_upd' fare='$d6_fare' main $d6_main_before->$d6_main_after->$d6_main_final total $d6_total_before->$d6_total_after drop='$(echo "$d6_drop" | flat)'"
       fi
+    fi
+  fi
+fi
+
+# D7: endpoint routing + supervised computes (icegresd control plane). One
+# public port serves BOTH endpoints, routed by the pgwire startup `database`
+# parameter: 'icegres' -> main compute, 'icegres@<branch>' -> a per-branch
+# compute spawned on demand (ephemeral localhost port, `serve --branch`).
+# Supervision: kill -9 the main compute; icegresd restarts it with capped
+# backoff and the endpoint keeps answering.
+D7_BRANCH=parity_d7
+D7_STATUS="$RUN_DIR/parity-icegresd-d7-status.json"
+stop_icegresd_pidfile "$RUN_DIR/parity-icegresd-d7.pid"
+"$BIN" branch drop demo.trips "$D7_BRANCH" >/dev/null 2>&1 || true
+qd7() { psql -h "$PG_HOST" -p "$D7_PORT" -U postgres -d icegres -tA -c "$1" 2>&1; }
+qd7b() { psql -h "$PG_HOST" -p "$D7_PORT" -U postgres -d "icegres@$D7_BRANCH" -tA -c "$1" 2>&1; }
+if psql -h "$PG_HOST" -p "$D7_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1 \
+   || psql -h "$PG_HOST" -p "$D7_COMPUTE_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+  record D7 elasticity "endpoint routing + supervised computes" GAP \
+    "port :$D7_PORT or :$D7_COMPUTE_PORT already occupied; could not probe"
+elif [[ ! -x "$DBIN" ]]; then
+  record D7 elasticity "endpoint routing + supervised computes" GAP "icegresd binary not found at $DBIN"
+elif ! "$BIN" branch create demo.trips "$D7_BRANCH" >/dev/null 2>&1; then
+  record D7 elasticity "endpoint routing + supervised computes" GAP "branch create $D7_BRANCH failed"
+else
+  : >"$RUN_DIR/parity-icegresd-d7.log"
+  if ! start_icegresd "$D7_PORT" "$D7_COMPUTE_PORT" 60 \
+       "$RUN_DIR/parity-icegresd-d7.pid" "$RUN_DIR/parity-icegresd-d7.log" "$D7_STATUS"; then
+    record D7 elasticity "endpoint routing + supervised computes" GAP \
+      "icegresd never listened on :$D7_PORT: $(tail -n 5 "$RUN_DIR/parity-icegresd-d7.log" | flat)"
+  else
+    D7_ID=$((98000000 + RANDOM))
+    d7_main1=$(qd7 'select count(*) from demo.trips')
+    d7_ins=$(psql -h "$PG_HOST" -p "$D7_PORT" -U postgres -d "icegres@$D7_BRANCH" -c \
+      "insert into demo.trips (trip_id, city, distance_km, fare, ts) values ($D7_ID, 'Parity D7', 1.0, 1.0, TIMESTAMP '2026-07-06 00:00:00')" 2>&1 | tail -n 1)
+    d7_br_sees=$(qd7b "select count(*) from demo.trips where trip_id = $D7_ID")
+    d7_main_sees=$(qd7 "select count(*) from demo.trips where trip_id = $D7_ID")
+    d7_br_port=$(istatus "$D7_STATUS" "branch:$D7_BRANCH" .port)
+    # Supervision: SIGKILL the main compute; icegresd must restart it.
+    d7_cpid=$(istatus "$D7_STATUS" main .pid)
+    kill -9 "$d7_cpid" 2>/dev/null
+    d7_recovered=0
+    for _ in $(seq 1 100); do
+      if [[ "$(istatus "$D7_STATUS" main .restarts)" -ge 1 ]] \
+          && [[ "$(istatus "$D7_STATUS" main .state)" == "running" ]]; then
+        d7_recovered=1; break
+      fi
+      sleep 0.1
+    done
+    d7_after=$(qd7 'select count(*) from demo.cities')
+    stop_icegresd_pidfile "$RUN_DIR/parity-icegresd-d7.pid"
+    "$BIN" branch drop demo.trips "$D7_BRANCH" >/dev/null 2>&1 || true
+    if [[ "$d7_main1" =~ ^[0-9]+$ && "$d7_ins" == "INSERT 0 1" && "$d7_br_sees" == 1 \
+          && "$d7_main_sees" == 0 && "$d7_recovered" == 1 && "$d7_after" == 20 ]]; then
+      record D7 elasticity "endpoint routing + supervised computes" PASS \
+        "ONE public port (:$D7_PORT) served two endpoints routed by the pgwire startup database param: dbname 'icegres' -> main compute on :$D7_COMPUTE_PORT (count=$d7_main1), dbname 'icegres@$D7_BRANCH' -> per-branch compute auto-spawned on ephemeral :$d7_br_port with --branch (INSERT '$d7_ins' visible on the branch endpoint ($d7_br_sees), INVISIBLE on main ($d7_main_sees)); then kill -9 of the main compute was auto-restarted by icegresd (capped backoff, restarts>=1) and the endpoint answered again (demo.cities count=$d7_after)."
+    else
+      record D7 elasticity "endpoint routing + supervised computes" GAP \
+        "routing/supervision incomplete: main1='$(echo "$d7_main1" | flat)' ins='$d7_ins' br_sees='$d7_br_sees' main_sees='$d7_main_sees' recovered=$d7_recovered after='$(echo "$d7_after" | flat)' — log: $(tail -n 5 "$RUN_DIR/parity-icegresd-d7.log" | flat)"
     fi
   fi
 fi

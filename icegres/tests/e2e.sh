@@ -147,12 +147,27 @@ stop_pidfile_generic() { # pidfile — identity-checked kill
   fi
 }
 
+stop_icegresd() { # identity-checked kill of the control plane (comm=icegresd)
+  local pidfile="$E2E_DIR/icegresd.pid" pid
+  if [[ -f "$pidfile" ]]; then
+    pid=$(cat "$pidfile")
+    if kill -0 "$pid" 2>/dev/null \
+        && [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == icegresd ]]; then
+      kill "$pid" 2>/dev/null || true # SIGTERM: icegresd terminates its computes
+      for _ in $(seq 1 40); do kill -0 "$pid" 2>/dev/null || break; sleep 0.25; done
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$pidfile"
+  fi
+}
+
 cleanup() {
   stop_server
   stop_secure_server
   stop_pidfile_generic "$PK_PID_FILE"
   stop_pidfile_generic "$E2E_DIR/serve-buffered.pid"
   stop_pidfile_generic "$E2E_DIR/serve-branch.pid"
+  stop_icegresd
 }
 trap cleanup EXIT
 
@@ -810,6 +825,147 @@ fi
 pass "branch drop removed the ref"
 assert_eq "main state fully intact after the branch lifecycle (dev row|main row|seeded)" "0|1|280" \
   "$(q "select count(*) from demo.trips where trip_id = $DEV_ID")|$(q "select count(*) from demo.trips where trip_id = $MAIN_ID")|$(q 'select count(*) from demo.trips where trip_id between 1 and 280')"
+
+# ---------------------------------------------------------------------------
+# (n) icegresd control plane (SPEC D5/D7): wake-on-connect scale-to-zero,
+#     branch-endpoint routing by pgwire database name, supervised computes.
+#     icegresd listens on :$PXY_PORT; the main compute lives on :$PXY_MAIN
+#     (spawned on demand, --idle-shutdown-secs 2), branch computes on
+#     ephemeral localhost ports.
+# ---------------------------------------------------------------------------
+PXY_PORT=5444
+PXY_MAIN=5445
+DBIN="$ICEGRES_DIR/target/debug/icegresd"
+PXY_LOG="$E2E_DIR/icegresd.log"
+PXY_STATUS="$E2E_DIR/icegresd-status.json"
+PXY_BRANCH=e2e_pxy
+log "(n) icegresd control plane on :$PXY_PORT (main compute :$PXY_MAIN, idle 2s)"
+[[ -x "$DBIN" ]] || fail "icegresd binary not found at $DBIN (cargo build builds both bins)"
+stop_icegresd
+for p in "$PXY_PORT" "$PXY_MAIN"; do
+  if psql -h "$PG_HOST" -p "$p" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+    fail "something is already listening on :$p — stop it first"
+  fi
+done
+"$BIN" branch drop demo.trips "$PXY_BRANCH" >/dev/null 2>&1 || true
+
+: >"$PXY_LOG"
+rm -f "$PXY_STATUS"
+"$DBIN" serve --host "$PG_HOST" --port "$PXY_PORT" --main-port "$PXY_MAIN" \
+  --icegres-bin "$BIN" --idle-shutdown-secs 2 --status-file "$PXY_STATUS" \
+  >>"$PXY_LOG" 2>&1 &
+echo $! >"$E2E_DIR/icegresd.pid"
+pxy_up=0
+for _ in $(seq 1 40); do
+  if (exec 3<>"/dev/tcp/$PG_HOST/$PXY_PORT") 2>/dev/null; then exec 3>&- 3<&-; pxy_up=1; break; fi
+  sleep 0.25
+done
+[[ "$pxy_up" == 1 ]] || { tail -n 20 "$PXY_LOG" >&2; fail "icegresd not listening on :$PXY_PORT"; }
+pass "icegresd listening on :$PXY_PORT"
+PXQ=(psql -h "$PG_HOST" -p "$PXY_PORT" -U postgres -d icegres -tA)
+
+# helper: read a field of one compute from the status file
+pxy_status() { # key jq-expr
+  jq -r --arg k "$1" ".computes[] | select(.key == \$k) | $2" "$PXY_STATUS" 2>/dev/null
+}
+
+# n1: wake-on-connect from cold — the compute does not exist yet; the FIRST
+#     client connection spawns it, waits for readiness, and splices.
+assert_eq "first connection through icegresd wakes the compute and answers" 20 \
+  "$("${PXQ[@]}" -c 'select count(*) from demo.cities')"
+main_cpid=$(pxy_status main .pid)
+[[ "$main_cpid" =~ ^[0-9]+$ ]] || fail "status file has no main compute pid: $(cat "$PXY_STATUS" 2>/dev/null)"
+[[ "$(ps -o comm= -p "$main_cpid" 2>/dev/null)" == icegres ]] \
+  || fail "status pid $main_cpid is not a live icegres process"
+pass "status file reports the main compute (pid $main_cpid on :$(pxy_status main .port))"
+
+# n2: scale-to-zero — with --idle-shutdown-secs 2 the compute exits on its
+#     own; icegresd reaps it and marks the slot stopped.
+compute_gone=0
+for _ in $(seq 1 40); do
+  if ! kill -0 "$main_cpid" 2>/dev/null && [[ "$(pxy_status main .state)" == "stopped" ]]; then
+    compute_gone=1; break
+  fi
+  sleep 0.25
+done
+[[ "$compute_gone" == 1 ]] || fail "compute did not idle-exit (pid $main_cpid state=$(pxy_status main .state))"
+if psql -h "$PG_HOST" -p "$PXY_MAIN" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+  fail "compute port :$PXY_MAIN still answering after idle exit"
+fi
+pass "compute idle-exited (scale-to-zero): process gone, slot marked stopped"
+
+# n3: wake-after-idle — the next connection through icegresd re-spawns the
+#     compute transparently; measure the first-connection-after-idle latency.
+t0=$(($(date +%s%N) / 1000000))
+wake_out=$("${PXQ[@]}" -c 'select 1' 2>&1)
+wake_after_idle_ms=$(( $(date +%s%N) / 1000000 - t0 ))
+assert_eq "reconnect after idle auto-wakes the compute" 1 "$wake_out"
+(( wake_after_idle_ms < 10000 )) || fail "wake-after-idle took ${wake_after_idle_ms}ms (>10s)"
+pass "wake-after-idle latency: ${wake_after_idle_ms}ms (cold start + splice setup, incl. psql overhead)"
+
+# n4: branch-endpoint routing — dbname 'icegres@<branch>' routes to a
+#     per-branch compute spawned on demand with --branch <branch>.
+"$BIN" branch create demo.trips "$PXY_BRANCH" >/dev/null 2>&1 \
+  || fail "branch create $PXY_BRANCH failed"
+PXB=(psql -h "$PG_HOST" -p "$PXY_PORT" -U postgres -d "icegres@$PXY_BRANCH" -tA)
+pxb_base=$(( $(q 'select coalesce(max(trip_id), 0) from demo.trips') + 200 ))
+(( pxb_base >= 900000 )) || pxb_base=980000
+assert_eq "branch endpoint INSERT via icegresd" "INSERT 0 1" \
+  "$(psql -h "$PG_HOST" -p "$PXY_PORT" -U postgres -d "icegres@$PXY_BRANCH" -c \
+     "insert into demo.trips (trip_id, city, distance_km, fare, ts)
+      values ($pxb_base, 'E2E ProxyBranch', 1.0, 5.0, TIMESTAMP '2026-07-06 00:00:00')" 2>&1 | tail -n 1)"
+assert_eq "branch endpoint sees its row (new connection via icegresd)" 1 \
+  "$("${PXB[@]}" -c "select count(*) from demo.trips where trip_id = $pxb_base")"
+assert_eq "main endpoint (dbname icegres) does NOT see the branch row" 0 \
+  "$("${PXQ[@]}" -c "select count(*) from demo.trips where trip_id = $pxb_base")"
+br_state=$(pxy_status "branch:$PXY_BRANCH" .state)
+br_port=$(pxy_status "branch:$PXY_BRANCH" .port)
+[[ "$br_state" == "running" || "$br_state" == "stopped" ]] \
+  || fail "branch compute missing from status: state='$br_state'"
+pass "per-branch compute spawned on demand (branch:$PXY_BRANCH on ephemeral :$br_port, state $br_state)"
+
+# n5: supervision — kill -9 the main compute while a session is open; the
+#     supervisor must restart it (capped backoff) WITHOUT a new connection.
+"${PXQ[@]}" -c 'select 1' >/dev/null 2>&1 || fail "pre-kill wake failed"
+( sleep 30 | psql -h "$PG_HOST" -p "$PXY_PORT" -U postgres -d icegres >/dev/null 2>&1 ) &
+HOLD_PID=$!
+held=0
+for _ in $(seq 1 40); do
+  if [[ "$(pxy_status main .active_connections)" == 1 ]]; then held=1; break; fi
+  sleep 0.1
+done
+[[ "$held" == 1 ]] || fail "held session never showed up in active_connections"
+main_cpid=$(pxy_status main .pid)
+restarts_before=$(pxy_status main .restarts)
+kill -9 "$main_cpid" 2>/dev/null || fail "could not SIGKILL compute pid $main_cpid"
+recovered=0
+for _ in $(seq 1 100); do
+  if [[ "$(pxy_status main .restarts)" -gt "$restarts_before" ]] \
+      && [[ "$(pxy_status main .state)" == "running" ]]; then
+    recovered=1; break
+  fi
+  sleep 0.1
+done
+kill "$HOLD_PID" 2>/dev/null || true
+[[ "$recovered" == 1 ]] || { tail -n 20 "$PXY_LOG" >&2; fail "supervisor did not restart the killed compute (restarts=$(pxy_status main .restarts), state=$(pxy_status main .state))"; }
+pass "kill -9 mid-session: supervisor restarted the compute (restarts $restarts_before -> $(pxy_status main .restarts))"
+assert_eq "next connection after the crash answers" 20 \
+  "$("${PXQ[@]}" -c 'select count(*) from demo.cities')"
+grep -q "exited UNCLEANLY" "$PXY_LOG" || fail "unclean exit was not logged loudly"
+pass "unclean exit logged loudly by the supervisor"
+
+# n6: shutdown — SIGTERM to icegresd terminates its computes; ports free.
+main_cpid=$(pxy_status main .pid)
+stop_icegresd
+sleep 0.5
+if [[ "$main_cpid" =~ ^[0-9]+$ ]] && kill -0 "$main_cpid" 2>/dev/null; then
+  fail "compute pid $main_cpid survived icegresd shutdown"
+fi
+if psql -h "$PG_HOST" -p "$PXY_MAIN" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+  fail "compute port :$PXY_MAIN still answering after icegresd shutdown"
+fi
+pass "icegresd shutdown terminated its computes (no leftovers)"
+"$BIN" branch drop demo.trips "$PXY_BRANCH" >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
 log "all assertions passed ($PASS_COUNT)"

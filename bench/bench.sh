@@ -172,8 +172,27 @@ stop_pidfile() { # identity-checked, like icegres/tests/e2e.sh
     rm -f "$PID_FILE"
   fi
 }
+stop_icegresd_pidfile() { # identity-checked (comm=icegresd); SIGTERM
+  # makes icegresd terminate its computes before exiting.
+  local pidfile="$RUN_DIR/bench-icegresd.pid" pid
+  if [[ -f "$pidfile" ]]; then
+    pid=$(cat "$pidfile")
+    if kill -0 "$pid" 2>/dev/null \
+        && [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == icegresd ]]; then
+      kill "$pid" 2>/dev/null || true
+      for _ in $(seq 1 40); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.25
+      done
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$pidfile"
+  fi
+}
+
 cleanup() {
   stop_pidfile
+  stop_icegresd_pidfile
   drop_scratch
 }
 trap cleanup EXIT
@@ -287,6 +306,65 @@ jq -s --argjson ms "$WRITE_BUFFER_MS" \
 log "merged buffered-mode metrics into $OUT_JSON"
 
 # ---------------------------------------------------------------------------
+# 4c. Wake-after-idle latency through icegresd (ADDITIONAL, ungated):
+#     cold_start_via_proxy_ms = first-connection-after-idle latency through
+#     the control plane (compute cold start + proxy wake + splice setup,
+#     measured with a timed psql so client overhead ~a few ms is included).
+#     One icegresd on :$PROXY_PORT supervises a compute on :$PROXY_COMPUTE
+#     with --idle-shutdown-secs 1; each iteration waits for the idle exit,
+#     then times the auto-wake query. The gated direct-serve metrics above
+#     are unaffected (their server never runs behind the proxy).
+# ---------------------------------------------------------------------------
+PROXY_PORT=5447
+PROXY_COMPUTE=5446
+DBIN="$ICEGRES_DIR/target/release/icegresd"
+PROXY_STATUS="$RUN_DIR/bench-icegresd-status.json"
+PROXY_RUNS=5
+if [[ -x "$DBIN" ]]; then
+  log "measuring cold_start_via_proxy_ms ($PROXY_RUNS wake-after-idle cycles via icegresd on :$PROXY_PORT)"
+  if port_answers "$PROXY_PORT" || port_answers "$PROXY_COMPUTE"; then
+    fatal "port :$PROXY_PORT or :$PROXY_COMPUTE is occupied — free it first"
+  fi
+  stop_icegresd_pidfile
+  rm -f "$PROXY_STATUS"
+  : >"$RUN_DIR/bench-icegresd.log"
+  "$DBIN" serve --host "$PG_HOST" --port "$PROXY_PORT" --main-port "$PROXY_COMPUTE" \
+    --icegres-bin "$BIN" --idle-shutdown-secs 1 --status-file "$PROXY_STATUS" \
+    >>"$RUN_DIR/bench-icegresd.log" 2>&1 &
+  echo $! >"$RUN_DIR/bench-icegresd.pid"
+  proxy_up=0
+  for _ in $(seq 1 40); do
+    if (exec 3<>"/dev/tcp/$PG_HOST/$PROXY_PORT") 2>/dev/null; then exec 3>&- 3<&-; proxy_up=1; break; fi
+    sleep 0.25
+  done
+  [[ "$proxy_up" == 1 ]] || fatal "icegresd not listening on :$PROXY_PORT"
+  wake_runs=()
+  for i in $(seq 1 "$PROXY_RUNS"); do
+    # Ensure the compute is idle-exited (state 'stopped' or never started).
+    settled=0
+    for _ in $(seq 1 80); do
+      st=$(jq -r '.computes[] | select(.key=="main") | .state' "$PROXY_STATUS" 2>/dev/null)
+      if [[ -z "$st" || "$st" == "stopped" ]]; then settled=1; break; fi
+      sleep 0.25
+    done
+    [[ "$settled" == 1 ]] || fatal "compute did not idle-exit before wake run $i (state=$st)"
+    t0=$(($(date +%s%N) / 1000000))
+    r=$(psql -h "$PG_HOST" -p "$PROXY_PORT" -U postgres -d icegres -tA -c 'select 1' 2>&1)
+    t1=$(($(date +%s%N) / 1000000))
+    [[ "$r" == 1 ]] || fatal "wake-after-idle query $i failed: $r"
+    wake_runs+=($((t1 - t0)))
+  done
+  stop_icegresd_pidfile
+  proxy_json=$(printf '%s\n' "${wake_runs[@]}" | jq -s \
+    '{p50: (sort | .[(length*0.5|floor)]), p95: (sort | .[-1]), n: length, runs: .}')
+  jq --argjson m "$proxy_json" '.metrics.cold_start_via_proxy_ms = $m' \
+    "$OUT_JSON" >"$OUT_JSON.tmp" && mv "$OUT_JSON.tmp" "$OUT_JSON"
+  log "cold_start_via_proxy_ms: $(printf '%s ' "${wake_runs[@]}")(ms; ungated extra metric)"
+else
+  log "icegresd release binary not found at $DBIN — skipping cold_start_via_proxy_ms"
+fi
+
+# ---------------------------------------------------------------------------
 # 5. Append human table to SCORECARD.md
 # ---------------------------------------------------------------------------
 if [[ ! -f "$SCORECARD" ]]; then
@@ -325,7 +403,7 @@ fi
     ( ["connect_ms","point_lookup_ms","filtered_scan_ms","aggregate_ms","join_ms",
        "insert_single_ms","insert_batch100_ms","freshness_ms","qps_8conn",
        "cold_start_ms","binary_size_mb","rss_idle_mb","rss_peak_mb","rss_after_load_mb",
-       "insert_single_buffered_ms","freshness_buffered_ms"][] ) as $k |
+       "insert_single_buffered_ms","freshness_buffered_ms","cold_start_via_proxy_ms"][] ) as $k |
     row($k; $m[$k])
   ' "$OUT_JSON"
 } >>"$SCORECARD"

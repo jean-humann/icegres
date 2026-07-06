@@ -26,6 +26,7 @@ every feature below is zero-copy on top of it.
 | Zero-copy branches | Neon-style branch-per-endpoint over Iceberg snapshot refs (`src/branch.rs`) | `icegres branch create/list/drop`, `serve --branch` |
 | Buffered writes (opt-in) | Moonlink-style group commit: ~1.5 ms INSERT ack, union reads, ≤N ms durability window, WARN on enable (`src/buffer.rs`) | `--write-buffer-ms N` (default 0 = synchronous) |
 | Scale-to-zero | clean exit after N idle seconds; stateless compute | `--idle-shutdown-secs` |
+| Wake-on-connect control plane | `icegresd`: pgwire-aware proxy that spawns computes on connect, routes `icegres@<branch>` dbnames to per-branch computes, supervises crashes with capped backoff | `icegresd serve` / `icegresd status` |
 | Health endpoint | HTTP 200 liveness | `--health-port` |
 
 ```
@@ -174,6 +175,62 @@ Restart=on-failure
 
 Health-endpoint connections (below) do not count as client activity, so
 liveness probes never keep an idle server alive.
+
+For a shipped supervisor that also completes the scale-from-zero half (and
+adds branch routing), use `icegresd` below.
+
+### icegresd — the minimal control plane (`icegresd serve` / `icegresd status`)
+
+`icegresd` (a second, ~3 MB binary in this crate) is the missing OSS piece
+of the Neon-style loop: a pgwire-aware proxy/supervisor that makes
+scale-to-zero fully transparent to clients and routes one public port to
+per-branch computes.
+
+```sh
+# quickstart: public endpoint on :5432, computes spawned on demand
+./target/release/icegresd serve --port 5432 --idle-shutdown-secs 300
+
+# first connection wakes the main compute (on :5439), then splices bytes
+psql -h 127.0.0.1 -p 5432 -U postgres -d icegres -c 'select 1'
+
+# branch endpoint: dbname 'icegres@<branch>' routes to a per-branch compute
+# spawned with `icegres serve --branch <branch>` on an ephemeral local port
+./target/release/icegres branch create demo.trips dev
+psql -h 127.0.0.1 -p 5432 -U postgres -d 'icegres@dev'
+
+# inspect computes, branches, ports, PIDs, restart counts
+./target/release/icegresd status
+```
+
+* **Wake-on-connect.** If the target compute is not running, the connection
+  spawns it, waits for TCP readiness, then forwards the client's ORIGINAL
+  startup bytes and splices. Computes idle-exit (`--idle-shutdown-secs`,
+  default 300) and are reaped; the next connection re-wakes them —
+  measured wake-after-idle is ~85 ms end to end on the dev box
+  (`cold_start_via_proxy_ms` in the bench).
+* **Routing.** Only the plaintext pgwire `StartupMessage` is parsed (the
+  `database` parameter, before any auth). `icegres` → main compute;
+  `icegres@<branch>` → that branch's compute (`[A-Za-z0-9_-]+`). Create the
+  branch first (`icegres branch create`), or queries fail loudly on the
+  branch endpoint.
+* **Supervision.** Clean idle exits are scale-to-zero; UNCLEAN compute
+  exits (crash, `kill -9`) are restarted with capped exponential backoff
+  (0.5 s/1 s/2 s, max 3 per crash episode) and logged loudly.
+* **TLS terminates at the compute.** icegresd answers `SSLRequest` with `N`
+  (plaintext at the proxy; libpq's default `sslmode=prefer` falls back
+  automatically) and talks plain TCP to computes on localhost. Clients that
+  require TLS should connect directly to a compute started with
+  `--tls-cert/--tls-key`. `CancelRequest` is not routed (no backend-key
+  tracking).
+* **Config.** Computes inherit icegresd's environment, so every `ICEGRES_*`
+  variable (catalog, S3, `ICEGRES_AUTH_FILE`, `ICEGRES_WRITE_BUFFER_MS`,
+  `ICEGRES_HEALTH_PORT`, ...) applies to spawned computes; `--host/--port/
+  --branch/--idle-shutdown-secs` are always passed as flags by icegresd and
+  win over env. Flags: `--port` (public, default 5432), `--main-port`
+  (default 5439), `--icegres-bin` (default: sibling binary), `--compute-host`
+  (default 127.0.0.1), `--wake-timeout-ms` (default 10000), `--status-file`
+  (default `<tmpdir>/icegresd-status.json`); env `ICEGRESD_*` equivalents
+  exist for all.
 
 ### Health checks (`--health-port`)
 
