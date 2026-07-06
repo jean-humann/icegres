@@ -1204,4 +1204,32 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# (r) ODBC client — SPEC A10 (bench/clients/a10_odbc_probe.sh)
+# ---------------------------------------------------------------------------
+# Runs the psqlODBC (unixODBC) compatibility probe against the main server:
+# connect (psqlODBC's version/type probes), SQLTables/SQLColumns metadata,
+# qmark-parameterized query, INSERT/readback/DELETE with rowcount (autocommit),
+# and a read inside an explicit transaction. Writes use trip_id >= 970000 and
+# clean up after themselves. Skips gracefully when pyodbc / the psqlODBC driver
+# is not installed (exit 3; apt install unixodbc odbc-postgresql + pip pyodbc,
+# or run infra/scripts/odbc-setup.sh).
+log "(r) ODBC client probe (bench/clients/a10_odbc_probe.sh)"
+if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import pyodbc' 2>/dev/null; then
+  log "    SKIPPED: pyodbc not available (apt install unixodbc odbc-postgresql; pip install pyodbc)"
+else
+  A10_OUT=$(env ICEGRES_PROBE_HOST="$PG_HOST" ICEGRES_PROBE_PORT="$PG_PORT" \
+      bash "$REPO_DIR/bench/clients/a10_odbc_probe.sh" 2>&1)
+  A10_RC=$?
+  if [[ $A10_RC -eq 3 ]]; then
+    log "    SKIPPED: $(echo "$A10_OUT" | tail -n 1)"
+  else
+    echo "$A10_OUT" | sed 's/^/    /'
+    [[ $A10_RC -eq 0 ]] || fail "A10 ODBC probe reported failures (exit $A10_RC)"
+    echo "$A10_OUT" | grep -q '^A10 RESULT: .*fail=0' \
+      || fail "A10 ODBC probe summary is not fail=0"
+    pass "ODBC client green ($(echo "$A10_OUT" | grep '^A10 RESULT:'))"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 log "all assertions passed ($PASS_COUNT)"

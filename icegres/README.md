@@ -50,6 +50,8 @@ compatibility, and scale-to-zero economics on lakehouse data — leave
 | ORM/BI compatibility | pg_catalog shims: coherent oids, `version()`, ORM introspection rewrites (`src/compat.rs`) — SQLAlchemy/psycopg2/pg8000/pandas verified | default |
 | ADBC / Arrow Flight SQL | second first-class wire protocol (`src/flight.rs`): Arrow end to end, catalog metadata (`get_objects`), prepared statements with binds, DML with real affected counts, BULK INGEST (`adbc_ingest` → ONE Iceberg commit per stream), basic-auth handshake | `icegres flight-serve` (default `:50051`) |
 | ADBC postgres driver | `COPY ... TO STDOUT (FORMAT binary\|text\|csv)` on both protocols (`ops.rs::CopyOutHook`) — `adbc_driver_postgresql` reads/params/DML verified | default (`serve`) |
+| ODBC | stock psqlODBC (unixODBC) — `SQLTables`/`SQLColumns` metadata, params, DML, read-in-txn verified (no icegres code changes; reuses the ORM/JDBC `pg_catalog` shims) | default (`serve`); DSN via `infra/scripts/odbc-setup.sh` |
+| JDBC | stock pgjdbc 42.7 — `DatabaseMetaData`, `PreparedStatement`, `executeUpdate`, txn cycles verified | default (`serve`) |
 
 ```
 psql ──pgwire──▶ icegres (DataFusion) ──REST──▶ Lakekeeper ──▶ Postgres (metadata)
@@ -504,6 +506,44 @@ JDBC-specific limit: SELECT inside an explicit transaction is
 simple-protocol only (the `0A000` above), and pgjdbc always uses the
 extended protocol — so with `autoCommit=false` keep reads on a second
 (autocommit) connection, or add `preferQueryMode=simple` to the URL.
+
+### ODBC
+
+The stock PostgreSQL ODBC driver (psqlODBC via unixODBC) works out of the
+box — no custom driver. Install once and either use a `DRIVER=` connection
+string or register a DSN:
+
+```bash
+# driver + a named DSN "icegres" -> 127.0.0.1:5439
+apt-get install -y unixodbc odbc-postgresql
+bash infra/scripts/odbc-setup.sh          # writes the DSN to /etc/odbc.ini
+echo "select count(*) from demo.trips;" | isql -v icegres
+```
+
+```python
+import pyodbc
+# DSN-less (only needs the driver registered in odbcinst.ini):
+cn = pyodbc.connect(
+    "DRIVER={PostgreSQL Unicode};Server=127.0.0.1;Port=5439;"
+    "Database=icegres;UID=postgres;SSLmode=disable;UseDeclareFetch=0")
+```
+
+Verified end-to-end by `bench/clients/a10_odbc_probe.py` (run it via
+`bench/clients/a10_odbc_probe.sh`; e2e section (r), parity probe A10) —
+no icegres code changes were needed, the `pg_catalog`/version shims added
+for the ORM and JDBC lanes already cover psqlODBC's probes:
+
+- connect (psqlODBC issues its server-version + `pg_type`/`pg_attribute`
+  probes on connect), `SQLTables` (`cursor.tables`) and `SQLColumns`
+  (`cursor.columns`) metadata with correct type names.
+- qmark-parameterized queries, INSERT/readback/DELETE with `rowcount`
+  (autocommit), and a read inside an explicit transaction.
+
+ODBC-specific notes: keep `UseDeclareFetch=0` (server-side `DECLARE`/`FETCH`
+cursors are not implemented — the same limit as the other lanes); for
+writes prefer autocommit, since DML inside an explicit transaction that
+also issues an intervening statement hits the shared `0A000`
+extended-protocol limit.
 
 ## Demo schema
 

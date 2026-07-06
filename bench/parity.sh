@@ -384,6 +384,28 @@ else
   fi
 fi
 
+# A10: ODBC compatibility — runs bench/clients/a10_odbc_probe.sh (stock psqlODBC
+# via unixODBC: connect + version/type probes, SQLTables/SQLColumns metadata,
+# qmark parameters, INSERT/readback/DELETE with rowcount, read-in-transaction)
+# against the main server. PASS requires exit 0 AND fail=0. A missing pyodbc or
+# psqlODBC driver records a GAP in evidence terms (environment, not server).
+A10_BEHAVIOR="ODBC compatibility (psqlODBC SQLTables/SQLColumns+params+DML)"
+a10_probe="$REPO_DIR/bench/clients/a10_odbc_probe.sh"
+if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import pyodbc' 2>/dev/null; then
+  record A10 wire "$A10_BEHAVIOR" GAP "pyodbc/psqlODBC not available to run bench/clients/a10_odbc_probe.sh (apt install unixodbc odbc-postgresql; pip install pyodbc)"
+else
+  a10_out=$(env ICEGRES_PROBE_HOST="$PG_HOST" ICEGRES_PROBE_PORT="$MAIN_PORT" bash "$a10_probe" 2>&1)
+  a10_rc=$?
+  a10_summary=$(echo "$a10_out" | grep '^A10 RESULT:' | tail -n 1)
+  if [[ $a10_rc -eq 0 && "$a10_summary" == *"fail=0"* ]]; then
+    record A10 wire "$A10_BEHAVIOR" PASS \
+      "bench/clients/a10_odbc_probe.sh all green ($a10_summary): psqlODBC connect (version/type probes on connect), SQLTables + SQLColumns metadata of demo.trips (correct type names), qmark-parameterized query, INSERT/readback/DELETE with rowcount (autocommit), read inside an explicit transaction. Self-contained DRIVER= connection string; DSN via infra/scripts/odbc-setup.sh."
+  else
+    record A10 wire "$A10_BEHAVIOR" GAP \
+      "probe exit=$a10_rc ($a10_summary): $(echo "$a10_out" | grep -E '^(    FAIL|A10 SKIP)' | flat)"
+  fi
+fi
+
 # A11: ADBC first-class — starts `icegres flight-serve` on :$FLIGHT_PORT and
 # runs bench/clients/a11_adbc_probe.py, both lanes: (1) adbc_driver_flightsql
 # against the Arrow Flight SQL endpoint (query, get_objects, prepared+bind,
