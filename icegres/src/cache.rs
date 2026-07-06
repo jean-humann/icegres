@@ -60,14 +60,17 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::catalog::{SchemaProvider, Session};
-use datafusion::datasource::{TableProvider, TableType};
+use datafusion::datasource::{MemTable, TableProvider, TableType};
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::ExecutionPlan;
 use iceberg::table::Table;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use iceberg_datafusion::{to_datafusion_error, IcebergStaticTableProvider};
+
+use crate::buffer::WriteBuffer;
 
 /// Identity of a table metadata version: metadata file location plus current
 /// snapshot id. Any commit (append, schema change, ...) moves the metadata
@@ -85,6 +88,10 @@ fn metadata_version(table: &Table) -> MetadataVersion {
 struct CachedSnapshot {
     version: MetadataVersion,
     provider: Arc<IcebergStaticTableProvider>,
+    /// Metadata of the snapshot the provider serves — the write buffer's
+    /// union read needs it to decide which flushed generations this
+    /// committed view already contains (buffer.rs).
+    metadata: iceberg::spec::TableMetadataRef,
 }
 
 /// A [`TableProvider`] that serves scans from a cached, snapshot-pinned
@@ -98,6 +105,11 @@ pub struct CachingTableProvider {
     write_delegate: Arc<dyn TableProvider>,
     schema: ArrowSchemaRef,
     cached: RwLock<Option<CachedSnapshot>>,
+    /// Buffered write mode (`--write-buffer-ms`, buffer.rs): scans union
+    /// the committed snapshot with this buffer's overlay so acked-but-
+    /// unflushed rows are readable on this server. `None` = default mode,
+    /// scans unchanged.
+    write_buffer: Option<Arc<WriteBuffer>>,
 }
 
 impl std::fmt::Debug for CachingTableProvider {
@@ -113,6 +125,7 @@ impl CachingTableProvider {
         catalog: Arc<dyn Catalog>,
         ident: TableIdent,
         write_delegate: Arc<dyn TableProvider>,
+        write_buffer: Option<Arc<WriteBuffer>>,
     ) -> Self {
         let schema = write_delegate.schema();
         Self {
@@ -121,30 +134,39 @@ impl CachingTableProvider {
             write_delegate,
             schema,
             cached: RwLock::new(None),
+            write_buffer,
         }
     }
 
-    /// Return a provider for the table's *current* snapshot, reusing the
-    /// cached one (and its warm manifest cache) when the metadata is
-    /// unchanged. Costs one REST `load_table` round trip per call.
-    async fn current_provider(&self) -> iceberg::Result<Arc<IcebergStaticTableProvider>> {
+    /// Return a provider for the table's *current* snapshot (plus the
+    /// metadata it serves), reusing the cached one (and its warm manifest
+    /// cache) when the metadata is unchanged. Costs one REST `load_table`
+    /// round trip per call.
+    async fn current_provider(
+        &self,
+    ) -> iceberg::Result<(
+        Arc<IcebergStaticTableProvider>,
+        iceberg::spec::TableMetadataRef,
+    )> {
         let fresh = self.catalog.load_table(&self.ident).await?;
         let version = metadata_version(&fresh);
         {
             let guard = self.cached.read().expect("cache lock poisoned");
             if let Some(cached) = guard.as_ref() {
                 if cached.version == version {
-                    return Ok(cached.provider.clone());
+                    return Ok((cached.provider.clone(), cached.metadata.clone()));
                 }
             }
         }
+        let metadata = fresh.metadata_ref();
         let provider = Arc::new(IcebergStaticTableProvider::try_new_from_table(fresh).await?);
         let mut guard = self.cached.write().expect("cache lock poisoned");
         *guard = Some(CachedSnapshot {
             version,
             provider: provider.clone(),
+            metadata: metadata.clone(),
         });
-        Ok(provider)
+        Ok((provider, metadata))
     }
 }
 
@@ -169,7 +191,25 @@ impl TableProvider for CachingTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let provider = self.current_provider().await.map_err(to_datafusion_error)?;
+        let (provider, metadata) = self.current_provider().await.map_err(to_datafusion_error)?;
+        // Buffered write mode: take the overlay AFTER loading the committed
+        // metadata — this ordering is what makes the union exactly-once
+        // under concurrent flushes (see the protocol in buffer.rs).
+        let overlay = self
+            .write_buffer
+            .as_ref()
+            .and_then(|b| b.overlay(&self.ident, &metadata));
+        if let Some(overlay) = overlay {
+            // Same union shape as the transaction hook's read view (txn.rs
+            // UnionProvider): both children scanned with the same projection,
+            // filters reported Inexact so DataFusion re-applies them above
+            // the union, no per-child limit (union only concatenates).
+            let committed =
+                crate::scan::tune(provider.scan(state, projection, filters, None).await?);
+            let mem = MemTable::try_new(overlay.schema, vec![overlay.batches])?;
+            let buffered = mem.scan(state, projection, filters, None).await?;
+            return Ok(UnionExec::try_new(vec![committed, buffered])?);
+        }
         let plan = provider.scan(state, projection, filters, limit).await?;
         // Re-run plain table scans at higher object-store IO concurrency
         // (see scan.rs); non-scan plans pass through unchanged.
@@ -312,6 +352,10 @@ pub struct CachingSchemaProvider {
     /// Snapshot-pinned time-travel providers (bounded LRU; snapshots are
     /// immutable, so entries never need invalidation — only eviction).
     pinned: PinnedCache,
+    /// Buffered write mode (buffer.rs); threaded into every
+    /// [`CachingTableProvider`]. Time-travel and metadata tables stay
+    /// point-in-time by design and never see the buffer.
+    write_buffer: Option<Arc<WriteBuffer>>,
 }
 
 /// Parse a `<table>@<snapshot_id>` time-travel reference. Returns the base
@@ -339,6 +383,7 @@ impl CachingSchemaProvider {
         inner: Arc<dyn SchemaProvider>,
         catalog: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
+        write_buffer: Option<Arc<WriteBuffer>>,
     ) -> DFResult<Self> {
         let mut map = HashMap::new();
         for name in inner.table_names() {
@@ -353,6 +398,7 @@ impl CachingSchemaProvider {
                         catalog.clone(),
                         ident,
                         write_delegate,
+                        write_buffer.clone(),
                     )),
                 );
             }
@@ -363,6 +409,7 @@ impl CachingSchemaProvider {
             namespace,
             cached: RwLock::new(map),
             pinned: PinnedCache::new(),
+            write_buffer,
         })
     }
 
@@ -445,6 +492,7 @@ impl SchemaProvider for CachingSchemaProvider {
                     self.catalog.clone(),
                     ident,
                     write_delegate,
+                    self.write_buffer.clone(),
                 ));
                 self.cached
                     .write()

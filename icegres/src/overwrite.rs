@@ -484,6 +484,23 @@ impl OverwriteEngine {
         }
     }
 
+    /// POST an externally-prepared commit (see [`prepare_commit`]) for
+    /// `ident`. Used by the write buffer's group-commit flusher, which
+    /// needs the prepare/post split so it can tag in-flight rows with the
+    /// new snapshot id between the two steps (buffer.rs).
+    pub async fn post_prepared(
+        &self,
+        ident: &TableIdent,
+        prepared: &PreparedCommit,
+    ) -> Result<CommitOutcome> {
+        self.post_commit(
+            &ident.namespace().to_url_string(),
+            ident.name(),
+            &prepared.request,
+        )
+        .await
+    }
+
     /// POST the commit to the REST catalog. 2xx = committed, 409 = conflict
     /// (caller retries), anything else = hard error.
     async fn post_commit(
@@ -523,7 +540,9 @@ impl OverwriteEngine {
     }
 }
 
-enum CommitOutcome {
+/// Result of POSTing a prepared commit: accepted, or rejected with 409
+/// (optimistic-concurrency conflict; the caller decides whether to retry).
+pub enum CommitOutcome {
     Committed,
     Conflict(String),
 }
@@ -536,6 +555,15 @@ pub struct PreparedCommit {
     /// Append ops), aligned with the input op list.
     rows_by_op: Vec<u64>,
     snapshot_id: i64,
+}
+
+impl PreparedCommit {
+    /// The snapshot id this commit will publish if the catalog accepts it
+    /// (known BEFORE the POST — the write buffer tags in-flight rows with
+    /// it so union reads can dedupe exactly; see buffer.rs).
+    pub fn snapshot_id(&self) -> i64 {
+        self.snapshot_id
+    }
 }
 
 /// Parse and validate the `icegres.primary-key` table property.

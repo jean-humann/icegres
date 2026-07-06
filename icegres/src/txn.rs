@@ -128,6 +128,15 @@ impl TxnRegistry {
         Self::default()
     }
 
+    /// Whether `addr` has an open transaction (used by the write-buffer
+    /// hook, which must not touch statements owned by this hook).
+    pub fn active(&self, addr: SocketAddr) -> bool {
+        self.sessions
+            .lock()
+            .expect("txn registry lock poisoned")
+            .contains_key(&addr)
+    }
+
     fn get(&self, addr: SocketAddr) -> Option<Arc<tokio::sync::Mutex<TxnSession>>> {
         self.sessions
             .lock()
@@ -1034,8 +1043,9 @@ impl QueryHook for TxnHook {
 /// Plan an INSERT through DataFusion (column-list reordering, NULL-filling
 /// of omitted nullable columns, type coercion — identical rules to the
 /// stock INSERT path) and execute ONLY its input, returning the target
-/// table plus the rows to append.
-async fn plan_insert_rows(
+/// table plus the rows to append. Also used by the write-buffer hook
+/// (buffer.rs) so buffered and synchronous INSERTs shape rows identically.
+pub(crate) async fn plan_insert_rows(
     ctx: &SessionContext,
     stmt: &Statement,
     params: Option<&ParamValues>,
@@ -1083,7 +1093,7 @@ fn table_ref_to_ident(table_ref: &TableReference) -> Result<TableIdent> {
 
 /// Extract the target table identity from an INSERT AST (Postgres identifier
 /// folding, default namespace).
-fn insert_target(stmt: &Statement) -> Result<TableIdent> {
+pub(crate) fn insert_target(stmt: &Statement) -> Result<TableIdent> {
     let Statement::Insert(insert) = stmt else {
         bail!("not an INSERT statement");
     };

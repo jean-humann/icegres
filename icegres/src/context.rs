@@ -18,6 +18,7 @@ use iceberg_datafusion::IcebergCatalogProvider;
 use iceberg_storage_opendal::OpenDalStorageFactory;
 use tracing::info;
 
+use crate::buffer::WriteBuffer;
 use crate::cache::CachingSchemaProvider;
 use crate::CatalogOpts;
 
@@ -98,19 +99,25 @@ fn session_config(target_partitions: Option<usize>) -> Result<SessionConfig> {
 /// because `setup_pg_catalog` needs `register_schema`, which
 /// `IcebergCatalogProvider` does not implement.
 pub async fn build_session_context(catalog: Arc<dyn Catalog>) -> Result<SessionContext> {
-    build_session_context_with(catalog, None).await
+    build_session_context_with(catalog, None, None).await
 }
 
-/// [`build_session_context`] with an explicit `target_partitions` override.
+/// [`build_session_context`] with an explicit `target_partitions` override
+/// and an optional write buffer.
 ///
 /// iceberg-datafusion's INSERT path round-robin-repartitions the input of an
 /// unpartitioned-table write across `target_partitions` workers and writes
 /// one Parquet file per non-empty worker. Callers that want a guaranteed
 /// single data file per commit (e.g. `icegres seed`, which optimizes the
 /// demo tables for scan speed) pass `Some(1)`.
+///
+/// `write_buffer` (serve-only, `--write-buffer-ms`) makes every plain-table
+/// scan union the committed snapshot with the buffer's overlay (buffer.rs);
+/// `None` keeps scans byte-for-byte on the default path.
 pub async fn build_session_context_with(
     catalog: Arc<dyn Catalog>,
     target_partitions: Option<usize>,
+    write_buffer: Option<Arc<WriteBuffer>>,
 ) -> Result<SessionContext> {
     let ctx = SessionContext::new_with_config(session_config(target_partitions)?);
 
@@ -133,6 +140,7 @@ pub async fn build_session_context_with(
                 schema,
                 catalog.clone(),
                 NamespaceIdent::new(schema_name.clone()),
+                write_buffer.clone(),
             )
             .await
             .with_context(|| format!("failed to build caching provider for {schema_name}"))?;

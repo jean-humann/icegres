@@ -46,6 +46,9 @@ export PGCONNECT_TIMEOUT=5
 # change what is being measured. (Clients would still pass credentials when
 # configured: psql/tokio-postgres read PGPASSWORD from the environment.)
 unset ICEGRES_AUTH_FILE ICEGRES_TLS_CERT ICEGRES_TLS_KEY
+# Same reasoning for buffered-write mode: the DEFAULT server under test must
+# be fully synchronous; only the dedicated section 4b run turns the flag on.
+unset ICEGRES_WRITE_BUFFER_MS ICEGRES_WRITE_BUFFER_MAX_ROWS
 
 BIN="$ICEGRES_DIR/target/release/icegres"
 HARNESS_BIN="$SCRIPT_DIR/harness/target/release/icegres-bench"
@@ -248,6 +251,42 @@ log "wrote $OUT_JSON"
 stop_pidfile
 
 # ---------------------------------------------------------------------------
+# 4b. Buffered-mode metrics (ADDITIONAL, ungated): a separate server run with
+#     --write-buffer-ms measures insert_single_buffered_ms and
+#     freshness_buffered_ms. The gated default-mode metrics above came from a
+#     default-mode server and are unaffected. Writes go to the same
+#     bench-owned scratch table (distinct id range >= 3,000,000).
+# ---------------------------------------------------------------------------
+WRITE_BUFFER_MS=100
+BUF_LOG="$RUN_DIR/bench-serve-buffered.log"
+BUF_JSON="$RUN_DIR/bench-buffered.json"
+log "starting buffered-mode server on :$PG_PORT (--write-buffer-ms $WRITE_BUFFER_MS)"
+: >"$BUF_LOG"
+"$BIN" serve --host "$PG_HOST" --port "$PG_PORT" --write-buffer-ms "$WRITE_BUFFER_MS" \
+  >>"$BUF_LOG" 2>&1 &
+BUF_PID=$!
+echo "$BUF_PID" >"$PID_FILE"
+for _ in $(seq 1 60); do
+  port_answers "$PG_PORT" && break
+  kill -0 "$BUF_PID" 2>/dev/null || { tail -n 20 "$BUF_LOG" >&2; fatal "buffered server exited during startup"; }
+  sleep 0.5
+done
+port_answers "$PG_PORT" || fatal "buffered server not ready on :$PG_PORT within 30s"
+
+log "running buffered-mode harness subset (insert_single_buffered_ms, freshness_buffered_ms)"
+"$HARNESS_BIN" --host "$PG_HOST" --port "$PG_PORT" --buffered >"$BUF_JSON" \
+  || { tail -n 5 "$BUF_LOG" >&2; fatal "buffered bench harness failed"; }
+
+# Let the last acked rows flush (cadence + margin), then stop the server and
+# merge the buffered metrics into the run document (annotated with the mode).
+sleep 1
+stop_pidfile
+jq -s --argjson ms "$WRITE_BUFFER_MS" \
+  '.[0] * {metrics: (.[0].metrics + .[1].metrics), write_buffer_ms_buffered_run: $ms}' \
+  "$OUT_JSON" "$BUF_JSON" >"$OUT_JSON.tmp" && mv "$OUT_JSON.tmp" "$OUT_JSON"
+log "merged buffered-mode metrics into $OUT_JSON"
+
+# ---------------------------------------------------------------------------
 # 5. Append human table to SCORECARD.md
 # ---------------------------------------------------------------------------
 if [[ ! -f "$SCORECARD" ]]; then
@@ -285,7 +324,8 @@ fi
     .metrics as $m |
     ( ["connect_ms","point_lookup_ms","filtered_scan_ms","aggregate_ms","join_ms",
        "insert_single_ms","insert_batch100_ms","freshness_ms","qps_8conn",
-       "cold_start_ms","binary_size_mb","rss_idle_mb","rss_peak_mb","rss_after_load_mb"][] ) as $k |
+       "cold_start_ms","binary_size_mb","rss_idle_mb","rss_peak_mb","rss_after_load_mb",
+       "insert_single_buffered_ms","freshness_buffered_ms"][] ) as $k |
     row($k; $m[$k])
   ' "$OUT_JSON"
 } >>"$SCORECARD"

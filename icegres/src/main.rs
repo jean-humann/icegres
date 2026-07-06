@@ -4,6 +4,7 @@
 //! and tables through DataFusion, and serves them over the Postgres wire
 //! protocol via datafusion-postgres.
 
+mod buffer;
 mod cache;
 mod context;
 mod dml;
@@ -144,6 +145,20 @@ enum Command {
             value_parser = clap::builder::BoolishValueParser::new()
         )]
         enforce_pk: bool,
+
+        /// Moonlink-style buffered writes: with N > 0, INSERTs acknowledge
+        /// after appending to an in-memory buffer and a background task
+        /// group-commits it to Iceberg every N ms (or at the row threshold,
+        /// env ICEGRES_WRITE_BUFFER_MAX_ROWS). Reads on THIS server union
+        /// the buffer with the committed table, so read-your-writes holds
+        /// locally and same-server cross-connection freshness is instant;
+        /// OTHER servers/readers see the rows at the commit cadence (<= N
+        /// ms after ack). TRADE-OFF: an unclean kill loses up to N ms of
+        /// acked-but-uncommitted writes — that is why the default is 0
+        /// (fully synchronous, semantics unchanged) and enabling it logs a
+        /// WARN. See icegres/src/buffer.rs for the full semantics.
+        #[arg(long, env = "ICEGRES_WRITE_BUFFER_MS", default_value_t = 0)]
+        write_buffer_ms: u64,
     },
     /// Create and populate the demo namespace/tables (idempotent).
     Seed {
@@ -194,6 +209,7 @@ async fn main() -> Result<()> {
             tls_key,
             auth_file,
             enforce_pk,
+            write_buffer_ms,
         } => {
             let serve_opts = ServeOpts {
                 idle_shutdown_secs,
@@ -202,6 +218,7 @@ async fn main() -> Result<()> {
                 tls_key,
                 auth_file,
                 enforce_pk,
+                write_buffer_ms,
             };
             run_serve(&catalog, &host, port, serve_opts).await
         }
@@ -222,6 +239,7 @@ struct ServeOpts {
     tls_key: Option<String>,
     auth_file: Option<PathBuf>,
     enforce_pk: bool,
+    write_buffer_ms: u64,
 }
 
 async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeOpts) -> Result<()> {
@@ -264,7 +282,34 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
         "connecting to Iceberg REST catalog"
     );
     let catalog = context::connect_catalog(opts).await?;
-    let ctx = context::build_session_context(catalog.clone()).await?;
+    let engine =
+        Arc::new(OverwriteEngine::connect(catalog.clone(), opts, serve_opts.enforce_pk).await?);
+
+    // Moonlink-style buffered write mode (--write-buffer-ms, buffer.rs).
+    // Default 0 = fully synchronous, current semantics unchanged.
+    let write_buffer = if serve_opts.write_buffer_ms > 0 {
+        let buf = Arc::new(buffer::WriteBuffer::new(
+            catalog.clone(),
+            engine.clone(),
+            serve_opts.write_buffer_ms,
+        ));
+        warn!(
+            write_buffer_ms = serve_opts.write_buffer_ms,
+            max_rows = buf.max_rows(),
+            "write buffering is ENABLED: INSERTs acknowledge BEFORE their Iceberg commit; \
+             an UNCLEAN kill loses up to {} ms of acked-but-uncommitted writes; other \
+             servers/readers see buffered rows only at the commit cadence. Reads on this \
+             server union the buffer (read-your-writes holds locally).",
+            serve_opts.write_buffer_ms
+        );
+        buf.spawn_flusher();
+        Some(buf)
+    } else {
+        None
+    };
+
+    let ctx =
+        context::build_session_context_with(catalog.clone(), None, write_buffer.clone()).await?;
 
     setup_pg_catalog(
         &ctx,
@@ -284,10 +329,14 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
             overwrite::PK_PROPERTY
         );
     }
-    let engine =
-        Arc::new(OverwriteEngine::connect(catalog.clone(), opts, serve_opts.enforce_pk).await?);
     let txn_registry = Arc::new(TxnRegistry::new());
-    let hooks = query_hooks(engine, txn_registry.clone(), catalog);
+    let hooks = query_hooks(
+        engine,
+        txn_registry.clone(),
+        catalog,
+        write_buffer,
+        serve_opts.enforce_pk,
+    );
 
     info!(listen_addr = %format!("{host}:{port}"), "starting pgwire server");
     // Always the icegres accept loop (ops.rs): it is byte-for-byte the
@@ -311,23 +360,37 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
 }
 
 /// The icegres query-hook chain, in order:
-/// 1. [`TxnHook`] — BEGIN/COMMIT/ROLLBACK and, while a transaction is open,
+/// 1. [`buffer::BufferHook`] (only with `--write-buffer-ms > 0`) — buffered
+///    autocommit INSERT ack + ordering fences (flush before UPDATE/DELETE/
+///    BEGIN/DDL). Must run first so a fence flush happens before the fenced
+///    statement's own handler; it defers to TxnHook for any connection with
+///    an open transaction.
+/// 2. [`TxnHook`] — BEGIN/COMMIT/ROLLBACK and, while a transaction is open,
 ///    EVERY statement on that connection (buffered writes, pinned reads);
 ///    also PK-enforced autocommit INSERT. Replaces the upstream
 ///    `TransactionStatementHook`, whose BEGIN/COMMIT were accepted but
 ///    non-transactional.
-/// 2. `SetShowHook` — upstream SET/SHOW handling.
-/// 3. [`dml::DmlHook`] — autocommit copy-on-write UPDATE/DELETE.
+/// 3. `SetShowHook` — upstream SET/SHOW handling.
+/// 4. [`dml::DmlHook`] — autocommit copy-on-write UPDATE/DELETE.
 fn query_hooks(
     engine: Arc<OverwriteEngine>,
     registry: Arc<TxnRegistry>,
     catalog: Arc<dyn Catalog>,
+    write_buffer: Option<Arc<buffer::WriteBuffer>>,
+    enforce_pk: bool,
 ) -> Vec<Arc<dyn QueryHook>> {
-    vec![
-        Arc::new(TxnHook::new(registry, engine.clone(), catalog)),
-        Arc::new(SetShowHook),
-        Arc::new(dml::DmlHook::new(engine)),
-    ]
+    let mut hooks: Vec<Arc<dyn QueryHook>> = Vec::with_capacity(4);
+    if let Some(buf) = write_buffer {
+        hooks.push(Arc::new(buffer::BufferHook::new(
+            buf,
+            registry.clone(),
+            enforce_pk,
+        )));
+    }
+    hooks.push(Arc::new(TxnHook::new(registry, engine.clone(), catalog)));
+    hooks.push(Arc::new(SetShowHook));
+    hooks.push(Arc::new(dml::DmlHook::new(engine)));
+    hooks
 }
 
 async fn run_sql(opts: &CatalogOpts, query: &str, enforce_pk: bool) -> Result<()> {

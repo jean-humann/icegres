@@ -38,6 +38,8 @@ export PGCONNECT_TIMEOUT=5
 # them. Clients still pass credentials when configured: psql reads PGPASSWORD
 # from the (inherited) environment on every invocation below.
 unset ICEGRES_AUTH_FILE ICEGRES_TLS_CERT ICEGRES_TLS_KEY
+# Same for buffered-write mode: only section (l)'s dedicated server enables it.
+unset ICEGRES_WRITE_BUFFER_MS ICEGRES_WRITE_BUFFER_MAX_ROWS
 
 CATALOG_URI="http://127.0.0.1:8181/catalog"
 WAREHOUSE=lakehouse
@@ -145,7 +147,12 @@ stop_pidfile_generic() { # pidfile — identity-checked kill
   fi
 }
 
-cleanup() { stop_server; stop_secure_server; stop_pidfile_generic "$PK_PID_FILE"; }
+cleanup() {
+  stop_server
+  stop_secure_server
+  stop_pidfile_generic "$PK_PID_FILE"
+  stop_pidfile_generic "$E2E_DIR/serve-buffered.pid"
+}
 trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
@@ -544,6 +551,142 @@ assert_eq "table holds exactly the accepted rows" "1|a" \
 
 stop_pk_server
 drop_pk_table
+
+# ---------------------------------------------------------------------------
+# (l) Buffered write mode (--write-buffer-ms, Moonlink-style union reads):
+#     insert burst acked from the buffer, instantly readable on NEW
+#     connections BEFORE any Iceberg commit (union read proven by the
+#     unchanged snapshot count), group-committed as ONE snapshot at the
+#     flush cadence, and durable across an UNCLEAN kill once flushed.
+# ---------------------------------------------------------------------------
+BUF_PORT=5449
+BUF_PID_FILE="$E2E_DIR/serve-buffered.pid"
+BUF_LOG="$E2E_DIR/serve-buffered.log"
+BUF_MS=1500 # long cadence so the "readable before commit" check is deterministic
+log "(l) buffered write mode (--write-buffer-ms $BUF_MS) on :$BUF_PORT"
+stop_pidfile_generic "$BUF_PID_FILE"
+if psql -h "$PG_HOST" -p "$BUF_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+  fail "something is already listening on :$BUF_PORT — stop it first"
+fi
+: >"$BUF_LOG"
+"$BIN" serve --host "$PG_HOST" --port "$BUF_PORT" --write-buffer-ms "$BUF_MS" \
+  >>"$BUF_LOG" 2>&1 &
+echo $! >"$BUF_PID_FILE"
+buf_ready=0
+for _ in $(seq 1 60); do
+  if psql -h "$PG_HOST" -p "$BUF_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+    buf_ready=1; break
+  fi
+  sleep 0.5
+done
+[[ "$buf_ready" == 1 ]] || { tail -n 20 "$BUF_LOG" >&2; fail "buffered server not ready on :$BUF_PORT"; }
+BQ=(psql -h "$PG_HOST" -p "$BUF_PORT" -U postgres -d icegres -tA)
+
+# The enabled mode must announce its durability trade loudly.
+grep -q "write buffering is ENABLED" "$BUF_LOG" \
+  || fail "buffered server did not log the durability WARN (log: $BUF_LOG)"
+pass "startup WARN present (acked-write loss window documented)"
+
+# Burst: 25 rows in 5 INSERT statements over one connection, all acked from
+# the buffer, then read back from NEW connections. The instant-visibility
+# assertion (count == 25) is timing-independent — the union view is correct
+# whether or not a flush has happened. The stronger "served from the buffer,
+# NOT the lake" proof (snapshot count unchanged across the burst) races the
+# background flush tick by construction, so it retries with fresh ids until
+# an attempt completes inside one flush window (3 attempts, each ~0.5 s in a
+# ${BUF_MS} ms window — a systematic failure means the union read is broken).
+buf_base=$(( $("${BQ[@]}" -c 'select coalesce(max(trip_id), 0) from demo.trips') + 1 ))
+(( buf_base >= 900000 )) || buf_base=950000
+snaps_start=$(trips_snap_count)
+burst_stmts=""
+attempts=0
+union_proven=0
+for attempt in 1 2 3; do
+  attempts=$attempt
+  base=$((buf_base + (attempt - 1) * 25))
+  snaps_pre=$(trips_snap_count)
+  burst_stmts=""
+  for k in 0 1 2 3 4; do
+    vals=""
+    for j in 0 1 2 3 4; do
+      id=$((base + k * 5 + j))
+      vals+="${vals:+, }($id, 'E2E Buffered', 1.0, 2.0, TIMESTAMP '2026-07-06 00:00:00')"
+    done
+    burst_stmts+="insert into demo.trips (trip_id, city, distance_km, fare, ts) values $vals;"$'\n'
+  done
+  burst_out=$(psql -h "$PG_HOST" -p "$BUF_PORT" -U postgres -d icegres -v ON_ERROR_STOP=1 2>&1 <<<"$burst_stmts") \
+    || fail "buffered INSERT burst failed: $burst_out"
+  [[ "$(grep -c '^INSERT 0 5$' <<<"$burst_out")" == 5 ]] || fail "burst tags wrong: $burst_out"
+  # Union read: all 25 rows visible IMMEDIATELY on a NEW connection.
+  burst_count=$("${BQ[@]}" -c "select count(*) from demo.trips where trip_id between $base and $((base + 24))")
+  [[ "$burst_count" == 25 ]] || fail "burst not instantly readable on a new connection (union read broken): got $burst_count/25"
+  # Aggregates also see the buffered rows (whole-scan union, no special case).
+  agg=$("${BQ[@]}" -c "select city, count(*) from demo.trips where trip_id between $base and $((base + 24)) group by city")
+  [[ "$agg" == "E2E Buffered|25" ]] || fail "aggregate over the union view wrong: $agg"
+  snaps_post=$(trips_snap_count)
+  if [[ "$snaps_post" == "$snaps_pre" ]]; then
+    union_proven=1
+    break
+  fi
+  log "  flush tick landed inside attempt $attempt's burst window (snapshots $snaps_pre -> $snaps_post); retrying with fresh ids"
+done
+[[ "$union_proven" == 1 ]] || fail "no burst attempt completed with an unchanged snapshot count — rows are not being served from the buffer"
+pass "burst of 25 rows readable instantly on new connections with ZERO new Iceberg snapshots (union read, acked from the buffer)"
+total_rows=$((attempts * 25))
+
+# Wait one flush cadence: the buffered statements group-commit. 5 INSERT
+# statements per attempt would be 5 snapshots each in synchronous mode; the
+# buffer coalesces each attempt's burst into one flush (2 max if a tick
+# split an earlier retried attempt).
+sleep $(( BUF_MS / 1000 + 2 ))
+snaps_settled=$(trips_snap_count)
+new_snaps=$((snaps_settled - snaps_start))
+if (( new_snaps >= 1 && new_snaps <= attempts + 1 )); then
+  pass "group commit: $((attempts * 5)) INSERT statements ($total_rows rows) produced $new_snaps snapshot(s) (sync mode would produce $((attempts * 5)))"
+else
+  fail "unexpected snapshot count after flush: $new_snaps new snapshots for $attempts burst attempt(s)"
+fi
+assert_eq "all burst rows committed after the flush cadence" "$total_rows" \
+  "$("${BQ[@]}" -c "select count(*) from demo.trips where trip_id between $buf_base and $((buf_base + total_rows - 1))")"
+
+# UNCLEAN kill (SIGKILL — no graceful shutdown), then restart: the flushed
+# rows are in Iceberg, so they survive the loss of the process.
+buf_pid=$(cat "$BUF_PID_FILE")
+kill -9 "$buf_pid" 2>/dev/null || fail "could not SIGKILL buffered server"
+for _ in $(seq 1 20); do kill -0 "$buf_pid" 2>/dev/null || break; sleep 0.25; done
+kill -0 "$buf_pid" 2>/dev/null && fail "buffered server survived SIGKILL"
+rm -f "$BUF_PID_FILE"
+"$BIN" serve --host "$PG_HOST" --port "$BUF_PORT" --write-buffer-ms "$BUF_MS" \
+  >>"$BUF_LOG" 2>&1 &
+echo $! >"$BUF_PID_FILE"
+buf_ready=0
+for _ in $(seq 1 60); do
+  if psql -h "$PG_HOST" -p "$BUF_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+    buf_ready=1; break
+  fi
+  sleep 0.5
+done
+[[ "$buf_ready" == 1 ]] || { tail -n 20 "$BUF_LOG" >&2; fail "buffered server not ready after unclean restart"; }
+assert_eq "committed burst survived the unclean kill + restart" "$total_rows" \
+  "$("${BQ[@]}" -c "select count(*) from demo.trips where trip_id between $buf_base and $((buf_base + total_rows - 1))")"
+# The main (synchronous, :$PG_PORT) server sees them too — cross-server
+# freshness after the flush cadence.
+assert_eq "burst visible on the default-mode server (cross-server = commit cadence)" "$total_rows" \
+  "$(q "select count(*) from demo.trips where trip_id between $buf_base and $((buf_base + total_rows - 1))")"
+
+# Ordering fence: with rows pending in the buffer, an UPDATE must see them
+# (buffered INSERT then immediate UPDATE behaves exactly like sync mode).
+fence_id=$((buf_base + total_rows))
+psql -h "$PG_HOST" -p "$BUF_PORT" -U postgres -d icegres -q -c \
+  "insert into demo.trips (trip_id, city, distance_km, fare, ts) values ($fence_id, 'E2E Fence', 1.0, 1.0, TIMESTAMP '2026-07-06 00:00:00')" \
+  || fail "fence INSERT failed"
+fence_tag=$(psql -h "$PG_HOST" -p "$BUF_PORT" -U postgres -d icegres -c \
+  "update demo.trips set fare = 42.0 where trip_id = $fence_id" | tail -n 1)
+assert_eq "UPDATE right after a buffered INSERT (flush fence)" "UPDATE 1" "$fence_tag"
+assert_eq "fenced row readable with the updated value" "$fence_id|42.0" \
+  "$("${BQ[@]}" -c "select trip_id, fare from demo.trips where trip_id = $fence_id")"
+
+stop_pidfile_generic "$BUF_PID_FILE"
 
 # ---------------------------------------------------------------------------
 log "all assertions passed ($PASS_COUNT)"

@@ -46,9 +46,9 @@ const RSS_SAMPLE_MS: u64 = 100;
 /// drift monotonically between runs (baseline runs could never agree).
 const SCRATCH: &str = "demo.bench_scratch";
 
-const Q_POINT: &str = "select trip_id, city, distance_km, fare, ts from demo.trips where trip_id = $1";
-const Q_FILTER: &str =
-    "select count(*) from demo.trips where city = 'Paris' and distance_km > 20";
+const Q_POINT: &str =
+    "select trip_id, city, distance_km, fare, ts from demo.trips where trip_id = $1";
+const Q_FILTER: &str = "select count(*) from demo.trips where city = 'Paris' and distance_km > 20";
 const Q_AGG: &str =
     "select city, count(*) as trips from demo.trips group by city order by trips desc, city asc limit 5";
 const Q_JOIN: &str = "select c.country, count(*) as trips from demo.trips t join demo.cities c on t.city = c.city group by c.country order by trips desc, c.country asc";
@@ -59,6 +59,11 @@ struct Args {
     server_bin: String,
     server_pid: Option<u32>,
     cold_port: u16,
+    /// Buffered-mode subset: measure ONLY insert_single_buffered_ms and
+    /// freshness_buffered_ms against a server started with
+    /// --write-buffer-ms > 0 (bench.sh runs this as a SEPARATE server run;
+    /// the gated default-mode metrics are untouched).
+    buffered: bool,
 }
 
 fn parse_args() -> Args {
@@ -67,6 +72,7 @@ fn parse_args() -> Args {
     let mut server_bin = String::new();
     let mut server_pid = None;
     let mut cold_port = 5442u16;
+    let mut buffered = false;
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < argv.len() {
@@ -80,11 +86,15 @@ fn parse_args() -> Args {
             "--server-bin" => server_bin = need(i).to_string(),
             "--server-pid" => server_pid = Some(need(i).parse().expect("bad --server-pid")),
             "--cold-port" => cold_port = need(i).parse().expect("bad --cold-port"),
+            "--buffered" => {
+                buffered = true;
+                i -= 1; // flag takes no value
+            }
             other => panic!("unknown argument: {other}"),
         }
         i += 2;
     }
-    if server_bin.is_empty() {
+    if server_bin.is_empty() && !buffered {
         panic!("--server-bin is required (release icegres binary path)");
     }
     Args {
@@ -93,6 +103,7 @@ fn parse_args() -> Args {
         server_bin,
         server_pid,
         cold_port,
+        buffered,
     }
 }
 
@@ -186,10 +197,7 @@ async fn measure_query(client: &Client, sql: &str, param: Option<i64>) -> Vec<f6
 
 async fn max_trip_id(client: &Client) -> i64 {
     let rows = client
-        .query(
-            &format!("select max(trip_id) from {SCRATCH}"),
-            &[],
-        )
+        .query(&format!("select max(trip_id) from {SCRATCH}"), &[])
         .await
         .expect("max(trip_id) on scratch table failed");
     rows[0].get::<_, Option<i64>>(0).unwrap_or(0)
@@ -231,7 +239,10 @@ async fn measure_insert_batch(client: &Client, mut next_id: i64) -> (Vec<f64>, i
         let sql = insert_sql(next_id, 100);
         next_id += 100;
         let t0 = Instant::now();
-        let n = client.execute(&sql, &[]).await.expect("batch insert failed");
+        let n = client
+            .execute(&sql, &[])
+            .await
+            .expect("batch insert failed");
         assert_eq!(n, 100, "batch insert affected {n} rows, expected 100");
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         if i >= WARMUP {
@@ -243,11 +254,7 @@ async fn measure_insert_batch(client: &Client, mut next_id: i64) -> (Vec<f64>, i
 
 /// Freshness: commit on conn A -> first successful readback on conn B,
 /// polling every 10 ms. Clock starts when the INSERT completes.
-async fn measure_freshness(
-    writer: &Client,
-    reader: &Client,
-    mut next_id: i64,
-) -> (Vec<f64>, i64) {
+async fn measure_freshness(writer: &Client, reader: &Client, mut next_id: i64) -> (Vec<f64>, i64) {
     let mut samples = Vec::with_capacity(ITERS);
     for i in 0..(WARMUP + ITERS) {
         let id = next_id;
@@ -464,9 +471,56 @@ impl RssSampler {
     }
 }
 
+/// Buffered-mode subset (bench.sh runs this against a SEPARATE server
+/// started with --write-buffer-ms > 0): measures the same single-row INSERT
+/// and cross-connection freshness loops as the default metrics, but the ack
+/// comes from the in-memory buffer and the readback is served by the
+/// server's union read. Distinct id range (>= 3_000_000) so a shared
+/// scratch table cannot collide with the default-mode write metrics.
+async fn run_buffered(args: &Args) {
+    let mut metrics = Map::new();
+    let writer = connect(&args.host, args.port)
+        .await
+        .expect("writer connect");
+    let max_id = max_trip_id(&writer).await;
+    let next_id = std::cmp::max(max_id + 1, 3_000_000);
+
+    let (samples, next_id) = measure_insert_single(&writer, next_id).await;
+    let s = summarize(samples);
+    eprint_metric("insert_single_buffered_ms", &s);
+    metrics.insert("insert_single_buffered_ms".into(), s);
+
+    let reader = connect(&args.host, args.port)
+        .await
+        .expect("reader connect");
+    let (samples, _next_id) = measure_freshness(&writer, &reader, next_id).await;
+    let s = summarize(samples);
+    eprint_metric("freshness_buffered_ms", &s);
+    metrics.insert("freshness_buffered_ms".into(), s);
+
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let out = json!({
+        "schema": "icegres-bench-buffered-v1",
+        "unix_ts": ts,
+        "host": args.host,
+        "port": args.port,
+        "warmup_discarded": WARMUP,
+        "iterations": ITERS,
+        "metrics": Value::Object(metrics),
+    });
+    println!("{}", serde_json::to_string_pretty(&out).unwrap());
+}
+
 #[tokio::main]
 async fn main() {
     let args = parse_args();
+    if args.buffered {
+        run_buffered(&args).await;
+        return;
+    }
     let mut metrics = Map::new();
 
     // Footprint first (server is idle-ish before we hammer it).
@@ -488,7 +542,10 @@ async fn main() {
         metrics.insert("rss_idle_mb".into(), json!({ "value": rss }));
         eprint_metric("rss_idle_mb", &json!(rss));
     } else {
-        metrics.insert("rss_idle_mb".into(), json!({ "value": null, "note": "no --server-pid given" }));
+        metrics.insert(
+            "rss_idle_mb".into(),
+            json!({ "value": null, "note": "no --server-pid given" }),
+        );
     }
 
     // From here on, sample the server RSS every RSS_SAMPLE_MS for the whole
@@ -540,7 +597,9 @@ async fn main() {
     let max_id = max_trip_id(&client).await;
     let next_id = std::cmp::max(max_id + 1, 2_000_000);
 
-    let writer = connect(&args.host, args.port).await.expect("writer connect");
+    let writer = connect(&args.host, args.port)
+        .await
+        .expect("writer connect");
     let (samples, next_id) = measure_insert_single(&writer, next_id).await;
     let s = summarize(samples);
     eprint_metric("insert_single_ms", &s);
@@ -551,7 +610,9 @@ async fn main() {
     eprint_metric("insert_batch100_ms", &s);
     metrics.insert("insert_batch100_ms".into(), s);
 
-    let reader = connect(&args.host, args.port).await.expect("reader connect");
+    let reader = connect(&args.host, args.port)
+        .await
+        .expect("reader connect");
     let (samples, _next_id) = measure_freshness(&writer, &reader, next_id).await;
     let s = summarize(samples);
     eprint_metric("freshness_ms", &s);

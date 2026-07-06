@@ -40,6 +40,8 @@ SECURE_PORT=5447 # auth+TLS server for the A6/A7 probes
 # them. Clients still pass credentials when configured: every psql below
 # reads PGPASSWORD from the inherited environment.
 unset ICEGRES_AUTH_FILE ICEGRES_TLS_CERT ICEGRES_TLS_KEY
+# Same for buffered-write mode: only the dedicated C4 buffered probe enables it.
+unset ICEGRES_WRITE_BUFFER_MS ICEGRES_WRITE_BUFFER_MAX_ROWS
 CATALOG_URI="http://127.0.0.1:8181/catalog"
 WAREHOUSE=lakehouse
 S3_ENDPOINT="http://127.0.0.1:9000"
@@ -119,6 +121,7 @@ cleanup() {
   stop_pidfile "$RUN_DIR/parity-serve-idle.pid"
   stop_pidfile "$RUN_DIR/parity-serve-secure.pid"
   stop_pidfile "$RUN_DIR/parity-serve-pk.pid"
+  stop_pidfile "$RUN_DIR/parity-serve-buffered.pid"
   rm -f "$RECORDS"
 }
 trap cleanup EXIT
@@ -481,16 +484,55 @@ record C3 lakehouse "CDC Postgres->Iceberg" NA_BY_DESIGN \
   "Moonlink exists to replicate Postgres heap data into Iceberg; icegres data is born in Iceberg (INSERT via wire commits an Iceberg snapshot directly, verified by B1+C1) — there is no second copy to synchronize."
 
 # C4: freshness — measured inside the B1 probe (commit -> first successful
-# new-connection readback, 10ms poll).
+# new-connection readback, 10ms poll). Additionally probe the opt-in
+# buffered write mode (--write-buffer-ms, Moonlink-style union reads) on a
+# dedicated server: ack -> new-connection readback, which is served from the
+# in-memory buffer union rather than waiting for the Iceberg commit.
+BUFC4_PORT=5449
+stop_pidfile "$RUN_DIR/parity-serve-buffered.pid"
+buffered_evidence="buffered mode not probed"
+if psql -h "$PG_HOST" -p "$BUFC4_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+  buffered_evidence="buffered-mode probe skipped: port :$BUFC4_PORT already occupied"
+else
+  : >"$RUN_DIR/parity-serve-buffered.log"
+  "$BIN" serve --host "$PG_HOST" --port "$BUFC4_PORT" --write-buffer-ms 100 \
+    >>"$RUN_DIR/parity-serve-buffered.log" 2>&1 &
+  echo $! >"$RUN_DIR/parity-serve-buffered.pid"
+  if wait_ready "$BUFC4_PORT" 40; then
+    C4B_ID=$next_id; next_id=$((next_id + 1))
+    psql -h "$PG_HOST" -p "$BUFC4_PORT" -U postgres -d icegres -q -c \
+      "insert into demo.trips (trip_id, city, distance_km, fare, ts) values ($C4B_ID, 'Parity C4buf', 1.0, 1.0, TIMESTAMP '2026-07-06 00:00:00')" \
+      2>/dev/null
+    t0=$(($(date +%s%N) / 1000000))
+    buf_fresh_ms=-1
+    for _ in $(seq 1 100); do
+      r=$(psql -h "$PG_HOST" -p "$BUFC4_PORT" -U postgres -d icegres -tA -c \
+        "select trip_id from demo.trips where trip_id = $C4B_ID" 2>&1)
+      if [[ "$r" == "$C4B_ID" ]]; then
+        buf_fresh_ms=$(( $(date +%s%N) / 1000000 - t0 )); break
+      fi
+      sleep 0.01
+    done
+    if [[ "$buf_fresh_ms" -ge 0 ]]; then
+      buffered_evidence="buffered mode (--write-buffer-ms 100, opt-in; default 0 = synchronous): INSERT acked from the in-memory buffer was readable from a NEW connection on the same server after ~${buf_fresh_ms}ms (union read — no wait for the Iceberg commit; precise p50/p95 is bench insert_single_buffered_ms/freshness_buffered_ms; cross-server freshness = flush cadence, unclean-kill loss window <= 100ms, WARNed at startup)"
+    else
+      buffered_evidence="buffered-mode probe FAILED: acked row trip_id=$C4B_ID not readable within 1s on :$BUFC4_PORT"
+    fi
+    sleep 0.5 # let the flusher commit the probe row before stopping
+  else
+    buffered_evidence="buffered-mode probe skipped: server with --write-buffer-ms never became ready: $(tail -n 3 "$RUN_DIR/parity-serve-buffered.log" | flat)"
+  fi
+  stop_pidfile "$RUN_DIR/parity-serve-buffered.pid"
+fi
 if [[ "$fresh_ms" -ge 0 && "$fresh_ms" -lt 1000 ]]; then
   record C4 lakehouse "write freshness (commit -> readable elsewhere)" PASS \
-    "row committed via conn A was readable from a new connection ~${fresh_ms}ms after commit (coarse; includes psql startup — precise p50/p95 is bench freshness_ms). Moonlink bar: sub-second."
+    "row committed via conn A was readable from a new connection ~${fresh_ms}ms after commit (coarse; includes psql startup — precise p50/p95 is bench freshness_ms). Moonlink bar: sub-second. Additionally: $buffered_evidence."
 elif [[ "$fresh_ms" -ge 0 ]]; then
   record C4 lakehouse "write freshness (commit -> readable elsewhere)" GAP \
-    "row visible only after ${fresh_ms}ms (> 1s Moonlink bar)"
+    "row visible only after ${fresh_ms}ms (> 1s Moonlink bar); $buffered_evidence"
 else
   record C4 lakehouse "write freshness (commit -> readable elsewhere)" GAP \
-    "row trip_id=$B1_ID never became visible while polling"
+    "row trip_id=$B1_ID never became visible while polling; $buffered_evidence"
 fi
 
 snaps=$(q 'select snapshot_id, committed_at from demo."trips$snapshots" order by committed_at')
