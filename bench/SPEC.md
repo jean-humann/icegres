@@ -57,6 +57,7 @@ pass criteria, verdict, evidence line.
 | D3 | cold start | measured in §2 (cold_start_ms); Neon bar: ~500ms–few s |
 | D4 | time-travel read (branching/PITR analogue) | query an older Iceberg snapshot (metadata tables/snapshot id); record actual support level honestly |
 | D5 | scale-to-zero | expect GAP (no idle-shutdown supervisor); document as roadmap |
+| D6 | writable zero-copy branches | `icegres branch create` (Iceberg snapshot ref, no data copied) + `icegres serve --branch` on its own port; INSERT/UPDATE on the branch commit to the branch ref only, main endpoint provably untouched; `branch drop` removes just the ref (Neon branch-per-endpoint model) |
 
 ### Area E — Ops
 | id | behavior | probe sketch |

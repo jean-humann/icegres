@@ -104,7 +104,7 @@ pub async fn run(opts: &CatalogOpts) -> Result<()> {
     // snapshots the table list at construction time. target_partitions is
     // pinned to 1 so each table's single INSERT writes exactly one Parquet
     // file (the write plan emits one file per non-empty output partition).
-    let ctx = build_session_context_with(catalog, Some(1), None).await?;
+    let ctx = build_session_context_with(catalog, Some(1), None, None).await?;
 
     // Insert based on the observed row count (not on whether this run created
     // the table), so a table left empty by an interrupted earlier seed run is

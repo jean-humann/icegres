@@ -110,6 +110,11 @@ pub struct CachingTableProvider {
     /// unflushed rows are readable on this server. `None` = default mode,
     /// scans unchanged.
     write_buffer: Option<Arc<WriteBuffer>>,
+    /// Branch pin (`--branch`, SPEC D6): scans serve the head of this
+    /// Iceberg snapshot ref instead of `main`'s current snapshot. A table
+    /// without the ref fails loudly at scan time (never silently falls back
+    /// to main). `None` = default mode, scans unchanged.
+    branch: Option<String>,
 }
 
 impl std::fmt::Debug for CachingTableProvider {
@@ -126,6 +131,7 @@ impl CachingTableProvider {
         ident: TableIdent,
         write_delegate: Arc<dyn TableProvider>,
         write_buffer: Option<Arc<WriteBuffer>>,
+        branch: Option<String>,
     ) -> Self {
         let schema = write_delegate.schema();
         Self {
@@ -135,13 +141,15 @@ impl CachingTableProvider {
             schema,
             cached: RwLock::new(None),
             write_buffer,
+            branch,
         }
     }
 
-    /// Return a provider for the table's *current* snapshot (plus the
-    /// metadata it serves), reusing the cached one (and its warm manifest
-    /// cache) when the metadata is unchanged. Costs one REST `load_table`
-    /// round trip per call.
+    /// Return a provider for the table's *current* snapshot — the head of
+    /// the configured branch (`main` by default) — plus the metadata it
+    /// serves, reusing the cached one (and its warm manifest cache) when the
+    /// metadata is unchanged. Costs one REST `load_table` round trip per
+    /// call.
     async fn current_provider(
         &self,
     ) -> iceberg::Result<(
@@ -149,7 +157,26 @@ impl CachingTableProvider {
         iceberg::spec::TableMetadataRef,
     )> {
         let fresh = self.catalog.load_table(&self.ident).await?;
-        let version = metadata_version(&fresh);
+        // Branch mode: the cache version and the served snapshot are the
+        // branch HEAD (a commit to any other branch moves the metadata
+        // location without changing what this endpoint serves; a commit to
+        // THIS branch changes the head). A missing ref is a loud error,
+        // never a silent fallback to main.
+        let branch_pin: Option<i64> = match &self.branch {
+            None => None,
+            Some(branch) => crate::overwrite::branch_head(fresh.metadata(), branch)
+                .map_err(|e| {
+                    iceberg::Error::new(
+                        iceberg::ErrorKind::Unexpected,
+                        format!("cannot read {}: {e:#}", self.ident),
+                    )
+                })?
+                .map(|s| s.snapshot_id()),
+        };
+        let version: MetadataVersion = match branch_pin {
+            Some(head) => (None, Some(head)),
+            None => metadata_version(&fresh),
+        };
         {
             let guard = self.cached.read().expect("cache lock poisoned");
             if let Some(cached) = guard.as_ref() {
@@ -159,7 +186,12 @@ impl CachingTableProvider {
             }
         }
         let metadata = fresh.metadata_ref();
-        let provider = Arc::new(IcebergStaticTableProvider::try_new_from_table(fresh).await?);
+        let provider = match branch_pin {
+            Some(head) => Arc::new(
+                IcebergStaticTableProvider::try_new_from_table_snapshot(fresh, head).await?,
+            ),
+            None => Arc::new(IcebergStaticTableProvider::try_new_from_table(fresh).await?),
+        };
         let mut guard = self.cached.write().expect("cache lock poisoned");
         *guard = Some(CachedSnapshot {
             version,
@@ -231,6 +263,17 @@ impl TableProvider for CachingTableProvider {
         input: Arc<dyn ExecutionPlan>,
         insert_op: InsertOp,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        // Branch mode routes every INSERT through the overwrite engine (the
+        // TxnHook intercepts them before planning reaches this provider);
+        // the upstream delegate would fast_append to MAIN, silently leaking
+        // a branch write onto the default branch — refuse instead.
+        if let Some(branch) = &self.branch {
+            return Err(datafusion::error::DataFusionError::Plan(format!(
+                "INSERT into {} on branch {branch:?} must go through the icegres write \
+                 engine (this path would write to 'main'); this is a bug — please report it",
+                self.ident
+            )));
+        }
         self.write_delegate
             .insert_into(state, input, insert_op)
             .await
@@ -356,6 +399,10 @@ pub struct CachingSchemaProvider {
     /// [`CachingTableProvider`]. Time-travel and metadata tables stay
     /// point-in-time by design and never see the buffer.
     write_buffer: Option<Arc<WriteBuffer>>,
+    /// Branch pin (`--branch`); threaded into every
+    /// [`CachingTableProvider`]. Explicit `table@snapshot` time travel and
+    /// metadata tables are unaffected (they address snapshots directly).
+    branch: Option<String>,
 }
 
 /// Parse a `<table>@<snapshot_id>` time-travel reference. Returns the base
@@ -384,6 +431,7 @@ impl CachingSchemaProvider {
         catalog: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
         write_buffer: Option<Arc<WriteBuffer>>,
+        branch: Option<String>,
     ) -> DFResult<Self> {
         let mut map = HashMap::new();
         for name in inner.table_names() {
@@ -399,6 +447,7 @@ impl CachingSchemaProvider {
                         ident,
                         write_delegate,
                         write_buffer.clone(),
+                        branch.clone(),
                     )),
                 );
             }
@@ -410,6 +459,7 @@ impl CachingSchemaProvider {
             cached: RwLock::new(map),
             pinned: PinnedCache::new(),
             write_buffer,
+            branch,
         })
     }
 
@@ -493,6 +543,7 @@ impl SchemaProvider for CachingSchemaProvider {
                     ident,
                     write_delegate,
                     self.write_buffer.clone(),
+                    self.branch.clone(),
                 ));
                 self.cached
                     .write()

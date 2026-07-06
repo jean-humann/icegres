@@ -4,6 +4,7 @@
 //! and tables through DataFusion, and serves them over the Postgres wire
 //! protocol via datafusion-postgres.
 
+mod branch;
 mod buffer;
 mod cache;
 mod context;
@@ -146,6 +147,17 @@ enum Command {
         )]
         enforce_pk: bool,
 
+        /// Serve a zero-copy BRANCH of the lakehouse (Neon's branch-per-
+        /// endpoint model, SPEC D6): all reads pin to the head of this
+        /// Iceberg snapshot ref and all writes (INSERT/UPDATE/DELETE/
+        /// transactions) commit to it with assert-ref-snapshot-id on the
+        /// branch — never touching `main` or any other branch. The branch
+        /// must already exist on each table you touch (`icegres branch
+        /// create <table> <name>`); reading a table without the ref fails
+        /// loudly. Default: main.
+        #[arg(long, env = "ICEGRES_BRANCH", default_value = "main")]
+        branch: String,
+
         /// Moonlink-style buffered writes: with N > 0, INSERTs acknowledge
         /// after appending to an in-memory buffer and a background task
         /// group-commits it to Iceberg every N ms (or at the row threshold,
@@ -164,6 +176,11 @@ enum Command {
     Seed {
         #[command(flatten)]
         catalog: CatalogOpts,
+    },
+    /// Manage zero-copy branches (named Iceberg snapshot refs, SPEC D6).
+    Branch {
+        #[command(subcommand)]
+        cmd: BranchCmd,
     },
     /// Execute a single SQL statement locally (no server) and print results.
     Sql {
@@ -188,6 +205,43 @@ enum Command {
     },
 }
 
+/// `icegres branch` subcommands. A branch is a named snapshot ref in table
+/// metadata: creating/dropping one is a pure metadata commit — zero data
+/// copied. See icegres/src/branch.rs for the full model.
+#[derive(Subcommand)]
+enum BranchCmd {
+    /// Create branch <name> on <table> (zero-copy fork of main's head, or
+    /// of --at-snapshot).
+    Create {
+        #[command(flatten)]
+        catalog: CatalogOpts,
+        /// Target table: <table> or <namespace>.<table>.
+        table: String,
+        /// Branch name to create (must not exist yet).
+        name: String,
+        /// Fork from this snapshot id instead of the current main head.
+        #[arg(long)]
+        at_snapshot: Option<i64>,
+    },
+    /// List all snapshot refs (branches/tags) of <table>.
+    List {
+        #[command(flatten)]
+        catalog: CatalogOpts,
+        /// Target table: <table> or <namespace>.<table>.
+        table: String,
+    },
+    /// Drop branch <name> from <table> (removes only the ref; snapshots
+    /// stay time-travel-readable until expiry).
+    Drop {
+        #[command(flatten)]
+        catalog: CatalogOpts,
+        /// Target table: <table> or <namespace>.<table>.
+        table: String,
+        /// Branch name to drop (`main` is refused).
+        name: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -208,6 +262,7 @@ async fn main() -> Result<()> {
             tls_cert,
             tls_key,
             auth_file,
+            branch,
             enforce_pk,
             write_buffer_ms,
         } => {
@@ -217,12 +272,27 @@ async fn main() -> Result<()> {
                 tls_cert,
                 tls_key,
                 auth_file,
+                branch,
                 enforce_pk,
                 write_buffer_ms,
             };
             run_serve(&catalog, &host, port, serve_opts).await
         }
         Command::Seed { catalog } => seed::run(&catalog).await,
+        Command::Branch { cmd } => match cmd {
+            BranchCmd::Create {
+                catalog,
+                table,
+                name,
+                at_snapshot,
+            } => branch::create(&catalog, &table, &name, at_snapshot).await,
+            BranchCmd::List { catalog, table } => branch::list(&catalog, &table).await,
+            BranchCmd::Drop {
+                catalog,
+                table,
+                name,
+            } => branch::drop(&catalog, &table, &name).await,
+        },
         Command::Sql {
             catalog,
             query,
@@ -238,6 +308,7 @@ struct ServeOpts {
     tls_cert: Option<String>,
     tls_key: Option<String>,
     auth_file: Option<PathBuf>,
+    branch: String,
     enforce_pk: bool,
     write_buffer_ms: u64,
 }
@@ -275,6 +346,22 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
         }
     };
 
+    // Zero-copy branch serving (--branch, SPEC D6): `None` = main = the
+    // historical read/write paths byte-for-byte; `Some(name)` pins reads to
+    // the branch head and routes every write to the branch ref.
+    let branch: Option<String> = if serve_opts.branch == iceberg::spec::MAIN_BRANCH {
+        None
+    } else {
+        info!(
+            branch = %serve_opts.branch,
+            "serving BRANCH {:?}: reads pin to the branch head, writes commit to the \
+             branch ref (main and other branches are untouched); tables without this \
+             branch fail loudly",
+            serve_opts.branch
+        );
+        Some(serve_opts.branch.clone())
+    };
+
     info!(
         catalog_uri = %opts.catalog_uri,
         warehouse = %opts.warehouse,
@@ -282,8 +369,10 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
         "connecting to Iceberg REST catalog"
     );
     let catalog = context::connect_catalog(opts).await?;
-    let engine =
-        Arc::new(OverwriteEngine::connect(catalog.clone(), opts, serve_opts.enforce_pk).await?);
+    let engine = Arc::new(
+        OverwriteEngine::connect(catalog.clone(), opts, serve_opts.enforce_pk, branch.clone())
+            .await?,
+    );
 
     // Moonlink-style buffered write mode (--write-buffer-ms, buffer.rs).
     // Default 0 = fully synchronous, current semantics unchanged.
@@ -308,8 +397,13 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
         None
     };
 
-    let ctx =
-        context::build_session_context_with(catalog.clone(), None, write_buffer.clone()).await?;
+    let ctx = context::build_session_context_with(
+        catalog.clone(),
+        None,
+        write_buffer.clone(),
+        branch.clone(),
+    )
+    .await?;
 
     setup_pg_catalog(
         &ctx,
@@ -398,7 +492,7 @@ async fn run_sql(opts: &CatalogOpts, query: &str, enforce_pk: bool) -> Result<()
     // UPDATE/DELETE take the same copy-on-write path as the server's wire
     // handler; everything else goes through DataFusion unchanged.
     if let Some(dml_stmt) = dml::parse_single_dml(query)? {
-        let engine = OverwriteEngine::connect(catalog, opts, enforce_pk).await?;
+        let engine = OverwriteEngine::connect(catalog, opts, enforce_pk, None).await?;
         let outcome = engine.execute(&dml_stmt.0).await?;
         println!("{} {}", dml_stmt.1, outcome.rows);
         return Ok(());

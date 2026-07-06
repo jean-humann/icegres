@@ -152,6 +152,7 @@ cleanup() {
   stop_secure_server
   stop_pidfile_generic "$PK_PID_FILE"
   stop_pidfile_generic "$E2E_DIR/serve-buffered.pid"
+  stop_pidfile_generic "$E2E_DIR/serve-branch.pid"
 }
 trap cleanup EXIT
 
@@ -687,6 +688,128 @@ assert_eq "fenced row readable with the updated value" "$fence_id|42.0" \
   "$("${BQ[@]}" -c "select trip_id, fare from demo.trips where trip_id = $fence_id")"
 
 stop_pidfile_generic "$BUF_PID_FILE"
+
+# ---------------------------------------------------------------------------
+# (m) Zero-copy branches (SPEC D6, Neon branch-per-endpoint model): a branch
+#     is a named Iceberg snapshot ref — creating one copies NO data. Two
+#     servers, one per branch, write to their own ref with full isolation:
+#     writes on dev never appear on main and vice versa, single copy of the
+#     shared history in the lake.
+# ---------------------------------------------------------------------------
+BR_PORT=5440
+BR_PID_FILE="$E2E_DIR/serve-branch.pid"
+BR_LOG="$E2E_DIR/serve-branch.log"
+BR_NAME=e2e_dev
+log "(m) zero-copy branches: main on :$PG_PORT, branch '$BR_NAME' on :$BR_PORT"
+stop_pidfile_generic "$BR_PID_FILE"
+if psql -h "$PG_HOST" -p "$BR_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+  fail "something is already listening on :$BR_PORT — stop it first"
+fi
+# Idempotency: a crashed earlier run may have left the ref behind.
+"$BIN" branch drop demo.trips "$BR_NAME" >/dev/null 2>&1 || true
+
+# m1: create = one metadata commit, zero data copied; both refs at one head.
+"$BIN" branch create demo.trips "$BR_NAME" >"$E2E_DIR/branch-create.log" 2>&1 \
+  || { cat "$E2E_DIR/branch-create.log" >&2; fail "branch create failed"; }
+grep -q "created branch $BR_NAME" "$E2E_DIR/branch-create.log" \
+  || fail "branch create output unexpected: $(cat "$E2E_DIR/branch-create.log")"
+pass "branch create $BR_NAME (zero-copy snapshot ref)"
+branch_list=$("$BIN" branch list demo.trips 2>&1)
+main_head=$(awk -F'\t' '$1=="main"{print $2}' <<<"$branch_list")
+dev_head=$(awk -F'\t' -v b="$BR_NAME" '$1==b{print $2}' <<<"$branch_list")
+[[ -n "$main_head" && "$main_head" == "$dev_head" ]] \
+  || fail "freshly created branch does not share main's head: main=$main_head dev=$dev_head ($branch_list)"
+pass "branch list shows $BR_NAME at main's head ($main_head)"
+if "$BIN" branch create demo.trips "$BR_NAME" >/dev/null 2>&1; then
+  fail "duplicate branch create was ACCEPTED (assert-ref-snapshot-id null must reject it)"
+fi
+pass "duplicate branch create rejected (atomic create via assert-ref-snapshot-id=null)"
+
+# m2: serve the branch on its own port (Neon: one endpoint per branch).
+: >"$BR_LOG"
+"$BIN" serve --host "$PG_HOST" --port "$BR_PORT" --branch "$BR_NAME" >>"$BR_LOG" 2>&1 &
+echo $! >"$BR_PID_FILE"
+br_ready=0
+for _ in $(seq 1 60); do
+  if psql -h "$PG_HOST" -p "$BR_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+    br_ready=1; break
+  fi
+  sleep 0.5
+done
+[[ "$br_ready" == 1 ]] || { tail -n 20 "$BR_LOG" >&2; fail "--branch server not ready on :$BR_PORT"; }
+BRQ=(psql -h "$PG_HOST" -p "$BR_PORT" -U postgres -d icegres -tA)
+assert_eq "both endpoints serve the shared history (same count)" \
+  "$(q 'select count(*) from demo.trips')" \
+  "$("${BRQ[@]}" -c 'select count(*) from demo.trips')"
+
+# m3: write to dev -> main unchanged (zero-copy isolation, direction 1).
+br_base=$(( $(q 'select coalesce(max(trip_id), 0) from demo.trips') + 100 ))
+(( br_base >= 900000 )) || br_base=970000
+DEV_ID=$br_base
+MAIN_ID=$((br_base + 1))
+main_total_before=$(q 'select count(*) from demo.trips')
+dev_ins=$("${BRQ[@]}" -c "insert into demo.trips (trip_id, city, distance_km, fare, ts)
+  values ($DEV_ID, 'E2E DevBranch', 1.0, 10.0, TIMESTAMP '2026-07-06 00:00:00')" 2>&1 | tail -n 1)
+assert_eq "INSERT on the dev endpoint" "INSERT 0 1" "$dev_ins"
+assert_eq "dev endpoint sees its row (new connection)" 1 \
+  "$("${BRQ[@]}" -c "select count(*) from demo.trips where trip_id = $DEV_ID")"
+assert_eq "main endpoint does NOT see the dev row" 0 \
+  "$(q "select count(*) from demo.trips where trip_id = $DEV_ID")"
+assert_eq "main total unchanged by the dev write" "$main_total_before" \
+  "$(q 'select count(*) from demo.trips')"
+
+# m4: write to main -> dev unchanged (direction 2).
+"${PSQL[@]}" -q -c "insert into demo.trips (trip_id, city, distance_km, fare, ts)
+  values ($MAIN_ID, 'E2E MainSide', 1.0, 20.0, TIMESTAMP '2026-07-06 00:00:00')" \
+  || fail "INSERT on the main endpoint failed"
+assert_eq "main endpoint sees its row" 1 \
+  "$(q "select count(*) from demo.trips where trip_id = $MAIN_ID")"
+assert_eq "dev endpoint does NOT see the main row" 0 \
+  "$("${BRQ[@]}" -c "select count(*) from demo.trips where trip_id = $MAIN_ID")"
+
+# m5: the full write engine works ON the branch (UPDATE + txn), still isolated.
+dev_upd=$("${BRQ[@]}" -c "update demo.trips set fare = 99.5 where trip_id = $DEV_ID" 2>&1 | tail -n 1)
+assert_eq "UPDATE on the dev endpoint" "UPDATE 1" "$dev_upd"
+assert_eq "updated fare visible on dev" "99.5" \
+  "$("${BRQ[@]}" -c "select fare from demo.trips where trip_id = $DEV_ID")"
+txn_out=$(psql -h "$PG_HOST" -p "$BR_PORT" -U postgres -d icegres -v ON_ERROR_STOP=1 2>&1 <<EOF
+BEGIN;
+insert into demo.trips (trip_id, city, distance_km, fare, ts) values ($((DEV_ID + 2)), 'E2E DevTxn', 1.0, 1.0, TIMESTAMP '2026-07-06 00:00:00');
+COMMIT;
+EOF
+) || fail "transaction on the dev endpoint failed: $txn_out"
+assert_eq "txn row committed to the branch, invisible on main" "1|0" \
+  "$("${BRQ[@]}" -c "select count(*) from demo.trips where trip_id = $((DEV_ID + 2))")|$(q "select count(*) from demo.trips where trip_id = $((DEV_ID + 2))")"
+assert_eq "seeded rows intact on BOTH endpoints" "280|280" \
+  "$(q 'select count(*) from demo.trips where trip_id between 1 and 280')|$("${BRQ[@]}" -c 'select count(*) from demo.trips where trip_id between 1 and 280')"
+
+# m6: heads have diverged; reading a table without the ref fails loudly.
+branch_list=$("$BIN" branch list demo.trips 2>&1)
+main_head2=$(awk -F'\t' '$1=="main"{print $2}' <<<"$branch_list")
+dev_head2=$(awk -F'\t' -v b="$BR_NAME" '$1==b{print $2}' <<<"$branch_list")
+[[ -n "$main_head2" && -n "$dev_head2" && "$main_head2" != "$dev_head2" ]] \
+  || fail "branch heads did not diverge after writes: main=$main_head2 dev=$dev_head2"
+pass "branch heads diverged (main=$main_head2, $BR_NAME=$dev_head2) with shared history below the fork"
+no_ref_out=$("${BRQ[@]}" -c 'select count(*) from demo.cities' 2>&1) || true
+echo "$no_ref_out" | grep -q "does not exist on this table" \
+  || fail "reading a table without the branch ref did not fail loudly: $no_ref_out"
+pass "table without the branch ref fails loudly (no silent fallback to main)"
+
+# m7: drop the branch — ref-only removal; main untouched; 'main' is protected.
+stop_pidfile_generic "$BR_PID_FILE"
+if "$BIN" branch drop demo.trips main >/dev/null 2>&1; then
+  fail "'branch drop main' was ACCEPTED — main must be protected"
+fi
+pass "dropping 'main' is refused"
+"$BIN" branch drop demo.trips "$BR_NAME" >"$E2E_DIR/branch-drop.log" 2>&1 \
+  || { cat "$E2E_DIR/branch-drop.log" >&2; fail "branch drop failed"; }
+branch_list=$("$BIN" branch list demo.trips 2>&1)
+if grep -q "^$BR_NAME	" <<<"$branch_list"; then
+  fail "branch $BR_NAME still listed after drop: $branch_list"
+fi
+pass "branch drop removed the ref"
+assert_eq "main state fully intact after the branch lifecycle (dev row|main row|seeded)" "0|1|280" \
+  "$(q "select count(*) from demo.trips where trip_id = $DEV_ID")|$(q "select count(*) from demo.trips where trip_id = $MAIN_ID")|$(q 'select count(*) from demo.trips where trip_id between 1 and 280')"
 
 # ---------------------------------------------------------------------------
 log "all assertions passed ($PASS_COUNT)"

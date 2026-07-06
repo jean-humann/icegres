@@ -222,16 +222,24 @@ pub struct OverwriteEngine {
     /// Opt-in PK enforcement (`--enforce-pk`); when off, `pk_columns`
     /// always answers `None` and no enforcement work happens anywhere.
     enforce_pk: bool,
+    /// Snapshot ref (branch) every commit anchors to and publishes on
+    /// (`--branch`, SPEC D6). Default `main` — byte-for-byte the historical
+    /// behavior. A non-`main` branch must already exist on the target table
+    /// (`icegres branch create`); commits carry
+    /// `assert-ref-snapshot-id <branch>=<head>` so two servers on different
+    /// branches of the same table never conflict with each other.
+    branch: String,
 }
 
 impl OverwriteEngine {
     /// Build an engine over an already-connected catalog, resolving the REST
     /// path prefix from `GET /v1/config?warehouse=...` (same handshake the
-    /// REST catalog client performs).
+    /// REST catalog client performs). `branch = None` means `main`.
     pub async fn connect(
         catalog: Arc<dyn Catalog>,
         opts: &CatalogOpts,
         enforce_pk: bool,
+        branch: Option<String>,
     ) -> Result<Self> {
         let http = reqwest::Client::new();
         let config_url = format!(
@@ -261,12 +269,25 @@ impl OverwriteEngine {
             catalog_uri: opts.catalog_uri.trim_end_matches('/').to_string(),
             prefix,
             enforce_pk,
+            branch: branch.unwrap_or_else(|| MAIN_BRANCH.to_string()),
         })
     }
 
     /// Whether `--enforce-pk` is on for this engine.
     pub fn enforce_pk(&self) -> bool {
         self.enforce_pk
+    }
+
+    /// The snapshot ref this engine commits to (`main` by default).
+    pub fn branch(&self) -> &str {
+        &self.branch
+    }
+
+    /// Whether this engine writes to the `main` branch (the default mode,
+    /// where autocommit INSERTs without PK enforcement may use the stock
+    /// fast_append path).
+    pub fn is_main_branch(&self) -> bool {
+        self.branch == MAIN_BRANCH
     }
 
     /// The enforced PK columns of `table`, or `None` when enforcement is off
@@ -294,7 +315,7 @@ impl OverwriteEngine {
                 .await
                 .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?;
             let pk = self.pk_columns(&table)?;
-            let prepared = prepare_commit(&table, &ops, pk.as_deref())
+            let prepared = prepare_commit(&table, &ops, pk.as_deref(), &self.branch)
                 .await
                 .with_context(|| format!("DML against {ident} failed"))?;
             let Some(mut prepared) = prepared else {
@@ -372,7 +393,7 @@ impl OverwriteEngine {
                 .await
                 .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?;
             let pk = self.pk_columns(&table)?;
-            let prepared = prepare_commit(&table, &ops, pk.as_deref())
+            let prepared = prepare_commit(&table, &ops, pk.as_deref(), &self.branch)
                 .await
                 .with_context(|| format!("INSERT into {ident} failed"))?;
             let Some(prepared) = prepared else {
@@ -415,29 +436,31 @@ impl OverwriteEngine {
     }
 
     /// Commit a transaction's buffered op list for one table as ONE snapshot
-    /// anchored at the snapshot pinned at BEGIN (`expected_main`).
+    /// anchored at the snapshot pinned at BEGIN (`expected_head`, the head of
+    /// this engine's branch at pin time).
     ///
     /// NO retry on conflict: statement-level results (row counts, reads)
-    /// were computed against the pin, so if `main` moved the only honest
+    /// were computed against the pin, so if the branch moved the only honest
     /// outcome is a serialization failure ([`CommitConflict`], wire sqlstate
     /// 40001) — exactly what Postgres REPEATABLE READ does. Returns the new
     /// snapshot id, or `None` when the ops net out to no change.
     pub async fn commit_pinned(
         &self,
         ident: &TableIdent,
-        expected_main: Option<i64>,
+        expected_head: Option<i64>,
         ops: &[TableOp],
     ) -> Result<Option<i64>> {
         // Fresh metadata for correct sequence numbers / uuid; the pin only
-        // anchors the ref requirement. If main already moved, abort cheaply
-        // before doing any work (the POSTed requirement is the real guard).
+        // anchors the ref requirement. If the branch already moved, abort
+        // cheaply before doing any work (the POSTed requirement is the real
+        // guard).
         let table = self
             .catalog
             .load_table(ident)
             .await
             .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?;
-        let fresh_main = table.metadata().current_snapshot_id();
-        if fresh_main != expected_main {
+        let fresh_head = branch_head(table.metadata(), &self.branch)?.map(|s| s.snapshot_id());
+        if fresh_head != expected_head {
             let show = |s: Option<i64>| {
                 s.map(|id| id.to_string())
                     .unwrap_or_else(|| "<none>".to_string())
@@ -445,14 +468,16 @@ impl OverwriteEngine {
             return Err(anyhow!(CommitConflict {
                 message: format!(
                     "could not serialize access due to concurrent update: table {ident} \
-                     moved from snapshot {} (pinned at BEGIN) to {}; retry the transaction",
-                    show(expected_main),
-                    show(fresh_main)
+                     (branch {}) moved from snapshot {} (pinned at BEGIN) to {}; retry \
+                     the transaction",
+                    self.branch,
+                    show(expected_head),
+                    show(fresh_head)
                 ),
             }));
         }
         let pk = self.pk_columns(&table)?;
-        let prepared = prepare_commit(&table, ops, pk.as_deref())
+        let prepared = prepare_commit(&table, ops, pk.as_deref(), &self.branch)
             .await
             .with_context(|| format!("transaction COMMIT against {ident} failed"))?;
         let Some(prepared) = prepared else {
@@ -499,6 +524,170 @@ impl OverwriteEngine {
             &prepared.request,
         )
         .await
+    }
+
+    /// Create branch `name` on `ident` pointing at `at_snapshot` (must exist
+    /// in the table's metadata) or, when `None`, at the current `main` head.
+    /// Zero-copy: the commit only adds a snapshot ref — no data or metadata
+    /// file is rewritten. The `assert-ref-snapshot-id <name>=null`
+    /// requirement makes the create atomic: if the ref already exists the
+    /// catalog answers 409 and this fails loudly. Returns the snapshot id
+    /// the new branch points at.
+    pub async fn create_branch(
+        &self,
+        ident: &TableIdent,
+        name: &str,
+        at_snapshot: Option<i64>,
+    ) -> Result<i64> {
+        anyhow::ensure!(
+            name != MAIN_BRANCH,
+            "branch {MAIN_BRANCH:?} always exists; pick another name"
+        );
+        let table = self
+            .catalog
+            .load_table(ident)
+            .await
+            .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?;
+        let metadata = table.metadata();
+        let src = match at_snapshot {
+            Some(id) => {
+                anyhow::ensure!(
+                    metadata.snapshot_by_id(id).is_some(),
+                    "snapshot {id} does not exist in table {ident}"
+                );
+                id
+            }
+            None => metadata.current_snapshot_id().ok_or_else(|| {
+                anyhow!("table {ident} has no snapshot yet; write to it before branching")
+            })?,
+        };
+        let request = CommitTableRequest {
+            identifier: Some(ident.clone()),
+            requirements: vec![
+                TableRequirement::UuidMatch {
+                    uuid: metadata.uuid(),
+                },
+                // null snapshot-id = "the ref must not already exist".
+                TableRequirement::RefSnapshotIdMatch {
+                    r#ref: name.to_string(),
+                    snapshot_id: None,
+                },
+            ],
+            updates: vec![TableUpdate::SetSnapshotRef {
+                ref_name: name.to_string(),
+                reference: SnapshotReference::new(src, SnapshotRetention::branch(None, None, None)),
+            }],
+        };
+        match self
+            .post_commit(&ident.namespace().to_url_string(), ident.name(), &request)
+            .await?
+        {
+            CommitOutcome::Committed => Ok(src),
+            CommitOutcome::Conflict(msg) => bail!(
+                "branch {name:?} already exists on {ident} (or the table changed \
+                 concurrently): {msg}"
+            ),
+        }
+    }
+
+    /// Drop branch `name` from `ident`. Zero-copy and non-destructive: only
+    /// the ref is removed; the snapshots it pointed at stay in table
+    /// metadata (time travel keeps working) until snapshot expiry. Anchored
+    /// with `assert-ref-snapshot-id <name>=<head>` so a concurrent commit to
+    /// the branch is never silently discarded. Returns the head the branch
+    /// pointed at when dropped.
+    pub async fn drop_branch(&self, ident: &TableIdent, name: &str) -> Result<i64> {
+        anyhow::ensure!(
+            name != MAIN_BRANCH,
+            "refusing to drop {MAIN_BRANCH:?} — it is the table's default branch"
+        );
+        let table = self
+            .catalog
+            .load_table(ident)
+            .await
+            .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?;
+        let head = table
+            .metadata()
+            .snapshot_for_ref(name)
+            .ok_or_else(|| anyhow!("branch {name:?} does not exist on table {ident}"))?
+            .snapshot_id();
+        let request = CommitTableRequest {
+            identifier: Some(ident.clone()),
+            requirements: vec![
+                TableRequirement::UuidMatch {
+                    uuid: table.metadata().uuid(),
+                },
+                TableRequirement::RefSnapshotIdMatch {
+                    r#ref: name.to_string(),
+                    snapshot_id: Some(head),
+                },
+            ],
+            updates: vec![TableUpdate::RemoveSnapshotRef {
+                ref_name: name.to_string(),
+            }],
+        };
+        match self
+            .post_commit(&ident.namespace().to_url_string(), ident.name(), &request)
+            .await?
+        {
+            CommitOutcome::Committed => Ok(head),
+            CommitOutcome::Conflict(msg) => bail!(
+                "branch {name:?} on {ident} moved while dropping it (concurrent commit?): {msg}"
+            ),
+        }
+    }
+
+    /// List every snapshot ref (branch/tag) of `ident` as
+    /// `(name, snapshot_id, type)` tuples, `main` first then sorted by name.
+    /// Read through the raw REST metadata because iceberg-rust 0.9.1 exposes
+    /// no public accessor for the full refs map.
+    pub async fn list_refs(&self, ident: &TableIdent) -> Result<Vec<(String, i64, String)>> {
+        let prefix_seg = if self.prefix.is_empty() {
+            String::new()
+        } else {
+            format!("/{}", urlencode(&self.prefix))
+        };
+        let url = format!(
+            "{}/v1{}/namespaces/{}/tables/{}",
+            self.catalog_uri,
+            prefix_seg,
+            urlencode(&ident.namespace().to_url_string()),
+            urlencode(ident.name())
+        );
+        let body: serde_json::Value = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("failed to load table metadata from {url}"))?
+            .error_for_status()
+            .with_context(|| format!("catalog rejected metadata request for {ident}"))?
+            .json()
+            .await
+            .context("table metadata response is not JSON")?;
+        let refs = body
+            .pointer("/metadata/refs")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let mut out: Vec<(String, i64, String)> = refs
+            .into_iter()
+            .filter_map(|(name, r)| {
+                let id = r.get("snapshot-id").and_then(|v| v.as_i64())?;
+                let kind = r
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("branch")
+                    .to_string();
+                Some((name, id, kind))
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            (a.0 != MAIN_BRANCH)
+                .cmp(&(b.0 != MAIN_BRANCH))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        Ok(out)
     }
 
     /// POST the commit to the REST catalog. 2xx = committed, 409 = conflict
@@ -662,15 +851,39 @@ async fn fold_dml_ops(
     Ok((changed, rows))
 }
 
-/// Compute ONE snapshot applying `ops` (in order) against the table's
-/// current metadata and stage every file it needs. Returns `None` when the
-/// ops net out to no change (nothing to commit). `pk` = enforced key
-/// columns; violations return [`ConstraintViolation`] before anything is
-/// posted.
+/// Resolve the head snapshot of `branch` in `metadata`. `main` falls back to
+/// the current snapshot (identical by construction — the builder keeps the
+/// `main` ref and `current-snapshot-id` in lockstep, and an empty table has
+/// neither); any other branch must exist as a snapshot ref.
+pub fn branch_head<'a>(
+    metadata: &'a iceberg::spec::TableMetadata,
+    branch: &str,
+) -> Result<Option<&'a iceberg::spec::SnapshotRef>> {
+    if branch == MAIN_BRANCH {
+        return Ok(metadata.current_snapshot());
+    }
+    match metadata.snapshot_for_ref(branch) {
+        Some(s) => Ok(Some(s)),
+        None => bail!(
+            "branch {branch:?} does not exist on this table — create it first with \
+             `icegres branch create <table> {branch}`"
+        ),
+    }
+}
+
+/// Compute ONE snapshot applying `ops` (in order) against the head of
+/// `branch` in the table's current metadata and stage every file it needs.
+/// Returns `None` when the ops net out to no change (nothing to commit).
+/// `pk` = enforced key columns; violations return [`ConstraintViolation`]
+/// before anything is posted. The produced commit asserts
+/// `assert-ref-snapshot-id <branch>=<head>` and publishes the new snapshot
+/// on `branch` only — snapshots reachable from other refs are untouched
+/// (zero-copy branch isolation, SPEC D6).
 pub async fn prepare_commit(
     table: &Table,
     ops: &[TableOp],
     pk: Option<&[String]>,
+    branch: &str,
 ) -> Result<Option<PreparedCommit>> {
     let metadata = table.metadata();
 
@@ -684,6 +897,9 @@ pub async fn prepare_commit(
     if !metadata.default_partition_spec().is_unpartitioned() {
         bail!("writes on partitioned tables are not supported yet");
     }
+    let head = branch_head(metadata, branch)
+        .with_context(|| format!("cannot commit to table {}", table.identifier()))?;
+    let head_id = head.map(|s| s.snapshot_id());
 
     let file_io = table.file_io();
     let schema = metadata.current_schema();
@@ -728,7 +944,7 @@ pub async fn prepare_commit(
     // PK columns of every FINAL row (kept + rewritten + appended).
     let mut pk_rows: Vec<RecordBatch> = Vec::new();
 
-    if let Some(current_snapshot) = metadata.current_snapshot() {
+    if let Some(current_snapshot) = head {
         let manifest_list = current_snapshot
             .load_manifest_list(file_io, &table.metadata_ref())
             .await
@@ -976,7 +1192,7 @@ pub async fn prepare_commit(
             .new_output(&manifest_list_path)
             .map_err(|e| anyhow!("failed to open manifest list output: {e}"))?,
         snapshot_id,
-        metadata.current_snapshot_id(),
+        head_id,
         next_seq,
     );
     list_writer
@@ -1030,7 +1246,7 @@ pub async fn prepare_commit(
 
     let snapshot = Snapshot::builder()
         .with_snapshot_id(snapshot_id)
-        .with_parent_snapshot_id(metadata.current_snapshot_id())
+        .with_parent_snapshot_id(head_id)
         .with_sequence_number(next_seq)
         .with_timestamp_ms(
             SystemTime::now()
@@ -1052,17 +1268,18 @@ pub async fn prepare_commit(
             TableRequirement::UuidMatch {
                 uuid: metadata.uuid(),
             },
-            // Optimistic concurrency: `main` must still point where we
-            // started, otherwise the catalog answers 409.
+            // Optimistic concurrency: the target BRANCH ref must still
+            // point where we started, otherwise the catalog answers 409.
+            // Commits to other branches of the same table do not conflict.
             TableRequirement::RefSnapshotIdMatch {
-                r#ref: MAIN_BRANCH.to_string(),
-                snapshot_id: metadata.current_snapshot_id(),
+                r#ref: branch.to_string(),
+                snapshot_id: head_id,
             },
         ],
         updates: vec![
             TableUpdate::AddSnapshot { snapshot },
             TableUpdate::SetSnapshotRef {
-                ref_name: MAIN_BRANCH.to_string(),
+                ref_name: branch.to_string(),
                 reference: SnapshotReference::new(
                     snapshot_id,
                     SnapshotRetention::branch(None, None, None),

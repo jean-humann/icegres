@@ -99,11 +99,11 @@ fn session_config(target_partitions: Option<usize>) -> Result<SessionConfig> {
 /// because `setup_pg_catalog` needs `register_schema`, which
 /// `IcebergCatalogProvider` does not implement.
 pub async fn build_session_context(catalog: Arc<dyn Catalog>) -> Result<SessionContext> {
-    build_session_context_with(catalog, None, None).await
+    build_session_context_with(catalog, None, None, None).await
 }
 
-/// [`build_session_context`] with an explicit `target_partitions` override
-/// and an optional write buffer.
+/// [`build_session_context`] with an explicit `target_partitions` override,
+/// an optional write buffer, and an optional branch pin.
 ///
 /// iceberg-datafusion's INSERT path round-robin-repartitions the input of an
 /// unpartitioned-table write across `target_partitions` workers and writes
@@ -114,10 +114,14 @@ pub async fn build_session_context(catalog: Arc<dyn Catalog>) -> Result<SessionC
 /// `write_buffer` (serve-only, `--write-buffer-ms`) makes every plain-table
 /// scan union the committed snapshot with the buffer's overlay (buffer.rs);
 /// `None` keeps scans byte-for-byte on the default path.
+///
+/// `branch` (serve-only, `--branch`, SPEC D6) pins every plain-table scan to
+/// the head of that Iceberg snapshot ref (see cache.rs); `None` = main.
 pub async fn build_session_context_with(
     catalog: Arc<dyn Catalog>,
     target_partitions: Option<usize>,
     write_buffer: Option<Arc<WriteBuffer>>,
+    branch: Option<String>,
 ) -> Result<SessionContext> {
     let ctx = SessionContext::new_with_config(session_config(target_partitions)?);
 
@@ -141,6 +145,7 @@ pub async fn build_session_context_with(
                 catalog.clone(),
                 NamespaceIdent::new(schema_name.clone()),
                 write_buffer.clone(),
+                branch.clone(),
             )
             .await
             .with_context(|| format!("failed to build caching provider for {schema_name}"))?;

@@ -320,7 +320,7 @@ impl WriteBuffer {
             let pk = self.engine.pk_columns(&table)?;
             let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
             let ops = [TableOp::Append(batches)];
-            let Some(prepared) = prepare_commit(&table, &ops, pk.as_deref())
+            let Some(prepared) = prepare_commit(&table, &ops, pk.as_deref(), self.engine.branch())
                 .await
                 .map_err(|e| anyhow!("buffered flush of {ident} failed to prepare: {e:#}"))?
             else {

@@ -73,7 +73,7 @@ use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context as _, Result};
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use async_trait::async_trait;
@@ -99,6 +99,7 @@ use datafusion_postgres::pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use datafusion_postgres::pgwire::types::format::FormatOptions;
 use datafusion_postgres::QueryHook;
 use iceberg::arrow::schema_to_arrow_schema;
+use iceberg::spec::MAIN_BRANCH;
 use iceberg::table::Table;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use iceberg_datafusion::IcebergStaticTableProvider;
@@ -192,8 +193,12 @@ impl TxnSession {
 
 /// Per-table transaction state: the pinned snapshot plus buffered ops.
 struct TxnTable {
-    /// Table as loaded at first touch — its current snapshot IS the pin.
+    /// Table as loaded at first touch.
     pinned: Table,
+    /// The pinned snapshot id: the head of the serving branch (`--branch`;
+    /// `main` by default) at first touch. COMMIT anchors its
+    /// `assert-ref-snapshot-id` requirement here.
+    pin_snapshot: Option<i64>,
     /// Read provider for the pinned snapshot (reused across statements).
     pinned_provider: Arc<IcebergStaticTableProvider>,
     /// Pinned Arrow schema (field-id annotated) — buffered rows are aligned
@@ -209,11 +214,16 @@ struct TxnTable {
 }
 
 impl TxnTable {
-    async fn pin(catalog: &Arc<dyn Catalog>, ident: &TableIdent) -> Result<Self> {
+    /// Pin `ident` at the current head of `branch` (`main` = the table's
+    /// current snapshot, identical to the historical behavior).
+    async fn pin(catalog: &Arc<dyn Catalog>, ident: &TableIdent, branch: &str) -> Result<Self> {
         let table = catalog
             .load_table(ident)
             .await
             .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?;
+        let pin_snapshot = crate::overwrite::branch_head(table.metadata(), branch)
+            .with_context(|| format!("cannot pin table {ident}"))?
+            .map(|s| s.snapshot_id());
         let schema: ArrowSchemaRef = Arc::new(
             schema_to_arrow_schema(table.metadata().current_schema())
                 .map_err(|e| anyhow!("schema conversion failed for {ident}: {e}"))?,
@@ -226,13 +236,24 @@ impl TxnTable {
             .iter()
             .map(|f| f.name.clone())
             .collect();
-        let pinned_provider = Arc::new(
-            IcebergStaticTableProvider::try_new_from_table(table.clone())
-                .await
-                .map_err(|e| anyhow!("failed to build pinned provider for {ident}: {e}"))?,
-        );
+        let pinned_provider = match pin_snapshot {
+            // Branch endpoint: the read view is the BRANCH head, not main's.
+            Some(head) if branch != MAIN_BRANCH => Arc::new(
+                IcebergStaticTableProvider::try_new_from_table_snapshot(table.clone(), head)
+                    .await
+                    .map_err(|e| {
+                        anyhow!("failed to build pinned provider for {ident}@{head}: {e}")
+                    })?,
+            ),
+            _ => Arc::new(
+                IcebergStaticTableProvider::try_new_from_table(table.clone())
+                    .await
+                    .map_err(|e| anyhow!("failed to build pinned provider for {ident}: {e}"))?,
+            ),
+        };
         Ok(Self {
             pinned: table,
+            pin_snapshot,
             pinned_provider,
             schema,
             columns,
@@ -403,6 +424,8 @@ impl TableProvider for UnionProvider {
 struct TxnCatalogList {
     inner: Arc<dyn CatalogProviderList>,
     catalog: Arc<dyn Catalog>,
+    /// Serving branch (`main` by default): tables pin at ITS head.
+    branch: String,
     sess: Arc<tokio::sync::Mutex<TxnSession>>,
 }
 
@@ -432,6 +455,7 @@ impl CatalogProviderList for TxnCatalogList {
             Some(Arc::new(TxnCatalogProvider {
                 inner,
                 catalog: self.catalog.clone(),
+                branch: self.branch.clone(),
                 sess: self.sess.clone(),
             }))
         } else {
@@ -443,6 +467,7 @@ impl CatalogProviderList for TxnCatalogList {
 struct TxnCatalogProvider {
     inner: Arc<dyn CatalogProvider>,
     catalog: Arc<dyn Catalog>,
+    branch: String,
     sess: Arc<tokio::sync::Mutex<TxnSession>>,
 }
 
@@ -468,6 +493,7 @@ impl CatalogProvider for TxnCatalogProvider {
             inner,
             namespace: NamespaceIdent::new(name.to_string()),
             catalog: self.catalog.clone(),
+            branch: self.branch.clone(),
             sess: self.sess.clone(),
         }))
     }
@@ -477,6 +503,7 @@ struct TxnSchemaProvider {
     inner: Arc<dyn SchemaProvider>,
     namespace: NamespaceIdent,
     catalog: Arc<dyn Catalog>,
+    branch: String,
     sess: Arc<tokio::sync::Mutex<TxnSession>>,
 }
 
@@ -511,7 +538,7 @@ impl SchemaProvider for TxnSchemaProvider {
         let ident = TableIdent::new(self.namespace.clone(), name.to_string());
         let mut sess = self.sess.lock().await;
         if !sess.tables.contains_key(&ident) {
-            let pinned = TxnTable::pin(&self.catalog, &ident)
+            let pinned = TxnTable::pin(&self.catalog, &ident, &self.branch)
                 .await
                 .map_err(|e| DataFusionError::External(e.into()))?;
             sess.tables.insert(ident.clone(), pinned);
@@ -575,6 +602,7 @@ impl TxnHook {
         let list = Arc::new(TxnCatalogList {
             inner: state.catalog_list().clone(),
             catalog: self.catalog.clone(),
+            branch: self.engine.branch().to_string(),
             sess,
         });
         SessionContext::new_with_state(
@@ -622,8 +650,11 @@ impl TxnHook {
         let mut committed: Vec<String> = Vec::new();
         for (k, ident) in idents.iter().enumerate() {
             let t = &sess.tables[*ident];
-            let pin = t.pinned.metadata().current_snapshot_id();
-            match self.engine.commit_pinned(ident, pin, &t.ops).await {
+            match self
+                .engine
+                .commit_pinned(ident, t.pin_snapshot, &t.ops)
+                .await
+            {
                 Ok(_) => committed.push(ident.to_string()),
                 Err(e) => {
                     let remaining: Vec<String> =
@@ -708,7 +739,7 @@ impl TxnHook {
             .map_err(|e| anyhow!("bad table identifier: {e}"))?;
         let mut sess = sess_arc.lock().await;
         if !sess.tables.contains_key(&ident) {
-            let pinned = TxnTable::pin(&self.catalog, &ident).await?;
+            let pinned = TxnTable::pin(&self.catalog, &ident, self.engine.branch()).await?;
             sess.tables.insert(ident.clone(), pinned);
         }
         let entry = sess.tables.get_mut(&ident).expect("just pinned");
@@ -784,11 +815,11 @@ impl TxnHook {
         Ok(Response::Query(resp))
     }
 
-    /// Autocommit INSERT under `--enforce-pk`: if the target table declares
-    /// a PK, the insert is routed through the engine's check-then-commit
-    /// path (validated against the anchor snapshot, re-validated on 409
-    /// retry). Tables without a PK keep the stock fast_append path —
-    /// answers `None` so the default handler runs.
+    /// Autocommit INSERT under `--enforce-pk` and/or `--branch`: routed
+    /// through the engine's anchored-commit path when the target declares a
+    /// PK (check-then-commit, re-validated on 409 retry) or when this server
+    /// serves a non-`main` branch (the stock fast_append path would commit
+    /// to `main`). Otherwise answers `None` so the default handler runs.
     async fn autocommit_insert(
         &self,
         stmt: &Statement,
@@ -801,12 +832,17 @@ impl TxnHook {
         };
         let table = match self.catalog.load_table(&ident).await {
             Ok(t) => t,
-            // Unknown table etc.: let the default path produce its usual error.
+            // Unknown table etc.: let the default path produce its usual
+            // error (in branch mode it fails on the same missing table, so
+            // nothing can leak onto main).
             Err(_) => return None,
         };
         match pk_columns_of(&table) {
             Ok(Some(_)) => {}
-            Ok(None) => return None, // no PK declared: stock INSERT path
+            // No PK declared: on main the stock fast_append path is fine;
+            // on a branch every INSERT must still go through the engine.
+            Ok(None) if self.engine.is_main_branch() => return None,
+            Ok(None) => {}
             Err(e) => return Some(Err(user_err("XX000", &format!("{e:#}")))),
         }
         let result: Result<Response> = async {
@@ -953,7 +989,9 @@ impl QueryHook for TxnHook {
                         .await
                 }
                 None => {
-                    if self.engine.enforce_pk() && matches!(statement, Statement::Insert(_)) {
+                    if (self.engine.enforce_pk() || !self.engine.is_main_branch())
+                        && matches!(statement, Statement::Insert(_))
+                    {
                         self.autocommit_insert(statement, session_context, None)
                             .await
                     } else {
@@ -1024,7 +1062,9 @@ impl QueryHook for TxnHook {
                     .await
                 }
                 None => {
-                    if self.engine.enforce_pk() && matches!(statement, Statement::Insert(_)) {
+                    if (self.engine.enforce_pk() || !self.engine.is_main_branch())
+                        && matches!(statement, Statement::Insert(_))
+                    {
                         self.autocommit_insert(statement, session_context, Some(params))
                             .await
                     } else {

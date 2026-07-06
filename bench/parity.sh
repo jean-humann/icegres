@@ -33,6 +33,7 @@ ENV_PORT=5444
 IDLE_PORT=5445
 HEALTH_PORT=5446
 SECURE_PORT=5447 # auth+TLS server for the A6/A7 probes
+BRANCH_PORT=5450 # --branch server for the D6 probe
 
 # Harness-owned servers are permissive/plaintext by design (except the
 # dedicated A6/A7 secure server, configured explicitly): a stray
@@ -122,6 +123,7 @@ cleanup() {
   stop_pidfile "$RUN_DIR/parity-serve-secure.pid"
   stop_pidfile "$RUN_DIR/parity-serve-pk.pid"
   stop_pidfile "$RUN_DIR/parity-serve-buffered.pid"
+  stop_pidfile "$RUN_DIR/parity-serve-branch.pid"
   rm -f "$RECORDS"
 }
 trap cleanup EXIT
@@ -683,6 +685,62 @@ else
       else
         record D5 elasticity "scale-to-zero" GAP \
           "idle shutdown incomplete: exit code=$idle_rc (want 0), query='$(echo "$idle_q" | flat)', restart answer='$wake' after ${wake_ms}ms"
+      fi
+    fi
+  fi
+fi
+
+# D6: writable zero-copy branches (Neon's branch-per-endpoint model). A
+# branch is a named Iceberg snapshot ref — `icegres branch create` copies NO
+# data. Serve the branch on its own port, INSERT + UPDATE on it, prove main
+# is byte-for-byte untouched (row invisible, count unchanged), then drop the
+# branch (ref-only removal) and re-verify main.
+D6_BRANCH=parity_dev
+stop_pidfile "$RUN_DIR/parity-serve-branch.pid"
+"$BIN" branch drop demo.trips "$D6_BRANCH" >/dev/null 2>&1 || true
+qbr() { psql -h "$PG_HOST" -p "$BRANCH_PORT" -U postgres -d icegres -tA -c "$1" 2>&1; }
+if psql -h "$PG_HOST" -p "$BRANCH_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+  record D6 elasticity "writable zero-copy branches" GAP \
+    "port :$BRANCH_PORT already occupied; could not probe"
+else
+  d6_create=$("$BIN" branch create demo.trips "$D6_BRANCH" 2>&1)
+  if ! grep -q "created branch $D6_BRANCH" <<<"$d6_create"; then
+    record D6 elasticity "writable zero-copy branches" GAP \
+      "branch create failed: $(echo "$d6_create" | flat)"
+  else
+    : >"$RUN_DIR/parity-serve-branch.log"
+    "$BIN" serve --host "$PG_HOST" --port "$BRANCH_PORT" --branch "$D6_BRANCH" \
+        >>"$RUN_DIR/parity-serve-branch.log" 2>&1 &
+    echo $! >"$RUN_DIR/parity-serve-branch.pid"
+    if ! wait_ready "$BRANCH_PORT" 40; then
+      record D6 elasticity "writable zero-copy branches" GAP \
+        "server with --branch $D6_BRANCH never became ready: $(tail -n 5 "$RUN_DIR/parity-serve-branch.log" | flat)"
+    else
+      # Far above every id range other probes/harnesses use (<= ~1M), so a
+      # pre-existing main row can never alias the isolation checks.
+      D6_ID=$((99000000 + RANDOM))
+      d6_main_before=$(q "select count(*) from demo.trips where trip_id = $D6_ID")
+      d6_total_before=$(q 'select count(*) from demo.trips')
+      d6_ins=$(psql -h "$PG_HOST" -p "$BRANCH_PORT" -U postgres -d icegres -c \
+        "insert into demo.trips (trip_id, city, distance_km, fare, ts) values ($D6_ID, 'Parity D6', 1.0, 1.0, TIMESTAMP '2026-07-06 00:00:00')" 2>&1 | tail -n 1)
+      d6_br_sees=$(qbr "select count(*) from demo.trips where trip_id = $D6_ID")
+      d6_upd=$(psql -h "$PG_HOST" -p "$BRANCH_PORT" -U postgres -d icegres -c \
+        "update demo.trips set fare = 123.0 where trip_id = $D6_ID" 2>&1 | tail -n 1)
+      d6_fare=$(qbr "select fare from demo.trips where trip_id = $D6_ID")
+      d6_main_after=$(q "select count(*) from demo.trips where trip_id = $D6_ID")
+      d6_total_after=$(q 'select count(*) from demo.trips')
+      stop_pidfile "$RUN_DIR/parity-serve-branch.pid"
+      d6_drop=$("$BIN" branch drop demo.trips "$D6_BRANCH" 2>&1)
+      d6_main_final=$(q "select count(*) from demo.trips where trip_id = $D6_ID")
+      if [[ "$d6_ins" == "INSERT 0 1" && "$d6_br_sees" == 1 && "$d6_upd" == "UPDATE 1" \
+            && "$d6_fare" == "123.0" && "$d6_main_after" == "$d6_main_before" \
+            && "$d6_total_after" == "$d6_total_before" && "$d6_main_final" == "$d6_main_before" \
+            && "$d6_drop" == *"dropped branch $D6_BRANCH"* ]]; then
+        record D6 elasticity "writable zero-copy branches" PASS \
+          "Neon branch-per-endpoint over Iceberg snapshot refs: 'icegres branch create demo.trips $D6_BRANCH' forked main's head with zero data copied; a second server (icegres serve --branch $D6_BRANCH on :$BRANCH_PORT) took INSERT trip_id=$D6_ID + UPDATE (fare -> $d6_fare) committed to the branch ref with assert-ref-snapshot-id; main endpoint on :$MAIN_PORT stayed untouched (row count for the id $d6_main_before -> $d6_main_after, total $d6_total_before -> $d6_total_after); 'branch drop' removed only the ref."
+      else
+        record D6 elasticity "writable zero-copy branches" GAP \
+          "branch write flow incomplete: ins='$d6_ins' br_sees='$d6_br_sees' upd='$d6_upd' fare='$d6_fare' main $d6_main_before->$d6_main_after->$d6_main_final total $d6_total_before->$d6_total_after drop='$(echo "$d6_drop" | flat)'"
       fi
     fi
   fi
