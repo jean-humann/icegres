@@ -95,8 +95,8 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{info, warn};
 
 use crate::context::{self, CATALOG_NAME, DEFAULT_SCHEMA};
+use crate::ops::BasicAuthVerifier;
 use crate::overwrite::{quote_ident, CommitConflict, ConstraintViolation, OverwriteEngine};
-use crate::pgauth::FileAuthSource;
 use crate::{dml, CatalogOpts};
 
 /// Table type reported for every Iceberg table (there are no views).
@@ -125,7 +125,7 @@ struct FlightSqlServiceImpl {
     ctx: Arc<SessionContext>,
     engine: Arc<OverwriteEngine>,
     /// `Some` = basic-auth handshake required (--auth-file); `None` = permissive.
-    auth: Option<Arc<FileAuthSource>>,
+    auth: Option<Arc<dyn BasicAuthVerifier>>,
     /// Bearer tokens issued by successful handshakes (per-boot, random).
     tokens: Mutex<HashSet<String>>,
     prepared: Mutex<HashMap<String, Prepared>>,
@@ -989,15 +989,27 @@ pub async fn run(
     auth_file: Option<PathBuf>,
 ) -> Result<()> {
     let start = std::time::Instant::now();
-    let auth = match &auth_file {
+    let auth: Option<Arc<dyn BasicAuthVerifier>> = match &auth_file {
         Some(path) => {
-            let source = Arc::new(FileAuthSource::load(path)?);
-            info!(
-                auth_file = %path.display(),
-                users = source.user_count(),
-                "Flight SQL basic-auth handshake enabled (bearer tokens per connection)"
-            );
-            Some(source)
+            #[cfg(feature = "managed")]
+            {
+                let source = Arc::new(crate::pgauth::FileAuthSource::load(path)?);
+                info!(
+                    auth_file = %path.display(),
+                    users = source.user_count(),
+                    "Flight SQL basic-auth handshake enabled (bearer tokens per connection)"
+                );
+                Some(source as Arc<dyn BasicAuthVerifier>)
+            }
+            #[cfg(not(feature = "managed"))]
+            {
+                let _ = path;
+                anyhow::bail!(
+                    "--auth-file is a managed add-on: this open-source build was compiled \
+                     without the `managed` feature. Rebuild with --features managed, or omit \
+                     --auth-file to run the Flight SQL endpoint open."
+                );
+            }
         }
         None => {
             warn!(

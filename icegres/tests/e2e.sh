@@ -1232,4 +1232,29 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# (s) Authorization — SPEC A12 (bench/clients/authz_probe.sh)
+# ---------------------------------------------------------------------------
+# Runs the ReBAC enforcement probe (managed add-on): it starts its own icegres
+# with --auth-file + --authz-file and verifies namespace-grant inheritance,
+# table-scoped grants, warehouse ownership, roles, per-statement 42501 denial,
+# JOIN-checks-every-table, and pg_catalog metadata staying free. Skips
+# gracefully when psql is missing or the binary lacks the `managed` feature.
+log "(s) authorization probe (bench/clients/authz_probe.sh)"
+if ! command -v psql >/dev/null 2>&1; then
+  log "    SKIPPED: psql not available"
+else
+  AZ_OUT=$(ICEGRES_BIN="$BIN" bash "$REPO_DIR/bench/clients/authz_probe.sh" 2>&1)
+  AZ_RC=$?
+  if [[ $AZ_RC -eq 3 ]]; then
+    log "    SKIPPED: $(echo "$AZ_OUT" | tail -n 1)"
+  else
+    echo "$AZ_OUT" | sed 's/^/    /'
+    [[ $AZ_RC -eq 0 ]] || fail "A12 authz probe reported failures (exit $AZ_RC)"
+    echo "$AZ_OUT" | grep -q '^A12 RESULT: .*fail=0' \
+      || fail "A12 authz probe summary is not fail=0"
+    pass "authorization enforced ($(echo "$AZ_OUT" | grep '^A12 RESULT:'))"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 log "all assertions passed ($PASS_COUNT)"

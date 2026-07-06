@@ -5,6 +5,19 @@ edition = "2021"
 description = "Postgres wire endpoint over an Iceberg lakehouse (Lakekeeper + RustFS)"
 license = "Apache-2.0"
 
+# Open-core split. The lakehouse SQL server, the authorization *seam*
+# (Authorizer trait + AuthzHook enforcement), and all wire/driver support are
+# open source and always compiled. The security *backends* — SCRAM
+# authentication (pgauth::FileAuthSource) and the ReBAC authorization policy
+# engine (authz::FileAuthorizer) — live behind the `managed` feature: the
+# "classic auth / authz" managed add-on. Default builds include it; a pure
+# open-source distribution is built with `--no-default-features`, where
+# `--auth-file` / `--authz-file` return a clear "managed add-on" error and the
+# server runs open (any user, all tables).
+[features]
+default = ["managed"]
+managed = []
+
 [[bin]]
 name = "icegres"
 path = "src/main.rs"

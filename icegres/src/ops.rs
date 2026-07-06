@@ -97,8 +97,18 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
-use crate::pgauth::FileAuthSource;
+// auth backend is injected as a trait object (dyn AuthSource) so the concrete
+// FileAuthSource backend can live behind the `managed` feature.
 use crate::txn::TxnRegistry;
+
+/// Core seam for the managed basic-auth backend: verify a plaintext
+/// username/password (used by the Flight SQL handshake). The concrete
+/// implementation — `pgauth::FileAuthSource`'s SCRAM verifier store — lives
+/// behind the `managed` feature; core holds only this trait object, so the
+/// open-source build carries no auth backend.
+pub trait BasicAuthVerifier: Send + Sync {
+    fn verify_password(&self, user: &str, password: &str) -> bool;
+}
 
 /// Startup handler that accepts every connection without authentication —
 /// the same behavior as datafusion-postgres's stock `serve()` path (its
@@ -151,7 +161,7 @@ impl ErrorHandler for LoggingErrorHandler {
 /// per-connection as pgwire requires.
 struct IcegresHandlerFactory {
     service: Arc<DfSessionService>,
-    auth: Option<Arc<FileAuthSource>>,
+    auth: Option<Arc<dyn AuthSource>>,
 }
 
 impl PgWireServerHandlers for IcegresHandlerFactory {
@@ -166,7 +176,7 @@ impl PgWireServerHandlers for IcegresHandlerFactory {
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
         match &self.auth {
             Some(source) => {
-                let auth_db: Arc<dyn AuthSource> = source.clone();
+                let auth_db = source.clone();
                 Arc::new(IcegresStartupHandler::Scram(
                     SASLAuthStartupHandler::new(
                         Arc::new(DefaultServerParameterProvider::default()),
@@ -233,7 +243,7 @@ pub async fn serve_custom(
     port: u16,
     idle_secs: Option<u64>,
     tls: Option<TlsAcceptor>,
-    auth: Option<Arc<FileAuthSource>>,
+    auth: Option<Arc<dyn AuthSource>>,
     hooks: Vec<Arc<dyn QueryHook>>,
     txn_registry: Arc<TxnRegistry>,
 ) -> Result<()> {

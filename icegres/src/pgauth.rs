@@ -124,6 +124,14 @@ impl FileAuthSource {
     }
 }
 
+/// Plug the managed SCRAM backend into core's basic-auth seam (used by the
+/// Flight SQL handshake). Core holds only `dyn BasicAuthVerifier`.
+impl crate::ops::BasicAuthVerifier for FileAuthSource {
+    fn verify_password(&self, user: &str, password: &str) -> bool {
+        FileAuthSource::verify_password(self, user, password)
+    }
+}
+
 /// Parse `user:password` lines; `#` comments and blank lines are skipped.
 fn parse_auth_file(content: &str) -> Result<Vec<(String, String)>> {
     let mut out: Vec<(String, String)> = Vec::new();

@@ -4,6 +4,7 @@
 //! and tables through DataFusion, and serves them over the Postgres wire
 //! protocol via datafusion-postgres.
 
+mod authz;
 mod branch;
 mod buffer;
 mod cache;
@@ -13,6 +14,9 @@ mod dml;
 mod flight;
 mod ops;
 mod overwrite;
+/// SCRAM authentication backend — the managed add-on (behind the `managed`
+/// feature). The open-source build carries no auth backend.
+#[cfg(feature = "managed")]
 mod pgauth;
 mod scan;
 mod seed;
@@ -132,6 +136,15 @@ enum Command {
         /// Without this flag the server stays permissive and logs a WARN.
         #[arg(long, env = "ICEGRES_AUTH_FILE")]
         auth_file: Option<PathBuf>,
+
+        /// Enforce Lakekeeper-style authorization (ReBAC) from this policy
+        /// file. Grants of read/write/drop/own on warehouse/namespace/table
+        /// entities (inherited down the hierarchy) gate every SQL statement;
+        /// a denied statement returns SQLSTATE 42501. Pair with --auth-file so
+        /// principals are authenticated, not client-asserted. Without this
+        /// flag authorization is OPEN (any authenticated user, all tables).
+        #[arg(long, env = "ICEGRES_AUTHZ_FILE")]
+        authz_file: Option<PathBuf>,
 
         /// Enforce per-table primary keys (SPEC B5): tables declaring the
         /// 'icegres.primary-key' property get NOT NULL + uniqueness checks
@@ -291,6 +304,7 @@ async fn main() -> Result<()> {
             tls_cert,
             tls_key,
             auth_file,
+            authz_file,
             branch,
             enforce_pk,
             write_buffer_ms,
@@ -301,6 +315,7 @@ async fn main() -> Result<()> {
                 tls_cert,
                 tls_key,
                 auth_file,
+                authz_file,
                 branch,
                 enforce_pk,
                 write_buffer_ms,
@@ -343,6 +358,7 @@ struct ServeOpts {
     tls_cert: Option<String>,
     tls_key: Option<String>,
     auth_file: Option<PathBuf>,
+    authz_file: Option<PathBuf>,
     branch: String,
     enforce_pk: bool,
     write_buffer_ms: u64,
@@ -362,24 +378,37 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
         // programmatic callers.
         _ => bail!("--tls-cert and --tls-key must be provided together"),
     };
-    let auth = match &serve_opts.auth_file {
-        Some(path) => {
-            let source = Arc::new(pgauth::FileAuthSource::load(path)?);
-            info!(
-                auth_file = %path.display(),
-                users = source.user_count(),
-                "SCRAM-SHA-256 authentication enabled"
-            );
-            Some(source)
-        }
-        None => {
-            warn!(
-                "authentication is DISABLED — any user/password is accepted; \
-                 pass --auth-file (env ICEGRES_AUTH_FILE) to require SCRAM-SHA-256 credentials"
-            );
-            None
-        }
-    };
+    let auth: Option<Arc<dyn datafusion_postgres::pgwire::api::auth::AuthSource>> =
+        match &serve_opts.auth_file {
+            Some(path) => {
+                #[cfg(feature = "managed")]
+                {
+                    let source = Arc::new(pgauth::FileAuthSource::load(path)?);
+                    info!(
+                        auth_file = %path.display(),
+                        users = source.user_count(),
+                        "SCRAM-SHA-256 authentication enabled (managed add-on)"
+                    );
+                    Some(source as Arc<dyn datafusion_postgres::pgwire::api::auth::AuthSource>)
+                }
+                #[cfg(not(feature = "managed"))]
+                {
+                    let _ = path;
+                    bail!(
+                        "--auth-file is a managed add-on: this open-source build was compiled \
+                         without the `managed` feature. Rebuild with --features managed, or omit \
+                         --auth-file to run open."
+                    );
+                }
+            }
+            None => {
+                warn!(
+                    "authentication is DISABLED — any user/password is accepted; \
+                     pass --auth-file (env ICEGRES_AUTH_FILE) to require SCRAM-SHA-256 credentials"
+                );
+                None
+            }
+        };
 
     // Zero-copy branch serving (--branch, SPEC D6): `None` = main = the
     // historical read/write paths byte-for-byte; `Some(name)` pins reads to
@@ -460,6 +489,41 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
             overwrite::PK_PROPERTY
         );
     }
+    // Lakekeeper-style ReBAC authorization (--authz-file). None = open (any
+    // authenticated principal, all tables); Some = every statement gated.
+    let authorizer: Option<authz::SharedAuthorizer> = match &serve_opts.authz_file {
+        Some(path) => {
+            #[cfg(feature = "managed")]
+            {
+                let a = Arc::new(authz::FileAuthorizer::load(path)?);
+                if serve_opts.auth_file.is_none() {
+                    warn!(
+                        "authorization is ENABLED but authentication is NOT (--auth-file unset): \
+                         principals are CLIENT-ASSERTED and spoofable. Pair --authz-file with \
+                         --auth-file in production."
+                    );
+                }
+                info!(
+                    authz_file = %path.display(),
+                    grants = a.grant_count(),
+                    "ReBAC authorization enabled (managed add-on; warehouse->namespace->table \
+                     grants, SQLSTATE 42501 on deny)"
+                );
+                Some(a as authz::SharedAuthorizer)
+            }
+            #[cfg(not(feature = "managed"))]
+            {
+                let _ = path;
+                bail!(
+                    "--authz-file is a managed add-on: this open-source build was compiled \
+                     without the `managed` feature. Rebuild with --features managed, or omit \
+                     --authz-file to run open (any authenticated user, all tables)."
+                );
+            }
+        }
+        None => None,
+    };
+
     let txn_registry = Arc::new(TxnRegistry::new());
     let hooks = query_hooks(
         engine,
@@ -467,6 +531,7 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
         catalog,
         write_buffer,
         serve_opts.enforce_pk,
+        authorizer,
     );
 
     info!(listen_addr = %format!("{host}:{port}"), "starting pgwire server");
@@ -520,8 +585,17 @@ fn query_hooks(
     catalog: Arc<dyn Catalog>,
     write_buffer: Option<Arc<buffer::WriteBuffer>>,
     enforce_pk: bool,
+    authorizer: Option<authz::SharedAuthorizer>,
 ) -> Vec<Arc<dyn QueryHook>> {
-    let mut hooks: Vec<Arc<dyn QueryHook>> = Vec::with_capacity(5);
+    let mut hooks: Vec<Arc<dyn QueryHook>> = Vec::with_capacity(6);
+    // 0. AuthzHook runs FIRST so an unauthorized statement is rejected (42501)
+    //    before any rewrite, buffering, or planning touches it.
+    if let Some(a) = authorizer {
+        hooks.push(Arc::new(authz::AuthzHook::new(
+            a,
+            context::DEFAULT_SCHEMA.to_string(),
+        )));
+    }
     if let Some(buf) = write_buffer {
         hooks.push(Arc::new(buffer::BufferHook::new(
             buf,

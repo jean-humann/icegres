@@ -460,6 +460,29 @@ else
   stop_pidfile "$RUN_DIR/parity-flight.pid"
 fi
 
+# A12: authorization (managed add-on) — runs bench/clients/authz_probe.sh, which
+# starts its own icegres with --auth-file + --authz-file and verifies the
+# Lakekeeper-style ReBAC enforcement matrix (namespace-grant inheritance,
+# table-scoped grants, warehouse ownership, roles, per-statement 42501 denial,
+# JOIN checks every table, pg_catalog metadata free). PASS requires exit 0 AND
+# fail=0. A build without the `managed` feature, or missing psql, records a GAP.
+A12_BEHAVIOR="Authorization (ReBAC managed add-on: warehouse/namespace/table grants, 42501)"
+a12_probe="$REPO_DIR/bench/clients/authz_probe.sh"
+if ! command -v psql >/dev/null 2>&1; then
+  record A12 wire "$A12_BEHAVIOR" GAP "psql not available to run bench/clients/authz_probe.sh"
+else
+  a12_out=$(bash "$a12_probe" 2>&1)
+  a12_rc=$?
+  a12_summary=$(echo "$a12_out" | grep '^A12 RESULT:' | tail -n 1)
+  if [[ $a12_rc -eq 0 && "$a12_summary" == *"fail=0"* ]]; then
+    record A12 wire "$A12_BEHAVIOR" PASS \
+      "bench/clients/authz_probe.sh all green ($a12_summary): SCRAM-authenticated principals; read grant on the demo namespace inherits to its tables; write grant scoped to demo.trips; warehouse ownership grants everything; role membership; INSERT/SELECT denied with SQLSTATE 42501 where ungranted; JOIN checks every referenced table; pg_catalog/information_schema metadata always allowed."
+  else
+    record A12 wire "$A12_BEHAVIOR" GAP \
+      "probe exit=$a12_rc ($a12_summary): $(echo "$a12_out" | grep -E '^(    FAIL|A12 (SKIP|ERROR))' | flat)"
+  fi
+fi
+
 # ===========================================================================
 # Area B — OLTP semantics
 # ===========================================================================

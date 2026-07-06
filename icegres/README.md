@@ -39,7 +39,8 @@ compatibility, and scale-to-zero economics on lakehouse data — leave
 | UPDATE / DELETE | copy-on-write overwrite snapshots — only files containing matched rows are rewritten (`src/overwrite.rs`) | default |
 | Transactions | BEGIN/COMMIT/ROLLBACK; snapshot-pinned reads, read-your-own-writes, COMMIT = ONE Iceberg snapshot, first-committer-wins (40001) (`src/txn.rs`) | default |
 | Primary-key enforcement | opt-in NOT NULL + uniqueness checks (23502/23505) anchored to the commit snapshot | `--enforce-pk` + table property `icegres.primary-key` |
-| Authentication | SCRAM-SHA-256 (salted hashes in memory, 28P01 on failure) | `--auth-file` |
+| Authentication | SCRAM-SHA-256 (salted hashes in memory, 28P01 on failure) — managed add-on | `--auth-file` |
+| Authorization | Lakekeeper-style ReBAC: warehouse/namespace/table grants, roles, per-statement 42501 — managed add-on | `--authz-file` |
 | TLS | rustls on the pgwire listener; misconfig aborts boot | `--tls-cert`/`--tls-key` |
 | Time travel | read-only snapshot-pinned queries | `demo."trips@<snapshot_id>"` |
 | Zero-copy branches | Neon-style branch-per-endpoint over Iceberg snapshot refs (`src/branch.rs`) | `icegres branch create/list/drop`, `serve --branch` |
@@ -544,6 +545,64 @@ cursors are not implemented — the same limit as the other lanes); for
 writes prefer autocommit, since DML inside an explicit transaction that
 also issues an intervening statement hits the shared `0A000`
 extended-protocol limit.
+
+## Open-core model: the managed auth/authz add-on
+
+icegres is open source: the lakehouse SQL server, every wire/driver protocol
+(pgwire, Arrow Flight SQL — psql, ODBC, JDBC, ADBC), the copy-on-write write
+engine, branching, the control plane, and the **authorization *seam*** (the
+`Authorizer` trait, the `AuthzHook` enforcement point, the SQL→action mapping,
+and the `--auth-file` / `--authz-file` flags) are always compiled.
+
+The security **backends** — SCRAM authentication (`pgauth::FileAuthSource`) and
+the ReBAC authorization policy engine (`authz::FileAuthorizer`) — are the
+**managed add-on**, gated behind the `managed` cargo feature:
+
+```bash
+cargo build --release                          # managed build (default): auth + authz
+cargo build --release --no-default-features    # pure open-source: no auth/authz backends
+```
+
+An open-source build runs the server fully, but `--auth-file` / `--authz-file`
+return a clear *"managed add-on"* error, and the endpoint is open (any user,
+all tables). Because core depends only on the `AuthSource` / `Authorizer` /
+`BasicAuthVerifier` traits, the managed backends plug in without touching any
+enforcement point — and a future OpenFGA backend that delegates to Lakekeeper's
+own authorization can implement the same `Authorizer` trait as a drop-in.
+
+## Authorization (managed add-on) — Lakekeeper-style ReBAC
+
+With `--authz-file` (managed build), every SQL statement is authorized before
+it executes, using the relationship-based model from Lakekeeper's
+`authz-openfga`: a `warehouse → namespace → table` hierarchy where a grant at a
+higher level is inherited by every descendant, and relations ordered
+`own ⊇ write ⊇ read` (plus `drop`). Principals are users (from `--auth-file`)
+or roles; a user inherits every grant of every role it belongs to.
+
+```bash
+icegres serve --auth-file users --authz-file policy    # pair authn + authz
+```
+
+Policy file (`#` comments; `grant <principal> <relation> <entity>`):
+
+```text
+grant analyst read demo          # read every table in the demo namespace
+grant writer  write demo.trips   # write just demo.trips (write implies read)
+grant admin   own   *            # warehouse owner — everything
+member alice analyst             # alice inherits analyst's grants
+member bob   writer
+```
+
+A denied statement returns SQLSTATE `42501` (`permission denied: role "…"
+cannot … on …`). A `SELECT` is checked against **every** table it references
+(joins, subqueries, CTEs); `INSERT`/`UPDATE`/`DELETE` need `write` on the
+target; `pg_catalog` / `information_schema` reads, `SET`/`SHOW`, and
+transaction control are metadata/session operations and are always allowed —
+the same split Lakekeeper draws. Enforced on the pgwire path (psql, ODBC, JDBC,
+and the ADBC postgres driver); verified by `bench/clients/authz_probe.sh`
+(parity A12, e2e section (s)). Pair `--authz-file` with `--auth-file` so
+principals are authenticated, not client-asserted. Flight-SQL-native
+enforcement (the ADBC Arrow lane) is the next increment.
 
 ## Demo schema
 
