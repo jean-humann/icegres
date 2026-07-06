@@ -28,6 +28,7 @@ every feature below is zero-copy on top of it.
 | Scale-to-zero | clean exit after N idle seconds; stateless compute | `--idle-shutdown-secs` |
 | Wake-on-connect control plane | `icegresd`: pgwire-aware proxy that spawns computes on connect, routes `icegres@<branch>` dbnames to per-branch computes, supervises crashes with capped backoff | `icegresd serve` / `icegresd status` |
 | Health endpoint | HTTP 200 liveness | `--health-port` |
+| ORM/BI compatibility | pg_catalog shims: coherent oids, `version()`, ORM introspection rewrites (`src/compat.rs`) — SQLAlchemy/psycopg2/pg8000/pandas verified | default |
 
 ```
 psql ──pgwire──▶ icegres (DataFusion) ──REST──▶ Lakekeeper ──▶ Postgres (metadata)
@@ -318,6 +319,34 @@ can leak onto `main`. A table without the ref fails loudly — no silent
 fallback. Both branches share every file below the fork point; only new
 commits diverge.
 
+### Works with your ORM/BI tool
+
+Real clients issue much gnarlier `pg_catalog` introspection than psql, and
+icegres serves it (`src/compat.rs`: a coherent-oid `pg_class`/`pg_namespace`/
+`pg_attribute` snapshot, a Postgres-parseable `version()`, and AST rewrites
+for the `unnest(indkey)`/`generate_subscripts`/nested-correlated-subquery/
+regclass constructs ORMs generate). Verified end-to-end by
+`bench/clients/a8_orm_probe.py` (e2e section (o), parity probe A8):
+
+| client | verified |
+|---|---|
+| **psycopg2** 2.9 | connect (plain + SCRAM over TLS), simple-protocol queries, `BEGIN`/`COMMIT`/`ROLLBACK` with read-your-own-writes and cross-connection visibility |
+| **pg8000** 1.31 | connect, extended-protocol parameterized queries, prepared-statement reuse across executions |
+| **SQLAlchemy** 2.0 | `inspect()` (schemas, tables, columns with correct types), full reflection of `demo.trips` into a `Table`, ORM expression-language SELECT/filter/GROUP BY — over both psycopg2 and pg8000 |
+| **pandas** 3.x | `read_sql` of a join through SQLAlchemy |
+
+Known limits (documented failures, not silent corruption):
+
+- **Server-side (named) cursors** — `DECLARE CURSOR`/`FETCH` is not
+  implemented by the DataFusion pgwire front-end; use client-side cursors
+  (psycopg2's default unnamed cursor works).
+- **Extended-protocol SELECT inside an explicit transaction** is rejected
+  with a clean `0A000` (transactional SELECT is simple-protocol only).
+  psycopg2 uses the simple protocol, so ORM transactions work; for pg8000
+  use autocommit (`isolation_level="AUTOCOMMIT"` in SQLAlchemy) or psycopg2.
+- `pg_constraint`/`pg_index` never reference user tables (Iceberg has no
+  PK/index objects), so ORMs correctly see “no primary key / no indexes”.
+
 ## Demo schema
 
 - `demo.cities` — `city STRING, country STRING, population BIGINT` (20 rows)
@@ -361,8 +390,8 @@ bash tests/e2e.sh   # end-to-end test (idempotent; needs psql, curl, jq, aws)
 ```
 
 The harness starts the stack (`infra/scripts/up.sh`), builds, seeds, serves,
-and asserts exact results over psql — **77 assertions** across sections
-(a)–(m): seeded row counts, filters/aggregates/joins, `INSERT` over the wire
+and asserts exact results over psql — **92 assertions** across sections
+(a)–(o): seeded row counts, filters/aggregates/joins, `INSERT` over the wire
 (verified from new connections), Parquet files on RustFS + catalog
 registration via the Lakekeeper REST API, durability across a server
 restart, auth + TLS (wrong password/unknown user rejected,

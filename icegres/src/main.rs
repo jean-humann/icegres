@@ -7,6 +7,7 @@
 mod branch;
 mod buffer;
 mod cache;
+mod compat;
 mod context;
 mod dml;
 mod ops;
@@ -411,6 +412,8 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
         Arc::new(AuthManager::default()),
     )
     .map_err(|e| anyhow::anyhow!("failed to set up pg_catalog emulation: {e}"))?;
+    compat::register_compat_udfs(&ctx);
+    compat::install_coherent_pg_catalog(&ctx, context::CATALOG_NAME).await?;
 
     if let Some(hp) = serve_opts.health_port {
         ops::spawn_health_listener(host, hp).await?;
@@ -459,13 +462,17 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
 ///    BEGIN/DDL). Must run first so a fence flush happens before the fenced
 ///    statement's own handler; it defers to TxnHook for any connection with
 ///    an open transaction.
-/// 2. [`TxnHook`] — BEGIN/COMMIT/ROLLBACK and, while a transaction is open,
+/// 2. [`compat::CompatHook`] — ORM/driver pg_catalog compatibility rewrites
+///    (SPEC A8). Must run before TxnHook: ORMs reflect inside a
+///    driver-opened transaction, and the rewritten introspection SQL reads
+///    static catalog tables only.
+/// 3. [`TxnHook`] — BEGIN/COMMIT/ROLLBACK and, while a transaction is open,
 ///    EVERY statement on that connection (buffered writes, pinned reads);
 ///    also PK-enforced autocommit INSERT. Replaces the upstream
 ///    `TransactionStatementHook`, whose BEGIN/COMMIT were accepted but
 ///    non-transactional.
-/// 3. `SetShowHook` — upstream SET/SHOW handling.
-/// 4. [`dml::DmlHook`] — autocommit copy-on-write UPDATE/DELETE.
+/// 4. `SetShowHook` — upstream SET/SHOW handling.
+/// 5. [`dml::DmlHook`] — autocommit copy-on-write UPDATE/DELETE.
 fn query_hooks(
     engine: Arc<OverwriteEngine>,
     registry: Arc<TxnRegistry>,
@@ -473,7 +480,7 @@ fn query_hooks(
     write_buffer: Option<Arc<buffer::WriteBuffer>>,
     enforce_pk: bool,
 ) -> Vec<Arc<dyn QueryHook>> {
-    let mut hooks: Vec<Arc<dyn QueryHook>> = Vec::with_capacity(4);
+    let mut hooks: Vec<Arc<dyn QueryHook>> = Vec::with_capacity(5);
     if let Some(buf) = write_buffer {
         hooks.push(Arc::new(buffer::BufferHook::new(
             buf,
@@ -481,6 +488,7 @@ fn query_hooks(
             enforce_pk,
         )));
     }
+    hooks.push(Arc::new(compat::CompatHook));
     hooks.push(Arc::new(TxnHook::new(registry, engine.clone(), catalog)));
     hooks.push(Arc::new(SetShowHook));
     hooks.push(Arc::new(dml::DmlHook::new(engine)));

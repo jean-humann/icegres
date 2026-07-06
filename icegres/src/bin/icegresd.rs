@@ -29,6 +29,44 @@
 //!   compute). Idle branch computes exit like the main one and are reaped;
 //!   the next `<db>@<branch>` connection re-wakes them.
 //!
+//! * **Session pooling (warm backend connections).** icegresd keeps up to
+//!   `--pool-size` (default 8) WARM, pre-handshaked pgwire connections per
+//!   compute. A client whose startup matches the pool's identity
+//!   (`user == --pool-user`, `database` == the compute's canonical name,
+//!   no `options`/`replication` startup parameter) is spliced onto a warm
+//!   connection immediately: icegresd replays the cached backend greeting
+//!   (AuthenticationOk .. ReadyForQuery) and the client is at
+//!   ReadyForQuery without any compute-side handshake. Everything else —
+//!   pool empty (overflow), different user/database, `options` present —
+//!   falls through to a DIRECT compute connection with the client's
+//!   ORIGINAL startup bytes forwarded verbatim, exactly the pre-pool path.
+//!
+//!   **A backend connection is never reused across client sessions.** Our
+//!   computes hold real per-session state (transaction buffers, SET
+//!   variables, prepared statements) and datafusion-postgres has no
+//!   `DISCARD ALL`-style reset, so handing a used session to a second
+//!   client could leak state. Each warm connection serves EXACTLY ONE
+//!   client and is closed when that client disconnects; the pool is a
+//!   warm-SPARE pool refilled in the background (this is the
+//!   correctness-first fallback: per-session backend conns + warm spares).
+//!   For the same reason icegresd does NOT do transaction pooling
+//!   (PgBouncer `pool_mode=transaction`): statements between transactions
+//!   would hop across backend sessions and silently lose SET state,
+//!   prepared statements, and buffered-write ordering. Session state makes
+//!   transaction pooling unsafe here by construction.
+//!
+//!   Pooling coexists with scale-to-zero: warm connections count as
+//!   active sessions on the compute, so after `--pool-idle-secs` (default
+//!   60) with zero CLIENT sessions the pool is drained, which lets the
+//!   compute's own `--idle-shutdown-secs` clock run; the next wake
+//!   re-warms the pool. The pool is also cleared and re-warmed when a
+//!   compute crashes and is restarted. With `ICEGRES_AUTH_FILE` set the
+//!   computes demand SCRAM and icegresd cannot pre-authenticate for a
+//!   client, so pooling disables itself (all sessions go direct).
+//!   Non-identity startup parameters of pooled clients (e.g.
+//!   `application_name`) are ignored, like PgBouncer's
+//!   `ignore_startup_parameters`.
+//!
 //! * **TLS.** icegresd itself speaks plain TCP: an `SSLRequest`/
 //!   `GSSENCRequest` preamble is answered with `N` (exactly like a
 //!   non-TLS-enabled Postgres listener), after which libpq clients fall

@@ -258,6 +258,42 @@ else
     "only $ok/8 parallel connections succeeded: $(flat <"$RUN_DIR/a5.out")"
 fi
 
+# A8: real ORM/driver compatibility — runs bench/clients/a8_orm_probe.py
+# (psycopg2 + pg8000 + SQLAlchemy 2.x + pandas) against the main server;
+# with `with_secure` the auth+TLS connect variants target the A6/A7 secure
+# server (must still be running). PASS requires exit 0 AND `fail=0` in the
+# probe's summary (server-side cursors are a documented XFAIL, not a fail).
+A8_BEHAVIOR="ORM/driver compatibility (SQLAlchemy+psycopg2+pg8000)"
+run_a8_probe() { # with_secure|plain
+  local probe="$REPO_DIR/bench/clients/a8_orm_probe.py"
+  local -a a8_env=(env ICEGRES_PROBE_HOST="$PG_HOST" ICEGRES_PROBE_PORT="$MAIN_PORT")
+  if [[ "${1:-plain}" == with_secure ]]; then
+    a8_env+=(ICEGRES_PROBE_SECURE_PORT="$SECURE_PORT"
+             ICEGRES_PROBE_SECURE_USER=parity_user
+             ICEGRES_PROBE_SECURE_PASSWORD=parity-secret-pw)
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    record A8 wire "$A8_BEHAVIOR" GAP "python3 not available to run bench/clients/a8_orm_probe.py"
+    return
+  fi
+  if ! python3 -c 'import sqlalchemy, psycopg2, pg8000, pandas' 2>/dev/null; then
+    record A8 wire "$A8_BEHAVIOR" GAP \
+      "python client libraries missing (pip install sqlalchemy psycopg2-binary pg8000 pandas)"
+    return
+  fi
+  local a8_out a8_rc a8_summary
+  a8_out=$("${a8_env[@]}" python3 "$probe" 2>&1)
+  a8_rc=$?
+  a8_summary=$(echo "$a8_out" | grep '^A8 RESULT:' | tail -n 1)
+  if [[ $a8_rc -eq 0 && "$a8_summary" == *"fail=0"* ]]; then
+    record A8 wire "$A8_BEHAVIOR" PASS \
+      "bench/clients/a8_orm_probe.py all green ($a8_summary; secure variants: ${1:-plain}): psycopg2+pg8000 connect, SCRAM+TLS connect, SQLAlchemy inspect()/reflection of demo.trips (correct column types), ORM filter+GROUP BY, pandas read_sql join, prepared-statement reuse, BEGIN/ROLLBACK + BEGIN/COMMIT via the driver. Documented XFAIL: server-side (named) cursors — DECLARE CURSOR unsupported."
+  else
+    record A8 wire "$A8_BEHAVIOR" GAP \
+      "probe exit=$a8_rc ($a8_summary): $(echo "$a8_out" | grep -E '^(FAIL|Traceback)' | flat)"
+  fi
+}
+
 # A6/A7 probe a dedicated server started WITH --auth-file + --tls-cert/key
 # (the icegres security posture is opt-in per server; other probes use the
 # permissive main server, which logs a startup WARN saying auth is off).
@@ -315,10 +351,12 @@ if [[ "$secure_up" == 1 ]]; then
     record A7 wire "TLS" GAP \
       "TLS incomplete: sslmode=require -> $(echo "$out_tls" | flat); s_client -> '${tls_line:-no handshake}'; verify-full -> $(echo "$out_vfull" | flat)"
   fi
+  run_a8_probe with_secure
   stop_pidfile "$RUN_DIR/parity-serve-secure.pid"
 else
   record A6 wire "server-side auth" GAP "$secure_err"
   record A7 wire "TLS" GAP "$secure_err"
+  run_a8_probe plain
 fi
 
 # ===========================================================================

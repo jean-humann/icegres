@@ -968,4 +968,28 @@ pass "icegresd shutdown terminated its computes (no leftovers)"
 "$BIN" branch drop demo.trips "$PXY_BRANCH" >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
+# (o) real ORM/driver clients — SPEC A8 (bench/clients/a8_orm_probe.py)
+# ---------------------------------------------------------------------------
+# Runs the headless ORM compatibility probe (psycopg2 + pg8000 +
+# SQLAlchemy 2.x + pandas: connect, inspect(), reflection of demo.trips,
+# ORM filter/aggregate, pandas join, prepared-statement reuse,
+# BEGIN/COMMIT/ROLLBACK) against the main server. The probe's writes use
+# trip_id >= 930000 and clean up after themselves. Server-side (named)
+# cursors are a documented XFAIL inside the probe, not a failure.
+log "(o) ORM/driver compatibility probe (bench/clients/a8_orm_probe.py)"
+if ! command -v python3 >/dev/null 2>&1 \
+    || ! python3 -c 'import sqlalchemy, psycopg2, pg8000, pandas' 2>/dev/null; then
+  log "    SKIPPED: python3 with sqlalchemy/psycopg2/pg8000/pandas not available" \
+      "(pip install sqlalchemy psycopg2-binary pg8000 pandas)"
+else
+  A8_OUT=$(env ICEGRES_PROBE_HOST="$PG_HOST" ICEGRES_PROBE_PORT="$PG_PORT" \
+      python3 "$REPO_DIR/bench/clients/a8_orm_probe.py" 2>&1) \
+    || { echo "$A8_OUT" | tail -n 25 >&2; fail "A8 ORM/driver probe reported failures"; }
+  echo "$A8_OUT" | sed 's/^/    /'
+  echo "$A8_OUT" | grep -q '^A8 RESULT: .*fail=0' \
+    || fail "A8 ORM/driver probe summary is not fail=0"
+  pass "ORM/driver clients green ($(echo "$A8_OUT" | grep '^A8 RESULT:'))"
+fi
+
+# ---------------------------------------------------------------------------
 log "all assertions passed ($PASS_COUNT)"
