@@ -12,6 +12,7 @@ mod compat;
 mod context;
 mod dml;
 mod flight;
+mod maintain;
 mod metrics;
 mod ops;
 mod overwrite;
@@ -249,6 +250,12 @@ enum Command {
         #[command(subcommand)]
         cmd: BranchCmd,
     },
+    /// Table lifecycle maintenance (snapshot expiry). No `compact` yet — see
+    /// the note above `Command`.
+    Maintain {
+        #[command(subcommand)]
+        cmd: MaintainCmd,
+    },
     /// Execute a single SQL statement locally (no server) and print results.
     Sql {
         #[command(flatten)]
@@ -306,6 +313,24 @@ enum BranchCmd {
         table: String,
         /// Branch name to drop (`main` is refused).
         name: String,
+    },
+}
+
+/// `icegres maintain` subcommands.
+#[derive(Subcommand)]
+enum MaintainCmd {
+    /// Expire old snapshots of <table>, keeping the newest --keep by commit
+    /// time plus every snapshot still reachable from a branch/tag ref.
+    /// Metadata-only and safe on a live endpoint (anchored commit).
+    ExpireSnapshots {
+        #[command(flatten)]
+        catalog: CatalogOpts,
+        /// Target table: <table> or <namespace>.<table>.
+        table: String,
+        /// Keep this many of the newest snapshots (referenced refs are always
+        /// kept regardless of age).
+        #[arg(long, default_value_t = 10)]
+        keep: usize,
     },
 }
 
@@ -394,6 +419,13 @@ async fn main() -> Result<()> {
                 table,
                 name,
             } => branch::drop(&catalog, &table, &name).await,
+        },
+        Command::Maintain { cmd } => match cmd {
+            MaintainCmd::ExpireSnapshots {
+                catalog,
+                table,
+                keep,
+            } => maintain::expire_snapshots(&catalog, &table, keep).await,
         },
         Command::Sql {
             catalog,

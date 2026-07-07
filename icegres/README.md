@@ -106,6 +106,7 @@ psql -h 127.0.0.1 -p 5439 -U postgres -d icegres
 | `icegres branch create <table> <name> [--at-snapshot <id>]` | Create a zero-copy branch: ONE metadata commit adding a snapshot ref at main's head (or `--at-snapshot`); no data copied. Fails if the branch exists (atomic via `assert-ref-snapshot-id = null`). |
 | `icegres branch list <table>` | List all snapshot refs (branches/tags) of a table with their head snapshot ids. |
 | `icegres branch drop <table> <name>` | Remove the ref only (`main` is refused); the branch's snapshots stay time-travel-readable until expiry. |
+| `icegres maintain expire-snapshots <table> [--keep N]` | Trim table metadata to the newest `N` snapshots (default 10) **plus every snapshot still reachable from a branch/tag ref** — a metadata-only, live-safe REST commit (anchored with `assert-table-uuid` + `assert-ref-snapshot-id main=<head>`). Data/manifest files of the expired snapshots are left for a separate orphan-file GC. Long-lived tables need this so `$snapshots` and the per-open metadata JSON stop growing unbounded. |
 | `icegres sql -e '<query>'` | One-shot local execution against the catalog (debugging aid; no server involved). Honors `--enforce-pk`. |
 
 ### Configuration
@@ -132,8 +133,13 @@ environment variables:
 | `--branch` (serve) | `ICEGRES_BRANCH` | `main` | Serve a zero-copy branch: reads pin to the ref's head, all writes commit to the ref with `assert-ref-snapshot-id` (never touching other branches) |
 | `--write-buffer-ms` (serve) | `ICEGRES_WRITE_BUFFER_MS` | `0` (sync) | Opt-in buffered writes: INSERTs ack from an in-memory buffer, group-committed every N ms; unclean kill loses ≤N ms of acked writes (WARN on enable) |
 |  | `ICEGRES_WRITE_BUFFER_MAX_ROWS` | `50000` | Row threshold that forces an early flush in buffered mode |
+|  | `ICEGRES_TXN_STRICT` | off | Refuse any multi-table `COMMIT` up front with `0A000` (nothing applied), guaranteeing every COMMIT is all-or-nothing. Off = best-effort ordered per-table commits (a partial apply reports `40003`, not the retryable `40001`). |
 
 Logging uses `tracing` with an env filter: `RUST_LOG=debug icegres serve`.
+Other GA operational env vars (memory pool `ICEGRES_MEMORY_LIMIT_MB`,
+connection cap `ICEGRES_MAX_CONNECTIONS`, catalog timeout/retry
+`ICEGRES_CATALOG_TIMEOUT_MS`/`_RETRIES`, `/metrics` on `--health-port`,
+`ICEGRES_LOG_FORMAT=json`) are set the same way.
 
 ### Authentication (`--auth-file`)
 

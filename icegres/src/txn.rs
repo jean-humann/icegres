@@ -589,6 +589,11 @@ pub struct TxnHook {
     registry: Arc<TxnRegistry>,
     engine: Arc<OverwriteEngine>,
     catalog: Arc<dyn Catalog>,
+    /// When true, a COMMIT that would touch more than one table is refused up
+    /// front (nothing applied) instead of being applied best-effort per-table.
+    /// Set via `ICEGRES_TXN_STRICT=true`. Trades multi-table transactions for a
+    /// guarantee that every COMMIT is all-or-nothing.
+    strict: bool,
 }
 
 impl TxnHook {
@@ -601,6 +606,7 @@ impl TxnHook {
             registry,
             engine,
             catalog,
+            strict: strict_txn_mode(),
         }
     }
 
@@ -660,6 +666,27 @@ impl TxnHook {
             .collect();
         idents.sort_by_key(|i| i.to_string());
 
+        // Strict mode: Iceberg REST commits are per-table, so a transaction
+        // spanning >1 table cannot be applied atomically. Rather than risk a
+        // partial apply, refuse before touching anything — the whole
+        // transaction rolls back (nothing was applied) with a clear
+        // feature_not_supported (0A000) error.
+        if self.strict && idents.len() > 1 {
+            let names: Vec<String> = idents.iter().map(|i| i.to_string()).collect();
+            return Err(user_err(
+                "0A000",
+                &format!(
+                    "strict transaction mode (ICEGRES_TXN_STRICT): COMMIT touches {} tables \
+                     [{}] but Iceberg REST commits are per-table and cannot be applied \
+                     atomically across tables; transaction rolled back (nothing applied). \
+                     Commit one table per transaction, or unset ICEGRES_TXN_STRICT to allow \
+                     best-effort ordered multi-table commits.",
+                    idents.len(),
+                    names.join(", ")
+                ),
+            ));
+        }
+
         let mut committed: Vec<String> = Vec::new();
         for (k, ident) in idents.iter().enumerate() {
             let t = &sess.tables[*ident];
@@ -673,25 +700,37 @@ impl TxnHook {
                     let remaining: Vec<String> =
                         idents[k + 1..].iter().map(|i| i.to_string()).collect();
                     let base = dml::engine_error(&e);
-                    let msg = if committed.is_empty() {
-                        format!(
+                    if committed.is_empty() {
+                        // Nothing applied yet: a true rollback. Preserve the
+                        // underlying sqlstate (e.g. 40001 serialization_failure)
+                        // so retry logic keyed on it still works — retrying is
+                        // safe because no table changed.
+                        let msg = format!(
                             "COMMIT failed, transaction rolled back (no changes were \
                              applied): {}",
                             err_message(&base)
-                        )
-                    } else {
-                        format!(
-                            "COMMIT PARTIALLY APPLIED: table(s) [{}] committed before table \
-                             {ident} failed: {}; table(s) [{}] were NOT committed. Iceberg \
-                             REST commits are per-table — multi-table transactions are \
-                             best-effort ordered (see icegres docs); split the transaction \
-                             per table for full atomicity.",
-                            committed.join(", "),
-                            err_message(&base),
-                            remaining.join(", ")
-                        )
-                    };
-                    return Err(with_message(base, msg));
+                        );
+                        return Err(with_message(base, msg));
+                    }
+                    // Some tables committed, then one failed: the outcome is
+                    // NOT a rollback. Report SQLSTATE 40003
+                    // (statement_completion_unknown) so a client does not
+                    // blindly retry the whole COMMIT — retrying would re-apply
+                    // the already-committed tables. The client must reconcile
+                    // per-table state instead.
+                    let msg = format!(
+                        "COMMIT PARTIALLY APPLIED: table(s) [{}] committed before table \
+                         {ident} failed: {}; table(s) [{}] were NOT committed. Iceberg \
+                         REST commits are per-table — multi-table transactions are \
+                         best-effort ordered (see icegres docs). Do NOT blindly retry \
+                         this COMMIT; reconcile per-table state, or set \
+                         ICEGRES_TXN_STRICT=true to refuse non-atomic multi-table commits \
+                         up front.",
+                        committed.join(", "),
+                        err_message(&base),
+                        remaining.join(", ")
+                    );
+                    return Err(user_err("40003", &msg));
                 }
             }
         }
@@ -1278,6 +1317,16 @@ fn user_err(code: &str, msg: &str) -> PgWireError {
         code.to_string(),
         msg.to_string(),
     )))
+}
+
+/// Whether strict transaction mode is enabled (`ICEGRES_TXN_STRICT` truthy).
+/// In strict mode a COMMIT spanning more than one table is refused before any
+/// table is written, guaranteeing every COMMIT is all-or-nothing.
+fn strict_txn_mode() -> bool {
+    matches!(
+        std::env::var("ICEGRES_TXN_STRICT").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("on")
+    )
 }
 
 fn aborted_err() -> PgWireError {

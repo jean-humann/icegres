@@ -32,7 +32,7 @@ use crate::CatalogOpts;
 
 /// Parse `table` as `namespace.table` (or bare `table` in the default
 /// namespace). Matches the identifier rules the SQL layer uses.
-fn parse_table(table: &str) -> Result<TableIdent> {
+pub(crate) fn parse_table(table: &str) -> Result<TableIdent> {
     let parts: Vec<&str> = table.split('.').collect();
     let (ns, name) = match parts.as_slice() {
         [name] => (DEFAULT_SCHEMA, *name),

@@ -95,7 +95,7 @@
 //!   subqueries are rejected (they would otherwise be evaluated per-file
 //!   and yield wrong answers).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -633,6 +633,89 @@ impl OverwriteEngine {
             CommitOutcome::Committed => Ok(head),
             CommitOutcome::Conflict(msg) => bail!(
                 "branch {name:?} on {ident} moved while dropping it (concurrent commit?): {msg}"
+            ),
+        }
+    }
+
+    /// Expire old snapshots of `ident`, keeping the newest `keep_last` by
+    /// commit timestamp plus every snapshot that is still reachable from a
+    /// branch/tag ref (so time-travel over live refs and the current head
+    /// never break). Metadata-only: the removed snapshots' data/manifest
+    /// files are left in object storage — a separate orphan-file GC reclaims
+    /// them — but they drop out of table metadata so `$snapshots` shrinks and
+    /// metadata stops growing unbounded. Anchored with `assert-table-uuid`
+    /// and a `assert-ref-snapshot-id main=<head>` guard so a snapshot written
+    /// concurrently is never expired out from under the writer. Returns the
+    /// number of snapshots removed.
+    pub async fn expire_snapshots(&self, ident: &TableIdent, keep_last: usize) -> Result<usize> {
+        let table = self
+            .catalog
+            .load_table(ident)
+            .await
+            .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?;
+        let metadata = table.metadata();
+
+        // Snapshots still reachable from a ref must always be kept, regardless
+        // of age — expiring them would strand the branch/tag on a missing
+        // snapshot. The current head is ref-referenced by `main`, so this
+        // also protects it.
+        let referenced: HashSet<i64> = self
+            .list_refs(ident)
+            .await?
+            .into_iter()
+            .map(|(_, id, _)| id)
+            .collect();
+
+        // Newest-first by commit time; ties broken by id for determinism.
+        let mut ordered: Vec<(i64, i64)> = metadata
+            .snapshots()
+            .map(|s| (s.timestamp_ms(), s.snapshot_id()))
+            .collect();
+        ordered.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+
+        // Keep the newest `keep_last` plus everything a ref points at.
+        let mut keep: HashSet<i64> = referenced.clone();
+        for (_, id) in ordered.iter().take(keep_last) {
+            keep.insert(*id);
+        }
+
+        let expire: Vec<i64> = ordered
+            .iter()
+            .map(|(_, id)| *id)
+            .filter(|id| !keep.contains(id))
+            .collect();
+        if expire.is_empty() {
+            return Ok(0);
+        }
+
+        let head = metadata.current_snapshot_id();
+        let mut requirements = vec![TableRequirement::UuidMatch {
+            uuid: metadata.uuid(),
+        }];
+        // If the table has a main head, pin it so a concurrent append (which
+        // moves main) forces us to reload and recompute rather than expiring a
+        // stale set.
+        if let Some(head) = head {
+            requirements.push(TableRequirement::RefSnapshotIdMatch {
+                r#ref: MAIN_BRANCH.to_string(),
+                snapshot_id: Some(head),
+            });
+        }
+        let request = CommitTableRequest {
+            identifier: Some(ident.clone()),
+            requirements,
+            updates: vec![TableUpdate::RemoveSnapshots {
+                snapshot_ids: expire.clone(),
+            }],
+        };
+        match self
+            .post_commit(&ident.namespace().to_url_string(), ident.name(), &request)
+            .await?
+        {
+            CommitOutcome::Committed => Ok(expire.len()),
+            CommitOutcome::Conflict(msg) => bail!(
+                "table {ident} changed while expiring snapshots (concurrent commit?); \
+                 retry: {msg}"
             ),
         }
     }

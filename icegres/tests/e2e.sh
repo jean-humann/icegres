@@ -29,6 +29,7 @@ PG_HOST=127.0.0.1
 PG_PORT=5439
 SECURE_PORT=5443 # auth+TLS server for section (h)
 PK_PORT=5448     # --enforce-pk server for section (k)
+STRICT_PORT=5450 # ICEGRES_TXN_STRICT server for section (u)
 PSQL=(psql -h "$PG_HOST" -p "$PG_PORT" -U postgres -d icegres -v ON_ERROR_STOP=1)
 export PGCONNECT_TIMEOUT=5
 
@@ -40,6 +41,8 @@ export PGCONNECT_TIMEOUT=5
 unset ICEGRES_AUTH_FILE ICEGRES_TLS_CERT ICEGRES_TLS_KEY
 # Same for buffered-write mode: only section (l)'s dedicated server enables it.
 unset ICEGRES_WRITE_BUFFER_MS ICEGRES_WRITE_BUFFER_MAX_ROWS
+# And for strict transaction mode: only section (u)'s dedicated server enables it.
+unset ICEGRES_TXN_STRICT
 
 CATALOG_URI="http://127.0.0.1:8181/catalog"
 WAREHOUSE=lakehouse
@@ -170,6 +173,7 @@ cleanup() {
   stop_pidfile_generic "$E2E_DIR/flight.pid"
   stop_pidfile_generic "$E2E_DIR/flight-secure.pid"
   stop_pidfile_generic "$E2E_DIR/flight-authz.pid"
+  stop_pidfile_generic "$E2E_DIR/serve-strict.pid"
   stop_icegresd
 }
 trap cleanup EXIT
@@ -1307,6 +1311,103 @@ else
     pass "authorization enforced ($(echo "$AZ_OUT" | grep '^A12 RESULT:'))"
   fi
 fi
+
+# ---------------------------------------------------------------------------
+# (t) Snapshot expiry (SPEC lifecycle): `icegres maintain expire-snapshots`
+# ---------------------------------------------------------------------------
+# Every write to an Iceberg table adds a snapshot forever; expiry trims the
+# metadata to the newest N + everything still reachable from a ref, without
+# touching the current data. Uses the main permissive server on :$PG_PORT.
+log "(t) snapshot expiry (maintain expire-snapshots)"
+# count(*) on Iceberg metadata tables hits a DataFusion logical/physical schema
+# mismatch (documented in parity probe C5); a *bare* projection over the
+# metadata table trips the same mismatch in the pg row encoder. Selecting with
+# an ORDER BY inserts a sort that re-establishes the schema, which is the shape
+# the C5 probe uses — count snapshots that way.
+count_snaps() {
+  q "select snapshot_id, committed_at from demo.\"$1\$snapshots\" order by committed_at" \
+    | grep -c '|'
+}
+q 'drop table if exists demo.e2e_expire' >/dev/null 2>&1 || true
+q 'create table demo.e2e_expire (id bigint, v text)' >/dev/null
+for i in 1 2 3 4 5; do
+  q "insert into demo.e2e_expire (id, v) values ($i, 'r$i')" >/dev/null
+done
+snap_before=$(count_snaps e2e_expire)
+assert_eq "five writes make five snapshots" "5" "$snap_before"
+head_before=$(q 'select snapshot_id from demo."e2e_expire$snapshots" order by committed_at desc limit 1')
+"$BIN" maintain expire-snapshots demo.e2e_expire --keep 2 >"$E2E_DIR/expire.log" 2>&1 \
+  || { cat "$E2E_DIR/expire.log" >&2; fail "expire-snapshots failed"; }
+grep -q 'expired 3 snapshot' "$E2E_DIR/expire.log" \
+  || { cat "$E2E_DIR/expire.log" >&2; fail "expire-snapshots did not remove 3 snapshots"; }
+snap_after=$(count_snaps e2e_expire)
+assert_eq "expiry keeps exactly the newest two snapshots" "2" "$snap_after"
+# A WHERE filter on the metadata table trips a separate DataFusion type-inference
+# quirk, so check head survival by listing surviving ids and matching in the shell.
+survivors=$(q 'select snapshot_id, committed_at from demo."e2e_expire$snapshots" order by committed_at' | cut -d'|' -f1)
+if echo "$survivors" | grep -qx "$head_before"; then
+  pass "current head survives expiry (never expired out from under a reader)"
+else
+  fail "current head $head_before missing after expiry; survivors: $(echo "$survivors" | tr '\n' ' ')"
+fi
+assert_eq "data is intact after expiry (metadata-only op)" "5" \
+  "$(q 'select count(*) from demo.e2e_expire')"
+# Idempotent: nothing older than the kept window remains to expire.
+"$BIN" maintain expire-snapshots demo.e2e_expire --keep 2 >"$E2E_DIR/expire2.log" 2>&1 \
+  || { cat "$E2E_DIR/expire2.log" >&2; fail "second expire-snapshots failed"; }
+grep -q 'expired 0 snapshot' "$E2E_DIR/expire2.log" \
+  || { cat "$E2E_DIR/expire2.log" >&2; fail "second expire should be a no-op"; }
+pass "expire-snapshots trims to newest-N, keeps head, is idempotent"
+q 'drop table demo.e2e_expire' >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
+# (u) Strict transaction mode (SPEC B4 hardening): ICEGRES_TXN_STRICT refuses
+# a multi-table COMMIT up front rather than applying it non-atomically.
+# ---------------------------------------------------------------------------
+log "(u) strict multi-table refusal (ICEGRES_TXN_STRICT) on :$STRICT_PORT"
+stop_pidfile_generic "$E2E_DIR/serve-strict.pid"
+: >"$E2E_DIR/serve-strict.log"
+ICEGRES_TXN_STRICT=true "$BIN" serve --host "$PG_HOST" --port "$STRICT_PORT" \
+  >>"$E2E_DIR/serve-strict.log" 2>&1 &
+echo $! >"$E2E_DIR/serve-strict.pid"
+strict_ready=0
+for _ in $(seq 1 60); do
+  if psql -h "$PG_HOST" -p "$STRICT_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+    strict_ready=1; break
+  fi
+  sleep 0.5
+done
+[[ "$strict_ready" == 1 ]] || { tail -n 20 "$E2E_DIR/serve-strict.log" >&2; fail "strict server not ready on :$STRICT_PORT"; }
+SQ=(psql -h "$PG_HOST" -p "$STRICT_PORT" -U postgres -d icegres)
+"${SQ[@]}" -tA -c 'drop table if exists demo.e2e_strict_a' >/dev/null 2>&1 || true
+"${SQ[@]}" -tA -c 'drop table if exists demo.e2e_strict_b' >/dev/null 2>&1 || true
+"${SQ[@]}" -tA -c 'create table demo.e2e_strict_a (id bigint)' >/dev/null
+"${SQ[@]}" -tA -c 'create table demo.e2e_strict_b (id bigint)' >/dev/null
+# Two-table transaction: strict mode must refuse the COMMIT and apply nothing.
+strict_out=$("${SQ[@]}" -v VERBOSITY=verbose 2>&1 <<'EOF'
+BEGIN;
+insert into demo.e2e_strict_a values (1);
+insert into demo.e2e_strict_b values (2);
+COMMIT;
+EOF
+) || true
+echo "$strict_out" | grep -q '0A000' \
+  || fail "strict multi-table COMMIT not refused with 0A000: $strict_out"
+pass "strict mode refuses multi-table COMMIT (0A000 feature_not_supported)"
+assert_eq "strict refusal applied nothing to either table (atomic rollback)" "0|0" \
+  "$("${SQ[@]}" -tA -c 'select (select count(*) from demo.e2e_strict_a) as a, (select count(*) from demo.e2e_strict_b) as b')"
+# Single-table transaction still commits normally under strict mode.
+"${SQ[@]}" 2>&1 <<'EOF' >/dev/null
+BEGIN;
+insert into demo.e2e_strict_a values (9);
+insert into demo.e2e_strict_a values (10);
+COMMIT;
+EOF
+assert_eq "strict mode still commits single-table transactions" "2" \
+  "$("${SQ[@]}" -tA -c 'select count(*) from demo.e2e_strict_a')"
+"${SQ[@]}" -tA -c 'drop table demo.e2e_strict_a' >/dev/null 2>&1 || true
+"${SQ[@]}" -tA -c 'drop table demo.e2e_strict_b' >/dev/null 2>&1 || true
+stop_pidfile_generic "$E2E_DIR/serve-strict.pid"
 
 # ---------------------------------------------------------------------------
 log "all assertions passed ($PASS_COUNT)"

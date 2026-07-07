@@ -752,6 +752,36 @@ else
     "snapshots metadata table not queryable: $(echo "$snaps" | flat)"
 fi
 
+# C6: snapshot expiry — table maintenance (`icegres maintain expire-snapshots`).
+# Every write adds a snapshot forever; expiry trims metadata to the newest N +
+# ref-reachable snapshots. Lakebase/Lakegres hide this behind managed
+# auto-vacuum; icegres exposes it as an explicit, live-safe metadata commit.
+# count(*) on Iceberg metadata tables trips the DataFusion schema mismatch (see
+# C5); a bare projection trips the same in the pg row encoder. Selecting WITH an
+# ORDER BY inserts a sort that re-establishes the schema (the C5 shape).
+csnaps() {
+  q "select snapshot_id, committed_at from demo.\"$1\$snapshots\" order by committed_at" | grep -c '|'
+}
+q 'drop table if exists demo.parity_expire' >/dev/null 2>&1 || true
+q 'create table demo.parity_expire (id bigint)' >/dev/null 2>&1 || true
+for i in 1 2 3 4; do q "insert into demo.parity_expire values ($i)" >/dev/null 2>&1 || true; done
+c6_before=$(csnaps parity_expire)
+c6_head=$(q 'select snapshot_id from demo."parity_expire$snapshots" order by committed_at desc limit 1')
+c6_out=$("$BIN" maintain expire-snapshots demo.parity_expire --keep 1 2>&1)
+c6_after=$(csnaps parity_expire)
+# WHERE on the metadata table trips a type-inference quirk; match the head in the shell.
+if q 'select snapshot_id, committed_at from demo."parity_expire$snapshots" order by committed_at' \
+     | cut -d'|' -f1 | grep -qx "$c6_head"; then c6_head_alive=1; else c6_head_alive=0; fi
+c6_rows=$(q 'select count(*) from demo.parity_expire')
+if [[ "$c6_before" -ge 2 && "$c6_after" == 1 && "$c6_head_alive" == 1 && "$c6_rows" == 4 ]]; then
+  record C6 lakehouse "snapshot expiry / table maintenance" PASS \
+    "maintain expire-snapshots demo.parity_expire --keep 1: $c6_before snapshots -> $c6_after; current head ($c6_head) survived; data intact (4 rows). Metadata-only, anchored (assert-table-uuid + assert-ref-snapshot-id main=<head>) so it is safe against concurrent writes. CLI: $(echo "$c6_out" | flat)"
+else
+  record C6 lakehouse "snapshot expiry / table maintenance" GAP \
+    "expire produced before=$c6_before after=$c6_after head_alive=$c6_head_alive rows=$c6_rows: $(echo "$c6_out" | flat)"
+fi
+q 'drop table if exists demo.parity_expire' >/dev/null 2>&1 || true
+
 # ===========================================================================
 # Area D — Serverless / elasticity
 # ===========================================================================
