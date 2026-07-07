@@ -1169,8 +1169,10 @@ pub async fn run(
                 .max_encoding_message_size(64 * 1024 * 1024),
         )
         .serve_with_incoming_shutdown(tcp_incoming(listener), async {
-            let _ = tokio::signal::ctrl_c().await;
-            info!("shutdown signal received");
+            // Drain on SIGTERM (k8s/systemd) as well as SIGINT — tonic stops
+            // accepting and lets in-flight RPCs finish before returning.
+            let sig = crate::ops::shutdown_signal().await;
+            info!(signal = %sig, "shutdown signal received; draining Flight RPCs");
         })
         .await
         .context("flight sql server failed")?;

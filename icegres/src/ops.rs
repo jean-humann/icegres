@@ -268,7 +268,24 @@ pub async fn serve_custom(
     // Instant of the last transition to the fully-idle state (boot counts).
     let idle_since = Arc::new(Mutex::new(Instant::now()));
 
+    // Bound concurrent connections so a flood cannot exhaust FDs/memory by
+    // building per-connection DataFusion+Arrow state without limit
+    // (production-readiness audit #4). Acquiring the permit BEFORE accepting
+    // the next socket backpressures the accept loop into the OS backlog rather
+    // than spawning unbounded handler tasks. `ICEGRES_MAX_CONNECTIONS` (default
+    // 512); 0 disables the cap.
+    let max_conns = max_connections_limit();
+    let conn_limiter = max_conns.map(|n| Arc::new(tokio::sync::Semaphore::new(n)));
+    if let Some(n) = max_conns {
+        info!(max_connections = n, "connection concurrency cap enabled");
+    }
+
     loop {
+        // Hold a permit across accept+process; drop when the handler ends.
+        let permit = match &conn_limiter {
+            Some(sem) => Some(sem.clone().acquire_owned().await.expect("semaphore closed")),
+            None => None,
+        };
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((socket, peer)) => {
@@ -279,6 +296,7 @@ pub async fn serve_custom(
                     let tls = tls.clone();
                     let txn_registry = txn_registry.clone();
                     tokio::spawn(async move {
+                        let _permit = permit; // released when the handler ends
                         if let Err(e) = process_socket(socket, tls, factory).await {
                             warn!(%peer, "error processing socket: {e}");
                         }
@@ -307,7 +325,80 @@ pub async fn serve_custom(
                     return Ok(());
                 }
             }
+            sig = shutdown_signal() => {
+                info!(signal = %sig, "shutdown signal received; draining in-flight connections");
+                drain_connections(&active).await;
+                return Ok(());
+            }
         }
+    }
+}
+
+/// Concurrent-connection cap from `ICEGRES_MAX_CONNECTIONS` (parsed once).
+/// `0` disables the cap; default 512.
+fn max_connections_limit() -> Option<usize> {
+    const DEFAULT: usize = 512;
+    match std::env::var("ICEGRES_MAX_CONNECTIONS") {
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(0) => None,
+            Ok(n) => Some(n),
+            Err(_) => {
+                warn!(value = %raw, default = DEFAULT, "invalid ICEGRES_MAX_CONNECTIONS; using default");
+                Some(DEFAULT)
+            }
+        },
+        Err(_) => Some(DEFAULT),
+    }
+}
+
+/// Resolve on SIGTERM (k8s/systemd stop) or SIGINT (Ctrl-C), whichever first.
+/// Returns the signal name for logging. Shared by the pgwire accept loop and
+/// the Flight SQL server so both drain on the same signals.
+pub async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => {
+                // Fall back to Ctrl-C only if SIGTERM can't be registered.
+                let _ = tokio::signal::ctrl_c().await;
+                return "SIGINT";
+            }
+        };
+        tokio::select! {
+            _ = term.recv() => "SIGTERM",
+            _ = tokio::signal::ctrl_c() => "SIGINT",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "SIGINT"
+    }
+}
+
+/// Grace period to let in-flight requests finish before exit on shutdown.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Stop accepting and wait (up to [`DRAIN_TIMEOUT`]) for in-flight connections
+/// to complete, so a rolling deploy (SIGTERM) does not sever running queries.
+async fn drain_connections(active: &Arc<AtomicUsize>) {
+    let deadline = Instant::now() + DRAIN_TIMEOUT;
+    loop {
+        let n = active.load(Ordering::SeqCst);
+        if n == 0 {
+            info!("all connections drained; exiting cleanly");
+            return;
+        }
+        if Instant::now() >= deadline {
+            warn!(
+                remaining = n,
+                "drain grace period elapsed; exiting with connections still active"
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 

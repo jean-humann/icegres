@@ -5,6 +5,9 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider};
+use datafusion::execution::disk_manager::DiskManagerBuilder;
+use datafusion::execution::memory_pool::FairSpillPool;
+use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use iceberg::io::{
     S3_ACCESS_KEY_ID, S3_DISABLE_CONFIG_LOAD, S3_DISABLE_EC2_METADATA, S3_ENDPOINT,
@@ -16,7 +19,7 @@ use iceberg_catalog_rest::{
 };
 use iceberg_datafusion::IcebergCatalogProvider;
 use iceberg_storage_opendal::OpenDalStorageFactory;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::buffer::WriteBuffer;
 use crate::cache::CachingSchemaProvider;
@@ -102,28 +105,73 @@ pub async fn build_session_context(catalog: Arc<dyn Catalog>) -> Result<SessionC
     build_session_context_with(catalog, None, None, None).await
 }
 
+/// Total system memory in bytes from `/proc/meminfo`, if readable.
+fn system_memory_bytes() -> Option<usize> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb: usize = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
+/// Build the DataFusion runtime with a BOUNDED memory pool + disk spill so a
+/// heavy sort/join/aggregate degrades to `ResourcesExhausted` (and spills to
+/// disk) instead of OOM-killing the whole process (production-readiness audit
+/// #3). Limit precedence: `ICEGRES_MEMORY_LIMIT_MB` env, else 70% of total
+/// system RAM, else a 1 GiB floor if `/proc/meminfo` is unreadable. Set the
+/// env to `0` to opt back into the historical unbounded pool.
+fn build_runtime_env() -> Result<Arc<RuntimeEnv>> {
+    let limit_bytes: Option<usize> = match std::env::var("ICEGRES_MEMORY_LIMIT_MB") {
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(0) => None, // explicit opt-out: unbounded pool
+            Ok(mb) => Some(mb * 1024 * 1024),
+            Err(_) => {
+                warn!(value = %raw, "invalid ICEGRES_MEMORY_LIMIT_MB; using the default (70% of RAM)");
+                None // fall through to default below
+            }
+        },
+        Err(_) => None,
+    };
+    // If env was unset/invalid, default to 70% of system RAM (1 GiB floor).
+    let limit_bytes = limit_bytes.or_else(|| {
+        let sys = system_memory_bytes().unwrap_or(1024 * 1024 * 1024);
+        Some((sys as f64 * 0.70) as usize)
+    });
+
+    let mut builder =
+        RuntimeEnvBuilder::new().with_disk_manager_builder(DiskManagerBuilder::default());
+    if let Some(bytes) = limit_bytes {
+        info!(
+            memory_pool_mb = bytes / 1024 / 1024,
+            "bounded DataFusion memory pool (FairSpillPool) with disk spill enabled"
+        );
+        builder = builder.with_memory_pool(Arc::new(FairSpillPool::new(bytes)));
+    }
+    Ok(Arc::new(builder.build()?))
+}
+
 /// [`build_session_context`] with an explicit `target_partitions` override,
-/// an optional write buffer, and an optional branch pin.
-///
-/// iceberg-datafusion's INSERT path round-robin-repartitions the input of an
-/// unpartitioned-table write across `target_partitions` workers and writes
-/// one Parquet file per non-empty worker. Callers that want a guaranteed
-/// single data file per commit (e.g. `icegres seed`, which optimizes the
-/// demo tables for scan speed) pass `Some(1)`.
+/// an optional write buffer, and an optional branch pin. Runs on a bounded
+/// memory pool with disk spill (see [`build_runtime_env`]).
 ///
 /// `write_buffer` (serve-only, `--write-buffer-ms`) makes every plain-table
 /// scan union the committed snapshot with the buffer's overlay (buffer.rs);
-/// `None` keeps scans byte-for-byte on the default path.
-///
-/// `branch` (serve-only, `--branch`, SPEC D6) pins every plain-table scan to
-/// the head of that Iceberg snapshot ref (see cache.rs); `None` = main.
+/// `None` keeps scans byte-for-byte on the default path. `branch` (serve-only,
+/// `--branch`, SPEC D6) pins every plain-table scan to the head of that
+/// Iceberg snapshot ref (see cache.rs); `None` = main.
 pub async fn build_session_context_with(
     catalog: Arc<dyn Catalog>,
     target_partitions: Option<usize>,
     write_buffer: Option<Arc<WriteBuffer>>,
     branch: Option<String>,
 ) -> Result<SessionContext> {
-    let ctx = SessionContext::new_with_config(session_config(target_partitions)?);
+    let ctx = SessionContext::new_with_config_rt(
+        session_config(target_partitions)?,
+        build_runtime_env()?,
+    );
 
     let iceberg_provider = IcebergCatalogProvider::try_new(catalog.clone())
         .await
