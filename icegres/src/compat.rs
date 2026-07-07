@@ -634,7 +634,12 @@ impl Visitor for PgCatalogOnly {
                 .as_ident()
                 .is_some_and(|id| id.value.eq_ignore_ascii_case("pg_catalog"));
         if !qualifier_ok {
+            // One non-pg_catalog relation is enough: eligibility is
+            // `seen == 0 || all_pg_catalog`, and both terms are now settled
+            // (seen > 0, all_pg_catalog = false), so walking the rest of the
+            // AST cannot change the answer. Stop here.
             self.all_pg_catalog = false;
+            return ControlFlow::Break(());
         }
         ControlFlow::Continue(())
     }

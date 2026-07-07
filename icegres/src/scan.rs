@@ -43,6 +43,14 @@ use tracing::warn;
 /// RustFS; see bench/SCORECARD.md.
 pub const DEFAULT_SCAN_CONCURRENCY: usize = 32;
 
+/// Default Parquet reader batch size. iceberg-rust leaves `batch_size: None`,
+/// which falls back to parquet's 1024-row default — ~8x more, smaller batches
+/// than DataFusion's execution batch size on the 5M-row path. Matching 8192
+/// cuts per-batch overhead on large scans; tables under one batch (the tiny
+/// demo tables) are unaffected. `ICEGRES_SCAN_BATCH_SIZE` overrides; `0`
+/// leaves the reader default.
+pub const DEFAULT_SCAN_BATCH_SIZE: usize = 8192;
+
 /// Scan IO concurrency from `ICEGRES_SCAN_CONCURRENCY` (parsed once).
 /// `0` disables [`tune`] entirely.
 fn scan_concurrency() -> usize {
@@ -57,6 +65,40 @@ fn scan_concurrency() -> usize {
             DEFAULT_SCAN_CONCURRENCY
         }),
         Err(_) => DEFAULT_SCAN_CONCURRENCY,
+    })
+}
+
+/// Parquet reader batch size from `ICEGRES_SCAN_BATCH_SIZE` (parsed once).
+/// `0` leaves iceberg-rust's reader default (1024).
+fn scan_batch_size() -> usize {
+    static BATCH: OnceLock<usize> = OnceLock::new();
+    *BATCH.get_or_init(|| match std::env::var("ICEGRES_SCAN_BATCH_SIZE") {
+        Ok(raw) => raw.trim().parse().unwrap_or_else(|_| {
+            warn!(
+                value = %raw,
+                default = DEFAULT_SCAN_BATCH_SIZE,
+                "invalid ICEGRES_SCAN_BATCH_SIZE; using default"
+            );
+            DEFAULT_SCAN_BATCH_SIZE
+        }),
+        Err(_) => DEFAULT_SCAN_BATCH_SIZE,
+    })
+}
+
+/// Parquet page-index row selection from `ICEGRES_SCAN_ROW_SELECTION`
+/// (parsed once; default OFF). When enabled the reader consults the Parquet
+/// page index to skip non-matching data pages inside surviving row groups.
+///
+/// Default off because iceberg-rust's Parquet writer does not emit a column
+/// (page) index, so the reader errors ("Parquet file metadata does not
+/// contain a column index") on icegres-written data files when this is on.
+/// The flag stays available for datasets whose files *do* carry a page index;
+/// wiring the writer to emit one is a separate change.
+fn row_selection_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("ICEGRES_SCAN_ROW_SELECTION") {
+        Ok(raw) => matches!(raw.trim(), "1" | "true" | "on" | "yes"),
+        Err(_) => false,
     })
 }
 
@@ -126,10 +168,15 @@ async fn get_batch_stream(
     if let Some(predicate) = predicate {
         scan_builder = scan_builder.with_filter(predicate);
     }
-    let table_scan = scan_builder
-        .with_concurrency_limit(concurrency)
-        .build()
-        .map_err(to_datafusion_error)?;
+    scan_builder = scan_builder.with_concurrency_limit(concurrency);
+    let batch_size = scan_batch_size();
+    if batch_size != 0 {
+        scan_builder = scan_builder.with_batch_size(Some(batch_size));
+    }
+    if row_selection_enabled() {
+        scan_builder = scan_builder.with_row_selection_enabled(true);
+    }
+    let table_scan = scan_builder.build().map_err(to_datafusion_error)?;
     let stream = table_scan
         .to_arrow()
         .await

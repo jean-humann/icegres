@@ -58,7 +58,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context as _, Result};
 use arrow::array::{Array, RecordBatch, UInt64Array};
-use arrow::datatypes::Schema;
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow::ipc::writer::IpcWriteOptions;
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::encode::FlightDataEncoderBuilder;
@@ -119,6 +119,11 @@ struct Prepared {
     sql: String,
     /// Bound parameter rows; each row is one `$1..$n` value set.
     params: Vec<Vec<ScalarValue>>,
+    /// Dataset (result) schema, planned once at create time. `GetFlightInfo`
+    /// answers from this instead of re-planning the SQL a second time; a
+    /// SELECT's result schema does not depend on the data snapshot, so this is
+    /// safe while `DoGet` still re-plans for snapshot-fresh execution.
+    schema: SchemaRef,
 }
 
 struct FlightSqlServiceImpl {
@@ -487,7 +492,8 @@ impl FlightSqlService for FlightSqlServiceImpl {
         // Plan for the dataset schema; a plan with untyped `$n` placeholders
         // that DataFusion cannot infer still yields a schema for SELECTs.
         let df = self.plan(&sql).await?;
-        let dataset_schema = encode_schema(df.schema().as_arrow())?;
+        let schema_ref: SchemaRef = Arc::new(df.schema().as_arrow().clone());
+        let dataset_schema = encode_schema(&schema_ref)?;
         // Parameter types are not inferred (DataFusion resolves them at bind
         // time); advertise an empty parameter schema.
         let parameter_schema = encode_schema(&Schema::empty())?;
@@ -497,6 +503,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
             Prepared {
                 sql,
                 params: Vec::new(),
+                schema: schema_ref,
             },
         );
         Ok(ActionCreatePreparedStatementResult {
@@ -546,16 +553,15 @@ impl FlightSqlService for FlightSqlServiceImpl {
         self.authorize(&request)?;
         let handle = String::from_utf8(cmd.prepared_statement_handle.to_vec())
             .map_err(|_| Status::invalid_argument("invalid prepared statement handle"))?;
-        let sql = {
+        // Answer from the schema captured at create time — no second plan pass.
+        let schema = {
             let prepared = self.prepared.lock().expect("prepared lock");
             prepared
                 .get(&handle)
                 .ok_or_else(|| Status::not_found(format!("unknown prepared statement {handle}")))?
-                .sql
+                .schema
                 .clone()
         };
-        let df = self.plan(&sql).await?;
-        let schema = df.schema().as_arrow().clone();
         Ok(Response::new(Self::make_info(
             &schema,
             cmd,
@@ -1058,7 +1064,14 @@ pub async fn run(
     );
 
     Server::builder()
-        .add_service(FlightServiceServer::new(service))
+        .add_service(
+            // Raise the gRPC message ceilings from tonic's 4 MB default so
+            // ADBC bulk-ingest DoPut chunks and large single-batch DoGet
+            // responses are not rejected mid-stream.
+            FlightServiceServer::new(service)
+                .max_decoding_message_size(64 * 1024 * 1024)
+                .max_encoding_message_size(64 * 1024 * 1024),
+        )
         .serve_with_incoming_shutdown(tcp_incoming(listener), async {
             let _ = tokio::signal::ctrl_c().await;
             info!("shutdown signal received");
@@ -1073,7 +1086,13 @@ fn tcp_incoming(
     listener: tokio::net::TcpListener,
 ) -> impl Stream<Item = std::io::Result<tokio::net::TcpStream>> {
     stream::unfold(listener, |listener| async move {
-        let item = listener.accept().await.map(|(s, _)| s);
+        // Disable Nagle: the ADBC Flight handshake is a sequence of small
+        // request/small response RPCs, so Nagle + delayed-ACK adds a ~40 ms
+        // loopback stall to every point query. Mirrors icegresd's listeners.
+        let item = listener.accept().await.map(|(s, _)| {
+            let _ = s.set_nodelay(true);
+            s
+        });
         Some((item, listener))
     })
 }

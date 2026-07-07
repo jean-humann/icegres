@@ -71,6 +71,7 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::{anyhow, bail, Context as _, Result};
@@ -122,6 +123,12 @@ use crate::overwrite::{
 #[derive(Default)]
 pub struct TxnRegistry {
     sessions: StdMutex<HashMap<SocketAddr, Arc<tokio::sync::Mutex<TxnSession>>>>,
+    /// Count of open sessions, kept in step with `sessions` (only ever mutated
+    /// while the map lock is held). Lets the per-statement `active`/`get`
+    /// lookups skip the mutex entirely on the overwhelmingly common path where
+    /// no transaction is open anywhere — the whole qps workload is autocommit
+    /// reads, so this removes the map lock from every wire statement.
+    open: AtomicUsize,
 }
 
 impl TxnRegistry {
@@ -132,6 +139,9 @@ impl TxnRegistry {
     /// Whether `addr` has an open transaction (used by the write-buffer
     /// hook, which must not touch statements owned by this hook).
     pub fn active(&self, addr: SocketAddr) -> bool {
+        if self.open.load(Ordering::Acquire) == 0 {
+            return false;
+        }
         self.sessions
             .lock()
             .expect("txn registry lock poisoned")
@@ -139,6 +149,9 @@ impl TxnRegistry {
     }
 
     fn get(&self, addr: SocketAddr) -> Option<Arc<tokio::sync::Mutex<TxnSession>>> {
+        if self.open.load(Ordering::Acquire) == 0 {
+            return None;
+        }
         self.sessions
             .lock()
             .expect("txn registry lock poisoned")
@@ -154,23 +167,23 @@ impl TxnRegistry {
             return false;
         }
         map.insert(addr, Arc::new(tokio::sync::Mutex::new(TxnSession::new())));
+        self.open.store(map.len(), Ordering::Release);
         true
     }
 
     fn take(&self, addr: SocketAddr) -> Option<Arc<tokio::sync::Mutex<TxnSession>>> {
-        self.sessions
-            .lock()
-            .expect("txn registry lock poisoned")
-            .remove(&addr)
+        let mut map = self.sessions.lock().expect("txn registry lock poisoned");
+        let taken = map.remove(&addr);
+        self.open.store(map.len(), Ordering::Release);
+        taken
     }
 
     /// Connection closed: drop any open transaction (implicit rollback —
     /// nothing was committed, so nothing needs undoing).
     pub fn disconnect(&self, addr: &SocketAddr) {
-        self.sessions
-            .lock()
-            .expect("txn registry lock poisoned")
-            .remove(addr);
+        let mut map = self.sessions.lock().expect("txn registry lock poisoned");
+        map.remove(addr);
+        self.open.store(map.len(), Ordering::Release);
     }
 }
 

@@ -63,3 +63,41 @@ Ranked by impact/effort against the baseline metrics. Write-path items rank lowe
 2. **Round "read hot path"** — `--snapshot-check-ms` staleness window, scan `batch_size` plumbing, and the atomic txn-counter fast-path (backlog #3/#4/#6). *Rationale:* the staleness window is the largest gated-latency+qps lever (removes ~2–3 ms of every 6.89 ms read), batch_size attacks the 136.9 ms bigfilter, and the atomic gate trims shared-mutex traffic under concurrency. *Gate risk:* concentrated in RYOW correctness — `last_probe_at` must be invalidated from **all** local commit paths (inserts flow through `write_delegate.insert_into`, not `current_provider`), or the `freshness` metric regresses under the flag; keep default 0 and gate on the full e2e.
 
 3. **Round "CPU-parallel 5M scan"** — real scan output partitions across min(cores, files) (backlog #7). *Rationale:* with batch_size already plumbed, this is the remaining lever on the CPU-bound 5M filter+aggregate — up to ~4x on decode+filter that currently serialize on one core while three idle. *Gate risk:* medium — single-file seed tables stay G=1 so small-table p50 is structurally safe, but per-partition limit slicing (scan.rs:180-197) must be re-applied *after* a merge, and `plan_files()` must be cheap enough at execute time; verify the measured delta rather than assuming a full 4x, since ~44 ms of the bigfilter budget is the Flight gRPC floor that partitioning cannot touch.
+
+---
+
+## Execution log — R12 (first round off this roadmap)
+
+Implemented the safe, measurable performance backlog and ran the full gate
+protocol. All landed changes gate-PASS against a **same-box control** (the box
+drifted ~1.6× slower than the 9-hour-old `baseline.json`, so the honest
+comparison rebuilds the pre-change binary and re-benches it now).
+
+**Kept (5):** Flight `TCP_NODELAY` (#2) — **adbc_query_point 44.0→12.8 ms, −71%**,
+the round's headline; 64 MB gRPC ceiling (#5); scan `batch_size` 1024→8192 (#4,
+env `ICEGRES_SCAN_BATCH_SIZE`); `AtomicUsize` open-txn fast-path (#6); Flight
+prepared dataset-schema cache (#8, safe half — `GetFlightInfo` only, `DoGet`
+still re-plans); plus `compat.rs` visitor break-early. e2e 110/110, parity
+31 PASS / 0 GAP / 1 NA, rss improved, binary flat.
+
+**Reverted (2, caught by the gate):**
+- `MALLOC_ARENA_MAX=2` (#1) — **−42% qps under 8 connections** for a ~2 % rss
+  win. The roadmap's "expected negligible on an 8-conn workload" was wrong: two
+  arenas throttle the multi-threaded DataFusion executor. Removed.
+- scan `with_row_selection_enabled` default-on — errors *"Parquet file metadata
+  does not contain a column index"* on icegres-written files (iceberg-rust's
+  writer emits no page index). Flag kept, **default off**; enabling it needs the
+  writer to emit a page index first (a separate change).
+
+**Deferred (4, each its own future round):** scan output-partition parallelism
+(#7 — wrong-result risk on LIMIT-across-partitions, needs result-equivalence
+tests); `panic=abort` (#9 — turns one panicking connection into a whole-server
+abort, a resilience regression); `--snapshot-check-ms` (#3 — RYOW-critical,
+default-off so no gated movement, belongs in its own round with a staleness
+test); write-path items #10–14 (invisible on the single-file seed; multi-file /
+real-S3 only).
+
+**Method note:** the apparent read regression vs `baseline.json` (+60–75 %) was
+pure box drift — the *identical pre-R12 code* re-benched now shows the same
+slowdown. `baseline.json` was re-established from two agreeing R12 runs (worst
+disagreement 10.3 % < the 25 % SPEC bar) on the current box.
