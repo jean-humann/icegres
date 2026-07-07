@@ -78,7 +78,7 @@ pub struct CatalogOpts {
 #[derive(Parser)]
 #[command(
     name = "icegres",
-    version,
+    version = env!("ICEGRES_LONG_VERSION"),
     about = "Postgres wire endpoint over an Iceberg lakehouse"
 )]
 struct Cli {

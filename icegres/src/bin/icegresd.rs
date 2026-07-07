@@ -128,7 +128,7 @@ const HEALTHY_UPTIME: Duration = Duration::from_secs(10);
 #[derive(Parser)]
 #[command(
     name = "icegresd",
-    version,
+    version = env!("ICEGRES_LONG_VERSION"),
     about = "Minimal icegres control plane: wake-on-connect scale-to-zero proxy, \
              branch-endpoint routing, compute supervision"
 )]

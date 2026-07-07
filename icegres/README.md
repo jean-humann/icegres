@@ -68,8 +68,16 @@ cargo build            # dev profile; add --release for optimized builds
 ```
 
 The crate pins a verified compatibility matrix (iceberg 0.9.1, datafusion
-52.5.0, datafusion-postgres 0.15.0, arrow 57.3.1). Do not bump versions
-independently — see comments in `Cargo.toml`.
+52.5.0, datafusion-postgres 0.15.0, arrow 57.3.1) and toolchain
+(`rust-toolchain.toml`, 1.96.1). Do not bump versions independently — see
+comments in `Cargo.toml`. `build.rs` stamps the commit SHA into `icegres
+--version`.
+
+**Deploying to production?** See **`../docs/deployment.md`** (container image,
+health/readiness/metrics probes, resource limits, graceful shutdown, security,
+snapshot-expiry maintenance) and **`../docs/limitations.md`** (what icegres
+deliberately does not do). A multi-stage, non-root **`../Dockerfile`** builds
+the GA image.
 
 ## Prerequisites
 
