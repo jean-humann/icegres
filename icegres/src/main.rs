@@ -186,6 +186,15 @@ enum Command {
         /// WARN. See icegres/src/buffer.rs for the full semantics.
         #[arg(long, env = "ICEGRES_WRITE_BUFFER_MS", default_value_t = 0)]
         write_buffer_ms: u64,
+
+        /// Acknowledge running an UNAUTHENTICATED listener on a non-loopback
+        /// interface. Without this, binding a public address (e.g. 0.0.0.0)
+        /// while `--auth-file` is unset is refused at startup (secure by
+        /// default). Loopback binds and authenticated servers are unaffected.
+        #[arg(long, env = "ICEGRES_INSECURE", num_args = 0..=1,
+              default_missing_value = "true", default_value = "false",
+              value_parser = clap::builder::BoolishValueParser::new())]
+        insecure: bool,
     },
     /// Serve the lakehouse over Arrow Flight SQL (gRPC) — the ADBC
     /// first-class endpoint (SPEC A11). Same engine wiring as `serve`
@@ -213,6 +222,21 @@ enum Command {
         /// permissive and logs a WARN.
         #[arg(long, env = "ICEGRES_AUTH_FILE")]
         auth_file: Option<PathBuf>,
+
+        /// Enforce Lakekeeper-style ReBAC authorization on the Flight SQL
+        /// endpoint from this policy file (managed add-on; same format and
+        /// semantics as `icegres serve --authz-file`). Every data RPC is gated
+        /// by the same policy the pgwire path enforces. Requires --auth-file
+        /// (an unauthenticated endpoint has no principal to authorize).
+        #[arg(long, env = "ICEGRES_AUTHZ_FILE")]
+        authz_file: Option<PathBuf>,
+
+        /// Acknowledge running an UNAUTHENTICATED Flight listener on a
+        /// non-loopback interface (see `icegres serve --insecure`).
+        #[arg(long, env = "ICEGRES_INSECURE", num_args = 0..=1,
+              default_missing_value = "true", default_value = "false",
+              value_parser = clap::builder::BoolishValueParser::new())]
+        insecure: bool,
     },
     /// Create and populate the demo namespace/tables (idempotent).
     Seed {
@@ -308,6 +332,7 @@ async fn main() -> Result<()> {
             branch,
             enforce_pk,
             write_buffer_ms,
+            insecure,
         } => {
             let serve_opts = ServeOpts {
                 idle_shutdown_secs,
@@ -319,6 +344,7 @@ async fn main() -> Result<()> {
                 branch,
                 enforce_pk,
                 write_buffer_ms,
+                insecure,
             };
             run_serve(&catalog, &host, port, serve_opts).await
         }
@@ -327,7 +353,22 @@ async fn main() -> Result<()> {
             host,
             port,
             auth_file,
-        } => flight::run(&catalog, &host, port, auth_file).await,
+            authz_file,
+            insecure,
+        } => {
+            // Flight authorization needs an authenticated principal: reject
+            // --authz-file without --auth-file rather than trusting an
+            // anonymous connection (a silent authz bypass otherwise).
+            if authz_file.is_some() && auth_file.is_none() {
+                bail!(
+                    "--authz-file on flight-serve requires --auth-file: the Flight endpoint has \
+                     no authenticated principal to authorize without it"
+                );
+            }
+            enforce_secure_default(&host, auth_file.is_some(), insecure)?;
+            let authorizer = build_authorizer(&authz_file, auth_file.is_some())?;
+            flight::run(&catalog, &host, port, auth_file, authorizer).await
+        }
         Command::Seed { catalog } => seed::run(&catalog).await,
         Command::Branch { cmd } => match cmd {
             BranchCmd::Create {
@@ -362,6 +403,70 @@ struct ServeOpts {
     branch: String,
     enforce_pk: bool,
     write_buffer_ms: u64,
+    insecure: bool,
+}
+
+/// True for a loopback / localhost bind address — safe to run open (dev).
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "::1" | "localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Secure-by-default guard: refuse to bind a NON-loopback interface with
+/// authentication disabled unless the operator explicitly opts into insecure
+/// exposure with `--insecure`. Prevents the "authenticate nobody, exposed on
+/// 0.0.0.0" default footgun (production-readiness audit #14).
+fn enforce_secure_default(host: &str, auth_present: bool, insecure: bool) -> Result<()> {
+    if auth_present || insecure || is_loopback_host(host) {
+        return Ok(());
+    }
+    bail!(
+        "refusing to bind {host} (a non-loopback interface) with authentication DISABLED: \
+         any client on the network could connect as any user. Pass --auth-file to require \
+         credentials, bind 127.0.0.1 for local-only use, or pass --insecure (env \
+         ICEGRES_INSECURE=1) to acknowledge an intentionally open, exposed listener."
+    );
+}
+
+/// Build the ReBAC authorizer from `--authz-file` (managed add-on). `None` =
+/// open (any authenticated principal, all tables). Shared by `serve` and
+/// `flight-serve` so both wire protocols enforce the identical policy.
+fn build_authorizer(
+    authz_file: &Option<PathBuf>,
+    auth_present: bool,
+) -> Result<Option<authz::SharedAuthorizer>> {
+    let Some(path) = authz_file else {
+        return Ok(None);
+    };
+    #[cfg(feature = "managed")]
+    {
+        let a = Arc::new(authz::FileAuthorizer::load(path)?);
+        if !auth_present {
+            warn!(
+                "authorization is ENABLED but authentication is NOT (--auth-file unset): \
+                 principals are CLIENT-ASSERTED and spoofable. Pair --authz-file with \
+                 --auth-file in production."
+            );
+        }
+        info!(
+            authz_file = %path.display(),
+            grants = a.grant_count(),
+            "ReBAC authorization enabled (managed add-on; warehouse->namespace->table \
+             grants, SQLSTATE 42501 on deny)"
+        );
+        Ok(Some(a as authz::SharedAuthorizer))
+    }
+    #[cfg(not(feature = "managed"))]
+    {
+        let _ = (path, auth_present);
+        bail!(
+            "--authz-file is a managed add-on: this open-source build was compiled \
+             without the `managed` feature. Rebuild with --features managed, or omit \
+             --authz-file to run open (any authenticated user, all tables)."
+        )
+    }
 }
 
 async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeOpts) -> Result<()> {
@@ -409,6 +514,9 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
                 None
             }
         };
+    // Secure-by-default: don't expose an unauthenticated listener on a
+    // non-loopback interface unless the operator opts in with --insecure.
+    enforce_secure_default(host, auth.is_some(), serve_opts.insecure)?;
 
     // Zero-copy branch serving (--branch, SPEC D6): `None` = main = the
     // historical read/write paths byte-for-byte; `Some(name)` pins reads to
@@ -491,38 +599,7 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
     }
     // Lakekeeper-style ReBAC authorization (--authz-file). None = open (any
     // authenticated principal, all tables); Some = every statement gated.
-    let authorizer: Option<authz::SharedAuthorizer> = match &serve_opts.authz_file {
-        Some(path) => {
-            #[cfg(feature = "managed")]
-            {
-                let a = Arc::new(authz::FileAuthorizer::load(path)?);
-                if serve_opts.auth_file.is_none() {
-                    warn!(
-                        "authorization is ENABLED but authentication is NOT (--auth-file unset): \
-                         principals are CLIENT-ASSERTED and spoofable. Pair --authz-file with \
-                         --auth-file in production."
-                    );
-                }
-                info!(
-                    authz_file = %path.display(),
-                    grants = a.grant_count(),
-                    "ReBAC authorization enabled (managed add-on; warehouse->namespace->table \
-                     grants, SQLSTATE 42501 on deny)"
-                );
-                Some(a as authz::SharedAuthorizer)
-            }
-            #[cfg(not(feature = "managed"))]
-            {
-                let _ = path;
-                bail!(
-                    "--authz-file is a managed add-on: this open-source build was compiled \
-                     without the `managed` feature. Rebuild with --features managed, or omit \
-                     --authz-file to run open (any authenticated user, all tables)."
-                );
-            }
-        }
-        None => None,
-    };
+    let authorizer = build_authorizer(&serve_opts.authz_file, serve_opts.auth_file.is_some())?;
 
     let txn_registry = Arc::new(TxnRegistry::new());
     let hooks = query_hooks(

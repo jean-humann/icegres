@@ -19,8 +19,11 @@
 //!
 //! # Enforcement
 //!
-//! [`AuthzHook`] runs first in the query-hook chain (and the Flight SQL path
-//! calls [`Authorizer::authorize_sql`] directly). Each statement is mapped to
+//! [`AuthzHook`] runs first in the query-hook chain on the pgwire path; the
+//! Flight SQL path enforces the same policy per RPC in `flight.rs`
+//! (`check_sql` / `check_write`, resolving the bearer token to the
+//! authenticated principal before calling [`Authorizer::authorize_sql`]).
+//! Each statement is mapped to
 //! the set of (action, table) checks it requires; a denied check aborts the
 //! statement with SQLSTATE `42501` (insufficient_privilege). `pg_catalog` /
 //! `information_schema` reads, `SET`/`SHOW`, and transaction-control
@@ -481,16 +484,23 @@ pub type SharedAuthorizer = Arc<dyn Authorizer>;
 
 /// Build the SQLSTATE 42501 (insufficient_privilege) error for a denied
 /// statement, in the shape Postgres clients expect.
-pub fn deny_error(principal: &str, action: Action, target: &TableRef) -> PgWireError {
+/// Human-readable permission-denied message, shared by the pgwire error
+/// (`deny_error`) and the Flight SQL `Status::permission_denied` so both wire
+/// protocols report a denial identically.
+pub fn deny_message(principal: &str, action: Action, target: &TableRef) -> String {
     let verb = match action {
         Action::ReadData => "SELECT",
         Action::WriteData => "write (INSERT/UPDATE/DELETE)",
         Action::DropTable => "DROP",
     };
+    format!("permission denied: role \"{principal}\" cannot {verb} on {target}")
+}
+
+pub fn deny_error(principal: &str, action: Action, target: &TableRef) -> PgWireError {
     PgWireError::UserError(Box::new(ErrorInfo::new(
         "ERROR".to_string(),
         "42501".to_string(),
-        format!("permission denied: role \"{principal}\" cannot {verb} on {target}"),
+        deny_message(principal, action, target),
     )))
 }
 

@@ -169,6 +169,7 @@ cleanup() {
   stop_pidfile_generic "$E2E_DIR/serve-branch.pid"
   stop_pidfile_generic "$E2E_DIR/flight.pid"
   stop_pidfile_generic "$E2E_DIR/flight-secure.pid"
+  stop_pidfile_generic "$E2E_DIR/flight-authz.pid"
   stop_icegresd
 }
 trap cleanup EXIT
@@ -1169,6 +1170,57 @@ else
   echo "$A11_OUT" | grep -q '^PASS flight: basic auth handshake' \
     || fail "A11 basic-auth step did not run/pass (secure server env was set)"
   pass "ADBC first-class green ($(echo "$A11_OUT" | grep '^A11 RESULT:'))"
+
+  # (p2) Flight-NATIVE authorization (SPEC A12 on the Flight lane / production-
+  #      readiness blocker #1): the ReBAC policy that gates pgwire MUST gate the
+  #      Flight endpoint too — otherwise the Flight port is a total authz bypass.
+  #      Grant e2e_flight_user read on demo.trips ONLY; assert trips allowed but
+  #      demo.cities SELECT and any write denied.
+  FLIGHT_AUTHZ_PORT=50053
+  printf 'grant e2e_flight_user read demo.trips\n' >"$E2E_DIR/flight-authz.conf"
+  "$BIN" flight-serve --host 127.0.0.1 --port "$FLIGHT_AUTHZ_PORT" \
+    --auth-file "$E2E_DIR/flight-auth.conf" --authz-file "$E2E_DIR/flight-authz.conf" \
+    >"$E2E_DIR/flight-authz.log" 2>&1 &
+  echo $! >"$E2E_DIR/flight-authz.pid"
+  for _ in $(seq 1 60); do
+    flight_port_open "$FLIGHT_AUTHZ_PORT" && break
+    kill -0 "$(cat "$E2E_DIR/flight-authz.pid")" 2>/dev/null \
+      || { tail -n 20 "$E2E_DIR/flight-authz.log" >&2; fail "flight-serve (authz) exited during startup"; }
+    sleep 0.5
+  done
+  flight_port_open "$FLIGHT_AUTHZ_PORT" || fail "flight-serve (authz) did not open :$FLIGHT_AUTHZ_PORT in 30s"
+  AZF_OUT=$(env FA_PORT="$FLIGHT_AUTHZ_PORT" python3 - <<'PYEOF' 2>&1
+import os
+from adbc_driver_flightsql import dbapi as fl
+port = os.environ["FA_PORT"]
+cn = fl.connect(f"grpc://127.0.0.1:{port}",
+                db_kwargs={"username": "e2e_flight_user", "password": "e2e-flight-pw"})
+cur = cn.cursor()
+cur.execute("select count(*) from demo.trips")
+assert cur.fetchone()[0] >= 0
+print("OK granted read demo.trips")
+denied = False
+try:
+    cur.execute("select count(*) from demo.cities"); cur.fetchone()
+except Exception as e:
+    denied = "permission denied" in str(e) or "cannot SELECT" in str(e)
+assert denied, "ungranted demo.cities SELECT was NOT denied"
+print("OK denied read demo.cities")
+wdenied = False
+try:
+    cur.execute("insert into demo.cities (city,country,population) values ('z','z',1)")
+except Exception as e:
+    wdenied = "permission denied" in str(e) or "cannot write" in str(e)
+assert wdenied, "ungranted demo.cities write was NOT denied"
+print("OK denied write demo.cities")
+cur.close(); cn.close()
+print("FLIGHT_AUTHZ_OK")
+PYEOF
+) || { echo "$AZF_OUT" | tail -n 15 >&2; fail "Flight-native authorization probe failed"; }
+  echo "$AZF_OUT" | grep -q FLIGHT_AUTHZ_OK \
+    || { echo "$AZF_OUT" | tail -n 15 >&2; fail "Flight authz probe did not confirm all denials"; }
+  pass "Flight-native authorization enforced (granted read allowed; ungranted table SELECT + write denied 42501)"
+  stop_pidfile_generic "$E2E_DIR/flight-authz.pid"
 
   stop_pidfile_generic "$FLIGHT_PID_FILE"
   stop_pidfile_generic "$FLIGHT_SECURE_PID_FILE"

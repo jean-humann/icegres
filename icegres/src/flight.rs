@@ -51,10 +51,11 @@
 //! supports `grpc+tls://`. Without `--auth-file` the endpoint is permissive
 //! (any/no credentials accepted) and logs the same startup WARN as pgwire.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use arrow::array::{Array, RecordBatch, UInt64Array};
@@ -94,10 +95,13 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{info, warn};
 
+use crate::authz::{self, Action as AuthzAction, SharedAuthorizer, TableRef};
 use crate::context::{self, CATALOG_NAME, DEFAULT_SCHEMA};
 use crate::ops::BasicAuthVerifier;
 use crate::overwrite::{quote_ident, CommitConflict, ConstraintViolation, OverwriteEngine};
 use crate::{dml, CatalogOpts};
+use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
+use datafusion::sql::sqlparser::parser::Parser;
 
 /// Table type reported for every Iceberg table (there are no views).
 const TABLE_TYPE: &str = "TABLE";
@@ -126,22 +130,42 @@ struct Prepared {
     schema: SchemaRef,
 }
 
+/// Lifetime of a bearer token minted by a handshake. After this the client
+/// must re-handshake; expired tokens are pruned lazily on the next RPC so the
+/// token map cannot grow without bound across a long-lived server.
+const TOKEN_TTL: Duration = Duration::from_secs(3600);
+
+/// A minted bearer token's bound identity and issue time.
+struct TokenEntry {
+    /// The authenticated principal (empty string when auth is disabled).
+    user: String,
+    issued: Instant,
+}
+
 struct FlightSqlServiceImpl {
     ctx: Arc<SessionContext>,
     engine: Arc<OverwriteEngine>,
     /// `Some` = basic-auth handshake required (--auth-file); `None` = permissive.
     auth: Option<Arc<dyn BasicAuthVerifier>>,
-    /// Bearer tokens issued by successful handshakes (per-boot, random).
-    tokens: Mutex<HashSet<String>>,
+    /// ReBAC authorizer (--authz-file, managed add-on). `Some` = every data RPC
+    /// is gated by the same policy the pgwire path enforces; `None` = open.
+    authorizer: Option<SharedAuthorizer>,
+    /// Namespace used to resolve unqualified table names in authorization.
+    default_namespace: String,
+    /// Bearer tokens issued by successful handshakes (per-boot, random) ->
+    /// their bound identity and issue time (TTL-pruned on use).
+    tokens: Mutex<HashMap<String, TokenEntry>>,
     prepared: Mutex<HashMap<String, Prepared>>,
     sql_info: SqlInfoData,
 }
 
 impl FlightSqlServiceImpl {
-    /// Enforce the bearer token on every RPC when auth is enabled.
-    fn authorize<T>(&self, request: &Request<T>) -> Result<(), Status> {
+    /// Enforce the bearer token on every RPC when auth is enabled and resolve
+    /// it to the authenticated principal. Returns `None` when auth is disabled
+    /// (no identity; authorization is also necessarily disabled in that case).
+    fn authorize<T>(&self, request: &Request<T>) -> Result<Option<String>, Status> {
         if self.auth.is_none() {
-            return Ok(());
+            return Ok(None);
         }
         let header = request
             .metadata()
@@ -152,11 +176,63 @@ impl FlightSqlServiceImpl {
         let token = header
             .strip_prefix("Bearer ")
             .ok_or_else(|| Status::unauthenticated("expected 'Bearer <token>' authorization"))?;
-        if self.tokens.lock().expect("token lock").contains(token) {
-            Ok(())
-        } else {
-            Err(Status::unauthenticated("unknown or expired bearer token"))
+        let mut store = self.tokens.lock().expect("token lock");
+        let now = Instant::now();
+        store.retain(|_, e| now.duration_since(e.issued) < TOKEN_TTL);
+        match store.get(token) {
+            Some(entry) => Ok(Some(entry.user.clone())),
+            None => Err(Status::unauthenticated("unknown or expired bearer token")),
         }
+    }
+
+    /// Gate a SQL statement against the ReBAC policy (no-op when authz is
+    /// disabled). Parses `sql` with the same Postgres dialect the pgwire path
+    /// uses and denies on the first failed (action, table) check — the exact
+    /// enforcement `AuthzHook` applies on pgwire, so neither wire protocol can
+    /// reach a table the principal is not granted.
+    fn check_sql(&self, principal: &Option<String>, sql: &str) -> Result<(), Status> {
+        let Some(authorizer) = &self.authorizer else {
+            return Ok(());
+        };
+        let user = principal.as_deref().unwrap_or("");
+        let stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql)
+            .map_err(|e| Status::invalid_argument(format!("sql parse error: {e}")))?;
+        for stmt in &stmts {
+            if let authz::Decision::Deny { action, target } =
+                authorizer.authorize_sql(user, stmt, &self.default_namespace)
+            {
+                return Err(Status::permission_denied(authz::deny_message(
+                    user, action, &target,
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Gate a bulk-ingest append (which carries no SQL statement) as a write on
+    /// the target table.
+    fn check_write(
+        &self,
+        principal: &Option<String>,
+        namespace: &str,
+        table: &str,
+    ) -> Result<(), Status> {
+        let Some(authorizer) = &self.authorizer else {
+            return Ok(());
+        };
+        let user = principal.as_deref().unwrap_or("");
+        let target = TableRef {
+            namespace: namespace.to_string(),
+            table: table.to_string(),
+        };
+        if let authz::Decision::Deny { action, target } =
+            authorizer.check(user, AuthzAction::WriteData, &target)
+        {
+            return Err(Status::permission_denied(authz::deny_message(
+                user, action, &target,
+            )));
+        }
+        Ok(())
     }
 
     async fn plan(&self, sql: &str) -> Result<DataFrame, Status> {
@@ -390,6 +466,9 @@ impl FlightSqlService for FlightSqlServiceImpl {
         &self,
         request: Request<Streaming<HandshakeRequest>>,
     ) -> Result<Response<HandshakeStream>, Status> {
+        // Authenticated principal bound to the minted token; empty when auth
+        // is disabled (no identity, and authz is disabled too).
+        let mut authenticated_user = String::new();
         if let Some(source) = &self.auth {
             let header = request
                 .metadata()
@@ -415,12 +494,16 @@ impl FlightSqlService for FlightSqlServiceImpl {
                 )));
             }
             info!(user, "flight handshake authenticated");
+            authenticated_user = user.to_string();
         }
         let token = uuid::Uuid::new_v4().to_string();
-        self.tokens
-            .lock()
-            .expect("token lock")
-            .insert(token.clone());
+        self.tokens.lock().expect("token lock").insert(
+            token.clone(),
+            TokenEntry {
+                user: authenticated_user,
+                issued: Instant::now(),
+            },
+        );
         let output: HandshakeStream = Box::pin(stream::iter([Ok(HandshakeResponse {
             protocol_version: 0,
             payload: token.clone().into_bytes().into(),
@@ -444,8 +527,9 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandStatementQuery,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        self.authorize(&request)?;
+        let principal = self.authorize(&request)?;
         let sql = query.query.clone();
+        self.check_sql(&principal, &sql)?;
         info!(%sql, "GetFlightInfo(CommandStatementQuery)");
         // Plan once to expose the result schema; the ticket carries the SQL
         // text and DoGet re-plans and executes it.
@@ -466,9 +550,10 @@ impl FlightSqlService for FlightSqlServiceImpl {
         ticket: TicketStatementQuery,
         request: Request<Ticket>,
     ) -> Result<Response<<Self::FlightService as FlightService>::DoGetStream>, Status> {
-        self.authorize(&request)?;
+        let principal = self.authorize(&request)?;
         let sql = String::from_utf8(ticket.statement_handle.to_vec())
             .map_err(|e| Status::invalid_argument(format!("ticket is not utf-8 SQL: {e}")))?;
+        self.check_sql(&principal, &sql)?;
         info!(%sql, "DoGet(TicketStatementQuery)");
         if let Some(stream) = self.dml_via_doget(&sql).await? {
             return Ok(Response::new(stream));
@@ -486,8 +571,9 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: ActionCreatePreparedStatementRequest,
         request: Request<Action>,
     ) -> Result<ActionCreatePreparedStatementResult, Status> {
-        self.authorize(&request)?;
+        let principal = self.authorize(&request)?;
         let sql = query.query.clone();
+        self.check_sql(&principal, &sql)?;
         info!(%sql, "CreatePreparedStatement");
         // Plan for the dataset schema; a plan with untyped `$n` placeholders
         // that DataFusion cannot infer still yields a schema for SELECTs.
@@ -574,7 +660,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         cmd: CommandPreparedStatementQuery,
         request: Request<Ticket>,
     ) -> Result<Response<<Self::FlightService as FlightService>::DoGetStream>, Status> {
-        self.authorize(&request)?;
+        let principal = self.authorize(&request)?;
         let handle = String::from_utf8(cmd.prepared_statement_handle.to_vec())
             .map_err(|_| Status::invalid_argument("invalid prepared statement handle"))?;
         let (sql, params) = {
@@ -584,6 +670,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
                 .ok_or_else(|| Status::not_found(format!("unknown prepared statement {handle}")))?;
             (entry.sql.clone(), entry.params.clone())
         };
+        self.check_sql(&principal, &sql)?;
         info!(%sql, bound_rows = params.len(), "DoGet(CommandPreparedStatementQuery)");
         // ADBC's dbapi prepares EVERY statement, so UPDATE/DELETE arrive
         // here too: same engine routing as the plain-statement flow.
@@ -626,7 +713,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandPreparedStatementUpdate,
         request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
-        self.authorize(&request)?;
+        let principal = self.authorize(&request)?;
         let handle = String::from_utf8(query.prepared_statement_handle.to_vec())
             .map_err(|_| Status::invalid_argument("invalid prepared statement handle"))?;
         let sql = {
@@ -637,6 +724,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
                 .sql
                 .clone()
         };
+        self.check_sql(&principal, &sql)?;
         let batches = decode_put_stream(request.into_inner()).await?;
         let rows = batches_to_param_rows(&batches)?;
         info!(%sql, bound_rows = rows.len(), "DoPut(CommandPreparedStatementUpdate)");
@@ -664,12 +752,13 @@ impl FlightSqlService for FlightSqlServiceImpl {
         ticket: CommandStatementUpdate,
         request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
-        self.authorize(&request)?;
+        let principal = self.authorize(&request)?;
         if ticket.transaction_id.is_some() {
             return Err(Status::unimplemented(
                 "Flight SQL transactions are not supported",
             ));
         }
+        self.check_sql(&principal, &ticket.query)?;
         info!(sql = %ticket.query, "DoPut(CommandStatementUpdate)");
         self.execute_update(&ticket.query, None).await
     }
@@ -679,7 +768,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         ticket: CommandStatementIngest,
         request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
-        self.authorize(&request)?;
+        let principal = self.authorize(&request)?;
         if ticket.transaction_id.is_some() {
             return Err(Status::unimplemented(
                 "ingest transactions are not supported",
@@ -702,6 +791,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
             .clone()
             .unwrap_or_else(|| DEFAULT_SCHEMA.to_string());
         let table = ticket.table.clone();
+        self.check_write(&principal, &namespace, &table)?;
 
         // Scope: append into an EXISTING Iceberg table (ADBC mode="append").
         // mode="create"/"replace" would need DDL through the REST catalog —
@@ -993,6 +1083,7 @@ pub async fn run(
     host: &str,
     port: u16,
     auth_file: Option<PathBuf>,
+    authorizer: Option<SharedAuthorizer>,
 ) -> Result<()> {
     let start = std::time::Instant::now();
     let auth: Option<Arc<dyn BasicAuthVerifier>> = match &auth_file {
@@ -1041,11 +1132,16 @@ pub async fn run(
     // clients see pgwire commits and vice versa.
     let ctx = context::build_session_context(catalog).await?;
 
+    if authorizer.is_some() {
+        info!("ReBAC authorization enabled on the Flight SQL endpoint (managed add-on; per-RPC gating, same policy as pgwire)");
+    }
     let service = FlightSqlServiceImpl {
         ctx: Arc::new(ctx),
         engine,
         auth,
-        tokens: Mutex::new(HashSet::new()),
+        authorizer,
+        default_namespace: DEFAULT_SCHEMA.to_string(),
+        tokens: Mutex::new(HashMap::new()),
         prepared: Mutex::new(HashMap::new()),
         sql_info: build_sql_info(),
     };
