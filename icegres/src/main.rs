@@ -587,7 +587,7 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
     compat::install_coherent_pg_catalog(&ctx, context::CATALOG_NAME).await?;
 
     if let Some(hp) = serve_opts.health_port {
-        ops::spawn_health_listener(host, hp).await?;
+        ops::spawn_health_listener(host, hp, catalog.clone()).await?;
     }
 
     if serve_opts.enforce_pk {

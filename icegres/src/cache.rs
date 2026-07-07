@@ -55,7 +55,8 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
@@ -69,8 +70,87 @@ use datafusion::physical_plan::ExecutionPlan;
 use iceberg::table::Table;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use iceberg_datafusion::{to_datafusion_error, IcebergStaticTableProvider};
+use tracing::warn;
 
 use crate::buffer::WriteBuffer;
+
+/// Per-attempt timeout for a catalog `load_table` from
+/// `ICEGRES_CATALOG_TIMEOUT_MS` (default 5000; `0` = no timeout).
+fn catalog_timeout() -> Option<Duration> {
+    static T: OnceLock<Option<Duration>> = OnceLock::new();
+    *T.get_or_init(|| match std::env::var("ICEGRES_CATALOG_TIMEOUT_MS") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(ms) => Some(Duration::from_millis(ms)),
+            Err(_) => Some(Duration::from_millis(5000)),
+        },
+        Err(_) => Some(Duration::from_millis(5000)),
+    })
+}
+
+/// Number of retries after the first failed `load_table` from
+/// `ICEGRES_CATALOG_RETRIES` (default 2).
+fn catalog_retries() -> u32 {
+    static R: OnceLock<u32> = OnceLock::new();
+    *R.get_or_init(|| {
+        std::env::var("ICEGRES_CATALOG_RETRIES")
+            .ok()
+            .and_then(|r| r.trim().parse().ok())
+            .unwrap_or(2)
+    })
+}
+
+/// When `ICEGRES_STALE_READ_ON_CATALOG_ERROR` is set truthy, a read whose
+/// catalog `load_table` fails (after timeout+retries) serves the last cached
+/// snapshot instead of erroring — availability over freshness. Default OFF
+/// because it can serve stale data during a catalog outage (bounded-stale
+/// reads), which changes the exact-freshness contract.
+fn stale_read_enabled() -> bool {
+    static S: OnceLock<bool> = OnceLock::new();
+    *S.get_or_init(
+        || match std::env::var("ICEGRES_STALE_READ_ON_CATALOG_ERROR") {
+            Ok(raw) => matches!(raw.trim(), "1" | "true" | "on" | "yes"),
+            Err(_) => false,
+        },
+    )
+}
+
+/// `catalog.load_table` with a bounded per-attempt timeout and bounded
+/// retries, so a catalog blip surfaces as a bounded error (or a stale-cache
+/// fallback) instead of hanging every read indefinitely (production-readiness
+/// audit #6).
+async fn load_table_with_retry(
+    catalog: &Arc<dyn Catalog>,
+    ident: &TableIdent,
+) -> iceberg::Result<Table> {
+    let timeout = catalog_timeout();
+    let retries = catalog_retries();
+    let mut last: Option<iceberg::Error> = None;
+    for attempt in 0..=retries {
+        let res = match timeout {
+            Some(d) => match tokio::time::timeout(d, catalog.load_table(ident)).await {
+                Ok(r) => r,
+                Err(_) => Err(iceberg::Error::new(
+                    iceberg::ErrorKind::Unexpected,
+                    format!("catalog load_table timed out after {} ms", d.as_millis()),
+                )),
+            },
+            None => catalog.load_table(ident).await,
+        };
+        match res {
+            Ok(t) => return Ok(t),
+            Err(e) => {
+                if attempt < retries {
+                    let backoff = Duration::from_millis(50u64 << attempt);
+                    warn!(%ident, attempt, error = %e, "catalog load_table failed; retrying");
+                    tokio::time::sleep(backoff).await;
+                }
+                last = Some(e);
+            }
+        }
+    }
+    Err(last.expect("at least one attempt was made"))
+}
 
 /// Identity of a table metadata version: metadata file location plus current
 /// snapshot id. Any commit (append, schema change, ...) moves the metadata
@@ -156,7 +236,27 @@ impl CachingTableProvider {
         Arc<IcebergStaticTableProvider>,
         iceberg::spec::TableMetadataRef,
     )> {
-        let fresh = self.catalog.load_table(&self.ident).await?;
+        let fresh = match load_table_with_retry(&self.catalog, &self.ident).await {
+            Ok(t) => t,
+            Err(e) => {
+                // Catalog unreachable after timeout+retries. Optionally fall
+                // back to the last cached snapshot (bounded-stale read) so
+                // reads stay available during a catalog outage; otherwise the
+                // error propagates loudly.
+                if stale_read_enabled() {
+                    let guard = self.cached.read().expect("cache lock poisoned");
+                    if let Some(cached) = guard.as_ref() {
+                        warn!(
+                            ident = %self.ident,
+                            error = %e,
+                            "catalog unreachable; serving last cached snapshot (bounded-stale read)"
+                        );
+                        return Ok((cached.provider.clone(), cached.metadata.clone()));
+                    }
+                }
+                return Err(e);
+            }
+        };
         // Branch mode: the cache version and the served snapshot are the
         // branch HEAD (a commit to any other branch moves the metadata
         // location without changing what this endpoint serves; a commit to

@@ -868,6 +868,10 @@ else
     # E2 evidence, and proof that health traffic does not reset the idle clock.
     health_code=$(curl -s -m 2 -o "$RUN_DIR/health-body.txt" -w '%{http_code}' "http://$PG_HOST:$HEALTH_PORT/health" 2>&1)
     health_body=$(flat <"$RUN_DIR/health-body.txt")
+    # Catalog-aware readiness (production-readiness #10): /ready does a bounded
+    # catalog round-trip. With the catalog up it must answer 200 'ready'.
+    ready_code=$(curl -s -m 5 -o "$RUN_DIR/ready-body.txt" -w '%{http_code}' "http://$PG_HOST:$HEALTH_PORT/ready" 2>&1)
+    ready_body=$(flat <"$RUN_DIR/ready-body.txt")
     t_last=$(($(date +%s%N) / 1000000))
     exited=0
     for _ in $(seq 1 80); do
@@ -1030,9 +1034,9 @@ else
 fi
 
 hc=$(q 'select 1')
-if [[ "$hc" == 1 && "$health_code" == 200 && "$health_body" == ok* ]]; then
+if [[ "$hc" == 1 && "$health_code" == 200 && "$health_body" == ok* && "$ready_code" == 200 && "$ready_body" == ready* ]]; then
   record E2 ops "health-checkable" PASS \
-    "two probes work: (1) pgwire connect + 'select 1' as the readiness check (what the harnesses use; plain TCP connect works for tcpSocket-style checks); (2) dedicated HTTP liveness endpoint via --health-port — curl http://$PG_HOST:$HEALTH_PORT/health during the D5 probe returned $health_code '$health_body'."
+    "three probes work: (1) pgwire connect + 'select 1' as the readiness check (what the harnesses use; plain TCP connect works for tcpSocket-style checks); (2) dedicated HTTP liveness endpoint --health-port /health returned $health_code '$health_body'; (3) catalog-aware /ready returned $ready_code '$ready_body' (does a bounded catalog round-trip -> 503 when the lakehouse is unreachable, so a load balancer pulls a dependency-down compute out of rotation)."
 elif [[ "$hc" == 1 ]]; then
   record E2 ops "health-checkable" PASS \
     "pgwire connect + 'select 1' works as a health probe (this is what the harnesses use); --health-port endpoint answered '$health_code' '$health_body' (expected 200 'ok' — see D5 probe log)."

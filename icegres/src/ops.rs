@@ -712,33 +712,73 @@ impl QueryHook for CopyOutHook {
     }
 }
 
-/// Bind a minimal HTTP liveness endpoint on `host:port` and serve it from a
-/// background task. Every connection gets `200 OK` + body `ok\n` regardless
-/// of the request. Binding errors are returned (loud at startup); per-
-/// connection errors are logged and ignored.
-pub async fn spawn_health_listener(host: &str, port: u16) -> Result<()> {
+/// Timeout for the `/ready` catalog probe. Kept short so a hung catalog turns
+/// into a fast 503 rather than a slow readiness check.
+const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Cheap catalog reachability check for `/ready`: list top-level namespaces
+/// with a bounded timeout. `Ok` = the REST catalog answered (dependency up).
+async fn catalog_ready(catalog: &Arc<dyn iceberg::Catalog>) -> bool {
+    matches!(
+        tokio::time::timeout(READY_PROBE_TIMEOUT, catalog.list_namespaces(None)).await,
+        Ok(Ok(_))
+    )
+}
+
+/// Bind the HTTP health endpoint on `host:port` and serve it from a background
+/// task, distinguishing **liveness** from **readiness**:
+///
+/// * `GET /ready` (and `/readyz`) does a bounded catalog round-trip →
+///   `200 ready` if the REST catalog answered, else `503` — so a load balancer
+///   pulls a compute out of rotation when its lakehouse dependency is down
+///   instead of routing queries that will all fail (production-readiness #10).
+/// * Any other path (and a bare TCP connect) is a **liveness** probe →
+///   `200 ok`: the process is alive and accepting, regardless of the catalog.
+///
+/// Binding errors are returned (loud at startup); per-connection errors are
+/// logged and ignored.
+pub async fn spawn_health_listener(
+    host: &str,
+    port: u16,
+    catalog: Arc<dyn iceberg::Catalog>,
+) -> Result<()> {
     let addr = format!("{host}:{port}");
     let listener = TcpListener::bind(&addr)
         .await
         .with_context(|| format!("failed to bind health listener on {addr}"))?;
-    info!(health_addr = %addr, "health endpoint listening (HTTP 200 'ok' liveness probe)");
+    info!(health_addr = %addr, "health endpoint listening (liveness /health, catalog-aware /ready)");
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((mut socket, _)) => {
+                    let catalog = catalog.clone();
                     tokio::spawn(async move {
-                        // Best-effort read of the request (a plain TCP
-                        // connect-and-close health check sends nothing).
+                        // Best-effort read of the request line (a plain TCP
+                        // connect-and-close liveness check sends nothing).
                         let mut buf = [0u8; 1024];
-                        let _ = socket.read(&mut buf).await;
-                        let _ = socket
-                            .write_all(
-                                b"HTTP/1.1 200 OK\r\n\
-                                  content-type: text/plain\r\n\
-                                  content-length: 3\r\n\
-                                  connection: close\r\n\r\nok\n",
-                            )
-                            .await;
+                        let n = socket.read(&mut buf).await.unwrap_or(0);
+                        let req = String::from_utf8_lossy(&buf[..n]);
+                        let is_ready_path = req
+                            .split_whitespace()
+                            .nth(1)
+                            .map(|p| {
+                                let path = p.split('?').next().unwrap_or(p);
+                                path == "/ready" || path == "/readyz"
+                            })
+                            .unwrap_or(false);
+                        let response: &[u8] = if is_ready_path {
+                            if catalog_ready(&catalog).await {
+                                b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n\
+                                  content-length: 6\r\nconnection: close\r\n\r\nready\n"
+                            } else {
+                                b"HTTP/1.1 503 Service Unavailable\r\ncontent-type: text/plain\r\n\
+                                  content-length: 10\r\nconnection: close\r\n\r\nnot ready\n"
+                            }
+                        } else {
+                            b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n\
+                              content-length: 3\r\nconnection: close\r\n\r\nok\n"
+                        };
+                        let _ = socket.write_all(response).await;
                         let _ = socket.shutdown().await;
                     });
                 }
