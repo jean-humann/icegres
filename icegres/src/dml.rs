@@ -168,6 +168,9 @@ pub(crate) fn engine_error(e: &anyhow::Error) -> PgWireError {
     let (code, msg) = if let Some(v) = e.downcast_ref::<ConstraintViolation>() {
         (v.sqlstate.to_string(), v.message.clone())
     } else if let Some(c) = e.downcast_ref::<CommitConflict>() {
+        crate::metrics::metrics()
+            .commit_conflicts_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         ("40001".to_string(), c.message.clone())
     } else {
         ("XX000".to_string(), format!("{e:#}"))

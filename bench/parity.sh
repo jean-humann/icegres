@@ -872,6 +872,9 @@ else
     # catalog round-trip. With the catalog up it must answer 200 'ready'.
     ready_code=$(curl -s -m 5 -o "$RUN_DIR/ready-body.txt" -w '%{http_code}' "http://$PG_HOST:$HEALTH_PORT/ready" 2>&1)
     ready_body=$(flat <"$RUN_DIR/ready-body.txt")
+    # Prometheus metrics endpoint (production-readiness #8): must expose the
+    # operational counters so the server is not run blind.
+    metrics_has_counter=$(curl -s -m 5 "http://$PG_HOST:$HEALTH_PORT/metrics" 2>&1 | grep -c '^icegres_queries_total ')
     t_last=$(($(date +%s%N) / 1000000))
     exited=0
     for _ in $(seq 1 80); do
@@ -1034,9 +1037,9 @@ else
 fi
 
 hc=$(q 'select 1')
-if [[ "$hc" == 1 && "$health_code" == 200 && "$health_body" == ok* && "$ready_code" == 200 && "$ready_body" == ready* ]]; then
+if [[ "$hc" == 1 && "$health_code" == 200 && "$health_body" == ok* && "$ready_code" == 200 && "$ready_body" == ready* && "${metrics_has_counter:-0}" -ge 1 ]]; then
   record E2 ops "health-checkable" PASS \
-    "three probes work: (1) pgwire connect + 'select 1' as the readiness check (what the harnesses use; plain TCP connect works for tcpSocket-style checks); (2) dedicated HTTP liveness endpoint --health-port /health returned $health_code '$health_body'; (3) catalog-aware /ready returned $ready_code '$ready_body' (does a bounded catalog round-trip -> 503 when the lakehouse is unreachable, so a load balancer pulls a dependency-down compute out of rotation)."
+    "four probes work: (1) pgwire connect + 'select 1' readiness check; (2) HTTP liveness --health-port /health returned $health_code '$health_body'; (3) catalog-aware /ready returned $ready_code '$ready_body' (bounded catalog round-trip -> 503 when the lakehouse is unreachable, so a load balancer drops a dependency-down compute); (4) Prometheus /metrics exposes the operational counters (icegres_queries_total etc.) so the server is not run blind."
 elif [[ "$hc" == 1 ]]; then
   record E2 ops "health-checkable" PASS \
     "pgwire connect + 'select 1' works as a health probe (this is what the harnesses use); --health-port endpoint answered '$health_code' '$health_body' (expected 200 'ok' — see D5 probe log)."

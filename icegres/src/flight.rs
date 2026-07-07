@@ -93,7 +93,7 @@ use prost::Message;
 use tonic::metadata::MetadataValue;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::authz::{self, Action as AuthzAction, SharedAuthorizer, TableRef};
 use crate::context::{self, CATALOG_NAME, DEFAULT_SCHEMA};
@@ -530,7 +530,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         let principal = self.authorize(&request)?;
         let sql = query.query.clone();
         self.check_sql(&principal, &sql)?;
-        info!(%sql, "GetFlightInfo(CommandStatementQuery)");
+        debug!(%sql, "GetFlightInfo(CommandStatementQuery)");
         // Plan once to expose the result schema; the ticket carries the SQL
         // text and DoGet re-plans and executes it.
         let df = self.plan(&sql).await?;
@@ -554,7 +554,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         let sql = String::from_utf8(ticket.statement_handle.to_vec())
             .map_err(|e| Status::invalid_argument(format!("ticket is not utf-8 SQL: {e}")))?;
         self.check_sql(&principal, &sql)?;
-        info!(%sql, "DoGet(TicketStatementQuery)");
+        debug!(%sql, "DoGet(TicketStatementQuery)");
         if let Some(stream) = self.dml_via_doget(&sql).await? {
             return Ok(Response::new(stream));
         }
@@ -574,7 +574,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         let principal = self.authorize(&request)?;
         let sql = query.query.clone();
         self.check_sql(&principal, &sql)?;
-        info!(%sql, "CreatePreparedStatement");
+        debug!(%sql, "CreatePreparedStatement");
         // Plan for the dataset schema; a plan with untyped `$n` placeholders
         // that DataFusion cannot infer still yields a schema for SELECTs.
         let df = self.plan(&sql).await?;
@@ -671,7 +671,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
             (entry.sql.clone(), entry.params.clone())
         };
         self.check_sql(&principal, &sql)?;
-        info!(%sql, bound_rows = params.len(), "DoGet(CommandPreparedStatementQuery)");
+        debug!(%sql, bound_rows = params.len(), "DoGet(CommandPreparedStatementQuery)");
         // ADBC's dbapi prepares EVERY statement, so UPDATE/DELETE arrive
         // here too: same engine routing as the plain-statement flow.
         if params.is_empty() {
@@ -727,7 +727,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         self.check_sql(&principal, &sql)?;
         let batches = decode_put_stream(request.into_inner()).await?;
         let rows = batches_to_param_rows(&batches)?;
-        info!(%sql, bound_rows = rows.len(), "DoPut(CommandPreparedStatementUpdate)");
+        debug!(%sql, bound_rows = rows.len(), "DoPut(CommandPreparedStatementUpdate)");
         if rows.is_empty() {
             return self.execute_update(&sql, None).await;
         }
@@ -759,7 +759,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
             ));
         }
         self.check_sql(&principal, &ticket.query)?;
-        info!(sql = %ticket.query, "DoPut(CommandStatementUpdate)");
+        debug!(sql = %ticket.query, "DoPut(CommandStatementUpdate)");
         self.execute_update(&ticket.query, None).await
     }
 

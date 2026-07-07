@@ -12,6 +12,7 @@ mod compat;
 mod context;
 mod dml;
 mod flight;
+mod metrics;
 mod ops;
 mod overwrite;
 /// SCRAM authentication backend — the managed add-on (behind the `managed`
@@ -310,12 +311,22 @@ enum BranchCmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // Log format: ICEGRES_LOG_FORMAT=json emits structured JSON lines (for log
+    // shippers/aggregators); anything else keeps the human-readable format.
+    let env_filter = || {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+    };
+    if std::env::var("ICEGRES_LOG_FORMAT").as_deref() == Ok("json") {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(env_filter())
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter())
+            .init();
+    }
 
     let cli = Cli::parse();
     match cli.command {
@@ -664,7 +675,10 @@ fn query_hooks(
     enforce_pk: bool,
     authorizer: Option<authz::SharedAuthorizer>,
 ) -> Vec<Arc<dyn QueryHook>> {
-    let mut hooks: Vec<Arc<dyn QueryHook>> = Vec::with_capacity(6);
+    let mut hooks: Vec<Arc<dyn QueryHook>> = Vec::with_capacity(7);
+    // Observe-only: count every wire statement (falls through, never changes
+    // behavior). First so it sees all statements including denied ones.
+    hooks.push(Arc::new(metrics::MetricsHook));
     // 0. AuthzHook runs FIRST so an unauthorized statement is rejected (42501)
     //    before any rewrite, buffering, or planning touches it.
     if let Some(a) = authorizer {

@@ -290,6 +290,12 @@ pub async fn serve_custom(
             accepted = listener.accept() => match accepted {
                 Ok((socket, peer)) => {
                     active.fetch_add(1, Ordering::SeqCst);
+                    crate::metrics::metrics()
+                        .connections_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    crate::metrics::metrics()
+                        .connections_active
+                        .fetch_add(1, Ordering::Relaxed);
                     let factory = factory.clone();
                     let active = active.clone();
                     let idle_since = idle_since.clone();
@@ -309,6 +315,9 @@ pub async fn serve_custom(
                         // idle_since).
                         *idle_since.lock().expect("idle clock lock poisoned") = Instant::now();
                         active.fetch_sub(1, Ordering::SeqCst);
+                        crate::metrics::metrics()
+                            .connections_active
+                            .fetch_sub(1, Ordering::Relaxed);
                     });
                 }
                 Err(e) => warn!("error accepting socket: {e}"),
@@ -758,15 +767,26 @@ pub async fn spawn_health_listener(
                         let mut buf = [0u8; 1024];
                         let n = socket.read(&mut buf).await.unwrap_or(0);
                         let req = String::from_utf8_lossy(&buf[..n]);
-                        let is_ready_path = req
+                        let path = req
                             .split_whitespace()
                             .nth(1)
-                            .map(|p| {
-                                let path = p.split('?').next().unwrap_or(p);
-                                path == "/ready" || path == "/readyz"
-                            })
-                            .unwrap_or(false);
-                        let response: &[u8] = if is_ready_path {
+                            .map(|p| p.split('?').next().unwrap_or(p).to_string())
+                            .unwrap_or_default();
+                        if path == "/metrics" {
+                            // Prometheus text exposition of the operational
+                            // counters (production-readiness #8).
+                            let body = crate::metrics::metrics().render_prometheus();
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: text/plain; version=0.0.4\r\n\
+                                 content-length: {}\r\nconnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = socket.write_all(head.as_bytes()).await;
+                            let _ = socket.write_all(body.as_bytes()).await;
+                            let _ = socket.shutdown().await;
+                            return;
+                        }
+                        let response: &[u8] = if path == "/ready" || path == "/readyz" {
                             if catalog_ready(&catalog).await {
                                 b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n\
                                   content-length: 6\r\nconnection: close\r\n\r\nready\n"

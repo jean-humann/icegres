@@ -82,7 +82,7 @@ uuid = { version = "1", features = ["v4"] }
 rustls-pemfile = "2"
 anyhow = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 async-trait = "0.1"
 
 # Resource hygiene: symbols stripped from the release binary (rust symbol tables
