@@ -85,9 +85,11 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
 
 - **`--write-buffer-ms > 0` trades durability for latency.** In buffered mode an
   INSERT acks from an in-memory buffer and is group-committed every N ms; an
-  unclean kill loses up to N ms of acked-but-uncommitted writes. Default is `0`
+  *unclean* kill (SIGKILL, power loss) loses up to N ms of acked-but-uncommitted
+  writes. A *clean* shutdown (SIGTERM/SIGINT, e.g. a rolling deploy) flushes the
+  buffer before exiting, so a graceful stop loses nothing. Default is `0`
   (fully synchronous); buffered mode logs a `WARN` on enable. Leave it off for
-  durability-critical writes.
+  durability-critical writes that cannot tolerate the unclean-kill window.
 
 ## Transport / security
 

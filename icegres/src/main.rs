@@ -645,6 +645,9 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
     let authorizer = build_authorizer(&serve_opts.authz_file, serve_opts.auth_file.is_some())?;
 
     let txn_registry = Arc::new(TxnRegistry::new());
+    // Keep a handle for the graceful-shutdown flush before the buffer is moved
+    // into the hook chain.
+    let shutdown_buffer = write_buffer.clone();
     let hooks = query_hooks(
         engine,
         txn_registry.clone(),
@@ -669,6 +672,7 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
         auth,
         hooks,
         txn_registry,
+        shutdown_buffer,
     )
     .await
     .context("pgwire server failed")?;

@@ -429,10 +429,14 @@ and a background task commits the buffer to Iceberg every `N` ms (or at
 committed table with the buffer, so read-your-writes holds across all
 local connections instantly; other servers/readers see rows at the commit
 cadence (≤ N ms after ack). UPDATE/DELETE/BEGIN/DDL/PK-checked INSERTs
-flush first (ordering fences). **Trade-off, stated plainly:** an unclean
+flush first (ordering fences). **Trade-off, stated plainly:** an *unclean*
 kill (SIGKILL, power loss) loses up to N ms of acked-but-uncommitted
-writes. That is why the default is `0` — fully synchronous, semantics
-identical to not having the feature — and enabling it logs a WARN.
+writes. A *clean* shutdown (SIGTERM/SIGINT — rolling deploys) flushes the
+buffer before exiting, so a graceful stop loses nothing. That is why the
+default is `0` — fully synchronous, semantics identical to not having the
+feature — and enabling it logs a WARN. Both halves of the contract are
+locked by e2e (kill-loss vs clean-shutdown-flush), and the union-read flush
+race is covered by `buffer.rs` unit tests.
 
 ### Zero-copy branches (`icegres branch`, `serve --branch`)
 

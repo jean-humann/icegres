@@ -107,8 +107,10 @@ Scrape metrics with a `prometheus.io/scrape` annotation on port 8080, path
 
 On `SIGTERM`/`SIGINT` icegres stops accepting new connections and drains
 in-flight requests for up to 30 s before exiting (both the pgwire and Flight
-listeners). Give the orchestrator enough grace so a rolling deploy never severs
-a query mid-flight:
+listeners). In buffered-write mode (`--write-buffer-ms > 0`) it also flushes
+the write buffer after draining, so a clean stop commits every acked row —
+only an *unclean* kill drops the in-memory window. Give the orchestrator enough
+grace so a rolling deploy never severs a query mid-flight:
 
 ```yaml
 terminationGracePeriodSeconds: 40   # > the 30 s drain window

@@ -30,6 +30,7 @@ PG_PORT=5439
 SECURE_PORT=5443 # auth+TLS server for section (h)
 PK_PORT=5448     # --enforce-pk server for section (k)
 STRICT_PORT=5450 # ICEGRES_TXN_STRICT server for section (u)
+VBUF_PORT=5451   # buffered durability server for section (v)
 PSQL=(psql -h "$PG_HOST" -p "$PG_PORT" -U postgres -d icegres -v ON_ERROR_STOP=1)
 export PGCONNECT_TIMEOUT=5
 
@@ -174,6 +175,7 @@ cleanup() {
   stop_pidfile_generic "$E2E_DIR/flight-secure.pid"
   stop_pidfile_generic "$E2E_DIR/flight-authz.pid"
   stop_pidfile_generic "$E2E_DIR/serve-strict.pid"
+  stop_pidfile_generic "$E2E_DIR/serve-vbuf.pid"
   stop_icegresd
 }
 trap cleanup EXIT
@@ -1408,6 +1410,77 @@ assert_eq "strict mode still commits single-table transactions" "2" \
 "${SQ[@]}" -tA -c 'drop table demo.e2e_strict_a' >/dev/null 2>&1 || true
 "${SQ[@]}" -tA -c 'drop table demo.e2e_strict_b' >/dev/null 2>&1 || true
 stop_pidfile_generic "$E2E_DIR/serve-strict.pid"
+
+# ---------------------------------------------------------------------------
+# (v) Buffered-write durability contract: an acked-but-UNFLUSHED row is LOST on
+# an UNCLEAN kill (the documented trade), but SURVIVES a CLEAN SIGTERM (the
+# shutdown-flush hardening). A 10-minute cadence guarantees the background
+# flusher never auto-commits within the test, so the only commit that can
+# happen is the shutdown flush — proving the behavior end to end.
+# ---------------------------------------------------------------------------
+VBUF_PID_FILE="$E2E_DIR/serve-vbuf.pid"
+VBUF_LOG="$E2E_DIR/serve-vbuf.log"
+VBUF_MS=600000
+VBQ=(psql -h "$PG_HOST" -p "$VBUF_PORT" -U postgres -d icegres -tA)
+: >"$VBUF_LOG"
+vbuf_start() {
+  stop_pidfile_generic "$VBUF_PID_FILE"
+  "$BIN" serve --host "$PG_HOST" --port "$VBUF_PORT" --write-buffer-ms "$VBUF_MS" >>"$VBUF_LOG" 2>&1 &
+  echo $! >"$VBUF_PID_FILE"
+  for _ in $(seq 1 60); do
+    if "${VBQ[@]}" -c 'select 1' >/dev/null 2>&1; then return 0; fi
+    sleep 0.5
+  done
+  tail -n 20 "$VBUF_LOG" >&2; fail "buffered durability server not ready on :$VBUF_PORT"
+}
+log "(v) buffered durability: kill-loss vs clean-shutdown-flush on :$VBUF_PORT"
+if "${VBQ[@]}" -c 'select 1' >/dev/null 2>&1; then fail "something is already listening on :$VBUF_PORT"; fi
+vbuf_start
+
+vbase=$(( $(q 'select coalesce(max(trip_id), 0) from demo.trips') + 1 ))
+(( vbase >= 990000 )) || vbase=990000
+KL_ID=$vbase        # kill-loss sentinel (never committed -> lost)
+CS_ID=$((vbase + 1)) # clean-shutdown sentinel (flushed on SIGTERM -> survives)
+
+# --- kill-loss: an acked-but-unflushed row is lost on SIGKILL ---
+"${VBQ[@]}" -c "insert into demo.trips (trip_id, city, distance_km, fare, ts) values ($KL_ID, 'E2E KillLoss', 1.0, 1.0, TIMESTAMP '2026-07-06 00:00:00')" >/dev/null \
+  || fail "kill-loss INSERT failed"
+assert_eq "unflushed acked row readable on the buffering server (union view)" "1" \
+  "$("${VBQ[@]}" -c "select count(*) from demo.trips where trip_id = $KL_ID")"
+assert_eq "unflushed acked row NOT yet committed (invisible to the sync server)" "0" \
+  "$(q "select count(*) from demo.trips where trip_id = $KL_ID")"
+vpid=$(cat "$VBUF_PID_FILE")
+kill -9 "$vpid" 2>/dev/null || fail "could not SIGKILL buffered durability server"
+for _ in $(seq 1 20); do kill -0 "$vpid" 2>/dev/null || break; sleep 0.25; done
+kill -0 "$vpid" 2>/dev/null && fail "buffered durability server survived SIGKILL"
+rm -f "$VBUF_PID_FILE"
+vbuf_start
+assert_eq "unflushed acked row LOST after the unclean kill (durability contract is real)" "0" \
+  "$("${VBQ[@]}" -c "select count(*) from demo.trips where trip_id = $KL_ID")"
+pass "kill-loss: an acked-but-unflushed write is genuinely lost on SIGKILL"
+
+# --- clean-shutdown-flush: an acked-but-unflushed row survives a graceful stop ---
+"${VBQ[@]}" -c "insert into demo.trips (trip_id, city, distance_km, fare, ts) values ($CS_ID, 'E2E CleanFlush', 1.0, 1.0, TIMESTAMP '2026-07-06 00:00:00')" >/dev/null \
+  || fail "clean-flush INSERT failed"
+assert_eq "clean-flush row is unflushed pre-SIGTERM (invisible to the sync server)" "0" \
+  "$(q "select count(*) from demo.trips where trip_id = $CS_ID")"
+vpid=$(cat "$VBUF_PID_FILE")
+kill -TERM "$vpid" 2>/dev/null || fail "could not SIGTERM buffered durability server"
+for _ in $(seq 1 120); do kill -0 "$vpid" 2>/dev/null || break; sleep 0.25; done
+if kill -0 "$vpid" 2>/dev/null; then kill -9 "$vpid" 2>/dev/null; fail "server did not exit within 30s of SIGTERM"; fi
+rm -f "$VBUF_PID_FILE"
+grep -q "flushing write buffer before clean shutdown" "$VBUF_LOG" \
+  || fail "clean shutdown did not attempt a buffer flush (log: $VBUF_LOG)"
+grep -q "write buffer flushed on shutdown; no acked rows lost" "$VBUF_LOG" \
+  || fail "shutdown flush did not report success (log: $VBUF_LOG)"
+pass "clean SIGTERM flushed the buffer before exit (log confirms)"
+assert_eq "clean-flush row COMMITTED to the lake by the shutdown flush (sync server sees it)" "1" \
+  "$(q "select count(*) from demo.trips where trip_id = $CS_ID")"
+vbuf_start
+assert_eq "clean-flush row survives the restart (durably in Iceberg)" "1" \
+  "$("${VBQ[@]}" -c "select count(*) from demo.trips where trip_id = $CS_ID")"
+pass "clean-shutdown-flush: an acked-but-unflushed write survives a graceful stop"
+stop_pidfile_generic "$VBUF_PID_FILE"
 
 # ---------------------------------------------------------------------------
 log "all assertions passed ($PASS_COUNT)"

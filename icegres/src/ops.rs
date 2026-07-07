@@ -237,6 +237,7 @@ const IDLE_POLL: Duration = Duration::from_millis(250);
 /// With `idle_secs = Some(n)` the loop exits cleanly (`Ok(())`) once there
 /// have been zero client connections for `n` consecutive seconds (boot
 /// counts); with `None` it runs forever.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_custom(
     ctx: Arc<SessionContext>,
     host: &str,
@@ -246,6 +247,10 @@ pub async fn serve_custom(
     auth: Option<Arc<dyn AuthSource>>,
     hooks: Vec<Arc<dyn QueryHook>>,
     txn_registry: Arc<TxnRegistry>,
+    // When buffered-write mode is on, flush the buffer on graceful shutdown so
+    // a clean stop (rolling deploy) loses NO acked rows — only an unclean kill
+    // does, which is the documented durability contract.
+    write_buffer: Option<Arc<crate::buffer::WriteBuffer>>,
 ) -> Result<()> {
     let addr = format!("{host}:{port}");
     let listener = TcpListener::bind(&addr)
@@ -337,6 +342,24 @@ pub async fn serve_custom(
             sig = shutdown_signal() => {
                 info!(signal = %sig, "shutdown signal received; draining in-flight connections");
                 drain_connections(&active).await;
+                // Drain finished (no in-flight INSERT can still be buffering),
+                // so flush the write buffer: a clean shutdown must not lose the
+                // acked-but-uncommitted rows the durability contract only
+                // permits an UNCLEAN kill to drop.
+                if let Some(buf) = &write_buffer {
+                    if buf.has_pending() {
+                        info!("flushing write buffer before clean shutdown");
+                        match buf.flush_now().await {
+                            Ok(()) => info!(
+                                "write buffer flushed on shutdown; no acked rows lost"
+                            ),
+                            Err(e) => warn!(
+                                "write-buffer flush on shutdown FAILED; up to the last \
+                                 cadence of acked rows may be lost: {e:#}"
+                            ),
+                        }
+                    }
+                }
                 return Ok(());
             }
         }

@@ -126,95 +126,40 @@ pub struct Overlay {
     pub batches: Vec<RecordBatch>,
 }
 
-/// Shared in-memory write buffer + its flush machinery. Constructed once
-/// per server when `--write-buffer-ms > 0`; `spawn_flusher` starts the
-/// background group-commit task.
-pub struct WriteBuffer {
-    catalog: Arc<dyn Catalog>,
-    engine: Arc<OverwriteEngine>,
-    interval: Duration,
-    max_rows: usize,
+/// The pure in-memory buffer bookkeeping — the union-read state machine
+/// (pending rows, flushed-but-maybe-unobserved generations) with NO catalog
+/// or engine dependency, so its correctness (the flush race is the one truly
+/// subtle property here) is unit-testable offline. `WriteBuffer` owns one of
+/// these and adds the catalog I/O (schema load, group commit) around it.
+#[derive(Default)]
+struct BufferState {
     tables: StdMutex<HashMap<TableIdent, TableBuf>>,
-    /// Serializes flushes (background cadence vs. forced fences).
-    flush_lock: tokio::sync::Mutex<()>,
-    /// Wakes the flusher early when `max_rows` is hit.
-    kick: tokio::sync::Notify,
 }
 
-impl WriteBuffer {
-    pub fn new(catalog: Arc<dyn Catalog>, engine: Arc<OverwriteEngine>, interval_ms: u64) -> Self {
-        let max_rows = std::env::var("ICEGRES_WRITE_BUFFER_MAX_ROWS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or(DEFAULT_MAX_ROWS);
-        Self {
-            catalog,
-            engine,
-            interval: Duration::from_millis(interval_ms),
-            max_rows,
-            tables: StdMutex::new(HashMap::new()),
-            flush_lock: tokio::sync::Mutex::new(()),
-            kick: tokio::sync::Notify::new(),
-        }
+impl BufferState {
+    fn contains(&self, ident: &TableIdent) -> bool {
+        self.tables
+            .lock()
+            .expect("write-buffer lock poisoned")
+            .contains_key(ident)
     }
 
-    pub fn max_rows(&self) -> usize {
-        self.max_rows
-    }
-
-    /// Start the background group-commit task: flush every `interval`, or
-    /// immediately when kicked by a threshold-crossing insert. A flush
-    /// failure (catalog down, ...) is logged loudly and the rows STAY
-    /// buffered — they retry on the next tick and remain readable through
-    /// the union view meanwhile.
-    pub fn spawn_flusher(self: &Arc<Self>) {
-        let buf = self.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = tokio::time::sleep(buf.interval) => {}
-                    _ = buf.kick.notified() => {}
-                }
-                if let Err(e) = buf.flush_now().await {
-                    tracing::error!(
-                        "write-buffer flush FAILED (rows stay buffered and readable on this \
-                         server; retrying next tick): {e:#}"
-                    );
-                }
-            }
-        });
-    }
-
-    /// Buffer aligned `batches` for `ident`; the INSERT is acked as soon as
-    /// this returns. Returns the number of buffered rows.
-    async fn buffer_insert(&self, ident: &TableIdent, batches: Vec<RecordBatch>) -> Result<usize> {
-        // First touch of a table: capture its canonical Arrow schema (one
-        // catalog load); afterwards inserts are pure in-memory appends.
-        let need_schema = {
-            let tables = self.tables.lock().expect("write-buffer lock poisoned");
-            !tables.contains_key(ident)
-        };
-        let schema = if need_schema {
-            let table = self
-                .catalog
-                .load_table(ident)
-                .await
-                .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?;
-            Some(Arc::new(
-                schema_to_arrow_schema(table.metadata().current_schema())
-                    .map_err(|e| anyhow!("schema conversion failed for {ident}: {e}"))?,
-            ))
-        } else {
-            None
-        };
+    /// Align `batches` to the table's canonical schema and append them to its
+    /// pending buffer, creating the entry from `schema_if_first` on first
+    /// touch. Returns `(rows_appended, pending_rows_total)`.
+    fn append(
+        &self,
+        ident: &TableIdent,
+        schema_if_first: Option<ArrowSchemaRef>,
+        batches: &[RecordBatch],
+    ) -> Result<(usize, usize)> {
         let mut tables = self.tables.lock().expect("write-buffer lock poisoned");
         if !tables.contains_key(ident) {
-            // Entries are never removed, so reaching here implies this call
-            // loaded the schema above (a racing first insert may have won
-            // the map entry, in which case contains_key is now true).
-            let schema =
-                schema.ok_or_else(|| anyhow!("write-buffer schema for {ident} disappeared"))?;
+            // Entries are never removed, so reaching here implies the caller
+            // loaded the schema (a racing first insert may have won the entry,
+            // in which case contains_key is now true and we skip this).
+            let schema = schema_if_first
+                .ok_or_else(|| anyhow!("write-buffer schema for {ident} disappeared"))?;
             tables.insert(
                 ident.clone(),
                 TableBuf {
@@ -233,22 +178,49 @@ impl WriteBuffer {
         let rows: usize = aligned.iter().map(|b| b.num_rows()).sum();
         entry.pending.extend(aligned);
         entry.pending_rows += rows;
-        if entry.pending_rows >= self.max_rows {
-            self.kick.notify_one();
-        }
-        Ok(rows)
+        Ok((rows, entry.pending_rows))
     }
 
-    /// The union overlay for one table against the committed metadata a
-    /// scan just loaded: all pending rows plus committed generations that
-    /// metadata cannot see yet. `None` when there is nothing to add
-    /// (fast path — scans are unchanged when the buffer is idle).
-    pub fn overlay(&self, ident: &TableIdent, metadata: &TableMetadata) -> Option<Overlay> {
+    fn has_pending(&self) -> bool {
+        let tables = self.tables.lock().expect("write-buffer lock poisoned");
+        tables.values().any(|t| !t.pending.is_empty())
+    }
+
+    /// Idents with pending rows (flush work list).
+    fn pending_idents(&self) -> Vec<TableIdent> {
+        let tables = self.tables.lock().expect("write-buffer lock poisoned");
+        tables
+            .iter()
+            .filter(|(_, t)| !t.pending.is_empty())
+            .map(|(ident, _)| ident.clone())
+            .collect()
+    }
+
+    /// Snapshot the current pending prefix WITHOUT removing it (rows stay
+    /// readable through the union while the commit is in flight). Returns
+    /// `(batches, batch_count)`.
+    fn snapshot_pending(&self, ident: &TableIdent) -> (Vec<RecordBatch>, usize) {
+        let tables = self.tables.lock().expect("write-buffer lock poisoned");
+        match tables.get(ident) {
+            Some(entry) => (entry.pending.clone(), entry.pending.len()),
+            None => (Vec::new(), 0),
+        }
+    }
+
+    /// The union overlay for one table: all pending rows plus every committed
+    /// generation the scan's metadata cannot see yet. `is_committed(S)` is the
+    /// caller's snapshot-membership test (real code: does the just-loaded
+    /// metadata contain `S`?). `None` when there is nothing to add.
+    fn overlay_with(
+        &self,
+        ident: &TableIdent,
+        is_committed: impl Fn(i64) -> bool,
+    ) -> Option<Overlay> {
         let tables = self.tables.lock().expect("write-buffer lock poisoned");
         let entry = tables.get(ident)?;
         let mut batches: Vec<RecordBatch> = entry.pending.clone();
         for flushed_gen in &entry.flushed {
-            if metadata.snapshot_by_id(flushed_gen.snapshot_id).is_none() {
+            if !is_committed(flushed_gen.snapshot_id) {
                 batches.extend(flushed_gen.batches.iter().cloned());
             }
         }
@@ -259,111 +231,6 @@ impl WriteBuffer {
             schema: entry.schema.clone(),
             batches,
         })
-    }
-
-    /// Synchronously flush every table's pending rows (ordering fence /
-    /// background tick body). Serialized by `flush_lock`.
-    pub async fn flush_now(&self) -> Result<()> {
-        let _guard = self.flush_lock.lock().await;
-        self.gc_flushed();
-        let idents: Vec<TableIdent> = {
-            let tables = self.tables.lock().expect("write-buffer lock poisoned");
-            tables
-                .iter()
-                .filter(|(_, t)| !t.pending.is_empty())
-                .map(|(ident, _)| ident.clone())
-                .collect()
-        };
-        let mut first_err: Option<anyhow::Error> = None;
-        for ident in idents {
-            if let Err(e) = self.flush_table(&ident).await {
-                tracing::error!(table = %ident, "write-buffer flush failed: {e:#}");
-                first_err.get_or_insert(e);
-            }
-        }
-        match first_err {
-            None => Ok(()),
-            Some(e) => Err(e),
-        }
-    }
-
-    /// Whether any pending rows exist (cheap check for the fence path).
-    pub fn has_pending(&self) -> bool {
-        let tables = self.tables.lock().expect("write-buffer lock poisoned");
-        tables.values().any(|t| !t.pending.is_empty())
-    }
-
-    /// Group-commit one table's pending rows as ONE snapshot, with bounded
-    /// optimistic-concurrency retries (fresh metadata per attempt, exactly
-    /// like autocommit INSERT).
-    async fn flush_table(&self, ident: &TableIdent) -> Result<()> {
-        let mut conflicts: Vec<String> = Vec::new();
-        for attempt in 1..=MAX_COMMIT_ATTEMPTS {
-            // Snapshot the current pending prefix WITHOUT removing it: the
-            // rows must stay readable through the union view while the
-            // commit is in flight. New inserts append behind the prefix.
-            let (batches, n_batches) = {
-                let tables = self.tables.lock().expect("write-buffer lock poisoned");
-                let Some(entry) = tables.get(ident) else {
-                    return Ok(());
-                };
-                (entry.pending.clone(), entry.pending.len())
-            };
-            if n_batches == 0 {
-                return Ok(());
-            }
-            let table = self
-                .catalog
-                .load_table(ident)
-                .await
-                .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?;
-            let pk = self.engine.pk_columns(&table)?;
-            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-            let ops = [TableOp::Append(batches)];
-            let Some(prepared) = prepare_commit(&table, &ops, pk.as_deref(), self.engine.branch())
-                .await
-                .map_err(|e| anyhow!("buffered flush of {ident} failed to prepare: {e:#}"))?
-            else {
-                // Zero net rows (shouldn't happen for a non-empty append
-                // list, but handle it: drop the prefix, nothing to commit).
-                self.drop_pending_prefix(ident, n_batches);
-                return Ok(());
-            };
-            let snapshot_id = prepared.snapshot_id();
-            // Tag the prefix as flushed(S) BEFORE posting: see the module
-            // docs for why this ordering makes the union race-free.
-            self.move_pending_to_flushed(ident, n_batches, snapshot_id);
-            match self.engine.post_prepared(ident, &prepared).await {
-                Ok(CommitOutcome::Committed) => {
-                    tracing::debug!(
-                        table = %ident,
-                        rows,
-                        snapshot_id,
-                        attempt,
-                        "write-buffer flushed (group commit)"
-                    );
-                    return Ok(());
-                }
-                Ok(CommitOutcome::Conflict(msg)) => {
-                    tracing::warn!(
-                        table = %ident,
-                        attempt,
-                        "buffered flush conflict (409), retrying from fresh metadata: {msg}"
-                    );
-                    self.move_flushed_back_to_pending(ident, snapshot_id);
-                    conflicts.push(msg);
-                }
-                Err(e) => {
-                    self.move_flushed_back_to_pending(ident, snapshot_id);
-                    return Err(e);
-                }
-            }
-        }
-        Err(anyhow!(
-            "buffered flush of {ident} lost the optimistic-concurrency race \
-             {MAX_COMMIT_ATTEMPTS} times; rows stay buffered for the next tick. Conflicts: {}",
-            conflicts.join(" | ")
-        ))
     }
 
     fn drop_pending_prefix(&self, ident: &TableIdent, n_batches: usize) {
@@ -410,16 +277,209 @@ impl WriteBuffer {
         }
     }
 
+    /// Drop flushed generations for which `keep` returns false.
+    fn retain_flushed(&self, keep: impl Fn(&FlushedGen) -> bool) {
+        let mut tables = self.tables.lock().expect("write-buffer lock poisoned");
+        for entry in tables.values_mut() {
+            entry.flushed.retain(&keep);
+        }
+    }
+}
+
+/// Shared in-memory write buffer + its flush machinery. Constructed once
+/// per server when `--write-buffer-ms > 0`; `spawn_flusher` starts the
+/// background group-commit task.
+pub struct WriteBuffer {
+    catalog: Arc<dyn Catalog>,
+    engine: Arc<OverwriteEngine>,
+    interval: Duration,
+    max_rows: usize,
+    state: BufferState,
+    /// Serializes flushes (background cadence vs. forced fences).
+    flush_lock: tokio::sync::Mutex<()>,
+    /// Wakes the flusher early when `max_rows` is hit.
+    kick: tokio::sync::Notify,
+}
+
+impl WriteBuffer {
+    pub fn new(catalog: Arc<dyn Catalog>, engine: Arc<OverwriteEngine>, interval_ms: u64) -> Self {
+        let max_rows = std::env::var("ICEGRES_WRITE_BUFFER_MAX_ROWS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_MAX_ROWS);
+        Self {
+            catalog,
+            engine,
+            interval: Duration::from_millis(interval_ms),
+            max_rows,
+            state: BufferState::default(),
+            flush_lock: tokio::sync::Mutex::new(()),
+            kick: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub fn max_rows(&self) -> usize {
+        self.max_rows
+    }
+
+    /// Start the background group-commit task: flush every `interval`, or
+    /// immediately when kicked by a threshold-crossing insert. A flush
+    /// failure (catalog down, ...) is logged loudly and the rows STAY
+    /// buffered — they retry on the next tick and remain readable through
+    /// the union view meanwhile.
+    pub fn spawn_flusher(self: &Arc<Self>) {
+        let buf = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(buf.interval) => {}
+                    _ = buf.kick.notified() => {}
+                }
+                if let Err(e) = buf.flush_now().await {
+                    tracing::error!(
+                        "write-buffer flush FAILED (rows stay buffered and readable on this \
+                         server; retrying next tick): {e:#}"
+                    );
+                }
+            }
+        });
+    }
+
+    /// Buffer aligned `batches` for `ident`; the INSERT is acked as soon as
+    /// this returns. Returns the number of buffered rows.
+    async fn buffer_insert(&self, ident: &TableIdent, batches: Vec<RecordBatch>) -> Result<usize> {
+        // First touch of a table: capture its canonical Arrow schema (one
+        // catalog load); afterwards inserts are pure in-memory appends.
+        let schema_if_first = if self.state.contains(ident) {
+            None
+        } else {
+            let table = self
+                .catalog
+                .load_table(ident)
+                .await
+                .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?;
+            Some(Arc::new(
+                schema_to_arrow_schema(table.metadata().current_schema())
+                    .map_err(|e| anyhow!("schema conversion failed for {ident}: {e}"))?,
+            ))
+        };
+        let (rows, pending_total) = self.state.append(ident, schema_if_first, &batches)?;
+        if pending_total >= self.max_rows {
+            self.kick.notify_one();
+        }
+        Ok(rows)
+    }
+
+    /// The union overlay for one table against the committed metadata a
+    /// scan just loaded: all pending rows plus committed generations that
+    /// metadata cannot see yet. `None` when there is nothing to add
+    /// (fast path — scans are unchanged when the buffer is idle).
+    pub fn overlay(&self, ident: &TableIdent, metadata: &TableMetadata) -> Option<Overlay> {
+        // A generation `S` is "committed" (and so already in the scan's data)
+        // exactly when the just-loaded metadata contains it.
+        self.state
+            .overlay_with(ident, |s| metadata.snapshot_by_id(s).is_some())
+    }
+
+    /// Synchronously flush every table's pending rows (ordering fence /
+    /// background tick body). Serialized by `flush_lock`.
+    pub async fn flush_now(&self) -> Result<()> {
+        let _guard = self.flush_lock.lock().await;
+        self.gc_flushed();
+        let idents = self.state.pending_idents();
+        let mut first_err: Option<anyhow::Error> = None;
+        for ident in idents {
+            if let Err(e) = self.flush_table(&ident).await {
+                tracing::error!(table = %ident, "write-buffer flush failed: {e:#}");
+                first_err.get_or_insert(e);
+            }
+        }
+        match first_err {
+            None => Ok(()),
+            Some(e) => Err(e),
+        }
+    }
+
+    /// Whether any pending rows exist (cheap check for the fence path).
+    pub fn has_pending(&self) -> bool {
+        self.state.has_pending()
+    }
+
+    /// Group-commit one table's pending rows as ONE snapshot, with bounded
+    /// optimistic-concurrency retries (fresh metadata per attempt, exactly
+    /// like autocommit INSERT).
+    async fn flush_table(&self, ident: &TableIdent) -> Result<()> {
+        let mut conflicts: Vec<String> = Vec::new();
+        for attempt in 1..=MAX_COMMIT_ATTEMPTS {
+            // Snapshot the current pending prefix WITHOUT removing it: the
+            // rows must stay readable through the union view while the
+            // commit is in flight. New inserts append behind the prefix.
+            let (batches, n_batches) = self.state.snapshot_pending(ident);
+            if n_batches == 0 {
+                return Ok(());
+            }
+            let table = self
+                .catalog
+                .load_table(ident)
+                .await
+                .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?;
+            let pk = self.engine.pk_columns(&table)?;
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            let ops = [TableOp::Append(batches)];
+            let Some(prepared) = prepare_commit(&table, &ops, pk.as_deref(), self.engine.branch())
+                .await
+                .map_err(|e| anyhow!("buffered flush of {ident} failed to prepare: {e:#}"))?
+            else {
+                // Zero net rows (shouldn't happen for a non-empty append
+                // list, but handle it: drop the prefix, nothing to commit).
+                self.state.drop_pending_prefix(ident, n_batches);
+                return Ok(());
+            };
+            let snapshot_id = prepared.snapshot_id();
+            // Tag the prefix as flushed(S) BEFORE posting: see the module
+            // docs for why this ordering makes the union race-free.
+            self.state
+                .move_pending_to_flushed(ident, n_batches, snapshot_id);
+            match self.engine.post_prepared(ident, &prepared).await {
+                Ok(CommitOutcome::Committed) => {
+                    tracing::debug!(
+                        table = %ident,
+                        rows,
+                        snapshot_id,
+                        attempt,
+                        "write-buffer flushed (group commit)"
+                    );
+                    return Ok(());
+                }
+                Ok(CommitOutcome::Conflict(msg)) => {
+                    tracing::warn!(
+                        table = %ident,
+                        attempt,
+                        "buffered flush conflict (409), retrying from fresh metadata: {msg}"
+                    );
+                    self.state.move_flushed_back_to_pending(ident, snapshot_id);
+                    conflicts.push(msg);
+                }
+                Err(e) => {
+                    self.state.move_flushed_back_to_pending(ident, snapshot_id);
+                    return Err(e);
+                }
+            }
+        }
+        Err(anyhow!(
+            "buffered flush of {ident} lost the optimistic-concurrency race \
+             {MAX_COMMIT_ATTEMPTS} times; rows stay buffered for the next tick. Conflicts: {}",
+            conflicts.join(" | ")
+        ))
+    }
+
     /// Drop flushed generations old enough that no scan can still need them
     /// (module docs: the metadata-load -> overlay-take window inside one
     /// scan is microseconds; FLUSHED_GC is 30 s).
     fn gc_flushed(&self) {
-        let mut tables = self.tables.lock().expect("write-buffer lock poisoned");
-        for entry in tables.values_mut() {
-            entry
-                .flushed
-                .retain(|g| g.committed_at.elapsed() < FLUSHED_GC);
-        }
+        self.state
+            .retain_flushed(|g| g.committed_at.elapsed() < FLUSHED_GC);
     }
 }
 
@@ -554,5 +614,187 @@ impl QueryHook for BufferHook {
     ) -> Option<PgWireResult<Response>> {
         self.dispatch(statement, session_context, client, Some(params))
             .await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests — the union-read state machine (BufferState).
+//
+// These exercise the one genuinely subtle property of buffered mode: a scan
+// must see every buffered row EXACTLY once regardless of where the flusher is
+// (idle, mid-commit, just-conflicted). BufferState has no catalog/engine
+// dependency, so the whole flush race is testable offline with hand-built
+// batches and a closure standing in for the "is this snapshot in the metadata
+// the scan just loaded?" test.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    fn schema() -> ArrowSchemaRef {
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
+    }
+
+    fn ident() -> TableIdent {
+        TableIdent::from_strs(["demo", "t"]).unwrap()
+    }
+
+    fn batch(sch: &ArrowSchemaRef, vals: &[i64]) -> RecordBatch {
+        RecordBatch::try_new(sch.clone(), vec![Arc::new(Int64Array::from(vals.to_vec()))]).unwrap()
+    }
+
+    /// Flatten an overlay's batches into the id column, in order.
+    fn ids(ov: &Overlay) -> Vec<i64> {
+        let mut out = Vec::new();
+        for b in &ov.batches {
+            let col = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id column is Int64");
+            out.extend(col.values().iter().copied());
+        }
+        out
+    }
+
+    // Overlay of pending rows always includes them: nothing is committed yet.
+    #[test]
+    fn overlay_sees_all_pending() {
+        let st = BufferState::default();
+        let sch = schema();
+        let (rows, total) = st
+            .append(&ident(), Some(sch.clone()), &[batch(&sch, &[1, 2, 3])])
+            .unwrap();
+        assert_eq!((rows, total), (3, 3));
+        assert!(st.has_pending());
+        let ov = st
+            .overlay_with(&ident(), |_| false)
+            .expect("pending rows present");
+        assert_eq!(ids(&ov), vec![1, 2, 3]);
+    }
+
+    // The flush race: once the prefix is tagged flushed(S), a scan whose
+    // metadata already contains S must NOT re-add those rows (the committed
+    // scan has them) — but a scan whose metadata predates S MUST see them via
+    // the flushed generation, so no row is ever lost mid-commit.
+    #[test]
+    fn flushed_generation_excluded_iff_metadata_sees_it() {
+        let st = BufferState::default();
+        let sch = schema();
+        st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[1, 2])])
+            .unwrap();
+        let (_batches, n) = st.snapshot_pending(&ident());
+        assert_eq!(n, 1); // one batch
+        let s: i64 = 4242;
+        st.move_pending_to_flushed(&ident(), n, s);
+        // No pending rows left; the rows now live only in flushed(S).
+        assert!(!st.has_pending());
+        // Scan whose metadata already contains S: committed scan has the rows,
+        // so the overlay must add NOTHING.
+        assert!(st.overlay_with(&ident(), |x| x == s).is_none());
+        // Scan whose metadata predates S: the committed scan lacks the rows,
+        // so the overlay must supply them from the flushed generation.
+        let ov = st
+            .overlay_with(&ident(), |_| false)
+            .expect("unseen flushed gen");
+        assert_eq!(ids(&ov), vec![1, 2]);
+    }
+
+    // A conflicted/failed post moves the flushed generation BACK to the FRONT
+    // of pending, preserving insert order relative to rows appended meanwhile,
+    // and never enters the catalog — so the rows stay readable throughout.
+    #[test]
+    fn conflict_restores_pending_order_at_front() {
+        let st = BufferState::default();
+        let sch = schema();
+        // Buffer A=[1], B=[2] -> pending [A,B].
+        st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[1])])
+            .unwrap();
+        st.append(&ident(), None, &[batch(&sch, &[2])]).unwrap();
+        let (_b, n) = st.snapshot_pending(&ident());
+        assert_eq!(n, 2);
+        let s: i64 = 99;
+        st.move_pending_to_flushed(&ident(), n, s);
+        // A new insert C=[3] lands while the commit is "in flight".
+        st.append(&ident(), None, &[batch(&sch, &[3])]).unwrap();
+        // Commit conflicts: restore the flushed prefix to the front.
+        st.move_flushed_back_to_pending(&ident(), s);
+        // Row accounting and order: [1,2] restored ahead of [3].
+        let ov = st.overlay_with(&ident(), |_| false).expect("rows present");
+        assert_eq!(ids(&ov), vec![1, 2, 3]);
+        // And with the (now-abandoned) S considered committed, the flushed gen
+        // is gone from flushed (it was moved back), so all three are pending.
+        let ov2 = st.overlay_with(&ident(), |x| x == s).expect("rows present");
+        assert_eq!(ids(&ov2), vec![1, 2, 3]);
+    }
+
+    // Dropping the committed prefix (the zero-net-rows / success bookkeeping)
+    // removes exactly those rows and their row count.
+    #[test]
+    fn drop_prefix_removes_committed_rows() {
+        let st = BufferState::default();
+        let sch = schema();
+        st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[1, 2, 3])])
+            .unwrap();
+        let (_b, n) = st.snapshot_pending(&ident());
+        st.drop_pending_prefix(&ident(), n);
+        assert!(!st.has_pending());
+        assert!(st.overlay_with(&ident(), |_| false).is_none());
+    }
+
+    // GC drops flushed generations by predicate (real code: older than
+    // FLUSHED_GC). A kept generation still overlays for pre-S scans.
+    #[test]
+    fn retain_flushed_by_predicate() {
+        let st = BufferState::default();
+        let sch = schema();
+        st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[7])])
+            .unwrap();
+        let (_b, n) = st.snapshot_pending(&ident());
+        let s: i64 = 5;
+        st.move_pending_to_flushed(&ident(), n, s);
+        // Keep-everything predicate: generation survives, still overlays.
+        st.retain_flushed(|_| true);
+        assert_eq!(ids(&st.overlay_with(&ident(), |_| false).unwrap()), vec![7]);
+        // Drop-everything predicate (stands in for "too old"): gone.
+        st.retain_flushed(|_| false);
+        assert!(st.overlay_with(&ident(), |_| false).is_none());
+    }
+
+    // pending_idents reports only tables with pending rows; moving to flushed
+    // clears a table from the flush work list.
+    #[test]
+    fn pending_idents_tracks_flush_worklist() {
+        let st = BufferState::default();
+        let sch = schema();
+        assert!(st.pending_idents().is_empty());
+        st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[1])])
+            .unwrap();
+        assert_eq!(st.pending_idents(), vec![ident()]);
+        let (_b, n) = st.snapshot_pending(&ident());
+        st.move_pending_to_flushed(&ident(), n, 1);
+        assert!(st.pending_idents().is_empty()); // pending drained into flushed
+    }
+
+    // Row-count accounting survives a move-out then move-back round trip.
+    #[test]
+    fn row_accounting_survives_roundtrip() {
+        let st = BufferState::default();
+        let sch = schema();
+        let (_r, total0) = st
+            .append(&ident(), Some(sch.clone()), &[batch(&sch, &[1, 2, 3])])
+            .unwrap();
+        assert_eq!(total0, 3);
+        let (_b, n) = st.snapshot_pending(&ident());
+        st.move_pending_to_flushed(&ident(), n, 1);
+        // Appending after the move must not corrupt the count.
+        let (_r2, total1) = st.append(&ident(), None, &[batch(&sch, &[4])]).unwrap();
+        assert_eq!(total1, 1); // only the new row is pending
+        st.move_flushed_back_to_pending(&ident(), 1);
+        // Back to 4 pending rows, in order.
+        let ov = st.overlay_with(&ident(), |_| false).unwrap();
+        assert_eq!(ids(&ov), vec![1, 2, 3, 4]);
     }
 }
