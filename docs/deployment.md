@@ -81,7 +81,15 @@ Enable the HTTP side-channel with `--health-port <port>` (env
 |---|---|---|
 | `/health` (and any other path) | **Liveness** — the process is up and the listener is bound. Does NOT touch the catalog. | `200 ok` |
 | `/ready`, `/readyz` | **Readiness** — a bounded `list_namespaces` round-trip to the catalog (3 s timeout). | `200 ready` / `503 not ready` |
-| `/metrics` | Prometheus text exposition. | `icegres_queries_total`, `icegres_connections_total`, `icegres_connections_active`, `icegres_commit_conflicts_total` |
+| `/metrics` | Prometheus text exposition. | `icegres_queries_total`, `icegres_connections_total`, `icegres_connections_active`, `icegres_commit_conflicts_total`, `icegres_queries_in_flight` (gauge), `icegres_queries_slow_total`, `icegres_query_duration_ms_total` |
+
+Query observability: every connection is wrapped in a `conn` correlation span
+(id + peer) so concurrent-connection logs de-multiplex, and each query is
+timed — one exceeding `ICEGRES_SLOW_QUERY_MS` (default 1000; `0` disables)
+logs a slow-query WARN (kind + duration + connection) and bumps
+`icegres_queries_slow_total`. `icegres_queries_in_flight` is the live
+concurrency; if it stays high while qps is low, queries are stuck, and a
+forced shutdown logs each still-running query by kind + age.
 
 Kubernetes example — liveness must NOT depend on the catalog (a catalog blip
 should not restart healthy pods), readiness pulls a pod out of rotation when
@@ -174,7 +182,8 @@ pass `--insecure`. In production always enable auth.
 | Authentication | `--auth-file` / `ICEGRES_AUTH_FILE` | SCRAM-SHA-256 against a `user:password` file. Without it the server is permissive and logs a `WARN`. |
 | Authorization (ReBAC) | `--authz-file` / `ICEGRES_AUTHZ_FILE` | Lakekeeper-style read/write/drop/own grants gate every statement (`42501` on deny), enforced identically on pgwire AND Flight SQL. Requires `--auth-file`. Part of the `managed` build feature. |
 | TLS (pgwire) | `--tls-cert` / `--tls-key` | rustls; clients opt in with `sslmode=require`/`verify-full`. Any TLS setup error aborts startup (no silent plaintext fallback). |
-| TLS (Flight SQL) | terminate-in-front | Run behind a TLS-terminating gRPC proxy; in-process Flight TLS is not wired against the pinned tonic 0.14 stack. |
+| TLS (Flight SQL) | `flight-serve --tls-cert`/`--tls-key` | In-process TLS (same rustls stack as pgwire, `h2` ALPN); `grpc+tls://` clients connect directly. A front proxy still works if preferred. |
+| Auth brute-force | per-IP backoff (automatic) | With `--auth-file`, repeated bad credentials from an IP get an escalating delay; failures decay after 60 s. No config. |
 | Remote-bind guard | `--insecure` | Required to bind `0.0.0.0` with auth off. Do not set it in production. |
 
 Mount credential/policy files read-only (`-v /etc/icegres:/etc/icegres:ro`) and

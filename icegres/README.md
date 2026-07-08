@@ -144,10 +144,20 @@ environment variables:
 |  | `ICEGRES_TXN_STRICT` | off | Refuse any multi-table `COMMIT` up front with `0A000` (nothing applied), guaranteeing every COMMIT is all-or-nothing. Off = best-effort ordered per-table commits (a partial apply reports `40003`, not the retryable `40001`). |
 
 Logging uses `tracing` with an env filter: `RUST_LOG=debug icegres serve`.
-Other GA operational env vars (memory pool `ICEGRES_MEMORY_LIMIT_MB`,
-connection cap `ICEGRES_MAX_CONNECTIONS`, catalog timeout/retry
-`ICEGRES_CATALOG_TIMEOUT_MS`/`_RETRIES`, `/metrics` on `--health-port`,
-`ICEGRES_LOG_FORMAT=json`) are set the same way.
+Every connection runs inside a correlation span (`conn` id + peer) so
+interleaved concurrent-connection logs de-multiplex, and each query is timed:
+one over `ICEGRES_SLOW_QUERY_MS` (default 1000; `0` disables) logs a slow-query
+WARN and increments `icegres_queries_slow_total`. Other GA operational env vars
+(memory pool `ICEGRES_MEMORY_LIMIT_MB`, connection cap
+`ICEGRES_MAX_CONNECTIONS`, catalog timeout/retry
+`ICEGRES_CATALOG_TIMEOUT_MS`/`_RETRIES`, `/metrics` on `--health-port` —
+including `icegres_queries_in_flight`/`_slow_total`/`_query_duration_ms_total`,
+`ICEGRES_LOG_FORMAT=json`) are set the same way. When `--auth-file` is set, a
+per-source-IP **failed-auth backoff** slows credential brute-forcing (failures
+decay after 60 s; a successful login is never delayed beyond the current
+penalty). The **Flight SQL** listener now supports in-process TLS via
+`flight-serve --tls-cert/--tls-key` (advertises the `h2` ALPN; `grpc+tls://`
+clients connect directly, no front proxy needed).
 
 ### Authentication (`--auth-file`)
 

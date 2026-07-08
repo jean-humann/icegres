@@ -44,12 +44,14 @@
 //! against the stored SCRAM verifier (pgauth.rs — cleartext is never kept in
 //! memory) and answers with a per-boot random `Bearer` token that every
 //! subsequent RPC must present. NOTE the trade-off vs pgwire SCRAM: basic
-//! auth sends the password itself, so run flight-serve behind TLS or on a
-//! trusted network. TLS termination is NOT built into the listener (tonic's
-//! TLS stack would add a second rustls config surface); terminate TLS in
-//! front (nginx/envoy grpc_pass, or any gRPC-aware LB) — the ADBC driver
-//! supports `grpc+tls://`. Without `--auth-file` the endpoint is permissive
-//! (any/no credentials accepted) and logs the same startup WARN as pgwire.
+//! auth sends the password itself, so pair it with TLS. In-process TLS is now
+//! built in: `--tls-cert`/`--tls-key` terminate TLS with the same rustls stack
+//! as pgwire (advertising the `h2` ALPN so gRPC negotiates HTTP/2), so the ADBC
+//! `grpc+tls://` client authenticates over an encrypted channel with no front
+//! proxy required; a bad cert/key aborts startup rather than downgrading. You
+//! may still terminate TLS in front (nginx/envoy grpc_pass) if you prefer.
+//! Without `--auth-file` the endpoint is permissive (any/no credentials
+//! accepted) and logs the same startup WARN as pgwire.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -1084,8 +1086,21 @@ pub async fn run(
     port: u16,
     auth_file: Option<PathBuf>,
     authorizer: Option<SharedAuthorizer>,
+    tls: Option<(String, String)>,
 ) -> Result<()> {
     let start = std::time::Instant::now();
+    // Build the TLS acceptor up front so a bad cert/key aborts startup (no
+    // silent plaintext fallback), exactly like the pgwire listener.
+    let tls_acceptor = match &tls {
+        // gRPC is HTTP/2 over TLS: advertise the `h2` ALPN token so clients
+        // negotiate HTTP/2 instead of refusing the connection.
+        Some((cert, key)) => Some(crate::ops::build_tls_acceptor_with_alpn(
+            cert,
+            key,
+            &[b"h2"],
+        )?),
+        None => None,
+    };
     let auth: Option<Arc<dyn BasicAuthVerifier>> = match &auth_file {
         Some(path) => {
             #[cfg(feature = "managed")]
@@ -1155,27 +1170,40 @@ pub async fn run(
         .with_context(|| format!("cannot bind {addr}"))?;
     info!(
         %addr,
+        tls = tls_acceptor.is_some(),
         startup_ms = start.elapsed().as_millis() as u64,
         "flight-serve ready (Arrow Flight SQL)"
     );
 
-    Server::builder()
-        .add_service(
-            // Raise the gRPC message ceilings from tonic's 4 MB default so
-            // ADBC bulk-ingest DoPut chunks and large single-batch DoGet
-            // responses are not rejected mid-stream.
-            FlightServiceServer::new(service)
-                .max_decoding_message_size(64 * 1024 * 1024)
-                .max_encoding_message_size(64 * 1024 * 1024),
-        )
-        .serve_with_incoming_shutdown(tcp_incoming(listener), async {
-            // Drain on SIGTERM (k8s/systemd) as well as SIGINT — tonic stops
-            // accepting and lets in-flight RPCs finish before returning.
-            let sig = crate::ops::shutdown_signal().await;
-            info!(signal = %sig, "shutdown signal received; draining Flight RPCs");
-        })
-        .await
-        .context("flight sql server failed")?;
+    let svc = FlightServiceServer::new(service)
+        // Raise the gRPC message ceilings from tonic's 4 MB default so ADBC
+        // bulk-ingest DoPut chunks and large single-batch DoGet responses are
+        // not rejected mid-stream.
+        .max_decoding_message_size(64 * 1024 * 1024)
+        .max_encoding_message_size(64 * 1024 * 1024);
+    // Drain on SIGTERM (k8s/systemd) as well as SIGINT — tonic stops accepting
+    // and lets in-flight RPCs finish before returning.
+    let shutdown = async {
+        let sig = crate::ops::shutdown_signal().await;
+        info!(signal = %sig, "shutdown signal received; draining Flight RPCs");
+    };
+
+    match tls_acceptor {
+        Some(acceptor) => {
+            Server::builder()
+                .add_service(svc)
+                .serve_with_incoming_shutdown(tls_incoming(listener, acceptor), shutdown)
+                .await
+                .context("flight sql server (TLS) failed")?;
+        }
+        None => {
+            Server::builder()
+                .add_service(svc)
+                .serve_with_incoming_shutdown(tcp_incoming(listener), shutdown)
+                .await
+                .context("flight sql server failed")?;
+        }
+    }
     Ok(())
 }
 
@@ -1193,6 +1221,113 @@ fn tcp_incoming(
         });
         Some((item, listener))
     })
+}
+
+// ---------------------------------------------------------------------------
+// In-process TLS (production-readiness audit #13)
+// ---------------------------------------------------------------------------
+//
+// tonic 0.14 removed server-side TLS from `tonic::transport` (only the client
+// `Endpoint` keeps `tls_config`), so we terminate TLS ourselves with the SAME
+// rustls stack the pgwire listener uses (`ops::build_tls_acceptor`, pgwire's
+// re-exported `tokio_rustls`) and hand tonic a stream of already-handshaked
+// connections via `serve_with_incoming`. `TlsConn` is the minimal newtype that
+// makes a `TlsStream` usable as a tonic connection: it delegates the byte
+// plumbing and reports the peer address through tonic's `Connected` trait —
+// this avoids enabling tonic's own `tls-*` feature (which would pull a second
+// tokio-rustls and risk a rustls version split against the pinned matrix).
+
+use datafusion_postgres::pgwire::tokio::tokio_rustls::server::TlsStream;
+use datafusion_postgres::pgwire::tokio::TlsAcceptor;
+use std::net::SocketAddr;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tonic::transport::server::Connected;
+
+/// A TLS-terminated connection presented to tonic. Delegates all IO to the
+/// inner `TlsStream` and exposes the peer address as its `ConnectInfo`.
+struct TlsConn {
+    inner: TlsStream<tokio::net::TcpStream>,
+    remote: Option<SocketAddr>,
+}
+
+impl Connected for TlsConn {
+    type ConnectInfo = Option<SocketAddr>;
+    fn connect_info(&self) -> Self::ConnectInfo {
+        self.remote
+    }
+}
+
+impl AsyncRead for TlsConn {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for TlsConn {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Accept TCP, TLS-handshake each connection in its own task (so one slow
+/// handshake can't stall the accept loop, mirroring the pgwire per-connection
+/// model), and yield the completed `TlsConn`s to tonic. A failed handshake is
+/// logged and dropped — never surfaced as a stream error that would stop the
+/// server.
+fn tls_incoming(
+    listener: tokio::net::TcpListener,
+    acceptor: TlsAcceptor,
+) -> impl Stream<Item = std::io::Result<TlsConn>> {
+    use futures::SinkExt;
+    let (tx, rx) = futures::channel::mpsc::channel::<std::io::Result<TlsConn>>(1024);
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((tcp, peer)) => {
+                    let _ = tcp.set_nodelay(true);
+                    let acceptor = acceptor.clone();
+                    let mut tx = tx.clone();
+                    tokio::spawn(async move {
+                        match acceptor.accept(tcp).await {
+                            Ok(tls) => {
+                                let _ = tx
+                                    .send(Ok(TlsConn {
+                                        inner: tls,
+                                        remote: Some(peer),
+                                    }))
+                                    .await;
+                            }
+                            Err(e) => warn!(%peer, "Flight TLS handshake failed: {e}"),
+                        }
+                    });
+                }
+                Err(e) => {
+                    warn!("Flight accept error: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+            // tonic dropped the receiver (shutdown): stop accepting.
+            if tx.is_closed() {
+                break;
+            }
+        }
+    });
+    rx
 }
 
 #[cfg(test)]

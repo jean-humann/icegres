@@ -34,6 +34,15 @@ pub struct Metrics {
     /// COMMIT/DML attempts rejected as serialization failures (SQLSTATE 40001,
     /// first-committer-wins) — a spike means writers are colliding.
     pub commit_conflicts_total: AtomicU64,
+    /// Queries currently executing on the pgwire listener (gauge). Rises with
+    /// load; a value that stays high while qps is low points at stuck queries.
+    pub queries_in_flight: AtomicU64,
+    /// Queries whose wall-clock exceeded the slow-query threshold
+    /// (`ICEGRES_SLOW_QUERY_MS`). Each also logs a WARN with its duration.
+    pub queries_slow_total: AtomicU64,
+    /// Summed wall-clock of completed pgwire queries, in milliseconds. Divide
+    /// by `queries_total` for a rolling average latency.
+    pub query_duration_ms_total: AtomicU64,
 }
 
 /// The process-global metrics registry.
@@ -49,6 +58,9 @@ impl Metrics {
         let ct = self.connections_total.load(Ordering::Relaxed);
         let ca = self.connections_active.load(Ordering::Relaxed);
         let cc = self.commit_conflicts_total.load(Ordering::Relaxed);
+        let qif = self.queries_in_flight.load(Ordering::Relaxed);
+        let qs = self.queries_slow_total.load(Ordering::Relaxed);
+        let qd = self.query_duration_ms_total.load(Ordering::Relaxed);
         format!(
             "# HELP icegres_queries_total Wire statements handled.\n\
              # TYPE icegres_queries_total counter\n\
@@ -62,7 +74,16 @@ impl Metrics {
              # HELP icegres_commit_conflicts_total Write attempts rejected as \
              serialization failures (SQLSTATE 40001).\n\
              # TYPE icegres_commit_conflicts_total counter\n\
-             icegres_commit_conflicts_total {cc}\n"
+             icegres_commit_conflicts_total {cc}\n\
+             # HELP icegres_queries_in_flight Queries currently executing (pgwire).\n\
+             # TYPE icegres_queries_in_flight gauge\n\
+             icegres_queries_in_flight {qif}\n\
+             # HELP icegres_queries_slow_total Queries over the slow-query threshold.\n\
+             # TYPE icegres_queries_slow_total counter\n\
+             icegres_queries_slow_total {qs}\n\
+             # HELP icegres_query_duration_ms_total Summed query wall-clock (ms).\n\
+             # TYPE icegres_query_duration_ms_total counter\n\
+             icegres_query_duration_ms_total {qd}\n"
         )
     }
 }

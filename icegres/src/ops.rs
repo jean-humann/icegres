@@ -57,10 +57,12 @@
 //! Plain TCP health checks (e.g. Kubernetes `tcpSocket`, `nc -z`) work too:
 //! connect + close is enough.
 
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::fs::File;
 use std::io::BufReader;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -95,7 +97,7 @@ use datafusion_postgres::{DfSessionService, QueryHook};
 use futures::{Sink, StreamExt as _};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tracing::{info, warn};
+use tracing::{info, warn, Instrument};
 
 // auth backend is injected as a trait object (dyn AuthSource) so the concrete
 // FileAuthSource backend can live behind the `managed` feature.
@@ -118,10 +120,14 @@ impl NoopStartupHandler for AcceptAllStartupHandler {}
 
 /// Per-connection startup handler: permissive (no `--auth-file`) or
 /// SCRAM-SHA-256 against the loaded auth file. An enum because
-/// `PgWireServerHandlers::startup_handler` must name one concrete type.
+/// `PgWireServerHandlers::startup_handler` must name one concrete type. The
+/// `Scram` arm carries the shared per-peer throttle (audit #4).
 enum IcegresStartupHandler {
     Open(AcceptAllStartupHandler),
-    Scram(SASLAuthStartupHandler<DefaultServerParameterProvider>),
+    Scram(
+        SASLAuthStartupHandler<DefaultServerParameterProvider>,
+        Arc<AuthThrottle>,
+    ),
 }
 
 #[async_trait]
@@ -138,9 +144,83 @@ impl StartupHandler for IcegresStartupHandler {
     {
         match self {
             IcegresStartupHandler::Open(h) => h.on_startup(client, message).await,
-            IcegresStartupHandler::Scram(h) => h.on_startup(client, message).await,
+            IcegresStartupHandler::Scram(h, throttle) => {
+                let ip = client.socket_addr().ip();
+                // Slow a brute-forcer down BEFORE the exchange, proportional to
+                // its recent failures from this IP.
+                if let Some(delay) = throttle.penalty(ip) {
+                    tokio::time::sleep(delay).await;
+                }
+                let res = h.on_startup(client, message).await;
+                // Record only genuine credential rejections. We do NOT reset on
+                // Ok: `on_startup` is called once per SASL message, and the
+                // intermediate steps of a *successful* exchange also return Ok —
+                // resetting there would wipe the count every message. Failures
+                // instead decay after `AUTH_WINDOW`, so a legitimate user who
+                // mistyped once heals on their own without ever handing an
+                // attacker a counter reset.
+                if let Err(e) = &res {
+                    if is_auth_failure(e) {
+                        throttle.record_failure(ip);
+                    }
+                }
+                return res;
+            }
         }
     }
+}
+
+/// Per-peer failed-authentication throttle (production-readiness audit #4):
+/// a brute-forcer opening connection after connection to guess passwords is
+/// slowed by an escalating delay applied BEFORE each SASL exchange, keyed by
+/// source IP. Only consulted when `--auth-file` is set (no auth ⇒ no failures).
+/// A successful auth clears the peer; failures older than `AUTH_WINDOW` decay.
+#[derive(Default)]
+struct AuthThrottle {
+    peers: Mutex<HashMap<IpAddr, (u32, Instant)>>,
+}
+
+/// Failures older than this decay to zero (a legitimate user who once mistyped
+/// is not penalized forever).
+const AUTH_WINDOW: Duration = Duration::from_secs(60);
+/// Per-failure backoff step and its cap.
+const AUTH_STEP: Duration = Duration::from_millis(250);
+const AUTH_MAX_DELAY: Duration = Duration::from_secs(5);
+
+impl AuthThrottle {
+    /// Backoff to apply before this peer's next auth attempt, if any.
+    fn penalty(&self, ip: IpAddr) -> Option<Duration> {
+        let peers = self.peers.lock().expect("auth throttle lock poisoned");
+        let (count, last) = peers.get(&ip)?;
+        if *count == 0 || last.elapsed() >= AUTH_WINDOW {
+            return None;
+        }
+        Some(AUTH_STEP.saturating_mul(*count).min(AUTH_MAX_DELAY))
+    }
+
+    /// Record a failed auth from `ip` (escalates its backoff).
+    fn record_failure(&self, ip: IpAddr) {
+        let mut peers = self.peers.lock().expect("auth throttle lock poisoned");
+        // Bound memory under a many-IP flood: drop peers whose last failure has
+        // decayed out of the window before inserting.
+        peers.retain(|_, (_, last)| last.elapsed() < AUTH_WINDOW);
+        let entry = peers.entry(ip).or_insert((0, Instant::now()));
+        if entry.1.elapsed() >= AUTH_WINDOW {
+            entry.0 = 0;
+        }
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = Instant::now();
+        warn!(%ip, failures = entry.0, "failed authentication; throttling this peer");
+    }
+}
+
+/// Whether a startup error is a credentials rejection, as opposed to a
+/// protocol/IO error. Two shapes reach here: an unknown user is rejected by
+/// our auth source with SQLSTATE 28P01 (`pgauth::auth_failed`), and a wrong
+/// password fails inside pgwire's SCRAM exchange as `InvalidPassword`.
+fn is_auth_failure(e: &PgWireError) -> bool {
+    matches!(e, PgWireError::UserError(info) if info.code == "28P01")
+        || matches!(e, PgWireError::InvalidPassword(_))
 }
 
 /// Error handler mirroring the stock factory's logging behavior.
@@ -160,8 +240,10 @@ impl ErrorHandler for LoggingErrorHandler {
 /// connection by `process_socket`, so the SASL state machine it returns is
 /// per-connection as pgwire requires.
 struct IcegresHandlerFactory {
-    service: Arc<DfSessionService>,
+    service: Arc<crate::traced::TracedService>,
     auth: Option<Arc<dyn AuthSource>>,
+    /// Per-peer failed-auth throttle (audit #4); only consulted when auth is on.
+    throttle: Arc<AuthThrottle>,
 }
 
 impl PgWireServerHandlers for IcegresHandlerFactory {
@@ -182,6 +264,7 @@ impl PgWireServerHandlers for IcegresHandlerFactory {
                         Arc::new(DefaultServerParameterProvider::default()),
                     )
                     .with_scram(ScramAuth::new(auth_db)),
+                    self.throttle.clone(),
                 ))
             }
             None => Arc::new(IcegresStartupHandler::Open(AcceptAllStartupHandler)),
@@ -198,6 +281,18 @@ impl PgWireServerHandlers for IcegresHandlerFactory {
 /// PLAINTEXT when TLS setup fails), any error here aborts startup —
 /// misconfigured TLS must never silently downgrade to unencrypted.
 pub fn build_tls_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor> {
+    // pgwire's SSLRequest upgrade does not use ALPN, so advertise none.
+    build_tls_acceptor_with_alpn(cert_path, key_path, &[])
+}
+
+/// As [`build_tls_acceptor`], but advertising the given ALPN protocols. The
+/// Flight SQL / gRPC listener passes `[b"h2"]` — HTTP/2 over TLS requires the
+/// `h2` ALPN token, so without it a strict gRPC client refuses to upgrade.
+pub fn build_tls_acceptor_with_alpn(
+    cert_path: &str,
+    key_path: &str,
+    alpn: &[&[u8]],
+) -> Result<TlsAcceptor> {
     // Same crypto provider as upstream setup_tls (pgwire ships the ring
     // feature); install_default is idempotent, ignore the AlreadyInstalled err.
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -218,12 +313,16 @@ pub fn build_tls_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor
     .with_context(|| format!("failed to parse PEM private key in {key_path}"))?
     .ok_or_else(|| anyhow::anyhow!("no PEM private key found in {key_path}"))?;
 
-    let config = rustls::ServerConfig::builder()
+    let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .context("invalid TLS certificate/key pair")?;
+    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
+
+/// Monotonic per-connection id for the correlation span (audit #11).
+static CONN_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// How often the idle watchdog wakes up to check the idle condition.
 const IDLE_POLL: Duration = Duration::from_millis(250);
@@ -265,8 +364,11 @@ pub async fn serve_custom(
     );
 
     let factory = Arc::new(IcegresHandlerFactory {
-        service: Arc::new(DfSessionService::new_with_hooks(ctx, hooks)),
+        service: Arc::new(crate::traced::TracedService::new(Arc::new(
+            DfSessionService::new_with_hooks(ctx, hooks),
+        ))),
         auth,
+        throttle: Arc::new(AuthThrottle::default()),
     });
     let idle_window = idle_secs.map(Duration::from_secs);
     let active = Arc::new(AtomicUsize::new(0));
@@ -306,24 +408,34 @@ pub async fn serve_custom(
                     let idle_since = idle_since.clone();
                     let tls = tls.clone();
                     let txn_registry = txn_registry.clone();
-                    tokio::spawn(async move {
-                        let _permit = permit; // released when the handler ends
-                        if let Err(e) = process_socket(socket, tls, factory).await {
-                            warn!(%peer, "error processing socket: {e}");
+                    // Per-connection correlation span (audit #11): every log
+                    // emitted while handling this connection — including the
+                    // TracedService query timings and slow-query WARNs — carries
+                    // conn_id + peer, so interleaved concurrent-connection logs
+                    // can be de-multiplexed and a slow query attributed.
+                    let conn_id = CONN_SEQ.fetch_add(1, Ordering::Relaxed);
+                    let span = tracing::info_span!("conn", id = conn_id, %peer);
+                    tokio::spawn(
+                        async move {
+                            let _permit = permit; // released when the handler ends
+                            if let Err(e) = process_socket(socket, tls, factory).await {
+                                warn!("error processing socket: {e}");
+                            }
+                            // Disconnect = implicit ROLLBACK: drop any open
+                            // transaction buffered for this connection (nothing
+                            // was committed, so nothing needs undoing).
+                            txn_registry.disconnect(&peer);
+                            // Reset the idle clock BEFORE decrementing so the
+                            // watchdog can never observe (active == 0, stale
+                            // idle_since).
+                            *idle_since.lock().expect("idle clock lock poisoned") = Instant::now();
+                            active.fetch_sub(1, Ordering::SeqCst);
+                            crate::metrics::metrics()
+                                .connections_active
+                                .fetch_sub(1, Ordering::Relaxed);
                         }
-                        // Disconnect = implicit ROLLBACK: drop any open
-                        // transaction buffered for this connection (nothing
-                        // was committed, so nothing needs undoing).
-                        txn_registry.disconnect(&peer);
-                        // Reset the idle clock BEFORE decrementing so the
-                        // watchdog can never observe (active == 0, stale
-                        // idle_since).
-                        *idle_since.lock().expect("idle clock lock poisoned") = Instant::now();
-                        active.fetch_sub(1, Ordering::SeqCst);
-                        crate::metrics::metrics()
-                            .connections_active
-                            .fetch_sub(1, Ordering::Relaxed);
-                    });
+                        .instrument(span),
+                    );
                 }
                 Err(e) => warn!("error accepting socket: {e}"),
             },
@@ -424,8 +536,19 @@ async fn drain_connections(active: &Arc<AtomicUsize>) {
             return;
         }
         if Instant::now() >= deadline {
+            // Name the queries still running past the grace period (audit #9
+            // in-flight visibility) so an operator knows what a forced exit cut.
+            for (id, kind, elapsed) in crate::traced::in_flight().snapshot() {
+                warn!(
+                    query_id = id,
+                    kind,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "query still in flight at forced shutdown"
+                );
+            }
             warn!(
                 remaining = n,
+                in_flight = crate::traced::in_flight().count(),
                 "drain grace period elapsed; exiting with connections still active"
             );
             return;

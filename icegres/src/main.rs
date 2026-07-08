@@ -22,6 +22,7 @@ mod overwrite;
 mod pgauth;
 mod scan;
 mod seed;
+mod traced;
 mod txn;
 
 use std::path::PathBuf;
@@ -233,6 +234,17 @@ enum Command {
         #[arg(long, env = "ICEGRES_AUTHZ_FILE")]
         authz_file: Option<PathBuf>,
 
+        /// PEM certificate (chain) enabling in-process TLS on the Flight SQL
+        /// listener (requires --tls-key). Terminates TLS with the same rustls
+        /// stack as pgwire, so basic-auth credentials are no longer sent in
+        /// cleartext without a front proxy. Any TLS setup error aborts startup.
+        #[arg(long, env = "ICEGRES_FLIGHT_TLS_CERT", requires = "tls_key")]
+        tls_cert: Option<String>,
+
+        /// PEM private key (PKCS#8/RSA/SEC1) for --tls-cert.
+        #[arg(long, env = "ICEGRES_FLIGHT_TLS_KEY", requires = "tls_cert")]
+        tls_key: Option<String>,
+
         /// Acknowledge running an UNAUTHENTICATED Flight listener on a
         /// non-loopback interface (see `icegres serve --insecure`).
         #[arg(long, env = "ICEGRES_INSECURE", num_args = 0..=1,
@@ -390,6 +402,8 @@ async fn main() -> Result<()> {
             port,
             auth_file,
             authz_file,
+            tls_cert,
+            tls_key,
             insecure,
         } => {
             // Flight authorization needs an authenticated principal: reject
@@ -403,7 +417,9 @@ async fn main() -> Result<()> {
             }
             enforce_secure_default(&host, auth_file.is_some(), insecure)?;
             let authorizer = build_authorizer(&authz_file, auth_file.is_some())?;
-            flight::run(&catalog, &host, port, auth_file, authorizer).await
+            // clap `requires` guarantees cert and key arrive together.
+            let tls = tls_cert.zip(tls_key);
+            flight::run(&catalog, &host, port, auth_file, authorizer, tls).await
         }
         Command::Seed { catalog } => seed::run(&catalog).await,
         Command::Branch { cmd } => match cmd {

@@ -93,10 +93,12 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
 
 ## Transport / security
 
-- **Arrow Flight SQL TLS is terminate-in-front.** In-process Flight TLS is not
-  wired against the pinned tonic 0.14 stack (which moved TLS to a separate
-  stack); run Flight SQL behind a TLS-terminating gRPC proxy. pgwire TLS is
-  in-process (rustls, `--tls-cert`/`--tls-key`).
+- **Arrow Flight SQL TLS is in-process** (`flight-serve --tls-cert/--tls-key`),
+  terminated with the same rustls stack as pgwire and advertising the `h2`
+  ALPN so `grpc+tls://` clients connect directly. tonic 0.14 removed
+  server-side TLS from its transport, so this is done by handshaking each
+  connection ourselves and handing tonic already-terminated streams; a
+  TLS-terminating gRPC proxy in front still works if you prefer that topology.
 - **Without `--auth-file` the server is permissive** (any user/password) and
   logs a startup `WARN`. Remote binds are guarded: binding a non-loopback
   interface with auth off requires `--insecure`. Always enable auth in

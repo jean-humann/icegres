@@ -176,6 +176,9 @@ cleanup() {
   stop_pidfile_generic "$E2E_DIR/flight-authz.pid"
   stop_pidfile_generic "$E2E_DIR/serve-strict.pid"
   stop_pidfile_generic "$E2E_DIR/serve-vbuf.pid"
+  stop_pidfile_generic "$E2E_DIR/serve-obs.pid"
+  stop_pidfile_generic "$E2E_DIR/serve-thr.pid"
+  stop_pidfile_generic "$E2E_DIR/flight-tls.pid"
   stop_icegresd
 }
 trap cleanup EXIT
@@ -1481,6 +1484,130 @@ assert_eq "clean-flush row survives the restart (durably in Iceberg)" "1" \
   "$("${VBQ[@]}" -c "select count(*) from demo.trips where trip_id = $CS_ID")"
 pass "clean-shutdown-flush: an acked-but-unflushed write survives a graceful stop"
 stop_pidfile_generic "$VBUF_PID_FILE"
+
+# ---------------------------------------------------------------------------
+# (w) Observability + security hardening: per-query duration metrics +
+# slow-query WARN correlated to a per-connection span (audit #9/#11), per-peer
+# failed-auth backoff (#4), and Flight SQL in-process TLS (#13).
+# ---------------------------------------------------------------------------
+log "(w) observability + hardening (#9/#11/#4/#13)"
+
+# --- w1: query metrics + slow-query WARN + correlation span ---
+OBS_PORT=5454
+OBS_HEALTH=8091
+OBS_PID="$E2E_DIR/serve-obs.pid"
+OBS_LOG="$E2E_DIR/serve-obs.log"
+stop_pidfile_generic "$OBS_PID"
+: >"$OBS_LOG"
+# ICEGRES_SLOW_QUERY_MS=1 makes any query "slow" (deterministic WARN); JSON logs
+# so the correlation span is assertable without ANSI escapes.
+ICEGRES_LOG_FORMAT=json ICEGRES_SLOW_QUERY_MS=1 \
+  "$BIN" serve --host "$PG_HOST" --port "$OBS_PORT" --health-port "$OBS_HEALTH" >>"$OBS_LOG" 2>&1 &
+echo $! >"$OBS_PID"
+obs_ready=0
+for _ in $(seq 1 60); do
+  if psql -h "$PG_HOST" -p "$OBS_PORT" -U postgres -d icegres -tAc 'select 1' >/dev/null 2>&1; then obs_ready=1; break; fi
+  sleep 0.5
+done
+[[ "$obs_ready" == 1 ]] || { tail -n 20 "$OBS_LOG" >&2; fail "observability server not ready on :$OBS_PORT"; }
+psql -h "$PG_HOST" -p "$OBS_PORT" -U postgres -d icegres -tAc 'select count(*) from demo.trips' >/dev/null
+if command -v curl >/dev/null 2>&1; then
+  OBS_M=$(curl -s "http://$PG_HOST:$OBS_HEALTH/metrics")
+  echo "$OBS_M" | grep -q '^icegres_queries_in_flight ' || fail "queries_in_flight metric missing"
+  echo "$OBS_M" | grep -q '^icegres_query_duration_ms_total ' || fail "query_duration_ms_total metric missing"
+  obs_slow=$(echo "$OBS_M" | awk '/^icegres_queries_slow_total /{print $2}')
+  [[ -n "$obs_slow" && "$obs_slow" -ge 1 ]] || fail "queries_slow_total not incremented (got ${obs_slow:-none})"
+  pass "new query metrics exposed (in_flight/slow_total=$obs_slow/duration)"
+else
+  log "    SKIPPED /metrics assertions: curl not available"
+fi
+# Correlation: the slow-query WARN line carries the per-connection span
+# (name=conn, id, peer) so concurrent-connection logs de-multiplex.
+slow_line=$(grep '"message":"slow query"' "$OBS_LOG" | head -1)
+[[ -n "$slow_line" ]] || fail "no slow-query WARN emitted"
+echo "$slow_line" | grep -q '"name":"conn"' || fail "slow-query WARN not inside a conn span: $slow_line"
+echo "$slow_line" | grep -q '"peer"' || fail "conn span missing peer: $slow_line"
+pass "query timing WARNs correlated to a per-connection span (conn id + peer)"
+stop_pidfile_generic "$OBS_PID"
+
+# --- w2: per-peer failed-auth backoff ---
+THR_PORT=5455
+THR_PID="$E2E_DIR/serve-thr.pid"
+THR_LOG="$E2E_DIR/serve-thr.log"
+THR_AUTH="$E2E_DIR/thr-auth.conf"
+printf 'thruser:right-pw\n' >"$THR_AUTH"; chmod 600 "$THR_AUTH"
+stop_pidfile_generic "$THR_PID"
+: >"$THR_LOG"
+"$BIN" serve --host "$PG_HOST" --port "$THR_PORT" --auth-file "$THR_AUTH" >>"$THR_LOG" 2>&1 &
+echo $! >"$THR_PID"
+thr_ready=0
+for _ in $(seq 1 60); do
+  if PGPASSWORD=right-pw psql "host=$PG_HOST port=$THR_PORT user=thruser dbname=icegres" -tAc 'select 1' >/dev/null 2>&1; then thr_ready=1; break; fi
+  sleep 0.5
+done
+[[ "$thr_ready" == 1 ]] || { tail -n 20 "$THR_LOG" >&2; fail "throttle server not ready on :$THR_PORT"; }
+# First wrong attempt is ~baseline (no prior failures); after a couple more the
+# escalating backoff makes a later attempt visibly slower.
+# These are expected to FAIL (wrong password) — guard against `set -e`.
+t0=$(date +%s%N)
+PGPASSWORD=nope psql "host=$PG_HOST port=$THR_PORT user=thruser dbname=icegres connect_timeout=30" -tAc 'select 1' >/dev/null 2>&1 || true
+first_ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+for _ in 1 2; do PGPASSWORD=nope psql "host=$PG_HOST port=$THR_PORT user=thruser dbname=icegres connect_timeout=30" -tAc 'select 1' >/dev/null 2>&1 || true; done
+t0=$(date +%s%N)
+PGPASSWORD=nope psql "host=$PG_HOST port=$THR_PORT user=thruser dbname=icegres connect_timeout=30" -tAc 'select 1' >/dev/null 2>&1 || true
+later_ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+grep -q 'throttling this peer' "$THR_LOG" || fail "failed-auth throttle did not fire (log: $THR_LOG)"
+(( later_ms > first_ms + 100 )) || fail "no backoff escalation: first=${first_ms}ms later=${later_ms}ms"
+pass "per-peer failed-auth backoff escalates (first=${first_ms}ms -> later=${later_ms}ms)"
+assert_eq "correct password still authenticates despite the throttle" "1" \
+  "$(PGPASSWORD=right-pw psql "host=$PG_HOST port=$THR_PORT user=thruser dbname=icegres connect_timeout=30" -tAc 'select 1')"
+stop_pidfile_generic "$THR_PID"
+
+# --- w3: Flight SQL in-process TLS ---
+FTLS_PORT=50056
+FTLS_PID="$E2E_DIR/flight-tls.pid"
+FTLS_LOG="$E2E_DIR/flight-tls.log"
+bash "$REPO_DIR/infra/scripts/gen-dev-cert.sh" >/dev/null 2>&1 || true
+FCRT="$REPO_DIR/infra/.data/tls/dev.crt"
+FKEY="$REPO_DIR/infra/.data/tls/dev.key"
+if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import adbc_driver_flightsql' >/dev/null 2>&1; then
+  log "    SKIPPED w3 Flight TLS: python3/adbc_driver_flightsql not available"
+elif [[ ! -f "$FCRT" || ! -f "$FKEY" ]]; then
+  log "    SKIPPED w3 Flight TLS: dev cert not available ($FCRT)"
+else
+  stop_pidfile_generic "$FTLS_PID"
+  : >"$FTLS_LOG"
+  "$BIN" flight-serve --host "$PG_HOST" --port "$FTLS_PORT" --tls-cert "$FCRT" --tls-key "$FKEY" >>"$FTLS_LOG" 2>&1 &
+  echo $! >"$FTLS_PID"
+  ftls_ready=0
+  for _ in $(seq 1 60); do grep -q 'flight-serve ready' "$FTLS_LOG" && { ftls_ready=1; break; }; sleep 0.5; done
+  [[ "$ftls_ready" == 1 ]] || { tail -n 20 "$FTLS_LOG" >&2; fail "Flight TLS server not ready on :$FTLS_PORT"; }
+  FT_OUT=$(FT_PORT="$FTLS_PORT" python3 - <<'PY' 2>&1
+import os
+import adbc_driver_flightsql.dbapi as f
+from adbc_driver_flightsql import DatabaseOptions
+p = os.environ["FT_PORT"]
+tls_ok = False
+plain_rejected = False
+try:
+    c = f.connect(f"grpc+tls://localhost:{p}", db_kwargs={DatabaseOptions.TLS_SKIP_VERIFY.value: "true"})
+    cur = c.cursor(); cur.execute("select count(*) from demo.trips"); cur.fetchone()
+    tls_ok = True; cur.close(); c.close()
+except Exception as e:
+    print("TLS-FAIL", type(e).__name__, str(e)[:140])
+try:
+    c = f.connect(f"grpc://localhost:{p}"); c.cursor().execute("select 1")
+except Exception:
+    plain_rejected = True
+print(f"RESULT tls_ok={tls_ok} plain_rejected={plain_rejected}")
+PY
+)
+  echo "$FT_OUT" | sed 's/^/    /'
+  echo "$FT_OUT" | grep -q 'tls_ok=True' || fail "ADBC over grpc+tls failed"
+  echo "$FT_OUT" | grep -q 'plain_rejected=True' || fail "plaintext client not rejected on the TLS Flight port"
+  pass "Flight in-process TLS: ADBC grpc+tls query works, plaintext client rejected"
+  stop_pidfile_generic "$FTLS_PID"
+fi
 
 # ---------------------------------------------------------------------------
 log "all assertions passed ($PASS_COUNT)"

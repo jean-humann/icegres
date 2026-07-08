@@ -902,9 +902,11 @@ else
     # catalog round-trip. With the catalog up it must answer 200 'ready'.
     ready_code=$(curl -s -m 5 -o "$RUN_DIR/ready-body.txt" -w '%{http_code}' "http://$PG_HOST:$HEALTH_PORT/ready" 2>&1)
     ready_body=$(flat <"$RUN_DIR/ready-body.txt")
-    # Prometheus metrics endpoint (production-readiness #8): must expose the
-    # operational counters so the server is not run blind.
-    metrics_has_counter=$(curl -s -m 5 "http://$PG_HOST:$HEALTH_PORT/metrics" 2>&1 | grep -c '^icegres_queries_total ')
+    # Prometheus metrics endpoint (production-readiness #8/#9): must expose the
+    # operational counters AND the R20 query-observability metrics (in-flight
+    # gauge, slow-query counter, summed duration) so the server is not run blind.
+    metrics_body=$(curl -s -m 5 "http://$PG_HOST:$HEALTH_PORT/metrics" 2>&1)
+    metrics_has_counter=$(echo "$metrics_body" | grep -Ec '^icegres_queries_total |^icegres_queries_in_flight |^icegres_query_duration_ms_total |^icegres_queries_slow_total ')
     t_last=$(($(date +%s%N) / 1000000))
     exited=0
     for _ in $(seq 1 80); do
@@ -1067,9 +1069,9 @@ else
 fi
 
 hc=$(q 'select 1')
-if [[ "$hc" == 1 && "$health_code" == 200 && "$health_body" == ok* && "$ready_code" == 200 && "$ready_body" == ready* && "${metrics_has_counter:-0}" -ge 1 ]]; then
+if [[ "$hc" == 1 && "$health_code" == 200 && "$health_body" == ok* && "$ready_code" == 200 && "$ready_body" == ready* && "${metrics_has_counter:-0}" -ge 4 ]]; then
   record E2 ops "health-checkable" PASS \
-    "four probes work: (1) pgwire connect + 'select 1' readiness check; (2) HTTP liveness --health-port /health returned $health_code '$health_body'; (3) catalog-aware /ready returned $ready_code '$ready_body' (bounded catalog round-trip -> 503 when the lakehouse is unreachable, so a load balancer drops a dependency-down compute); (4) Prometheus /metrics exposes the operational counters (icegres_queries_total etc.) so the server is not run blind."
+    "four probes work: (1) pgwire connect + 'select 1' readiness check; (2) HTTP liveness --health-port /health returned $health_code '$health_body'; (3) catalog-aware /ready returned $ready_code '$ready_body' (bounded catalog round-trip -> 503 when the lakehouse is unreachable, so a load balancer drops a dependency-down compute); (4) Prometheus /metrics exposes the operational counters AND the query-observability metrics (icegres_queries_total, icegres_queries_in_flight gauge, icegres_queries_slow_total, icegres_query_duration_ms_total) so the server is not run blind."
 elif [[ "$hc" == 1 ]]; then
   record E2 ops "health-checkable" PASS \
     "pgwire connect + 'select 1' works as a health probe (this is what the harnesses use); --health-port endpoint answered '$health_code' '$health_body' (expected 200 'ok' — see D5 probe log)."
