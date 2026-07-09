@@ -120,6 +120,44 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
   which is unreliable on NFS — put the tail dir on a local filesystem.
   Default is off (no tail, behavior above unchanged);
   requires `--write-buffer-ms > 0` or startup fails.
+- **`--tail-url` (Postgres tail) buys node-loss durability, with its own honest
+  bounds.** The tail lives in a Postgres database (schema `icegres_tail`), so
+  it survives losing the compute node — but durability is *delegated*: it is
+  exactly as strong as that database's own `synchronous_commit`/`fsync`/
+  replication settings, no stronger. A tail-database outage **blocks buffered
+  writes** (the INSERT's statement fails — backpressure, never a silent
+  downgrade to non-durable buffering), and the worker never reconnects after a
+  broken connection (the connection *is* the one-writer advisory lock;
+  re-acquiring it silently would race a replacement process) — restart the
+  server instead. The one-writer advisory lock is **best-effort boot-time
+  mutual exclusion, not the correctness guard**: it releases with its session,
+  so a replacement server can take over while a half-dead predecessor is still
+  flushing buffered rows — that overlap cannot double-apply, because
+  exactly-once is enforced by the in-commit watermark property + the catalog's
+  `assert-ref-snapshot-id` CAS + the fresh metadata reload before every flush
+  attempt (`buffer.rs`), never by the lock. The takeover window, honestly: a
+  cleanly dying process releases the lock immediately, but a dead **host**
+  (power loss, partition) releases it only when the tail database notices the
+  dead TCP peer — icegres sets a 30 s keepalive probe on the tail connection
+  (unless the URL carries its own `keepalives*` parameters), so expect roughly
+  tens of seconds; an operator can force takeover sooner with `SELECT
+  pg_terminate_backend(<pid>)` (the boot refusal prints the holder's pid) —
+  only after confirming the old process is really gone. `--tail-url` must be a
+  **direct connection or session-pooled**: a transaction-mode pooler
+  (pgbouncer transaction pooling, RDS Proxy) scatters the session's statements
+  across backends and would silently void the lock, so boot verifies the lock
+  is visible from its own backend and refuses otherwise. Every buffered ack
+  pays one round trip + commit to the tail
+  database (~1–3 ms same-box; a remote tail taxes every ack accordingly), and
+  like the local tail it runs under the buffer lock, so a slow tail database
+  stalls other tables' buffered INSERTs and same-server union reads. The
+  `frames` table grows without bound during a catalog outage (nothing
+  truncates until a flush commits). TLS connections to the tail database are
+  not supported yet (`NoTls` client), and the tail is still **single-writer,
+  single-reader**: fleet-shared overlays (several computes reading one tail,
+  LISTEN/NOTIFY, flush leases) are the roadmap's explicit next increment
+  (docs/sota-roadmap.md §3), not this backend. Mutually exclusive with
+  `--tail-dir`; requires `--write-buffer-ms > 0` or startup fails.
 
 ## Transport / security
 

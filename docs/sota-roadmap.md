@@ -167,6 +167,21 @@ Backends, in build order:
    per-key writes (Phase 2). Quorum durability = the Postgres instance's own
    replication, delegated rather than rebuilt. No OSS analogue needed —
    plain SQL.
+
+   > **STATUS: shipped — the durability half.** `--tail-url` /
+   > `ICEGRES_TAIL_URL` (`icegres/src/tail_pg.rs`): durable-before-ack
+   > appends into a `frames` table (statement-atomic Arrow IPC payloads,
+   > same encoding and table-key namespace as the local WAL), identity +
+   > watermark sidecar in the same schema, one-writer advisory lock,
+   > boot replay/truncate/seq-floor under the unchanged watermark
+   > protocol — verified by live unit tests (`ICEGRES_TEST_PG_URL`) and
+   > `tail_durability.sh` sections 6–8 (kill -9 recovery, exactly-once
+   > across a double crash, post-flush seq floor). The tail therefore
+   > survives node loss (durability = the tail database's replication).
+   > **Not yet:** the SHARED half — fleet-wide overlays via
+   > `LISTEN/NOTIFY`, flush leases, per-key arbitration — is the explicit
+   > next increment; today the tail is single-writer/single-reader like
+   > the local backend.
 3. **`quorum` — the SafeKeeper-class backend (future).** Here Neon changes
    the math: the article's SafeKeeper **is Apache-2.0 Rust in
    `neon/safekeeper/`** — the proposer–acceptor consensus

@@ -23,6 +23,7 @@ mod pgauth;
 mod scan;
 mod seed;
 mod tail;
+mod tail_pg;
 mod traced;
 mod txn;
 
@@ -202,6 +203,22 @@ enum Command {
         /// un-flushed acked rows (see icegres/src/tail.rs). Off by default.
         #[arg(long, env = "ICEGRES_TAIL_DIR")]
         tail_dir: Option<PathBuf>,
+
+        /// Durable Postgres-backed tail for buffered writes (requires
+        /// --write-buffer-ms > 0; mutually exclusive with --tail-dir):
+        /// every buffered INSERT is committed to a frames table in this
+        /// Postgres database (schema `icegres_tail`, auto-created) BEFORE
+        /// its ack, and acked-but-uncommitted rows are replayed into the
+        /// buffer on the next boot with the same URL. Unlike --tail-dir,
+        /// the tail SURVIVES LOSING THIS NODE: durability = the tail
+        /// database's own fsync/replication (the natural target is a
+        /// dedicated database on the instance already backing Lakekeeper).
+        /// A tail-database outage blocks buffered writes (statement
+        /// errors — backpressure, never silent loss). One server process
+        /// per tail (session advisory lock); TLS URLs are not yet
+        /// supported. See icegres/src/tail_pg.rs. Off by default.
+        #[arg(long, env = "ICEGRES_TAIL_URL", conflicts_with = "tail_dir")]
+        tail_url: Option<String>,
 
         /// Acknowledge running an UNAUTHENTICATED listener on a non-loopback
         /// interface. Without this, binding a public address (e.g. 0.0.0.0)
@@ -415,6 +432,7 @@ async fn main() -> Result<()> {
             enforce_pk,
             write_buffer_ms,
             tail_dir,
+            tail_url,
             insecure,
         } => {
             let serve_opts = ServeOpts {
@@ -428,6 +446,7 @@ async fn main() -> Result<()> {
                 enforce_pk,
                 write_buffer_ms,
                 tail_dir,
+                tail_url,
                 insecure,
             };
             run_serve(&catalog, &host, port, serve_opts).await
@@ -501,6 +520,7 @@ struct ServeOpts {
     enforce_pk: bool,
     write_buffer_ms: u64,
     tail_dir: Option<PathBuf>,
+    tail_url: Option<String>,
     insecure: bool,
 }
 
@@ -578,6 +598,18 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
              synchronous default commits every INSERT before its ack, so the durable tail \
              would be a no-op. Set --write-buffer-ms, or drop --tail-dir."
         );
+    }
+    if serve_opts.tail_url.is_some() && serve_opts.write_buffer_ms == 0 {
+        bail!(
+            "--tail-url requires buffered writes (--write-buffer-ms N with N > 0): the \
+             synchronous default commits every INSERT before its ack, so the durable tail \
+             would be a no-op. Set --write-buffer-ms, or drop --tail-url."
+        );
+    }
+    // clap's conflicts_with already refuses the pair; keep a hard error for
+    // programmatic callers (one process writes ONE tail).
+    if serve_opts.tail_dir.is_some() && serve_opts.tail_url.is_some() {
+        bail!("--tail-dir and --tail-url are mutually exclusive: a server writes ONE tail");
     }
     // Fail fast on TLS/auth misconfiguration BEFORE touching the catalog:
     // a server asked to be secure must never come up insecure.
@@ -660,10 +692,16 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
     // --tail-dir, a durable local WAL (tail.rs) closes the unclean-kill
     // loss window: fsync before every buffered ack, replay at boot.
     let write_buffer = if serve_opts.write_buffer_ms > 0 {
-        let tail_store: Option<Arc<dyn tail::TailStore>> = match &serve_opts.tail_dir {
-            Some(dir) => Some(Arc::new(tail::LocalWal::open(dir)?)),
-            None => None,
-        };
+        let tail_store: Option<Arc<dyn tail::TailStore>> =
+            match (&serve_opts.tail_dir, &serve_opts.tail_url) {
+                (Some(dir), None) => Some(Arc::new(tail::LocalWal::open(dir)?)),
+                // PgTail::open connects, takes the one-writer advisory
+                // lock, and ensures the schema — an unreachable/locked
+                // tail database fails startup loudly right here.
+                (None, Some(url)) => Some(Arc::new(tail_pg::PgTail::open(url)?)),
+                (None, None) => None,
+                (Some(_), Some(_)) => unreachable!("refused above"),
+            };
         let buf = Arc::new(buffer::WriteBuffer::new(
             catalog.clone(),
             engine.clone(),
@@ -682,6 +720,19 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
                  still loses acked-but-uncommitted rows. Other servers/readers see \
                  buffered rows only at the commit cadence; reads on this server union \
                  the buffer (read-your-writes holds locally)."
+            );
+        } else if serve_opts.tail_url.is_some() {
+            warn!(
+                write_buffer_ms = serve_opts.write_buffer_ms,
+                max_rows = buf.max_rows(),
+                "write buffering is ENABLED with a durable Postgres tail (--tail-url): \
+                 INSERTs commit to the tail database BEFORE their ack and un-flushed \
+                 rows replay on the next boot against the same tail, so an unclean kill \
+                 — or losing this NODE entirely — loses NOTHING; durability = the tail \
+                 database's own fsync/replication. A tail-database outage BLOCKS \
+                 buffered writes (statement errors — backpressure, never silent loss). \
+                 Other servers/readers see buffered rows only at the commit cadence; \
+                 reads on this server union the buffer (read-your-writes holds locally)."
             );
         } else {
             warn!(

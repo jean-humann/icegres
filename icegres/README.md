@@ -144,6 +144,7 @@ environment variables:
 | `--write-buffer-ms` (serve) | `ICEGRES_WRITE_BUFFER_MS` | `0` (sync) | Opt-in buffered writes: INSERTs ack from an in-memory buffer, group-committed every N ms; unclean kill loses ≤N ms of acked writes (WARN on enable) |
 |  | `ICEGRES_WRITE_BUFFER_MAX_ROWS` | `50000` | Row threshold that forces an early flush in buffered mode |
 | `--tail-dir` (serve) | `ICEGRES_TAIL_DIR` | off | Durable local tail for buffered writes (requires `--write-buffer-ms > 0`): fsync'd per-table WAL appended BEFORE each buffered ack, replayed on boot — closes the unclean-kill loss window (node/disk loss still loses the tail) |
+| `--tail-url` (serve) | `ICEGRES_TAIL_URL` | off | Durable Postgres-backed tail for buffered writes (requires `--write-buffer-ms > 0`, mutually exclusive with `--tail-dir`): each buffered INSERT commits to a frames table in this Postgres database BEFORE its ack, replayed on boot — survives losing the compute node (durability = the tail database's fsync/replication); an unreachable tail database blocks buffered writes (statement errors, never silent loss) |
 |  | `ICEGRES_TXN_STRICT` | off | Only relevant on catalogs WITHOUT the multi-table `transactions/commit` endpoint (with it — e.g. Lakekeeper — multi-table COMMITs are always atomic and strict mode never bites): refuse a multi-table `COMMIT` up front with `0A000` (nothing applied) instead of best-effort ordered per-table commits (where a partial apply reports `40003`, not the retryable `40001`). |
 
 Logging uses `tracing` with an env filter: `RUST_LOG=debug icegres serve`.
@@ -464,7 +465,37 @@ feature — and enabling it logs a WARN. Both halves of the contract are
 locked by e2e (kill-loss vs clean-shutdown-flush), and the union-read flush
 race is covered by `buffer.rs` unit tests.
 
-**Durable local tail (`--tail-dir <dir>`, opt-in)** closes the unclean-kill
+**Durable tail — two backends.** Buffered mode can attach a durable tail
+that every INSERT is appended to BEFORE its ack, replayed into the buffer
+on the next boot; the two backends hold the identical exactly-once protocol
+(the `icegres.tail-seq.<tail-id>` watermark stamped into each flush commit)
+and differ only in where the tail lives — i.e. in the durability class:
+
+| Backend | Flag | The tail lives in | Survives unclean kill | Survives node/disk loss | Ack cost |
+|---|---|---|---|---|---|
+| Local WAL | `--tail-dir <dir>` | fsync'd segments on this node's disk | yes | **no** — the tail dies with the disk | one local fsync (~3.2 ms p50 measured) |
+| Postgres | `--tail-url <postgres url>` | a `frames` table (schema `icegres_tail`, auto-created) in any Postgres database — the natural target is a dedicated DB on the instance already backing Lakekeeper | yes | **yes** — durability = the tail database's own fsync/replication | one INSERT round trip + commit (~1–3 ms to a same-box database) |
+
+The flags are mutually exclusive (one server writes ONE tail), and both
+require `--write-buffer-ms > 0`. For `--tail-url`: the identity behind the
+watermark key is minted once into the schema's `meta` table (same URL =
+same logical tail across restarts), and an unreachable tail database fails
+startup / fails the INSERT statement mid-flight — backpressure, never
+silent loss, exactly like a failing tail disk. A session advisory lock
+refuses a second `serve` on the same URL/schema at boot — best-effort
+boot-time mutual exclusion, NOT the correctness guard: the lock releases
+with its session, and exactly-once is enforced by the in-commit watermark
+property + the catalog's `assert-ref-snapshot-id` CAS + the fresh metadata
+reload before every flush attempt (`buffer.rs`), so even a replacement
+server overlapping a half-dead predecessor cannot double-apply. The URL
+must be a direct connection or session-pooled (a transaction-mode pooler
+would silently void the session lock; boot verifies and refuses). TLS URLs
+are not yet supported (keep the tail database
+on localhost or a trusted segment), and fleet-SHARED tails — several
+computes overlaying one tail — are the roadmap's next increment, not this
+backend (docs/sota-roadmap.md §3).
+
+**The local backend in detail (`--tail-dir <dir>`)** closes the unclean-kill
 window without giving up the buffered ack (measured on the dev box: ~3.2 ms
 p50 / 6.3 ms p95 ack with the tail vs ~1.3 ms untailed and ~50–80 ms
 synchronous — the fsync is the price of the closed window): every buffered
@@ -493,7 +524,11 @@ foreign writer dropping the table property. The tail dir is single-writer
 Requires `--write-buffer-ms > 0` (refused at boot otherwise); verified
 standalone by `icegres/tests/tail_durability.sh` (kill -9 with the tail =
 zero loss, without = the documented loss, plus the no-double-apply and
-post-flush-restart sequence-floor cases).
+post-flush-restart sequence-floor cases — each proven for BOTH backends,
+sections 2–4 local and 6–8 Postgres). The Postgres backend's unit tests
+(`src/tail_pg.rs`) run live against `ICEGRES_TEST_PG_URL` (the local
+stack's `postgresql://lakekeeper:lakekeeper@127.0.0.1:5433/icegres_test`)
+and skip cleanly when it is unset.
 
 ### Zero-copy branches (`icegres branch`, `serve --branch`)
 

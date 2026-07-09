@@ -621,6 +621,14 @@ impl WriteBuffer {
             if n_batches == 0 {
                 return Ok(());
             }
+            // LOAD-BEARING: reload the table metadata on EVERY attempt. The
+            // fresh properties feed the generation_already_committed guard
+            // below, and the fresh snapshot pins the commit's
+            // assert-ref-snapshot-id CAS. Together these — NOT the tail's
+            // one-writer lock, which is only best-effort boot-time
+            // exclusion and releases with a dead tail connection — are
+            // what make a flush racing a replacement writer on the same
+            // tail unable to double-apply.
             let table = self
                 .catalog
                 .load_table(ident)
@@ -830,16 +838,33 @@ fn generation_already_committed(prev: Option<u64>, mark: u64) -> bool {
 }
 
 /// After a flush generation is safely committed (or netted out to zero
-/// rows), record the covered watermark in the local sidecar (best-effort;
-/// the second gate against a foreign writer dropping the table property)
-/// and forget its tail frames. A truncate failure only leaks segments —
-/// the committed watermark keeps replay exactly-once regardless — so it is
-/// a WARN, never a flush failure.
+/// rows), record the covered watermark in the sidecar (the second gate
+/// against a foreign writer dropping the table property) and forget its
+/// tail frames. Neither failure ever fails the flush (the committed
+/// watermark keeps replay exactly-once regardless), but a FAILED watermark
+/// record SKIPS the truncate: deleting the frames anyway could leave a
+/// table — on its very first flush — with NEITHER frames NOR a watermark
+/// row in the durable store, so replay would not report the table at all,
+/// the `icegres.tail-seq.<id>` property floor would never be applied, and
+/// post-restart sequences would restart UNDER the committed watermark (the
+/// next crash-replay then silently drops those acked rows as covered).
+/// Keeping the frames instead is a bounded leak with zero loss: replay
+/// neutralizes them via the in-commit property watermark.
 fn tail_truncate_covered(tail: Option<&dyn TailStore>, ident: &TableIdent, mark: Option<u64>) {
     let (Some(tail), Some(upto_seq)) = (tail, mark) else {
         return;
     };
-    tail.record_watermark(ident, upto_seq);
+    if let Err(e) = tail.record_watermark(ident, upto_seq) {
+        tracing::warn!(
+            table = %ident,
+            upto_seq,
+            "cannot record the tail watermark sidecar; SKIPPING the covered-frame \
+             truncate for this generation so the table cannot vanish from the \
+             durable store (frames stay until a later flush covers them; replay \
+             drops them via the committed watermark — bounded leak, zero loss): {e:#}"
+        );
+        return;
+    }
     if let Err(e) = tail.truncate(ident, upto_seq) {
         tracing::warn!(
             table = %ident,
@@ -1167,6 +1192,7 @@ mod tests {
     struct MockTail {
         next_seq: std::sync::atomic::AtomicU64,
         fail_appends: std::sync::atomic::AtomicBool,
+        fail_watermarks: std::sync::atomic::AtomicBool,
         /// (table, seq, batch_count, total_rows) per STATEMENT append.
         appends: StdMutex<Vec<(TableIdent, u64, usize, usize)>>,
         truncates: StdMutex<Vec<(TableIdent, u64)>>,
@@ -1217,8 +1243,15 @@ mod tests {
             "icegres.tail-seq.mock-tail-id"
         }
 
-        fn record_watermark(&self, table: &TableIdent, seq: u64) {
+        fn record_watermark(&self, table: &TableIdent, seq: u64) -> Result<()> {
+            if self
+                .fail_watermarks
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(anyhow!("mock tail: watermark store on fire"));
+            }
             self.watermarks.lock().unwrap().push((table.clone(), seq));
+            Ok(())
         }
     }
 
@@ -1303,6 +1336,31 @@ mod tests {
         tail_truncate_covered(None, &ident(), Some(9));
         tail_truncate_covered(Some(&tail), &ident(), None);
         assert_eq!(tail.truncates.lock().unwrap().len(), 1);
+    }
+
+    // FIX (phase1b-1): a FAILED watermark record must SKIP the truncate —
+    // otherwise a table's first flush could delete its only frames while
+    // leaving no watermark row, making the table vanish from the durable
+    // store entirely (replay would never apply the property seq floor and
+    // post-restart sequences would duck under the committed watermark).
+    // Once the watermark records again, truncation proceeds normally.
+    #[test]
+    fn watermark_record_failure_skips_truncate() {
+        let tail = MockTail::default();
+        tail.fail_watermarks
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        tail_truncate_covered(Some(&tail), &ident(), Some(2));
+        assert!(
+            tail.truncates.lock().unwrap().is_empty(),
+            "truncate must be skipped when the watermark record failed"
+        );
+        assert!(tail.watermarks.lock().unwrap().is_empty());
+        // Recovery: the next covered flush records AND truncates.
+        tail.fail_watermarks
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        tail_truncate_covered(Some(&tail), &ident(), Some(2));
+        assert_eq!(*tail.watermarks.lock().unwrap(), vec![(ident(), 2)]);
+        assert_eq!(*tail.truncates.lock().unwrap(), vec![(ident(), 2)]);
     }
 
     // Boot replay bookkeeping: recovered rows enter pending with no tail

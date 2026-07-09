@@ -187,11 +187,19 @@ pub trait TailStore: Send + Sync {
     /// the same tail dir.
     fn watermark_property(&self) -> &str;
 
-    /// Best-effort local record that a flush commit covered `seq` (the
-    /// watermark sidecar — second gate against table-property loss). A
-    /// failure here is a WARN inside the implementation, never an error:
-    /// the property stamped in the commit already keeps replay exact.
-    fn record_watermark(&self, _table: &TableIdent, _seq: u64) {}
+    /// Record locally that a flush commit covered `seq` (the watermark
+    /// sidecar — second gate against table-property loss). Implementations
+    /// must report the REAL outcome instead of swallowing it: the caller
+    /// (`buffer.rs::tail_truncate_covered`) skips the covered-frame
+    /// truncate when this fails, so one flush can never leave a table with
+    /// NEITHER frames NOR a watermark row (that table would vanish from
+    /// replay entirely and the property sequence floor would never apply).
+    /// The failure itself still never fails the flush — the property
+    /// stamped in the commit keeps replay exact; skipping the truncate is
+    /// a bounded leak, not a loss.
+    fn record_watermark(&self, _table: &TableIdent, _seq: u64) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Drop replayed frames already covered by the committed watermark
@@ -550,39 +558,24 @@ impl TailStore for LocalWal {
         &self.prop_key
     }
 
-    fn record_watermark(&self, table: &TableIdent, seq: u64) {
+    fn record_watermark(&self, table: &TableIdent, seq: u64) -> Result<()> {
         // Unencodable names cannot have appended (append fails on them), so
-        // this arm is theoretical — but record_watermark is best-effort by
-        // contract: WARN, never panic.
-        let dir = match table_dir_name(table) {
-            Ok(name) => self.root.join(name),
-            Err(e) => {
-                tracing::warn!(
-                    table = %table,
-                    seq,
-                    "cannot encode tail table dir name for the watermark sidecar: {e:#}"
-                );
-                return;
-            }
-        };
+        // this arm is theoretical — but the outcome is the caller's to act
+        // on (it skips the covered-frame truncate on failure), so report it
+        // instead of swallowing it.
+        let dir = self.root.join(table_dir_name(table).with_context(|| {
+            format!("cannot encode tail table dir name for the watermark sidecar of {table}")
+        })?);
         // Never regress a higher sidecar (an older flush retrying late).
         if read_sidecar_watermark(&dir).is_some_and(|cur| cur >= seq) {
-            return;
+            return Ok(());
         }
-        let write = fs::create_dir_all(&dir)
+        fs::create_dir_all(&dir)
             .map_err(anyhow::Error::from)
             .and_then(|()| {
                 write_atomic(&dir, &dir.join(WATERMARK_FILE), seq.to_string().as_bytes())
-            });
-        if let Err(e) = write {
-            tracing::warn!(
-                table = %table,
-                seq,
-                "cannot write tail watermark sidecar (the table property stamped in \
-                 the commit keeps replay exact; the sidecar is only the second gate \
-                 against property loss): {e:#}"
-            );
-        }
+            })
+            .with_context(|| format!("cannot write tail watermark sidecar for {table} ({seq})"))
     }
 }
 
@@ -757,8 +750,11 @@ fn decode_component(part: &str) -> Option<String> {
 /// `ns=["a"], table="b.c"` becomes `a.b%2ec`, distinct from
 /// `ns=["a","b"], table="c"` = `a.b.c`. Round-trips through
 /// [`parse_table_dir_name`]. Errors on a component no directory name can
-/// carry (NUL).
-fn table_dir_name(ident: &TableIdent) -> Result<String> {
+/// carry (NUL). `pub(crate)`: this is the canonical table-key encoding
+/// shared by every tail backend — `tail_pg.rs` stores exactly this string
+/// in its `table_key` column, so one table addresses the same logical tail
+/// state whichever backend holds it.
+pub(crate) fn table_dir_name(ident: &TableIdent) -> Result<String> {
     let mut parts: Vec<String> = ident
         .namespace()
         .clone()
@@ -770,7 +766,10 @@ fn table_dir_name(ident: &TableIdent) -> Result<String> {
     Ok(parts.join("."))
 }
 
-fn parse_table_dir_name(name: &str) -> Option<TableIdent> {
+/// Undo [`table_dir_name`]. `None` on anything that does not decode to a
+/// namespaced table identifier (`pub(crate)` for the same backend-sharing
+/// reason as its inverse).
+pub(crate) fn parse_table_dir_name(name: &str) -> Option<TableIdent> {
     let parts: Vec<String> = name
         .split('.')
         .map(decode_component)
@@ -803,18 +802,21 @@ fn check_frame_len(len: usize) -> Result<()> {
     Ok(())
 }
 
-/// `[u32 len][u32 crc32(payload)][payload]`, payload = LE u64 seq + Arrow
-/// IPC stream bytes of ALL batches of one statement (multi-batch streams
-/// are native to the IPC format).
-fn encode_frame(seq: u64, batches: &[RecordBatch]) -> Result<Vec<u8>> {
+/// Arrow IPC stream encoding of ALL batches of ONE statement — the
+/// statement-atomic payload every tail backend stores (schema per payload:
+/// simple and self-describing, fine for v1's per-statement volumes).
+/// LocalWal wraps it in `[len][crc]` file framing plus the LE seq prefix;
+/// `tail_pg.rs` stores it verbatim as a `BYTEA` column (Postgres' own page
+/// checksums/WAL replace the torn-write machinery). `pub(crate)` so the
+/// backends share ONE payload format and frames stay interchangeable.
+pub(crate) fn encode_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>> {
     let first = batches
         .first()
         .ok_or_else(|| anyhow!("tail frame needs at least one batch"))?;
     let size_hint: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
-    let mut payload = Vec::with_capacity(64 + size_hint);
-    payload.extend_from_slice(&seq.to_le_bytes());
+    let mut out = Vec::with_capacity(64 + size_hint);
     {
-        let mut writer = StreamWriter::try_new(&mut payload, first.schema_ref())
+        let mut writer = StreamWriter::try_new(&mut out, first.schema_ref())
             .map_err(|e| anyhow!("tail frame IPC writer failed: {e}"))?;
         for batch in batches {
             writer
@@ -825,6 +827,30 @@ fn encode_frame(seq: u64, batches: &[RecordBatch]) -> Result<Vec<u8>> {
             .finish()
             .map_err(|e| anyhow!("tail frame IPC finish failed: {e}"))?;
     }
+    Ok(out)
+}
+
+/// Undo [`encode_ipc`]: every batch of one statement, in order. An empty
+/// stream is an error — a tail frame is never rowless.
+pub(crate) fn decode_ipc(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
+    let reader = StreamReader::try_new(std::io::Cursor::new(bytes), None)
+        .map_err(|e| anyhow!("tail frame IPC header invalid: {e}"))?;
+    let batches: Vec<RecordBatch> = reader
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| anyhow!("tail frame IPC decode failed: {e}"))?;
+    if batches.is_empty() {
+        bail!("tail frame IPC stream holds no batch");
+    }
+    Ok(batches)
+}
+
+/// `[u32 len][u32 crc32(payload)][payload]`, payload = LE u64 seq + Arrow
+/// IPC stream bytes of ALL batches of one statement ([`encode_ipc`]).
+fn encode_frame(seq: u64, batches: &[RecordBatch]) -> Result<Vec<u8>> {
+    let ipc = encode_ipc(batches)?;
+    let mut payload = Vec::with_capacity(8 + ipc.len());
+    payload.extend_from_slice(&seq.to_le_bytes());
+    payload.extend_from_slice(&ipc);
     check_frame_len(payload.len())?;
     let mut frame = Vec::with_capacity(8 + payload.len());
     frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -838,14 +864,7 @@ fn decode_payload(payload: &[u8]) -> Result<(u64, Vec<RecordBatch>)> {
         bail!("payload shorter than its sequence header");
     }
     let seq = u64::from_le_bytes(payload[..8].try_into().expect("8 bytes"));
-    let reader = StreamReader::try_new(std::io::Cursor::new(&payload[8..]), None)
-        .map_err(|e| anyhow!("tail frame IPC header invalid: {e}"))?;
-    let batches: Vec<RecordBatch> = reader
-        .collect::<std::result::Result<_, _>>()
-        .map_err(|e| anyhow!("tail frame IPC decode failed: {e}"))?;
-    if batches.is_empty() {
-        bail!("tail frame IPC stream holds no batch");
-    }
+    let batches = decode_ipc(&payload[8..])?;
     Ok((seq, batches))
 }
 
@@ -1439,8 +1458,8 @@ mod tests {
         let root = temp_root("sidecar");
         let wal = LocalWal::open(&root).unwrap();
         wal.append(&ident(), &[batch(&[1])]).unwrap();
-        wal.record_watermark(&ident(), 7);
-        wal.record_watermark(&ident(), 5); // lower: must not regress
+        wal.record_watermark(&ident(), 7).unwrap();
+        wal.record_watermark(&ident(), 5).unwrap(); // lower: must not regress
         drop(wal);
         let wal2 = LocalWal::open(&root).unwrap();
         let tables = wal2.replay().unwrap();

@@ -89,6 +89,15 @@ crc32fast = "=1.5.0"
 # icegres processes can never share one --tail-dir (double-apply / cross-
 # truncate hazard). Already in the tree transitively at exactly this version.
 libc = "=0.2.186"
+# Durable-tail Postgres backend (src/tail_pg.rs, --tail-url). Pinned EXACTLY
+# because the wire-protocol crates it builds on — postgres-protocol 0.6.12 and
+# postgres-types 0.2.14 — are ALREADY in this graph (pgwire/arrow-pg via
+# datafusion-postgres), and 0.7.18 is the version known to resolve against
+# exactly that pair on this toolchain (bench/harness pins the same trio); a
+# floating bound could drag the shared protocol crates and with them the
+# pinned pgwire matrix. Default features only ("runtime" = tokio connect);
+# no with-* type extensions — the tail schema is TEXT/BIGINT/BYTEA only.
+tokio-postgres = "=0.7.18"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

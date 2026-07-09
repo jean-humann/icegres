@@ -23,11 +23,20 @@
 #      the persisted watermark (or the second replay would drop them).
 #   5. Contrast: the same kill -9 sequence WITHOUT --tail-dir loses the acked
 #      rows (today's documented behavior, unchanged).
+#   6-8. The POSTGRES tail backend (--tail-url, icegres/src/tail_pg.rs) holds
+#      the same contract with the tail living in the stack's Postgres
+#      (database icegres_test, schema icegres_tail): distinct startup WARN,
+#      frames durable in the tail database, kill -9 recovery (6); flush +
+#      watermark exactly-once across a second crash, sidecar row written,
+#      covered frames truncated (7); post-flush-restart sequence floor (8).
+#      Section 1 also proves --tail-url without buffered writes and
+#      --tail-dir + --tail-url together are refused at boot.
 #
 # Non-destructive, self-contained, idempotent: creates/purges its own scratch
 # table demo.tail_durability_scratch via the REST catalog (never touches
-# demo.trips) and its own tail dir under .e2e. Uses port 5456 (left free:
-# 5452 belongs to bench/parity.sh D7, 5455 to e2e.sh THR_PORT).
+# demo.trips), its own tail dir under .e2e, and its own icegres_tail schema
+# in icegres_test. Uses port 5456 (left free: 5452 belongs to bench/parity.sh
+# D7, 5455 to e2e.sh THR_PORT).
 # Standalone by design — NOT wired into e2e.sh (keep the gate stable).
 
 set -euo pipefail
@@ -46,6 +55,7 @@ export PGCONNECT_TIMEOUT=5
 # This harness owns its server config: a stray environment must not flip it.
 unset ICEGRES_AUTH_FILE ICEGRES_TLS_CERT ICEGRES_TLS_KEY
 unset ICEGRES_WRITE_BUFFER_MS ICEGRES_WRITE_BUFFER_MAX_ROWS ICEGRES_TAIL_DIR
+unset ICEGRES_TAIL_URL
 
 CATALOG_URI="http://127.0.0.1:8181/catalog"
 WAREHOUSE=lakehouse
@@ -60,6 +70,16 @@ TAIL_DIR="$RUN_DIR/tail-durability-wal"
 SERVE_LOG="$RUN_DIR/tail-durability-serve.log"
 PID_FILE="$RUN_DIR/tail-durability.pid"
 mkdir -p "$RUN_DIR"
+
+# The Postgres tail backend (--tail-url, sections 6-8): the stack's own
+# Postgres (infra/scripts/pg-start.sh creates icegres_test OWNED by the
+# lakekeeper role), schema icegres_tail auto-created by the server.
+TAIL_PG_URL="postgresql://lakekeeper:lakekeeper@127.0.0.1:5433/icegres_test"
+pg_tail() { psql "$TAIL_PG_URL" -v ON_ERROR_STOP=1 -tA -c "$1"; }
+drop_pg_tail_schema() {
+  psql "$TAIL_PG_URL" -c 'DROP SCHEMA IF EXISTS icegres_tail CASCADE' \
+    >/dev/null 2>&1 || true
+}
 
 PASS_COUNT=0
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -156,6 +176,7 @@ cleanup() {
   stop_server
   [[ -n "$PREFIX" ]] && drop_scratch "$PREFIX"
   rm -rf "$TAIL_DIR"
+  drop_pg_tail_schema
 }
 trap cleanup EXIT
 
@@ -195,6 +216,29 @@ set -e
 grep -q "tail-dir requires buffered writes" <<<"$noop_out" \
   || fail "unexpected refusal message: $noop_out"
 pass "--tail-dir without buffered writes refused at boot (exit $noop_rc)"
+
+log "(1b) --tail-url without --write-buffer-ms fails loudly"
+set +e
+noop_out=$(timeout 10 "$BIN" serve --host "$PG_HOST" --port "$PG_PORT" \
+  --write-buffer-ms 0 --tail-url "$TAIL_PG_URL" 2>&1)
+noop_rc=$?
+set -e
+[[ $noop_rc -ne 0 ]] || fail "--tail-url with --write-buffer-ms 0 was accepted"
+grep -q "tail-url requires buffered writes" <<<"$noop_out" \
+  || fail "unexpected refusal message: $noop_out"
+pass "--tail-url without buffered writes refused at boot (exit $noop_rc)"
+
+log "(1c) --tail-dir and --tail-url together are refused (one process, ONE tail)"
+set +e
+noop_out=$(timeout 10 "$BIN" serve --host "$PG_HOST" --port "$PG_PORT" \
+  --write-buffer-ms "$BUF_MS" --tail-dir "$TAIL_DIR" --tail-url "$TAIL_PG_URL" 2>&1)
+noop_rc=$?
+set -e
+[[ $noop_rc -ne 0 ]] || fail "--tail-dir together with --tail-url was accepted"
+grep -q "cannot be used with" <<<"$noop_out" \
+  || fail "unexpected refusal message: $noop_out"
+pass "--tail-dir + --tail-url refused at boot (exit $noop_rc)"
+rm -rf "$TAIL_DIR"
 
 # ---------------------------------------------------------------------------
 # 2. Tail replay: acked-but-unflushed rows SURVIVE kill -9
@@ -284,5 +328,80 @@ start_server # restart, still no tail
 assert_eq "untailed acked rows LOST after kill -9 (unchanged trade-off)" "6" \
   "$(q "select count(*) from demo.$TABLE")"
 pass "without --tail-dir the unclean-kill loss window is unchanged"
+
+# ---------------------------------------------------------------------------
+# 6. POSTGRES tail backend (--tail-url): acked rows survive kill -9 with the
+#    tail living in the stack's Postgres — the node-loss-durable backend.
+#    Fresh scratch table + fresh icegres_tail schema so counts start at 0.
+# ---------------------------------------------------------------------------
+log "(6) postgres tail: acked rows survive an unclean kill"
+stop_server
+drop_scratch "$PREFIX"
+create_scratch "$PREFIX" || fail "could not re-create demo.$TABLE via REST catalog"
+drop_pg_tail_schema
+: >"$SERVE_LOG"
+start_server --tail-url "$TAIL_PG_URL"
+strip_ansi <"$SERVE_LOG" | grep -q "durable Postgres tail" \
+  || fail "startup WARN does not announce the Postgres tail backend (log: $SERVE_LOG)"
+pass "startup WARN announces the Postgres tail backend (node-loss durability class)"
+
+for i in 1 2 3; do
+  q "insert into demo.$TABLE (id, note) values ($i, 'pg-tail-survivor')" >/dev/null \
+    || fail "pg-tailed INSERT $i failed"
+done
+assert_eq "acked rows readable via the union view (buffered, uncommitted)" "3" \
+  "$(q "select count(*) from demo.$TABLE")"
+assert_eq "frames durable in the tail DATABASE before the kill" "3" \
+  "$(pg_tail "select count(*) from icegres_tail.frames")"
+
+kill_9
+start_server --tail-url "$TAIL_PG_URL"
+strip_ansi <"$SERVE_LOG" | grep -q "recovered .* rows for .* tables from the" \
+  || fail "restart log does not report a tail replay (log: $SERVE_LOG)"
+assert_eq "ALL acked rows present after kill -9 + pg-tail replay" "3" \
+  "$(q "select count(*) from demo.$TABLE")"
+pass "unclean kill lost NOTHING with --tail-url"
+
+# ---------------------------------------------------------------------------
+# 7. PG tail: fence-forced flush commits the replayed rows, stamps the
+#    watermark, writes the sidecar row, truncates the covered frames — and
+#    the NEXT crash double-applies nothing (exactly-once).
+# ---------------------------------------------------------------------------
+log "(7) pg tail: flush + watermark = exactly-once across a second crash"
+q "delete from demo.$TABLE where id < 0" >/dev/null || fail "fence DELETE failed"
+assert_eq "rows COMMITTED by the fence-forced flush" "3" \
+  "$(q "select count(*) from demo.$TABLE")"
+assert_eq "watermark sidecar row records the covered seq" "3" \
+  "$(pg_tail "select seq from icegres_tail.watermarks")"
+assert_eq "covered frames truncated from the tail database" "0" \
+  "$(pg_tail "select count(*) from icegres_tail.frames")"
+kill_9
+start_server --tail-url "$TAIL_PG_URL"
+assert_eq "no double-apply after commit + crash (watermark honored)" "3" \
+  "$(q "select count(*) from demo.$TABLE")"
+pass "exactly-once held across commit -> kill -9 -> replay (pg tail)"
+
+# ---------------------------------------------------------------------------
+# 8. PG tail sequence floor: rows acked AFTER a flushed generation and a
+#    restart must survive the next crash — post-restart numbering must not
+#    duck under the persisted watermark (same trap as section 4; here the
+#    floor is seeded from the watermarks table at open).
+# ---------------------------------------------------------------------------
+log "(8) pg tail seq floor: post-flush restart + new inserts survive a crash"
+for i in 11 12 13; do
+  q "insert into demo.$TABLE (id, note) values ($i, 'pg-second-generation')" >/dev/null \
+    || fail "pg second-generation INSERT $i failed"
+done
+assert_eq "both generations readable pre-kill (union view)" "6" \
+  "$(q "select count(*) from demo.$TABLE")"
+kill_9
+start_server --tail-url "$TAIL_PG_URL"
+assert_eq "BOTH generations present after the second crash" "6" \
+  "$(q "select count(*) from demo.$TABLE")"
+pass "post-restart sequences cleared the persisted watermark (pg tail)"
+q "delete from demo.$TABLE where id < 0" >/dev/null || fail "fence DELETE failed"
+assert_eq "second generation COMMITTED by the fence-forced flush" "6" \
+  "$(q "select count(*) from demo.$TABLE")"
+stop_server
 
 log "all assertions passed ($PASS_COUNT)"
