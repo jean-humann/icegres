@@ -1,71 +1,119 @@
-<!--
-**jean-humann/jean-humann** is a ✨ _special_ ✨ repository because its `README.md` (this file) appears on your GitHub profile.
+# icegres
 
-Here are some ideas to get you started:
+**A Postgres-wire and Arrow Flight SQL endpoint over an Apache Iceberg lakehouse.**
 
-- 🔭 I’m currently working on ...
-- 🌱 I’m currently learning ...
-- 👯 I’m looking to collaborate on ...
-- 🤔 I’m looking for help with ...
-- 💬 Ask me about ...
-- 📫 How to reach me: ...
-- 😄 Pronouns: ...
-- ⚡ Fun fact: ...
--->
+`icegres` connects to an Iceberg REST catalog (Lakekeeper), mounts every
+namespace/table into a DataFusion session, and serves that session over **two
+first-class wire protocols** — the Postgres wire protocol and Arrow Flight SQL
+(ADBC). Any Postgres client (`psql`, JDBC/ODBC drivers, ORMs, BI tools) or ADBC
+client can then query **and modify** Iceberg tables whose data lives as Parquet
+on S3-compatible storage. There is exactly **one copy of the data**, in open
+Iceberg format on the lake; every feature is zero-copy on top of it.
 
+It compiles to a single static binary (plus `icegresd`, a small scale-to-zero
+control plane) with no JVM, coordinator, or per-query task scheduler — so it
+starts in ~0.3 s and serves interactive queries in single-digit milliseconds.
 
-# Hey, I'm Jean Humann! 👋
-
-**Technical Director** @ [Cleyrop](https://www.cleyrop.com/) | **LLM Enthusiast** | **Data Platform Builder**
-
----
-
-## 👨‍💻 About Me
-
-I'm building the future of secure, sovereign data platforms at Cleyrop. My journey started in Machine Learning, but these days I'm deep in the world of **Large Language Models (LLMs)**, **AI agents**, and **cloud-native architectures**. I believe in technology that respects user privacy while pushing the boundaries of what's possible.
-
-```python
-class Jean:
-    def __init__(self):
-        self.role = "Technical Director"
-        self.company = "Cleyrop"
-        self.interests = ["LLMs", "AI Agents", "Data Sovereignty", "Kubernetes"]
-        self.currently_exploring = "Building AI-powered data pipelines"
+```
+   psql / JDBC / ODBC / ORMs ─┐
+                              ├─▶  icegres  ─▶  Iceberg REST catalog (Lakekeeper)
+   ADBC / Arrow Flight SQL ───┘       │              │
+                                      └─▶  Parquet on S3 (RustFS / MinIO / S3)
 ```
 
-## 🚀 What I'm Working On
+---
 
-| Area | Focus |
-|------|-------|
-| 🤖 **AI & LLMs** | Integrating LLMs into enterprise data workflows, prompt engineering, RAG systems |
-| 🔐 **Data Sovereignty** | Building platforms where your data stays yours |
-| ☁️ **Cloud Native** | Kubernetes, containers, and scalable architectures |
-| 👥 **Team Leadership** | Growing engineers who ship great products |
+## What it does
 
-## 🧠 Current Obsessions
+| Capability | Summary |
+|---|---|
+| **Postgres wire** | Simple + extended protocol, `pg_catalog`/`information_schema` emulation, SCRAM-SHA-256 auth, TLS. Verified against psql, psycopg2, pg8000, SQLAlchemy, pgjdbc, psqlODBC. |
+| **Arrow Flight SQL / ADBC** | Second first-class protocol: queries stream as Arrow IPC, catalog metadata (`get_objects`), prepared statements, DML, and bulk ingest (one Iceberg commit per stream). In-process TLS (`grpc+tls://`). |
+| **OLTP over the lake** | `INSERT`/`UPDATE`/`DELETE` as copy-on-write Iceberg snapshots; explicit `BEGIN/COMMIT/ROLLBACK` with snapshot isolation and first-committer-wins concurrency (`40001`); opt-in primary-key enforcement. |
+| **Time travel & branches** | `table@snapshot_id` reads; Neon-style zero-copy branches (`icegres branch …`, `serve --branch`) — a branch is one metadata commit, no data copied. |
+| **Buffered writes** | Opt-in Moonlink-style group commit (`--write-buffer-ms`): ~1.5 ms INSERT ack, union reads, flushed on clean shutdown (only an unclean kill loses the in-memory window). |
+| **Scale-to-zero** | `icegresd` wakes computes on connect and idles them to zero; branch-endpoint routing; warm session pooling. |
+| **Ops surface** | Graceful drain, bounded memory pool + disk spill, connection cap + per-IP failed-auth backoff, catalog timeouts, catalog-aware `/ready`, Prometheus `/metrics` (incl. in-flight/slow-query), correlation-ID spans, snapshot expiry. |
 
-- 🔥 **LLM Orchestration** — Exploring frameworks like LangChain, LlamaIndex, and building custom AI agents
-- 🛠️ **MLOps & LLMOps** — Making AI systems production-ready and reliable
-- 📊 **Vector Databases** — Because RAG is the future of enterprise AI
-- 🏃‍♂️ **Running & Biking** — Clearing my head while the models train
+## Where it fits
 
-## 💡 Philosophy
+Measured on a single 4-core box against Trino 446 and Spark 3.5.8 Thrift
+reading the **same** Iceberg tables through the same REST catalog, `icegres` is
+the clear **interactive-serving** winner — small-query p50s of 7–10 ms vs
+115–436 ms (16–43× faster), higher qps at 8 connections, ~0.3 s startup vs
+10–14 s, and 8–10× less peak RSS. It is **not** a distributed analytics engine:
+Trino wins the largest full-table aggregations, and that gap widens with data
+volume or a real cluster.
 
-> *"The best data platform is one you don't have to think about — it just works, securely."*
-
-I'm passionate about building technology that empowers businesses without compromising on security. In the age of AI, data sovereignty isn't just nice-to-have — it's essential.
-
-## 🤝 Let's Connect
-
-I love talking about LLMs, data architecture, and the future of AI. Don't hesitate to reach out!
-
-[![Email](https://img.shields.io/badge/Email-jean.humann%40cleyrop.com-blue?style=flat-square&logo=gmail)](mailto:jean.humann@cleyrop.com)
-[![Twitter](https://img.shields.io/badge/Twitter-@HumannJean-1DA1F2?style=flat-square&logo=twitter)](https://twitter.com/HumannJean)
-[![LinkedIn](https://img.shields.io/badge/LinkedIn-jeanhumann-0A66C2?style=flat-square&logo=linkedin)](https://www.linkedin.com/in/jeanhumann/)
+**Honest fit:** sub-second point / filtered / join queries, Postgres-protocol
+and ADBC compatibility, and scale-to-zero economics on lakehouse data. Leave
+100 GB+ distributed scans to Trino/Spark.
 
 ---
 
-<p align="center">
-  <i>Building secure AI-powered data platforms, one commit at a time.</i>
-</p>
+## Quick start
 
+Prerequisites: Rust (pinned in `rust-toolchain.toml`), and the local lakehouse
+stack (Postgres + RustFS + Lakekeeper) which `infra/scripts/up.sh` provisions.
+
+```sh
+# 1. Bring up the local Iceberg lakehouse (Lakekeeper + RustFS + Postgres)
+bash infra/scripts/up.sh
+
+# 2. Build and seed demo data
+cd icegres && cargo build --release
+./target/release/icegres seed
+
+# 3. Serve over the Postgres wire protocol
+./target/release/icegres serve --host 127.0.0.1 --port 5439 --health-port 8080
+
+# 4. Connect with any Postgres client
+psql "host=127.0.0.1 port=5439 dbname=icegres" \
+  -c "select city, count(*) from demo.trips group by city"
+```
+
+Serve the same lakehouse over Arrow Flight SQL for ADBC clients:
+
+```sh
+./target/release/icegres flight-serve --host 127.0.0.1 --port 50051
+```
+
+Run in a container (multi-stage, non-root):
+
+```sh
+docker build -t icegres .
+docker run --rm -p 5439:5439 -p 8080:8080 \
+  -e ICEGRES_CATALOG_URI=https://catalog.example.com/catalog \
+  -e ICEGRES_S3_ENDPOINT=https://s3.example.com \
+  -e ICEGRES_S3_ACCESS_KEY=... -e ICEGRES_S3_SECRET_KEY=... \
+  icegres serve --host 0.0.0.0 --health-port 8080
+```
+
+---
+
+## Documentation
+
+| Doc | What's in it |
+|---|---|
+| [`icegres/README.md`](icegres/README.md) | Full CLI/flag/env reference and per-feature detail (auth, TLS, transactions, PK, branches, buffered writes, ADBC, `icegresd`). |
+| [`docs/deployment.md`](docs/deployment.md) | Operator guide: container, health/readiness/metrics probes, graceful shutdown, resource limits, security, snapshot-expiry maintenance, full env-var reference. |
+| [`docs/limitations.md`](docs/limitations.md) | Every deliberate non-goal / caveat, with its workaround and why-not-yet. |
+| [`docs/cqrs-topology.md`](docs/cqrs-topology.md) | CQRS reference topology — which tier serves OLTP vs API vs BI, with measured latencies. |
+| [`docs/production-readiness-audit.md`](docs/production-readiness-audit.md) | Multi-agent pre-GA audit and how each finding was closed. |
+| [`bench/SCORECARD.md`](bench/SCORECARD.md) | All benchmark numbers, the parity matrix, and the round-by-round development history. |
+
+## Testing
+
+- `icegres/tests/e2e.sh` — end-to-end suite against the live stack (130+ assertions across every feature and both wire protocols).
+- `cargo test` — unit tests (buffer union-read state machine, PK checks, transactions, auth parsing, …).
+- `bench/parity.sh` — feature-parity probes vs the Lakebase/Neon/Moonlink bar.
+- `bench/bench.sh` + `bench/gate.sh` — the performance harness and no-regression gate.
+
+## Architecture notes
+
+- **Pinned dependency matrix** (do not bump independently — see `icegres/Cargo.toml`): iceberg-rust 0.9.1, DataFusion 52.5.0, arrow 57.3.1, datafusion-postgres 0.15.0 (pgwire 0.38.3), tonic 0.14, sqlparser 0.62.0, toolchain 1.96.1.
+- **Open-core split:** the SQL server, the authorization *seam*, and all wire/driver support are open source and always compiled; the auth/authz *backends* live behind the default `managed` cargo feature (`--no-default-features` builds a pure open-source distribution).
+
+## License
+
+Apache-2.0 — see [`LICENSE`](LICENSE).
