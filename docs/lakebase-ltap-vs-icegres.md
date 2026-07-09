@@ -174,6 +174,9 @@ concrete difference below follows from that polarity.
 
 ## 4. What LTAP has that icegres does not
 
+> How icegres closes these without giving up §5 is designed in
+> **`sota-roadmap.md`** (the durable-tail architecture).
+
 1. **A quorum-WAL durability tier.** This is the deepest difference. LTAP
    commits are durable at network-RTT cost *before* anything reaches the
    lake; icegres' only durable act is the Iceberg commit itself (~50–60 ms),
