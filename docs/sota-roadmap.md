@@ -261,11 +261,13 @@ The comparison doc scores Lakebase's whole-database branching and icegres'
 `40003` multi-table caveat as two separate gaps. They share one fix, and it
 is cheaper than it looks: the **Iceberg REST spec's multi-table transaction
 endpoint (`POST /v1/{prefix}/transactions/commit`)**, which Lakekeeper —
-already the assumed catalog — implements. The pinned iceberg-rust 0.9.1
-doesn't surface it, but icegres already speaks raw authenticated REST to
-the catalog; building the `CommitTransactionRequest` (per-table
-`assert-ref-snapshot-id` requirements + updates) directly is a contained
-addition. (First step: verify endpoint behavior against the deployed
+already the assumed catalog — implements (verified in source:
+`CommitTransaction(POST, "/catalog/v1/{prefix}/transactions/commit")` in
+`lakekeeper/crates/lakekeeper/src/api/endpoints.rs`). The pinned
+iceberg-rust 0.9.1 doesn't surface it, but icegres already speaks raw
+authenticated REST to the catalog; building the `CommitTransactionRequest`
+(per-table `assert-ref-snapshot-id` requirements + updates) directly is a
+contained addition. (First step: exercise the endpoint against the deployed
 Lakekeeper version in e2e, then adopt.)
 
 - **Atomic multi-table COMMIT**: a transaction touching N tables becomes

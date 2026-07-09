@@ -200,7 +200,7 @@ concrete difference below follows from that polarity.
 | Small tables | skipped from columnar conversion (bookkeeping > benefit) | everything is Iceberg; small-file/snapshot bloat is a documented anti-pattern with no compaction command yet |
 | Cache hierarchy | buffer pool → local file cache → PageServer → object store | manifest/metadata cache + OS page cache → object store (no page tier to cache; Parquet is read directly) |
 | Maintenance | PageServer compaction/GC machinery, managed | snapshot expiry is shipped (`maintain expire-snapshots`); compaction and orphan-file GC are explicit gaps (pinned iceberg-rust 0.9.1) |
-| Openness / deployment | managed service (Neon core is OSS; the LTAP transcoding tier and control plane are Databricks-proprietary) | one ~123 MB static binary + `icegresd`, self-hostable on any REST catalog + S3; open-core (auth/authz backends are the managed add-on); ~0.3 s cold start |
+| Openness / deployment | managed service (Neon core is OSS; the LTAP transcoding tier and control plane are Databricks-proprietary) | one ~126 MB static binary + `icegresd`, self-hostable on any REST catalog + S3; open-core (auth/authz backends are the managed add-on); ~0.3 s cold start |
 
 ## 4. What LTAP has that icegres does not
 
@@ -250,7 +250,8 @@ concrete difference below follows from that polarity.
 4. **Two first-class wire protocols** — pgwire *and* Arrow Flight SQL/ADBC
    with Arrow end-to-end.
 5. **Self-hostability and verifiability.** Single static binary, local stack,
-   104-assertion e2e, published benchmark harness; every performance claim
+   133-assertion e2e (per `bench/SCORECARD.md`, R20), published benchmark
+   harness; every performance claim
    above is reproducible from `bench/`. LTAP's 5×/2×/10× figures are vendor
    statements about a managed service (the post is transparent that rollout
    is still transitional/dual-write).
