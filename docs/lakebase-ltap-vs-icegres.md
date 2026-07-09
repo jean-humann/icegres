@@ -134,6 +134,36 @@ Final section ("Every table, automatically"): CDC/"mirroring"/"zero-ETL"
 pipelines cost per table, so teams replicate only selected tables; LTAP's
 conversion happens in the storage layer for **every table automatically**.
 
+### 1.4 The open-source substrate behind the article
+
+Both halves of the described system exist as inspectable code, which
+anchors the summary above to implementations:
+
+- The entire "Lakebase architecture" section describes
+  [neondatabase/neon](https://github.com/neondatabase/neon)
+  (**Apache-2.0**): SafeKeeper's proposer–acceptor quorum protocol is
+  `safekeeper/src/safekeeper.rs` (+ `docs/safekeeper-protocol.md`), the
+  PageServer's layer materialization and page reconstruction are
+  `pageserver/src/tenant/storage_layer/` and `walredo.rs`, the read-cache
+  hierarchy figure maps to `page_cache.rs` plus the compute-side file
+  cache, and branching/PITR are the LSN-addressed `tenant/timeline/`
+  machinery.
+- LTAP's row→columnar tail lineage is
+  [Mooncake-Labs/moonlink](https://github.com/Mooncake-Labs/moonlink)
+  (**BSL 1.1**; Mooncake Labs was acquired by Databricks in Oct 2025): a
+  per-table WAL over pluggable storage (`storage/wal.rs`), keyed memory
+  buffers with deletion vectors (`storage/mooncake_table/`), Iceberg
+  materialization incl. v3 deletion vectors
+  (`storage/table/iceberg/iceberg_table_syncer.rs`), and the
+  LSN-consistent union-read merge (`union_read/`,
+  `moonlink_datafusion`'s TableProvider) — the article's freshness
+  mechanism in miniature. The LTAP production transcoding tier itself is
+  proprietary.
+
+What each piece means for icegres — including the license and
+dependency-matrix constraints on actual reuse — is worked through in
+`sota-roadmap.md` §2.
+
 ## 2. The two architectures in one sentence each
 
 - **LTAP** is *row-authoritative Postgres pushed down into the lake*: a real
