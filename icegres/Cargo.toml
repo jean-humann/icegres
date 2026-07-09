@@ -80,6 +80,15 @@ uuid = { version = "1", features = ["v4"] }
 # datafusion-postgres; rustls itself is reached through pgwire's re-export of
 # tokio_rustls so no second rustls version can drift in.
 rustls-pemfile = "2"
+# Durable-tail WAL frame checksums (src/tail.rs). Already in the dependency
+# graph transitively (parquet et al.) at exactly this version, so the pin
+# matches Cargo.lock and adds no new code to the binary. Arrow IPC framing
+# for the same file comes through the existing `arrow` facade (arrow::ipc).
+crc32fast = "=1.5.0"
+# Durable-tail directory lock (src/tail.rs): flock(LOCK_EX | LOCK_NB) so two
+# icegres processes can never share one --tail-dir (double-apply / cross-
+# truncate hazard). Already in the tree transitively at exactly this version.
+libc = "=0.2.186"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

@@ -50,7 +50,10 @@ unset ICEGRES_AUTH_FILE ICEGRES_TLS_CERT ICEGRES_TLS_KEY
 # be fully synchronous; only the dedicated section 4b run turns the flag on.
 unset ICEGRES_WRITE_BUFFER_MS ICEGRES_WRITE_BUFFER_MAX_ROWS
 
-BIN="$ICEGRES_DIR/target/release/icegres"
+# ICEGRES_BIN overrides the server under test (e.g. a preserved baseline
+# binary for A/B regression runs); when set, the tree build is skipped so
+# the override cannot be silently clobbered by a rebuild.
+BIN="${ICEGRES_BIN:-$ICEGRES_DIR/target/release/icegres}"
 HARNESS_BIN="$SCRIPT_DIR/harness/target/release/icegres-bench"
 PID_FILE="$RUN_DIR/bench-serve.pid"
 SERVE_LOG="$RUN_DIR/bench-serve.log"
@@ -211,8 +214,12 @@ fi
 # ---------------------------------------------------------------------------
 # 2. Release binaries (server under test + harness)
 # ---------------------------------------------------------------------------
-log "building icegres (release) — no-op when fresh"
-(cd "$ICEGRES_DIR" && cargo build --release --quiet) || fatal "cargo build --release failed"
+if [[ -n "${ICEGRES_BIN:-}" ]]; then
+  log "using override binary ICEGRES_BIN=$BIN (tree build skipped)"
+else
+  log "building icegres (release) — no-op when fresh"
+  (cd "$ICEGRES_DIR" && cargo build --release --quiet) || fatal "cargo build --release failed"
+fi
 [[ -x "$BIN" ]] || fatal "release binary not found at $BIN"
 
 log "building bench harness (release)"

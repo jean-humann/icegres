@@ -90,6 +90,27 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
   buffer before exiting, so a graceful stop loses nothing. Default is `0`
   (fully synchronous); buffered mode logs a `WARN` on enable. Leave it off for
   durability-critical writes that cannot tolerate the unclean-kill window.
+- **`--tail-dir` closes the unclean-kill window with a durable local tail.**
+  Added to buffered mode, `--tail-dir <dir>` fsyncs every buffered INSERT to a
+  per-table WAL segment before its ack and replays un-flushed rows into the
+  buffer on the next boot (exactly-once via the `icegres.tail-seq.<tail-id>`
+  table property each flush commit records, belt-and-braced with a local
+  watermark sidecar), so SIGKILL/power loss of the *process* loses nothing.
+  The caveat moves one honest level down: the tail is this node's disk, so
+  losing the node or the disk still loses acked-but-uncommitted rows — disk
+  durability, not node-loss durability. Known bounds, stated plainly: the
+  tail dir grows without bound during a catalog outage (it mirrors the
+  pending buffer, and nothing truncates until a flush commits); boot replay
+  materializes the whole surviving tail in memory before the flusher drains
+  it; and one residual double-apply window remains (a crash between the
+  commit and the sidecar write combined with a foreign writer dropping the
+  watermark property). Two more operational notes: the tail fsync runs under
+  the buffer lock, so a slow tail disk stalls other tables' buffered INSERTs
+  *and* same-server union reads for that fsync's window (per-table locking is
+  the known follow-up); and the single-writer guard is an advisory `flock`,
+  which is unreliable on NFS — put the tail dir on a local filesystem.
+  Default is off (no tail, behavior above unchanged);
+  requires `--write-buffer-ms > 0` or startup fails.
 
 ## Transport / security
 

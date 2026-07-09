@@ -340,7 +340,7 @@ impl TableProvider for CachingTableProvider {
                 crate::scan::tune(provider.scan(state, projection, filters, None).await?);
             let mem = MemTable::try_new(overlay.schema, vec![overlay.batches])?;
             let buffered = mem.scan(state, projection, filters, None).await?;
-            return Ok(UnionExec::try_new(vec![committed, buffered])?);
+            return UnionExec::try_new(vec![committed, buffered]);
         }
         let plan = provider.scan(state, projection, filters, limit).await?;
         // Re-run plain table scans at higher object-store IO concurrency

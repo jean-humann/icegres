@@ -141,6 +141,7 @@ environment variables:
 | `--branch` (serve) | `ICEGRES_BRANCH` | `main` | Serve a zero-copy branch: reads pin to the ref's head, all writes commit to the ref with `assert-ref-snapshot-id` (never touching other branches) |
 | `--write-buffer-ms` (serve) | `ICEGRES_WRITE_BUFFER_MS` | `0` (sync) | Opt-in buffered writes: INSERTs ack from an in-memory buffer, group-committed every N ms; unclean kill loses ≤N ms of acked writes (WARN on enable) |
 |  | `ICEGRES_WRITE_BUFFER_MAX_ROWS` | `50000` | Row threshold that forces an early flush in buffered mode |
+| `--tail-dir` (serve) | `ICEGRES_TAIL_DIR` | off | Durable local tail for buffered writes (requires `--write-buffer-ms > 0`): fsync'd per-table WAL appended BEFORE each buffered ack, replayed on boot — closes the unclean-kill loss window (node/disk loss still loses the tail) |
 |  | `ICEGRES_TXN_STRICT` | off | Refuse any multi-table `COMMIT` up front with `0A000` (nothing applied), guaranteeing every COMMIT is all-or-nothing. Off = best-effort ordered per-table commits (a partial apply reports `40003`, not the retryable `40001`). |
 
 Logging uses `tracing` with an env filter: `RUST_LOG=debug icegres serve`.
@@ -447,6 +448,37 @@ default is `0` — fully synchronous, semantics identical to not having the
 feature — and enabling it logs a WARN. Both halves of the contract are
 locked by e2e (kill-loss vs clean-shutdown-flush), and the union-read flush
 race is covered by `buffer.rs` unit tests.
+
+**Durable local tail (`--tail-dir <dir>`, opt-in)** closes the unclean-kill
+window without giving up the buffered ack (measured on the dev box: ~3.2 ms
+p50 / 6.3 ms p95 ack with the tail vs ~1.3 ms untailed and ~50–80 ms
+synchronous — the fsync is the price of the closed window): every buffered
+INSERT is appended
+to an fsync'd per-table WAL segment under `<dir>` BEFORE the client ack (a
+tail write failure is the statement's error — never a silent downgrade), and
+on the next boot with the same `--tail-dir` acked-but-uncommitted rows are
+replayed into the buffer and committed by the normal flusher, so SIGKILL /
+power loss of the process loses nothing. Exactly-once across crashes is
+anchored in the lake: each flush commit records the highest drained tail
+sequence as a table property namespaced by the tail's persistent identity
+(`icegres.tail-seq.<tail-id>`, minted once into `<dir>/identity`) in the same
+atomic commit, plus a best-effort local sidecar (`<dir>/<table>/watermark`),
+and boot replay drops frames at or below `max(property, sidecar)` (a crash
+between commit and tail truncation cannot double-apply; several buffered
+writers on one table keep independent cursors). **Honest scope:** durability
+is THIS node's disk — losing the node or the disk still loses the tail; this
+is a strict upgrade over in-memory buffering, not node-loss durability
+(`src/tail.rs`). Like the pending buffer it mirrors, the tail dir grows
+without bound while the catalog is unreachable (nothing truncates until a
+flush commits), and boot replay materializes the whole surviving tail in
+memory before the flusher drains it. One residual double-apply window
+remains: a crash between the commit and the sidecar write COMBINED with a
+foreign writer dropping the table property. The tail dir is single-writer
+(exclusive `flock`; a second server on the same dir is refused at boot).
+Requires `--write-buffer-ms > 0` (refused at boot otherwise); verified
+standalone by `icegres/tests/tail_durability.sh` (kill -9 with the tail =
+zero loss, without = the documented loss, plus the no-double-apply and
+post-flush-restart sequence-floor cases).
 
 ### Zero-copy branches (`icegres branch`, `serve --branch`)
 

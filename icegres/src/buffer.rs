@@ -20,6 +20,23 @@
 //!   past the cadence). `main.rs` prints a WARN at startup when the mode is
 //!   enabled. Rows the flusher HAS committed are exactly as durable as any
 //!   synchronous write.
+//! * **Durable tail (`--tail-dir`, opt-in, closes the unclean-kill window)**:
+//!   with a [`TailStore`] attached, every buffered INSERT is fsync'd to a
+//!   per-table WAL BEFORE its ack (a tail failure is the statement's error —
+//!   no silent downgrade), replayed into `pending` on the next boot, and
+//!   truncated when the flush commit lands. One STATEMENT is one tail frame
+//!   (all its batches in a single fsync'd append), so a failed statement can
+//!   never leave a replayable partial prefix. Each flush commit records the
+//!   highest drained tail sequence as a table property namespaced by the
+//!   tail's persistent identity (`icegres.tail-seq.<tail-id>`, see
+//!   [`TAIL_SEQ_PROPERTY_PREFIX`](crate::tail::TAIL_SEQ_PROPERTY_PREFIX)) in
+//!   the SAME atomic commit, plus a best-effort local sidecar; boot replay
+//!   drops frames at or below `max(property, sidecar)` — exactly-once across
+//!   crashes, reconcilable from the lake alone even when a foreign writer
+//!   drops the property. Honest scope: durability is this NODE's disk, not
+//!   node-loss durability (see `tail.rs`). Tail appends and the flush
+//!   snapshot both run under the buffer lock, so per-table pending order ==
+//!   tail sequence order — the invariant the watermark depends on.
 //! * **Cross-SERVER freshness = commit cadence**: other icegres computes
 //!   (and any external Iceberg reader) see buffered rows only once the
 //!   flusher commits them — at most ~`N` ms after the ack. Only reads on
@@ -70,7 +87,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context as _, Result};
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use async_trait::async_trait;
@@ -90,6 +107,7 @@ use crate::dml;
 use crate::overwrite::{
     align_batch, prepare_commit, CommitOutcome, OverwriteEngine, TableOp, MAX_COMMIT_ATTEMPTS,
 };
+use crate::tail::{drop_stale_frames, effective_watermark, parse_watermark_property, TailStore};
 use crate::txn::{insert_target, plan_insert_rows, TxnRegistry};
 
 /// Flush early once a table has this many pending buffered rows (bounds
@@ -118,6 +136,11 @@ struct TableBuf {
     pending_rows: usize,
     /// Committed generations kept until every scan can see them (GC'd).
     flushed: Vec<FlushedGen>,
+    /// Highest durable-tail sequence reflected in this buffer (None when no
+    /// tail is attached). Because tail appends happen under the same lock
+    /// that orders `pending`, this is exactly the max sequence of any
+    /// pending-snapshot taken now — the flush commit's watermark.
+    tail_high: Option<u64>,
 }
 
 /// The overlay a scan must union with its committed data (see cache.rs).
@@ -146,12 +169,19 @@ impl BufferState {
 
     /// Align `batches` to the table's canonical schema and append them to its
     /// pending buffer, creating the entry from `schema_if_first` on first
-    /// touch. Returns `(rows_appended, pending_rows_total)`.
+    /// touch. With a `tail`, the aligned batches are durably appended to it
+    /// FIRST (fsync before return) — a tail error leaves `pending` untouched
+    /// and becomes the statement's error, so nothing is ever acked from
+    /// memory alone. Running the tail append under the buffer lock keeps
+    /// pending order == tail sequence order (the watermark invariant; the
+    /// fsync is the same latency the client is paying for durability anyway).
+    /// Returns `(rows_appended, pending_rows_total)`.
     fn append(
         &self,
         ident: &TableIdent,
         schema_if_first: Option<ArrowSchemaRef>,
         batches: &[RecordBatch],
+        tail: Option<&dyn TailStore>,
     ) -> Result<(usize, usize)> {
         let mut tables = self.tables.lock().expect("write-buffer lock poisoned");
         if !tables.contains_key(ident) {
@@ -167,6 +197,7 @@ impl BufferState {
                     pending: Vec::new(),
                     pending_rows: 0,
                     flushed: Vec::new(),
+                    tail_high: None,
                 },
             );
         }
@@ -175,10 +206,30 @@ impl BufferState {
             .iter()
             .map(|b| align_batch(b, &entry.schema))
             .collect::<Result<_>>()?;
+        if let Some(tail) = tail {
+            // ONE append for the whole statement (all batches in one frame,
+            // one fsync, one sequence): all-or-nothing by construction — a
+            // failure leaves NO durable frame (tail.rs rolls back partial
+            // bytes), so rows of a failed statement can never replay.
+            if !aligned.is_empty() {
+                entry.tail_high = Some(tail.append(ident, &aligned)?);
+            }
+        }
         let rows: usize = aligned.iter().map(|b| b.num_rows()).sum();
         entry.pending.extend(aligned);
         entry.pending_rows += rows;
         Ok((rows, entry.pending_rows))
+    }
+
+    /// Record that tail frames up to `seq` are reflected in this buffer
+    /// (boot replay pushes recovered rows via [`append`](Self::append) with
+    /// no tail — they are already durable — then notes their sequences here
+    /// so the next flush commit's watermark covers them).
+    fn note_tail_high(&self, ident: &TableIdent, seq: u64) {
+        let mut tables = self.tables.lock().expect("write-buffer lock poisoned");
+        if let Some(entry) = tables.get_mut(ident) {
+            entry.tail_high = Some(entry.tail_high.map_or(seq, |h| h.max(seq)));
+        }
     }
 
     fn has_pending(&self) -> bool {
@@ -198,12 +249,15 @@ impl BufferState {
 
     /// Snapshot the current pending prefix WITHOUT removing it (rows stay
     /// readable through the union while the commit is in flight). Returns
-    /// `(batches, batch_count)`.
-    fn snapshot_pending(&self, ident: &TableIdent) -> (Vec<RecordBatch>, usize) {
+    /// `(batches, batch_count, tail_mark)` where `tail_mark` is the highest
+    /// durable-tail sequence the snapshot covers (the commit's watermark;
+    /// `None` without a tail) — taken under the same lock as the batches,
+    /// so it is exact for this snapshot.
+    fn snapshot_pending(&self, ident: &TableIdent) -> (Vec<RecordBatch>, usize, Option<u64>) {
         let tables = self.tables.lock().expect("write-buffer lock poisoned");
         match tables.get(ident) {
-            Some(entry) => (entry.pending.clone(), entry.pending.len()),
-            None => (Vec::new(), 0),
+            Some(entry) => (entry.pending.clone(), entry.pending.len(), entry.tail_high),
+            None => (Vec::new(), 0, None),
         }
     }
 
@@ -272,7 +326,7 @@ impl BufferState {
                 .sum::<usize>();
             // These were the OLDEST rows: restore insert order at the front.
             let mut restored = flushed_gen.batches;
-            restored.extend(entry.pending.drain(..));
+            restored.append(&mut entry.pending);
             entry.pending = restored;
         }
     }
@@ -295,6 +349,9 @@ pub struct WriteBuffer {
     interval: Duration,
     max_rows: usize,
     state: BufferState,
+    /// Durable tail (`--tail-dir`): acked rows are fsync'd here before the
+    /// ack and replayed at boot. `None` = today's in-memory-only semantics.
+    tail: Option<Arc<dyn TailStore>>,
     /// Serializes flushes (background cadence vs. forced fences).
     flush_lock: tokio::sync::Mutex<()>,
     /// Wakes the flusher early when `max_rows` is hit.
@@ -302,7 +359,12 @@ pub struct WriteBuffer {
 }
 
 impl WriteBuffer {
-    pub fn new(catalog: Arc<dyn Catalog>, engine: Arc<OverwriteEngine>, interval_ms: u64) -> Self {
+    pub fn new(
+        catalog: Arc<dyn Catalog>,
+        engine: Arc<OverwriteEngine>,
+        interval_ms: u64,
+        tail: Option<Arc<dyn TailStore>>,
+    ) -> Self {
         let max_rows = std::env::var("ICEGRES_WRITE_BUFFER_MAX_ROWS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -314,6 +376,7 @@ impl WriteBuffer {
             interval: Duration::from_millis(interval_ms),
             max_rows,
             state: BufferState::default(),
+            tail,
             flush_lock: tokio::sync::Mutex::new(()),
             kick: tokio::sync::Notify::new(),
         }
@@ -321,6 +384,130 @@ impl WriteBuffer {
 
     pub fn max_rows(&self) -> usize {
         self.max_rows
+    }
+
+    /// Whether a durable tail is attached (shutdown messaging honesty:
+    /// a failed shutdown flush is not lossy when the tail replays).
+    pub fn tail_enabled(&self) -> bool {
+        self.tail.is_some()
+    }
+
+    /// Boot-time recovery (`--tail-dir`): replay every surviving tail frame,
+    /// drop those at or below each table's committed watermark (the
+    /// `icegres.tail-seq.<tail-id>` property, belt-and-braced with the local
+    /// sidecar), and push the survivors into `pending` for the normal
+    /// flusher to drain. Call once, after catalog/engine init and BEFORE
+    /// `spawn_flusher`/the listener. Fails loudly (aborting startup) rather
+    /// than silently dropping acked rows — if a tailed table was dropped
+    /// since the crash, remove its `<ns>.<table>` directory from the tail
+    /// dir to acknowledge the loss.
+    pub async fn replay_tail(&self) -> Result<()> {
+        let Some(tail) = &self.tail else {
+            return Ok(());
+        };
+        let replayed = tail.replay()?;
+        if replayed.is_empty() {
+            tracing::info!("durable tail is empty; nothing to replay");
+            return Ok(());
+        }
+        let (mut recovered_rows, mut recovered_tables) = (0usize, 0usize);
+        for table_tail in replayed {
+            let ident = table_tail.ident;
+            let table = match self.catalog.load_table(&ident).await {
+                Ok(t) => t,
+                // A frameless tail dir holds no acked rows, so a table that
+                // no longer loads (dropped since?) costs nothing: WARN and
+                // move on. With frames present, abort loudly as ever.
+                Err(e) if table_tail.frames.is_empty() => {
+                    tracing::warn!(
+                        table = %ident,
+                        "tail replay: cannot load the table behind a FRAMELESS tail \
+                         dir (dropped since the crash?); skipping it — no acked rows \
+                         are at stake: {e}"
+                    );
+                    // The sidecar alone (no catalog needed) must still floor
+                    // the sequence: if the table is merely UNLOADABLE (not
+                    // gone) and later takes appends, numbering restarting at
+                    // 1 UNDER the committed watermark would make the next
+                    // crash-replay drop those acked rows as already covered.
+                    apply_sidecar_seq_floor(tail.as_ref(), &ident, table_tail.sidecar_watermark)?;
+                    continue;
+                }
+                Err(e) => {
+                    return Err(anyhow!(
+                        "tail replay: cannot load table {ident} (its tail holds acked \
+                         rows; if the table was dropped, delete its directory under \
+                         --tail-dir to acknowledge losing them): {e}"
+                    ));
+                }
+            };
+            // Watermark = max(own namespaced property, local sidecar): the
+            // sidecar survives a foreign writer dropping the property; the
+            // property survives a crash before the sidecar write.
+            let watermark = effective_watermark(
+                &ident,
+                table
+                    .metadata()
+                    .properties()
+                    .get(tail.watermark_property())
+                    .map(String::as_str),
+                table_tail.sidecar_watermark,
+            );
+            // Sequence floor for EVERY table dir — crucially including the
+            // frameless ones a full truncate + restart leaves behind:
+            // without it, numbering restarts at 1 UNDER the persisted
+            // watermark and the NEXT crash-replay silently drops the new
+            // acked rows as "already covered".
+            if let Some(w) = watermark {
+                tail.ensure_seq_floor(&ident, w + 1)?;
+            }
+            let (survivors, dropped) = drop_stale_frames(table_tail.frames, watermark);
+            if dropped > 0 {
+                tracing::info!(
+                    table = %ident,
+                    dropped,
+                    watermark = watermark.unwrap_or_default(),
+                    "tail replay: dropped frames already covered by the committed \
+                     watermark (crash landed between commit and truncate)"
+                );
+                // Best-effort disk cleanup of the covered frames.
+                if let Some(w) = watermark {
+                    if let Err(e) = tail.truncate(&ident, w) {
+                        tracing::warn!(
+                            table = %ident,
+                            upto_seq = w,
+                            "tail truncate of stale frames failed (harmless; the \
+                             watermark keeps replay exact): {e:#}"
+                        );
+                    }
+                }
+            }
+            let Some((max_seq, _)) = survivors.last() else {
+                continue;
+            };
+            let max_seq = *max_seq;
+            let schema = Arc::new(
+                schema_to_arrow_schema(table.metadata().current_schema())
+                    .map_err(|e| anyhow!("schema conversion failed for {ident}: {e}"))?,
+            );
+            let batches: Vec<RecordBatch> = survivors.into_iter().flat_map(|(_, b)| b).collect();
+            // No tail here: the rows are already durable. align_batch inside
+            // fails loudly if the table's schema evolved past the frames.
+            let (rows, _) = self
+                .state
+                .append(&ident, Some(schema), &batches, None)
+                .with_context(|| format!("tail replay: cannot re-buffer rows for {ident}"))?;
+            self.state.note_tail_high(&ident, max_seq);
+            recovered_rows += rows;
+            recovered_tables += 1;
+        }
+        tracing::info!(
+            rows = recovered_rows,
+            tables = recovered_tables,
+            "recovered {recovered_rows} rows for {recovered_tables} tables from the \
+             durable tail; the flusher will commit them"
+        );
+        Ok(())
     }
 
     /// Start the background group-commit task: flush every `interval`, or
@@ -364,7 +551,12 @@ impl WriteBuffer {
                     .map_err(|e| anyhow!("schema conversion failed for {ident}: {e}"))?,
             ))
         };
-        let (rows, pending_total) = self.state.append(ident, schema_if_first, &batches)?;
+        // With a tail: durable append FIRST, then pending, then the ack
+        // (a tail error is this statement's error — never a silent
+        // downgrade to non-durable buffering).
+        let (rows, pending_total) =
+            self.state
+                .append(ident, schema_if_first, &batches, self.tail.as_deref())?;
         if pending_total >= self.max_rows {
             self.kick.notify_one();
         }
@@ -410,12 +602,22 @@ impl WriteBuffer {
     /// optimistic-concurrency retries (fresh metadata per attempt, exactly
     /// like autocommit INSERT).
     async fn flush_table(&self, ident: &TableIdent) -> Result<()> {
+        // Rotate the tail ONCE per flush, before the commit is built: new
+        // appends land in a fresh segment, so a successful commit can delete
+        // whole covered segments instead of head-truncating a live file.
+        // Retries reuse the rotation; on failure the segments simply stay
+        // until a later successful flush covers them.
+        if let Some(tail) = &self.tail {
+            tail.rotate(ident)?;
+        }
         let mut conflicts: Vec<String> = Vec::new();
         for attempt in 1..=MAX_COMMIT_ATTEMPTS {
             // Snapshot the current pending prefix WITHOUT removing it: the
             // rows must stay readable through the union view while the
             // commit is in flight. New inserts append behind the prefix.
-            let (batches, n_batches) = self.state.snapshot_pending(ident);
+            // `tail_mark` is the generation's exact watermark (taken under
+            // the same lock, see snapshot_pending).
+            let (batches, n_batches, tail_mark) = self.state.snapshot_pending(ident);
             if n_batches == 0 {
                 return Ok(());
             }
@@ -427,13 +629,78 @@ impl WriteBuffer {
             let pk = self.engine.pk_columns(&table)?;
             let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
             let ops = [TableOp::Append(batches)];
-            let Some(prepared) = prepare_commit(&table, &ops, pk.as_deref(), self.engine.branch())
-                .await
-                .map_err(|e| anyhow!("buffered flush of {ident} failed to prepare: {e:#}"))?
+            // Record the drained tail sequence in the SAME atomic commit
+            // (the exactly-once watermark boot replay filters against),
+            // under THIS tail's namespaced key only. Never regress a
+            // previously stamped value: after a full truncate + restart the
+            // in-memory mark starts over from the floor, and a lower stamp
+            // would re-open the double-apply window the watermark closes.
+            let tail_props = match (&self.tail, tail_mark) {
+                (Some(tail), Some(mark)) => {
+                    let key = tail.watermark_property();
+                    let prev = parse_watermark_property(
+                        ident,
+                        table.metadata().properties().get(key).map(String::as_str),
+                    );
+                    // Prepare-time already-committed guard: when the stamp
+                    // in the metadata just loaded already covers this whole
+                    // generation, an EARLIER flush of these same rows
+                    // committed but its outcome came back ambiguous (POST
+                    // error + failed disambiguation reload re-queued it).
+                    // Re-posting would double-apply the rows. Run the
+                    // Committed-arm bookkeeping instead: park the rows as a
+                    // flushed generation tagged with a snapshot this
+                    // metadata already contains (new scans exclude it;
+                    // in-flight ones still see the rows until GC), then
+                    // sidecar + truncate the covered tail frames — the
+                    // reload-failure residual heals on the next flush.
+                    if generation_already_committed(prev, mark) {
+                        tracing::warn!(
+                            table = %ident,
+                            rows,
+                            tail_mark = mark,
+                            committed_watermark = prev.unwrap_or_default(),
+                            "flush generation is already covered by the committed \
+                             tail watermark (an earlier ambiguous flush LANDED); \
+                             skipping the post instead of double-applying"
+                        );
+                        let seen_snapshot = table
+                            .metadata()
+                            .snapshot_for_ref(self.engine.branch())
+                            .map(|s| s.snapshot_id())
+                            .or_else(|| table.metadata().current_snapshot_id());
+                        match seen_snapshot {
+                            Some(s) => self.state.move_pending_to_flushed(ident, n_batches, s),
+                            // No snapshot in the metadata at all (cannot
+                            // happen when the watermark was stamped by a
+                            // snapshot commit, but stay safe): the rows are
+                            // committed — drop them outright.
+                            None => self.state.drop_pending_prefix(ident, n_batches),
+                        }
+                        tail_truncate_covered(self.tail.as_deref(), ident, tail_mark);
+                        return Ok(());
+                    }
+                    let stamped = prev.map_or(mark, |p| p.max(mark));
+                    Some(HashMap::from([(key.to_string(), stamped.to_string())]))
+                }
+                _ => None,
+            };
+            let Some(prepared) = prepare_commit(
+                &table,
+                &ops,
+                pk.as_deref(),
+                self.engine.branch(),
+                tail_props.as_ref(),
+            )
+            .await
+            .map_err(|e| anyhow!("buffered flush of {ident} failed to prepare: {e:#}"))?
             else {
                 // Zero net rows (shouldn't happen for a non-empty append
                 // list, but handle it: drop the prefix, nothing to commit).
+                // The covered tail frames also net zero rows on any future
+                // replay, so forgetting them without a commit is safe.
                 self.state.drop_pending_prefix(ident, n_batches);
+                tail_truncate_covered(self.tail.as_deref(), ident, tail_mark);
                 return Ok(());
             };
             let snapshot_id = prepared.snapshot_id();
@@ -443,6 +710,9 @@ impl WriteBuffer {
                 .move_pending_to_flushed(ident, n_batches, snapshot_id);
             match self.engine.post_prepared(ident, &prepared).await {
                 Ok(CommitOutcome::Committed) => {
+                    // The commit carries the watermark, so the covered tail
+                    // segments are dead weight from here on.
+                    tail_truncate_covered(self.tail.as_deref(), ident, tail_mark);
                     tracing::debug!(
                         table = %ident,
                         rows,
@@ -462,6 +732,54 @@ impl WriteBuffer {
                     conflicts.push(msg);
                 }
                 Err(e) => {
+                    // Ambiguous outcome: a transport error / 5xx can follow
+                    // a commit the catalog actually APPLIED, and re-queueing
+                    // then double-applies the generation on the next tick.
+                    // The tail watermark makes this detectable while alive:
+                    // reload the metadata once, and if our own namespaced
+                    // key already covers this generation's mark, the commit
+                    // landed — treat it exactly as the Committed arm (the
+                    // flushed(S) bookkeeping with the known snapshot id is
+                    // already in place; just truncate, no re-queue). The
+                    // mark cannot come from an OLDER commit: this
+                    // generation holds at least one seq consumed after the
+                    // last stamped watermark, and flush_lock serializes any
+                    // newer one.
+                    if let (Some(tail), Some(mark)) = (&self.tail, tail_mark) {
+                        match self.catalog.load_table(ident).await {
+                            Ok(fresh) => {
+                                let seen = parse_watermark_property(
+                                    ident,
+                                    fresh
+                                        .metadata()
+                                        .properties()
+                                        .get(tail.watermark_property())
+                                        .map(String::as_str),
+                                );
+                                if seen.is_some_and(|s| s >= mark) {
+                                    tracing::warn!(
+                                        table = %ident,
+                                        rows,
+                                        snapshot_id,
+                                        tail_mark = mark,
+                                        "flush POST errored but the committed tail \
+                                         watermark covers this generation: the commit \
+                                         LANDED — treating it as committed (no \
+                                         re-queue, no double-apply): {e:#}"
+                                    );
+                                    tail_truncate_covered(self.tail.as_deref(), ident, tail_mark);
+                                    return Ok(());
+                                }
+                            }
+                            Err(load_err) => tracing::warn!(
+                                table = %ident,
+                                "cannot reload metadata to disambiguate a failed flush \
+                                 POST; re-queueing the generation (the prepare-time \
+                                 already-committed guard resolves it on the next \
+                                 flush): {load_err}"
+                            ),
+                        }
+                    }
                     self.state.move_flushed_back_to_pending(ident, snapshot_id);
                     return Err(e);
                 }
@@ -480,6 +798,55 @@ impl WriteBuffer {
     fn gc_flushed(&self) {
         self.state
             .retain_flushed(|g| g.committed_at.elapsed() < FLUSHED_GC);
+    }
+}
+
+/// Floor a table's next tail sequence from its watermark SIDECAR alone —
+/// the boot-replay path for a FRAMELESS tail dir whose table failed to
+/// load from the catalog (needs no catalog: the sidecar is a local file).
+/// Without it, a full truncate + restart + transiently unloadable table
+/// would restart numbering at 1 UNDER the committed watermark, and the
+/// next crash-replay would silently drop freshly acked rows as covered.
+fn apply_sidecar_seq_floor(
+    tail: &dyn TailStore,
+    ident: &TableIdent,
+    sidecar: Option<u64>,
+) -> Result<()> {
+    match sidecar {
+        Some(w) => tail.ensure_seq_floor(ident, w + 1),
+        None => Ok(()),
+    }
+}
+
+/// Whether the watermark already stamped in table metadata (`prev`) covers
+/// a generation about to be posted (whose highest tail seq is `mark`).
+/// Sequence numbers are only ever consumed ABOVE the last stamped
+/// watermark (the boot floor plus the never-regress stamp guarantee it),
+/// so full coverage can only mean an earlier flush of exactly these rows
+/// COMMITTED but its outcome came back ambiguous and the generation was
+/// re-queued — posting it again would double-apply.
+fn generation_already_committed(prev: Option<u64>, mark: u64) -> bool {
+    prev.is_some_and(|p| p >= mark)
+}
+
+/// After a flush generation is safely committed (or netted out to zero
+/// rows), record the covered watermark in the local sidecar (best-effort;
+/// the second gate against a foreign writer dropping the table property)
+/// and forget its tail frames. A truncate failure only leaks segments —
+/// the committed watermark keeps replay exactly-once regardless — so it is
+/// a WARN, never a flush failure.
+fn tail_truncate_covered(tail: Option<&dyn TailStore>, ident: &TableIdent, mark: Option<u64>) {
+    let (Some(tail), Some(upto_seq)) = (tail, mark) else {
+        return;
+    };
+    tail.record_watermark(ident, upto_seq);
+    if let Err(e) = tail.truncate(ident, upto_seq) {
+        tracing::warn!(
+            table = %ident,
+            upto_seq,
+            "tail truncate after commit failed (segments leak until a later flush \
+             covers them; replay stays exact via the committed watermark): {e:#}"
+        );
     }
 }
 
@@ -665,7 +1032,12 @@ mod tests {
         let st = BufferState::default();
         let sch = schema();
         let (rows, total) = st
-            .append(&ident(), Some(sch.clone()), &[batch(&sch, &[1, 2, 3])])
+            .append(
+                &ident(),
+                Some(sch.clone()),
+                &[batch(&sch, &[1, 2, 3])],
+                None,
+            )
             .unwrap();
         assert_eq!((rows, total), (3, 3));
         assert!(st.has_pending());
@@ -683,9 +1055,9 @@ mod tests {
     fn flushed_generation_excluded_iff_metadata_sees_it() {
         let st = BufferState::default();
         let sch = schema();
-        st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[1, 2])])
+        st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[1, 2])], None)
             .unwrap();
-        let (_batches, n) = st.snapshot_pending(&ident());
+        let (_batches, n, _) = st.snapshot_pending(&ident());
         assert_eq!(n, 1); // one batch
         let s: i64 = 4242;
         st.move_pending_to_flushed(&ident(), n, s);
@@ -710,15 +1082,17 @@ mod tests {
         let st = BufferState::default();
         let sch = schema();
         // Buffer A=[1], B=[2] -> pending [A,B].
-        st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[1])])
+        st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[1])], None)
             .unwrap();
-        st.append(&ident(), None, &[batch(&sch, &[2])]).unwrap();
-        let (_b, n) = st.snapshot_pending(&ident());
+        st.append(&ident(), None, &[batch(&sch, &[2])], None)
+            .unwrap();
+        let (_b, n, _) = st.snapshot_pending(&ident());
         assert_eq!(n, 2);
         let s: i64 = 99;
         st.move_pending_to_flushed(&ident(), n, s);
         // A new insert C=[3] lands while the commit is "in flight".
-        st.append(&ident(), None, &[batch(&sch, &[3])]).unwrap();
+        st.append(&ident(), None, &[batch(&sch, &[3])], None)
+            .unwrap();
         // Commit conflicts: restore the flushed prefix to the front.
         st.move_flushed_back_to_pending(&ident(), s);
         // Row accounting and order: [1,2] restored ahead of [3].
@@ -736,9 +1110,14 @@ mod tests {
     fn drop_prefix_removes_committed_rows() {
         let st = BufferState::default();
         let sch = schema();
-        st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[1, 2, 3])])
-            .unwrap();
-        let (_b, n) = st.snapshot_pending(&ident());
+        st.append(
+            &ident(),
+            Some(sch.clone()),
+            &[batch(&sch, &[1, 2, 3])],
+            None,
+        )
+        .unwrap();
+        let (_b, n, _) = st.snapshot_pending(&ident());
         st.drop_pending_prefix(&ident(), n);
         assert!(!st.has_pending());
         assert!(st.overlay_with(&ident(), |_| false).is_none());
@@ -750,9 +1129,9 @@ mod tests {
     fn retain_flushed_by_predicate() {
         let st = BufferState::default();
         let sch = schema();
-        st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[7])])
+        st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[7])], None)
             .unwrap();
-        let (_b, n) = st.snapshot_pending(&ident());
+        let (_b, n, _) = st.snapshot_pending(&ident());
         let s: i64 = 5;
         st.move_pending_to_flushed(&ident(), n, s);
         // Keep-everything predicate: generation survives, still overlays.
@@ -770,12 +1149,207 @@ mod tests {
         let st = BufferState::default();
         let sch = schema();
         assert!(st.pending_idents().is_empty());
-        st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[1])])
+        st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[1])], None)
             .unwrap();
         assert_eq!(st.pending_idents(), vec![ident()]);
-        let (_b, n) = st.snapshot_pending(&ident());
+        let (_b, n, _) = st.snapshot_pending(&ident());
         st.move_pending_to_flushed(&ident(), n, 1);
         assert!(st.pending_idents().is_empty()); // pending drained into flushed
+    }
+
+    // -----------------------------------------------------------------------
+    // Durable-tail wiring (mock TailStore): the insert path appends durably
+    // BEFORE rows enter pending, the flush snapshot carries the exact
+    // watermark, and a committed flush truncates at that watermark.
+    // -----------------------------------------------------------------------
+
+    #[derive(Default)]
+    struct MockTail {
+        next_seq: std::sync::atomic::AtomicU64,
+        fail_appends: std::sync::atomic::AtomicBool,
+        /// (table, seq, batch_count, total_rows) per STATEMENT append.
+        appends: StdMutex<Vec<(TableIdent, u64, usize, usize)>>,
+        truncates: StdMutex<Vec<(TableIdent, u64)>>,
+        watermarks: StdMutex<Vec<(TableIdent, u64)>>,
+    }
+
+    impl TailStore for MockTail {
+        fn append(&self, table: &TableIdent, batches: &[RecordBatch]) -> Result<u64> {
+            if self.fail_appends.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(anyhow!("mock tail: disk on fire"));
+            }
+            let seq = self
+                .next_seq
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            self.appends.lock().unwrap().push((
+                table.clone(),
+                seq,
+                batches.len(),
+                batches.iter().map(|b| b.num_rows()).sum(),
+            ));
+            Ok(seq)
+        }
+
+        fn replay(&self) -> Result<Vec<crate::tail::ReplayedTable>> {
+            Ok(Vec::new())
+        }
+
+        fn truncate(&self, table: &TableIdent, upto_seq: u64) -> Result<()> {
+            self.truncates
+                .lock()
+                .unwrap()
+                .push((table.clone(), upto_seq));
+            Ok(())
+        }
+
+        fn ensure_seq_floor(&self, _table: &TableIdent, floor: u64) -> Result<()> {
+            let cur = self.next_seq.load(std::sync::atomic::Ordering::SeqCst);
+            // next_seq holds "last handed out"; the floor is the NEXT seq.
+            self.next_seq.store(
+                cur.max(floor.saturating_sub(1)),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            Ok(())
+        }
+
+        fn watermark_property(&self) -> &str {
+            "icegres.tail-seq.mock-tail-id"
+        }
+
+        fn record_watermark(&self, table: &TableIdent, seq: u64) {
+            self.watermarks.lock().unwrap().push((table.clone(), seq));
+        }
+    }
+
+    // Insert path: each STATEMENT is durably appended as one frame (all its
+    // batches, one seq) before it becomes pending, and the snapshot's tail
+    // mark is the exact highest seq.
+    #[test]
+    fn tail_appends_precede_pending_and_mark_is_exact() {
+        let st = BufferState::default();
+        let sch = schema();
+        let tail = MockTail::default();
+        // A 2-batch statement: ONE tail append covering both batches.
+        st.append(
+            &ident(),
+            Some(sch.clone()),
+            &[batch(&sch, &[1, 2]), batch(&sch, &[3])],
+            Some(&tail),
+        )
+        .unwrap();
+        st.append(&ident(), None, &[batch(&sch, &[4])], Some(&tail))
+            .unwrap();
+        assert_eq!(
+            *tail.appends.lock().unwrap(),
+            vec![(ident(), 1, 2, 3), (ident(), 2, 1, 1)]
+        );
+        let (_batches, n, mark) = st.snapshot_pending(&ident());
+        assert_eq!((n, mark), (3, Some(2)));
+    }
+
+    // A tail append failure is the statement's failure: nothing enters
+    // pending, so nothing could be acked from memory alone.
+    #[test]
+    fn tail_failure_keeps_rows_out_of_pending() {
+        let st = BufferState::default();
+        let sch = schema();
+        let tail = MockTail::default();
+        tail.fail_appends
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = st
+            .append(
+                &ident(),
+                Some(sch.clone()),
+                &[batch(&sch, &[1])],
+                Some(&tail),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("disk on fire"));
+        assert!(!st.has_pending());
+        assert!(tail.appends.lock().unwrap().is_empty());
+        // The mark never moved either: no watermark could cover the failure.
+        assert_eq!(st.snapshot_pending(&ident()).2, None);
+    }
+
+    // The flush success path truncates at exactly the generation's mark
+    // (tail_truncate_covered is the function flush_table calls), and a
+    // markless / tailless flush truncates nothing.
+    #[test]
+    fn flush_success_truncates_at_generation_mark() {
+        let st = BufferState::default();
+        let sch = schema();
+        let tail = MockTail::default();
+        // Two statements = two frames (seqs 1 and 2).
+        st.append(
+            &ident(),
+            Some(sch.clone()),
+            &[batch(&sch, &[1])],
+            Some(&tail),
+        )
+        .unwrap();
+        st.append(&ident(), None, &[batch(&sch, &[2])], Some(&tail))
+            .unwrap();
+        let (_batches, n, mark) = st.snapshot_pending(&ident());
+        assert_eq!((n, mark), (2, Some(2)));
+        // ... prepare + post succeed (mocked away), then:
+        st.move_pending_to_flushed(&ident(), n, 7);
+        tail_truncate_covered(Some(&tail), &ident(), mark);
+        assert_eq!(*tail.truncates.lock().unwrap(), vec![(ident(), 2)]);
+        // The covered watermark was recorded in the sidecar (second gate)
+        // before the truncation.
+        assert_eq!(*tail.watermarks.lock().unwrap(), vec![(ident(), 2)]);
+        // No tail / no mark: no truncation attempted.
+        tail_truncate_covered(None, &ident(), Some(9));
+        tail_truncate_covered(Some(&tail), &ident(), None);
+        assert_eq!(tail.truncates.lock().unwrap().len(), 1);
+    }
+
+    // Boot replay bookkeeping: recovered rows enter pending with no tail
+    // re-append, and note_tail_high makes the next flush's watermark cover
+    // their (already durable) sequences.
+    #[test]
+    fn replayed_rows_carry_their_recovered_sequences() {
+        let st = BufferState::default();
+        let sch = schema();
+        st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[5])], None)
+            .unwrap();
+        st.note_tail_high(&ident(), 41);
+        let (_batches, n, mark) = st.snapshot_pending(&ident());
+        assert_eq!((n, mark), (1, Some(41)));
+        // note_tail_high never regresses the mark.
+        st.note_tail_high(&ident(), 12);
+        assert_eq!(st.snapshot_pending(&ident()).2, Some(41));
+    }
+
+    // FIX (r3-1): a FRAMELESS tail dir whose table cannot load from the
+    // catalog still floors the sequence from the sidecar alone — the next
+    // append lands ABOVE the committed watermark, never under it (where
+    // the next crash-replay would drop it as already covered).
+    #[test]
+    fn frameless_unloadable_table_floors_from_sidecar() {
+        let sch = schema();
+        let tail = MockTail::default();
+        // Sidecar 7 → floor 8: the next handed-out seq clears the watermark.
+        apply_sidecar_seq_floor(&tail, &ident(), Some(7)).unwrap();
+        assert_eq!(tail.append(&ident(), &[batch(&sch, &[1])]).unwrap(), 8);
+        // No sidecar: nothing to floor from, and no error either.
+        let bare = MockTail::default();
+        apply_sidecar_seq_floor(&bare, &ident(), None).unwrap();
+        assert_eq!(bare.append(&ident(), &[batch(&sch, &[1])]).unwrap(), 1);
+    }
+
+    // FIX (r3-5): the prepare-time already-committed guard fires exactly
+    // when the stamped watermark covers the generation's whole mark —
+    // boundary: equality fires (all seqs covered), one below does not
+    // (this generation holds at least one uncovered seq), and an absent
+    // property never fires.
+    #[test]
+    fn already_committed_guard_boundary() {
+        assert!(!generation_already_committed(None, 1));
+        assert!(!generation_already_committed(Some(6), 7));
+        assert!(generation_already_committed(Some(7), 7));
+        assert!(generation_already_committed(Some(9), 7));
     }
 
     // Row-count accounting survives a move-out then move-back round trip.
@@ -784,13 +1358,20 @@ mod tests {
         let st = BufferState::default();
         let sch = schema();
         let (_r, total0) = st
-            .append(&ident(), Some(sch.clone()), &[batch(&sch, &[1, 2, 3])])
+            .append(
+                &ident(),
+                Some(sch.clone()),
+                &[batch(&sch, &[1, 2, 3])],
+                None,
+            )
             .unwrap();
         assert_eq!(total0, 3);
-        let (_b, n) = st.snapshot_pending(&ident());
+        let (_b, n, _) = st.snapshot_pending(&ident());
         st.move_pending_to_flushed(&ident(), n, 1);
         // Appending after the move must not corrupt the count.
-        let (_r2, total1) = st.append(&ident(), None, &[batch(&sch, &[4])]).unwrap();
+        let (_r2, total1) = st
+            .append(&ident(), None, &[batch(&sch, &[4])], None)
+            .unwrap();
         assert_eq!(total1, 1); // only the new row is pending
         st.move_flushed_back_to_pending(&ident(), 1);
         // Back to 4 pending rows, in order.

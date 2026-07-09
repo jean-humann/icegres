@@ -22,6 +22,7 @@ mod overwrite;
 mod pgauth;
 mod scan;
 mod seed;
+mod tail;
 mod traced;
 mod txn;
 
@@ -184,11 +185,23 @@ enum Command {
         /// locally and same-server cross-connection freshness is instant;
         /// OTHER servers/readers see the rows at the commit cadence (<= N
         /// ms after ack). TRADE-OFF: an unclean kill loses up to N ms of
-        /// acked-but-uncommitted writes — that is why the default is 0
-        /// (fully synchronous, semantics unchanged) and enabling it logs a
-        /// WARN. See icegres/src/buffer.rs for the full semantics.
+        /// acked-but-uncommitted writes (--tail-dir closes that window) —
+        /// that is why the default is 0 (fully synchronous, semantics
+        /// unchanged) and enabling it logs a WARN. See icegres/src/buffer.rs
+        /// for the full semantics.
         #[arg(long, env = "ICEGRES_WRITE_BUFFER_MS", default_value_t = 0)]
         write_buffer_ms: u64,
+
+        /// Durable local tail for buffered writes (requires
+        /// --write-buffer-ms > 0): every buffered INSERT is appended to an
+        /// fsync'd per-table WAL under this directory BEFORE its ack, and
+        /// acked-but-uncommitted rows are replayed into the buffer on the
+        /// next boot with the same directory — an unclean kill (SIGKILL,
+        /// power loss) of the process loses NOTHING. Honest scope: the tail
+        /// is THIS node's disk, so losing the node or the disk still loses
+        /// un-flushed acked rows (see icegres/src/tail.rs). Off by default.
+        #[arg(long, env = "ICEGRES_TAIL_DIR")]
+        tail_dir: Option<PathBuf>,
 
         /// Acknowledge running an UNAUTHENTICATED listener on a non-loopback
         /// interface. Without this, binding a public address (e.g. 0.0.0.0)
@@ -380,6 +393,7 @@ async fn main() -> Result<()> {
             branch,
             enforce_pk,
             write_buffer_ms,
+            tail_dir,
             insecure,
         } => {
             let serve_opts = ServeOpts {
@@ -392,6 +406,7 @@ async fn main() -> Result<()> {
                 branch,
                 enforce_pk,
                 write_buffer_ms,
+                tail_dir,
                 insecure,
             };
             run_serve(&catalog, &host, port, serve_opts).await
@@ -462,6 +477,7 @@ struct ServeOpts {
     branch: String,
     enforce_pk: bool,
     write_buffer_ms: u64,
+    tail_dir: Option<PathBuf>,
     insecure: bool,
 }
 
@@ -529,6 +545,17 @@ fn build_authorizer(
 }
 
 async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeOpts) -> Result<()> {
+    // Fail fast BEFORE touching the catalog. --tail-dir only means something
+    // in buffered mode: with the synchronous default every INSERT already IS
+    // an Iceberg commit before its ack, so a durable tail nothing writes to
+    // would silently promise durability it never provides.
+    if serve_opts.tail_dir.is_some() && serve_opts.write_buffer_ms == 0 {
+        bail!(
+            "--tail-dir requires buffered writes (--write-buffer-ms N with N > 0): the \
+             synchronous default commits every INSERT before its ack, so the durable tail \
+             would be a no-op. Set --write-buffer-ms, or drop --tail-dir."
+        );
+    }
     // Fail fast on TLS/auth misconfiguration BEFORE touching the catalog:
     // a server asked to be secure must never come up insecure.
     let tls = match (&serve_opts.tls_cert, &serve_opts.tls_key) {
@@ -606,22 +633,48 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
     );
 
     // Moonlink-style buffered write mode (--write-buffer-ms, buffer.rs).
-    // Default 0 = fully synchronous, current semantics unchanged.
+    // Default 0 = fully synchronous, current semantics unchanged. With
+    // --tail-dir, a durable local WAL (tail.rs) closes the unclean-kill
+    // loss window: fsync before every buffered ack, replay at boot.
     let write_buffer = if serve_opts.write_buffer_ms > 0 {
+        let tail_store: Option<Arc<dyn tail::TailStore>> = match &serve_opts.tail_dir {
+            Some(dir) => Some(Arc::new(tail::LocalWal::open(dir)?)),
+            None => None,
+        };
         let buf = Arc::new(buffer::WriteBuffer::new(
             catalog.clone(),
             engine.clone(),
             serve_opts.write_buffer_ms,
+            tail_store,
         ));
-        warn!(
-            write_buffer_ms = serve_opts.write_buffer_ms,
-            max_rows = buf.max_rows(),
-            "write buffering is ENABLED: INSERTs acknowledge BEFORE their Iceberg commit; \
-             an UNCLEAN kill loses up to {} ms of acked-but-uncommitted writes; other \
-             servers/readers see buffered rows only at the commit cadence. Reads on this \
-             server union the buffer (read-your-writes holds locally).",
-            serve_opts.write_buffer_ms
-        );
+        if let Some(dir) = &serve_opts.tail_dir {
+            warn!(
+                write_buffer_ms = serve_opts.write_buffer_ms,
+                max_rows = buf.max_rows(),
+                tail_dir = %dir.display(),
+                "write buffering is ENABLED with a durable local tail: INSERTs fsync to \
+                 the tail BEFORE their ack and un-flushed rows replay on the next boot \
+                 with the same --tail-dir, so an unclean kill of this process loses \
+                 NOTHING. Durability is THIS node's disk — losing the node or the disk \
+                 still loses acked-but-uncommitted rows. Other servers/readers see \
+                 buffered rows only at the commit cadence; reads on this server union \
+                 the buffer (read-your-writes holds locally)."
+            );
+        } else {
+            warn!(
+                write_buffer_ms = serve_opts.write_buffer_ms,
+                max_rows = buf.max_rows(),
+                "write buffering is ENABLED: INSERTs acknowledge BEFORE their Iceberg commit; \
+                 an UNCLEAN kill loses up to {} ms of acked-but-uncommitted writes; other \
+                 servers/readers see buffered rows only at the commit cadence. Reads on this \
+                 server union the buffer (read-your-writes holds locally).",
+                serve_opts.write_buffer_ms
+            );
+        }
+        // Recover acked rows a previous process failed to commit: into
+        // pending BEFORE the flusher starts (and before the listener opens),
+        // so the normal cadence drains them like any other buffered rows.
+        buf.replay_tail().await?;
         buf.spawn_flusher();
         Some(buf)
     } else {

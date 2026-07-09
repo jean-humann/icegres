@@ -315,7 +315,7 @@ impl OverwriteEngine {
                 .await
                 .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?;
             let pk = self.pk_columns(&table)?;
-            let prepared = prepare_commit(&table, &ops, pk.as_deref(), &self.branch)
+            let prepared = prepare_commit(&table, &ops, pk.as_deref(), &self.branch, None)
                 .await
                 .with_context(|| format!("DML against {ident} failed"))?;
             let Some(mut prepared) = prepared else {
@@ -393,7 +393,7 @@ impl OverwriteEngine {
                 .await
                 .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?;
             let pk = self.pk_columns(&table)?;
-            let prepared = prepare_commit(&table, &ops, pk.as_deref(), &self.branch)
+            let prepared = prepare_commit(&table, &ops, pk.as_deref(), &self.branch, None)
                 .await
                 .with_context(|| format!("INSERT into {ident} failed"))?;
             let Some(prepared) = prepared else {
@@ -477,7 +477,7 @@ impl OverwriteEngine {
             }));
         }
         let pk = self.pk_columns(&table)?;
-        let prepared = prepare_commit(&table, ops, pk.as_deref(), &self.branch)
+        let prepared = prepare_commit(&table, ops, pk.as_deref(), &self.branch, None)
             .await
             .with_context(|| format!("transaction COMMIT against {ident} failed"))?;
         let Some(prepared) = prepared else {
@@ -961,12 +961,16 @@ pub fn branch_head<'a>(
 /// before anything is posted. The produced commit asserts
 /// `assert-ref-snapshot-id <branch>=<head>` and publishes the new snapshot
 /// on `branch` only — snapshots reachable from other refs are untouched
-/// (zero-copy branch isolation, SPEC D6).
+/// (zero-copy branch isolation, SPEC D6). `extra_properties` (if non-empty)
+/// become a `set-properties` update in the SAME atomic commit — the durable
+/// tail records its drained-sequence watermark this way (`buffer.rs` /
+/// `tail.rs`); all other callers pass `None`.
 pub async fn prepare_commit(
     table: &Table,
     ops: &[TableOp],
     pk: Option<&[String]>,
     branch: &str,
+    extra_properties: Option<&HashMap<String, String>>,
 ) -> Result<Option<PreparedCommit>> {
     let metadata = table.metadata();
 
@@ -1345,6 +1349,23 @@ pub async fn prepare_commit(
         .with_schema_id(metadata.current_schema_id())
         .build();
 
+    let mut updates = vec![
+        TableUpdate::AddSnapshot { snapshot },
+        TableUpdate::SetSnapshotRef {
+            ref_name: branch.to_string(),
+            reference: SnapshotReference::new(
+                snapshot_id,
+                SnapshotRetention::branch(None, None, None),
+            ),
+        },
+    ];
+    if let Some(props) = extra_properties {
+        if !props.is_empty() {
+            updates.push(TableUpdate::SetProperties {
+                updates: props.clone(),
+            });
+        }
+    }
     let request = CommitTableRequest {
         identifier: Some(table.identifier().clone()),
         requirements: vec![
@@ -1359,16 +1380,7 @@ pub async fn prepare_commit(
                 snapshot_id: head_id,
             },
         ],
-        updates: vec![
-            TableUpdate::AddSnapshot { snapshot },
-            TableUpdate::SetSnapshotRef {
-                ref_name: branch.to_string(),
-                reference: SnapshotReference::new(
-                    snapshot_id,
-                    SnapshotRetention::branch(None, None, None),
-                ),
-            },
-        ],
+        updates,
     };
 
     Ok(Some(PreparedCommit {
