@@ -96,7 +96,7 @@
 //!   and yield wrong answers).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context as _, Result};
@@ -135,6 +135,11 @@ pub const MAX_COMMIT_ATTEMPTS: u32 = 3;
 
 /// Table property naming the enforced primary-key columns (comma-separated).
 pub const PK_PROPERTY: &str = "icegres.primary-key";
+
+/// The Iceberg REST capability identifier for the multi-table transaction
+/// endpoint, exactly as advertised in `GET /v1/config`'s `endpoints` array
+/// (spec form: `"<HTTP verb> <path template>"`).
+const TXN_COMMIT_ENDPOINT: &str = "POST /v1/{prefix}/transactions/commit";
 
 /// What a DML statement does to matched rows.
 #[derive(Debug, Clone)]
@@ -229,6 +234,15 @@ pub struct OverwriteEngine {
     /// `assert-ref-snapshot-id <branch>=<head>` so two servers on different
     /// branches of the same table never conflict with each other.
     branch: String,
+    /// Whether the catalog implements the multi-table transaction endpoint
+    /// (`POST /v1/{prefix}/transactions/commit`). Seeded from the config
+    /// response's `endpoints` capability list when the catalog advertises
+    /// one (Lakekeeper does); otherwise resolved on first use by an explicit
+    /// DATA-FREE probe ([`Self::probe_txn_endpoint`]) — never learned from a
+    /// real commit's response, so a commit-level 404 (e.g. a missing table)
+    /// or a transient routing failure can never poison this cache. Unset =
+    /// unknown yet.
+    txn_endpoint: OnceLock<bool>,
 }
 
 impl OverwriteEngine {
@@ -263,6 +277,24 @@ impl OverwriteEngine {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        // Multi-table transaction capability. Test-only knob
+        // ICEGRES_TXN_DISABLE_ATOMIC forces the "catalog lacks the endpoint"
+        // path so the ordered fallback (and strict-mode refusal) stays
+        // e2e-provable against a catalog that DOES support it.
+        let txn_endpoint = OnceLock::new();
+        if std::env::var_os("ICEGRES_TXN_DISABLE_ATOMIC").is_some() {
+            tracing::warn!(
+                "ICEGRES_TXN_DISABLE_ATOMIC set (test-only): treating the catalog as if it \
+                 lacked {TXN_COMMIT_ENDPOINT:?}"
+            );
+            let _ = txn_endpoint.set(false);
+        } else if let Some(endpoints) = config.get("endpoints").and_then(|v| v.as_array()) {
+            // The catalog advertises its capabilities: trust the list.
+            let supported = endpoints
+                .iter()
+                .any(|e| e.as_str() == Some(TXN_COMMIT_ENDPOINT));
+            let _ = txn_endpoint.set(supported);
+        }
         Ok(Self {
             catalog,
             http,
@@ -270,6 +302,7 @@ impl OverwriteEngine {
             prefix,
             enforce_pk,
             branch: branch.unwrap_or_else(|| MAIN_BRANCH.to_string()),
+            txn_endpoint,
         })
     }
 
@@ -509,6 +542,102 @@ impl OverwriteEngine {
         }
     }
 
+    /// Commit a transaction's buffered op lists for SEVERAL tables as ONE
+    /// atomic multi-table catalog transaction
+    /// (`POST /v1/{prefix}/transactions/commit`, Iceberg REST spec;
+    /// implemented by Lakekeeper). Per table the request carries exactly the
+    /// requirements/updates [`commit_pinned`] would post — including the
+    /// `assert-ref-snapshot-id <branch>=<pin>` anchor — so the semantics are
+    /// the single-table semantics, made all-or-nothing across tables:
+    ///
+    /// * every table commits, or NONE does (the catalog checks all
+    ///   requirements against freshly-loaded metadata before touching
+    ///   anything, and applies all pointer swaps in one transaction);
+    /// * any conflict (a branch moved since its pin) is a
+    ///   [`CommitConflict`] → wire sqlstate 40001, retryable because
+    ///   nothing was applied;
+    /// * NO retry, same reason as [`commit_pinned`]: statement-time row
+    ///   counts were computed against the pins.
+    ///
+    /// Returns [`MultiTableCommit::Unsupported`] — with nothing applied AND
+    /// nothing staged — when the catalog does not implement the endpoint
+    /// (known from the config capability list, or resolved here by a
+    /// data-free probe BEFORE any table is prepared); the caller falls back
+    /// to the ordered per-table path (or refuses, in strict mode) without a
+    /// single data file having been written twice.
+    pub async fn commit_pinned_multi(
+        &self,
+        tables: &[(&TableIdent, Option<i64>, &[TableOp])],
+    ) -> Result<MultiTableCommit> {
+        // Resolve the endpoint capability BEFORE staging (writing Parquet
+        // for) any table: when unknown this costs one data-free probe, so an
+        // unsupported catalog is discovered — and strict mode can refuse —
+        // with zero staging work done.
+        if !self.probe_txn_endpoint().await? {
+            return Ok(MultiTableCommit::Unsupported);
+        }
+        // Prepare every table first (all data/manifest files durable before
+        // any catalog mutation), with the same cheap pre-check as
+        // commit_pinned so a stale pin aborts before staging N tables.
+        let mut prepared_all: Vec<Option<PreparedCommit>> = Vec::with_capacity(tables.len());
+        for (ident, expected_head, ops) in tables {
+            let table = self
+                .catalog
+                .load_table(ident)
+                .await
+                .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?;
+            let fresh_head = branch_head(table.metadata(), &self.branch)?.map(|s| s.snapshot_id());
+            if fresh_head != *expected_head {
+                let show = |s: Option<i64>| {
+                    s.map(|id| id.to_string())
+                        .unwrap_or_else(|| "<none>".to_string())
+                };
+                return Err(anyhow!(CommitConflict {
+                    message: format!(
+                        "could not serialize access due to concurrent update: table {ident} \
+                         (branch {}) moved from snapshot {} (pinned at BEGIN) to {}; nothing \
+                         was applied — retry the transaction",
+                        self.branch,
+                        show(*expected_head),
+                        show(fresh_head)
+                    ),
+                }));
+            }
+            let pk = self.pk_columns(&table)?;
+            let prepared = prepare_commit(&table, ops, pk.as_deref(), &self.branch, None)
+                .await
+                .with_context(|| format!("transaction COMMIT against {ident} failed"))?;
+            prepared_all.push(prepared);
+        }
+        let live: Vec<&PreparedCommit> = prepared_all.iter().flatten().collect();
+        if live.is_empty() {
+            // Every table's ops net out to no change: nothing to commit.
+            return Ok(MultiTableCommit::Committed);
+        }
+        let requests: Vec<&CommitTableRequest> = live.iter().map(|p| &p.request).collect();
+        match self.post_transaction(&requests).await? {
+            TxnCommitOutcome::Committed => {
+                let snapshot_ids: Vec<i64> = live.iter().map(|p| p.snapshot_id).collect();
+                tracing::info!(
+                    tables = tables.len(),
+                    committed = live.len(),
+                    snapshot_ids = ?snapshot_ids,
+                    "transaction committed atomically via transactions/commit \
+                     (one all-or-nothing multi-table catalog commit)"
+                );
+                Ok(MultiTableCommit::Committed)
+            }
+            TxnCommitOutcome::Conflict(msg) => Err(anyhow!(CommitConflict {
+                message: format!(
+                    "could not serialize access due to concurrent update: catalog rejected \
+                     the multi-table transaction commit (409): {msg}; nothing was applied — \
+                     retry the transaction"
+                ),
+            })),
+            TxnCommitOutcome::Unsupported => Ok(MultiTableCommit::Unsupported),
+        }
+    }
+
     /// POST an externally-prepared commit (see [`prepare_commit`]) for
     /// `ident`. Used by the write buffer's group-commit flusher, which
     /// needs the prepare/post split so it can tag in-flight rows with the
@@ -531,8 +660,14 @@ impl OverwriteEngine {
     /// Zero-copy: the commit only adds a snapshot ref — no data or metadata
     /// file is rewritten. The `assert-ref-snapshot-id <name>=null`
     /// requirement makes the create atomic: if the ref already exists the
-    /// catalog answers 409 and this fails loudly. Returns the snapshot id
-    /// the new branch points at.
+    /// catalog answers 409 and this fails loudly. When forking from `main`'s
+    /// head (no `at_snapshot`), the request additionally anchors
+    /// `assert-ref-snapshot-id main=<head>` so the branch is guaranteed to
+    /// fork the head that was actually read — a concurrent commit yields a
+    /// clean 409 (retry) instead of silently branching a superseded state.
+    /// An explicit `at_snapshot` carries no main anchor: the user chose the
+    /// snapshot, main is free to move. Returns the snapshot id the new
+    /// branch points at.
     pub async fn create_branch(
         &self,
         ident: &TableIdent,
@@ -561,31 +696,16 @@ impl OverwriteEngine {
                 anyhow!("table {ident} has no snapshot yet; write to it before branching")
             })?,
         };
-        let request = CommitTableRequest {
-            identifier: Some(ident.clone()),
-            requirements: vec![
-                TableRequirement::UuidMatch {
-                    uuid: metadata.uuid(),
-                },
-                // null snapshot-id = "the ref must not already exist".
-                TableRequirement::RefSnapshotIdMatch {
-                    r#ref: name.to_string(),
-                    snapshot_id: None,
-                },
-            ],
-            updates: vec![TableUpdate::SetSnapshotRef {
-                ref_name: name.to_string(),
-                reference: SnapshotReference::new(src, SnapshotRetention::branch(None, None, None)),
-            }],
-        };
+        let request =
+            set_branch_ref_request(ident, metadata.uuid(), name, src, at_snapshot.is_none());
         match self
             .post_commit(&ident.namespace().to_url_string(), ident.name(), &request)
             .await?
         {
             CommitOutcome::Committed => Ok(src),
             CommitOutcome::Conflict(msg) => bail!(
-                "branch {name:?} already exists on {ident} (or the table changed \
-                 concurrently): {msg}"
+                "branch {name:?} already exists on {ident}, or main moved concurrently \
+                 (nothing was applied — retry the create): {msg}"
             ),
         }
     }
@@ -611,21 +731,7 @@ impl OverwriteEngine {
             .snapshot_for_ref(name)
             .ok_or_else(|| anyhow!("branch {name:?} does not exist on table {ident}"))?
             .snapshot_id();
-        let request = CommitTableRequest {
-            identifier: Some(ident.clone()),
-            requirements: vec![
-                TableRequirement::UuidMatch {
-                    uuid: table.metadata().uuid(),
-                },
-                TableRequirement::RefSnapshotIdMatch {
-                    r#ref: name.to_string(),
-                    snapshot_id: Some(head),
-                },
-            ],
-            updates: vec![TableUpdate::RemoveSnapshotRef {
-                ref_name: name.to_string(),
-            }],
-        };
+        let request = remove_branch_ref_request(ident, table.metadata().uuid(), name, head);
         match self
             .post_commit(&ident.namespace().to_url_string(), ident.name(), &request)
             .await?
@@ -633,6 +739,178 @@ impl OverwriteEngine {
             CommitOutcome::Committed => Ok(head),
             CommitOutcome::Conflict(msg) => bail!(
                 "branch {name:?} on {ident} moved while dropping it (concurrent commit?): {msg}"
+            ),
+        }
+    }
+
+    /// Every table in the catalog — NESTED namespaces included: the Iceberg
+    /// REST `list_namespaces` answers one level per call, so this walks the
+    /// namespace tree depth-first (`list_namespaces(Some(parent))` per
+    /// namespace), accumulating tables at every level. A visited set guards
+    /// (defensively) against a catalog answering cyclic or duplicated
+    /// listings; the result is sorted by qualified name for deterministic
+    /// whole-lakehouse operations.
+    pub async fn list_all_tables(&self) -> Result<Vec<TableIdent>> {
+        let mut out: Vec<TableIdent> = Vec::new();
+        let mut visited: HashSet<iceberg::NamespaceIdent> = HashSet::new();
+        let mut stack: Vec<iceberg::NamespaceIdent> = self
+            .catalog
+            .list_namespaces(None)
+            .await
+            .map_err(|e| anyhow!("failed to list namespaces: {e}"))?;
+        while let Some(ns) = stack.pop() {
+            if !visited.insert(ns.clone()) {
+                // Defensive: a misbehaving catalog repeating a namespace (or
+                // cycling) must not loop or double-count.
+                continue;
+            }
+            let tables = self
+                .catalog
+                .list_tables(&ns)
+                .await
+                .map_err(|e| anyhow!("failed to list tables of namespace {ns:?}: {e}"))?;
+            out.extend(tables);
+            let children = self
+                .catalog
+                .list_namespaces(Some(&ns))
+                .await
+                .map_err(|e| anyhow!("failed to list child namespaces of {ns:?}: {e}"))?;
+            stack.extend(children);
+        }
+        out.sort_by_key(|i| i.to_string());
+        Ok(out)
+    }
+
+    /// `icegres branch create-all`: create branch `name` on EVERY table in
+    /// the catalog in ONE atomic multi-table transaction — a
+    /// consistent-or-nothing cross-table cut of the whole lakehouse. Each
+    /// table carries the `assert-ref-snapshot-id <name>=null` creation guard
+    /// AND an `assert-ref-snapshot-id main=<head captured at load>` anchor:
+    /// the commit succeeds only if every captured `main` head is STILL
+    /// current at commit time, so the cut can never show half of a
+    /// concurrent (even atomic multi-table) commit that landed between the
+    /// per-table loads — any such race is a clean 409 with nothing applied
+    /// (retry the create-all). A table without a snapshot cannot hold a
+    /// ref at all (Iceberg refs point at snapshots) and is SKIPPED — the cut
+    /// covers every table that has history; skipped tables are returned so
+    /// the caller can warn loudly. Requires a catalog that implements
+    /// `transactions/commit`; without it the command errors cleanly rather
+    /// than applying a partial cut. Returns the branched
+    /// `(table, snapshot_id)` pairs plus the skipped (snapshot-less) tables.
+    #[allow(clippy::type_complexity)]
+    pub async fn create_branch_all(
+        &self,
+        name: &str,
+    ) -> Result<(Vec<(TableIdent, i64)>, Vec<TableIdent>)> {
+        anyhow::ensure!(
+            name != MAIN_BRANCH,
+            "branch {MAIN_BRANCH:?} always exists; pick another name"
+        );
+        let idents = self.list_all_tables().await?;
+        anyhow::ensure!(!idents.is_empty(), "the catalog has no tables to branch");
+        let mut requests: Vec<CommitTableRequest> = Vec::with_capacity(idents.len());
+        let mut branched: Vec<(TableIdent, i64)> = Vec::with_capacity(idents.len());
+        let mut skipped: Vec<TableIdent> = Vec::new();
+        for ident in &idents {
+            let table = self
+                .catalog
+                .load_table(ident)
+                .await
+                .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?;
+            let metadata = table.metadata();
+            let Some(src) = metadata.current_snapshot_id() else {
+                skipped.push(ident.clone());
+                continue;
+            };
+            // Branch source is always main's head here: anchor main to the
+            // captured head so a torn cross-table cut is impossible.
+            requests.push(set_branch_ref_request(
+                ident,
+                metadata.uuid(),
+                name,
+                src,
+                true,
+            ));
+            branched.push((ident.clone(), src));
+        }
+        anyhow::ensure!(
+            !branched.is_empty(),
+            "no table in the catalog has a snapshot yet, so branch {name:?} cannot point \
+             anywhere (write to at least one table first)"
+        );
+        let refs: Vec<&CommitTableRequest> = requests.iter().collect();
+        match self.post_transaction(&refs).await? {
+            TxnCommitOutcome::Committed => Ok((branched, skipped)),
+            TxnCommitOutcome::Conflict(msg) => bail!(
+                "branch {name:?} already exists on at least one table, or a table's main \
+                 head moved between load and commit (the per-table \
+                 `assert-ref-snapshot-id main=<captured head>` anchors reject a torn \
+                 cross-table cut) — the whole-lakehouse create is all-or-nothing and \
+                 NOTHING was applied; retry the create-all: {msg}"
+            ),
+            TxnCommitOutcome::Unsupported => bail!(
+                "the catalog does not implement the multi-table transaction endpoint \
+                 ({TXN_COMMIT_ENDPOINT:?}), so a whole-lakehouse branch cannot be created \
+                 atomically; NOTHING was applied. Create branches per table instead: \
+                 icegres branch create <table> {name}"
+            ),
+        }
+    }
+
+    /// `icegres branch drop-all`: remove branch `name` from every table that
+    /// has it, in ONE atomic multi-table transaction (each removal anchored
+    /// with `assert-ref-snapshot-id <name>=<head>`, so a concurrent commit
+    /// to the branch aborts the whole request with nothing applied).
+    /// Tables without the ref are skipped; if NO table has it, errors.
+    /// Returns the dropped `(table, head)` pairs plus the skipped count.
+    pub async fn drop_branch_all(&self, name: &str) -> Result<(Vec<(TableIdent, i64)>, usize)> {
+        anyhow::ensure!(
+            name != MAIN_BRANCH,
+            "refusing to drop {MAIN_BRANCH:?} — it is every table's default branch"
+        );
+        let idents = self.list_all_tables().await?;
+        let mut requests: Vec<CommitTableRequest> = Vec::new();
+        let mut dropped: Vec<(TableIdent, i64)> = Vec::new();
+        let mut skipped = 0usize;
+        for ident in &idents {
+            let table = self
+                .catalog
+                .load_table(ident)
+                .await
+                .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?;
+            let Some(head) = table
+                .metadata()
+                .snapshot_for_ref(name)
+                .map(|s| s.snapshot_id())
+            else {
+                skipped += 1;
+                continue;
+            };
+            requests.push(remove_branch_ref_request(
+                ident,
+                table.metadata().uuid(),
+                name,
+                head,
+            ));
+            dropped.push((ident.clone(), head));
+        }
+        anyhow::ensure!(
+            !dropped.is_empty(),
+            "branch {name:?} does not exist on any table in the catalog"
+        );
+        let refs: Vec<&CommitTableRequest> = requests.iter().collect();
+        match self.post_transaction(&refs).await? {
+            TxnCommitOutcome::Committed => Ok((dropped, skipped)),
+            TxnCommitOutcome::Conflict(msg) => bail!(
+                "branch {name:?} moved on at least one table while dropping it (concurrent \
+                 commit?) — the whole-lakehouse drop is all-or-nothing and NOTHING was \
+                 applied: {msg}"
+            ),
+            TxnCommitOutcome::Unsupported => bail!(
+                "the catalog does not implement the multi-table transaction endpoint \
+                 ({TXN_COMMIT_ENDPOINT:?}), so a whole-lakehouse branch drop cannot be \
+                 applied atomically; NOTHING was applied. Drop branches per table instead: \
+                 icegres branch drop <table> {name}"
             ),
         }
     }
@@ -810,6 +1088,222 @@ impl OverwriteEngine {
         }
         bail!("catalog rejected commit ({status}) at {url}: {body}")
     }
+
+    /// The multi-table transaction endpoint URL for this catalog.
+    fn transactions_commit_url(&self) -> String {
+        let prefix_seg = if self.prefix.is_empty() {
+            String::new()
+        } else {
+            format!("/{}", urlencode(&self.prefix))
+        };
+        format!("{}/v1{}/transactions/commit", self.catalog_uri, prefix_seg)
+    }
+
+    /// Resolve the multi-table transaction capability, running an explicit
+    /// DATA-FREE probe when it is not already known (config advertisement or
+    /// a previous probe): POST one empty, identifier-less table change to
+    /// the transactions endpoint. A catalog that implements the endpoint
+    /// answers that body with a request-level validation error — live-
+    /// verified against Lakekeeper 0.13.1, which answers 400
+    /// `TableIdentifierRequiredForCommitTransaction` (the spec-prescribed
+    /// shape requires an identifier per change, so no catalog can commit
+    /// anything from it) — while a catalog WITHOUT the endpoint answers
+    /// 404/405/501 at routing level. Interpretation is
+    /// [`txn_endpoint_capability`]; an indeterminate answer (5xx, a catalog
+    /// restart) or a network error bails WITHOUT caching, so the next
+    /// attempt re-probes. This is the ONLY place the capability is learned
+    /// off the wire: a real commit's 404 (e.g. a missing table) can never
+    /// be misread as "endpoint unsupported" and poison the cache.
+    async fn probe_txn_endpoint(&self) -> Result<bool> {
+        if let Some(known) = self.txn_endpoint.get() {
+            return Ok(*known);
+        }
+        let url = self.transactions_commit_url();
+        let probe_change = CommitTableRequest {
+            identifier: None,
+            requirements: Vec::new(),
+            updates: Vec::new(),
+        };
+        let resp = self
+            .http
+            .post(&url)
+            .json(&transaction_request_body(&[&probe_change]))
+            .send()
+            .await
+            .with_context(|| {
+                format!("multi-table transaction capability probe POST to {url} failed")
+            })?;
+        let status = resp.status();
+        match txn_endpoint_capability(status) {
+            Some(supported) => {
+                let _ = self.txn_endpoint.set(supported);
+                if supported {
+                    tracing::debug!(
+                        status = %status,
+                        "capability probe: catalog implements {TXN_COMMIT_ENDPOINT:?}"
+                    );
+                } else {
+                    tracing::warn!(
+                        status = %status,
+                        "capability probe: catalog does not implement \
+                         {TXN_COMMIT_ENDPOINT:?}; falling back to per-table commits"
+                    );
+                }
+                Ok(supported)
+            }
+            None => {
+                let body = resp.text().await.unwrap_or_default();
+                bail!(
+                    "could not determine whether the catalog implements \
+                     {TXN_COMMIT_ENDPOINT:?}: the data-free capability probe at {url} \
+                     answered {status}: {body} — nothing was cached, the next attempt \
+                     re-probes"
+                )
+            }
+        }
+    }
+
+    /// POST one multi-table transaction (`{"table-changes": [...]}`) to
+    /// `POST /v1/{prefix}/transactions/commit`. The endpoint capability is
+    /// resolved FIRST ([`Self::probe_txn_endpoint`]: cached answer, or one
+    /// data-free probe) — the real commit's own response NEVER teaches
+    /// "unsupported", so once support is established a 404 here is what it
+    /// is at commit level (e.g. a table vanished): a hard error, exactly
+    /// like every other non-409 rejection. All-or-nothing on the server:
+    /// 2xx = every change committed; 409 = conflict (a requirement failed
+    /// or the catalog CAS lost) with NOTHING applied. Skips the wire
+    /// entirely when support is already known to be absent.
+    async fn post_transaction(&self, requests: &[&CommitTableRequest]) -> Result<TxnCommitOutcome> {
+        if !self.probe_txn_endpoint().await? {
+            return Ok(TxnCommitOutcome::Unsupported);
+        }
+        let url = self.transactions_commit_url();
+        let resp = self
+            .http
+            .post(&url)
+            .json(&transaction_request_body(requests))
+            .send()
+            .await
+            .with_context(|| format!("transaction commit POST to {url} failed"))?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(TxnCommitOutcome::Committed);
+        }
+        let body = resp.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::CONFLICT {
+            return Ok(TxnCommitOutcome::Conflict(body));
+        }
+        // Endpoint support was established above, so ANY other status —
+        // including 404 (a table named in the transaction does not exist) —
+        // is a commit-level failure of THIS transaction (nothing applied),
+        // never a capability signal.
+        bail!("catalog rejected transaction commit ({status}) at {url}: {body}")
+    }
+}
+
+/// Interpret the status a DATA-FREE capability probe (one empty,
+/// identifier-less table change) got from `POST
+/// /v1/{prefix}/transactions/commit`:
+///
+/// * request-level validation errors (400/422) — and, defensively, 409 or a
+///   2xx — mean the endpoint EXISTS: the request was routed to a handler
+///   that understood it (`Some(true)`);
+/// * routing-level 404/405/501 mean the endpoint is NOT implemented
+///   (`Some(false)`);
+/// * anything else (5xx during a catalog restart, auth hiccups, ...) is
+///   indeterminate: `None` — the caller must NOT cache a capability from
+///   it.
+fn txn_endpoint_capability(status: reqwest::StatusCode) -> Option<bool> {
+    use reqwest::StatusCode;
+    if status.is_success() || status == StatusCode::CONFLICT {
+        return Some(true);
+    }
+    match status {
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => Some(true),
+        StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED => {
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
+/// The wire body of a multi-table transaction commit
+/// (`CommitTransactionRequest` in the Iceberg REST spec): the prepared
+/// per-table [`CommitTableRequest`]s — each REQUIRED to carry its
+/// `identifier` — wrapped under `"table-changes"`.
+fn transaction_request_body(requests: &[&CommitTableRequest]) -> serde_json::Value {
+    serde_json::json!({ "table-changes": requests })
+}
+
+/// The zero-copy branch-create commit for one table: set ref `name` to
+/// snapshot `src`, guarded by `assert-ref-snapshot-id <name>=null` (the ref
+/// must not already exist) + `assert-table-uuid`. With `anchor_main` (used
+/// whenever the branch source IS main's freshly-read head: single-table
+/// creates without `--at-snapshot`, and every table of `create_branch_all`)
+/// the request additionally asserts `assert-ref-snapshot-id main=<src>`, so
+/// the commit succeeds only if the captured head is still current — for
+/// create-all this is what makes the cross-table cut consistent-or-nothing.
+/// Callers branching from an explicit user-chosen snapshot pass `false`
+/// (main is free to move). Shared by [`OverwriteEngine::create_branch`]
+/// (single-table POST) and [`OverwriteEngine::create_branch_all`] (one
+/// atomic multi-table transaction).
+fn set_branch_ref_request(
+    ident: &TableIdent,
+    uuid: Uuid,
+    name: &str,
+    src: i64,
+    anchor_main: bool,
+) -> CommitTableRequest {
+    let mut requirements = vec![
+        TableRequirement::UuidMatch { uuid },
+        // null snapshot-id = "the ref must not already exist".
+        TableRequirement::RefSnapshotIdMatch {
+            r#ref: name.to_string(),
+            snapshot_id: None,
+        },
+    ];
+    if anchor_main {
+        // The branch forks main's head as read: pin main to it, so a
+        // concurrent commit between load and this commit is a 409, never a
+        // silently stale (or, across tables, torn) fork point.
+        requirements.push(TableRequirement::RefSnapshotIdMatch {
+            r#ref: MAIN_BRANCH.to_string(),
+            snapshot_id: Some(src),
+        });
+    }
+    CommitTableRequest {
+        identifier: Some(ident.clone()),
+        requirements,
+        updates: vec![TableUpdate::SetSnapshotRef {
+            ref_name: name.to_string(),
+            reference: SnapshotReference::new(src, SnapshotRetention::branch(None, None, None)),
+        }],
+    }
+}
+
+/// The branch-drop commit for one table: remove ref `name`, anchored at its
+/// current `head` so a concurrent commit to the branch is never silently
+/// discarded. Shared by [`OverwriteEngine::drop_branch`] and
+/// [`OverwriteEngine::drop_branch_all`].
+fn remove_branch_ref_request(
+    ident: &TableIdent,
+    uuid: Uuid,
+    name: &str,
+    head: i64,
+) -> CommitTableRequest {
+    CommitTableRequest {
+        identifier: Some(ident.clone()),
+        requirements: vec![
+            TableRequirement::UuidMatch { uuid },
+            TableRequirement::RefSnapshotIdMatch {
+                r#ref: name.to_string(),
+                snapshot_id: Some(head),
+            },
+        ],
+        updates: vec![TableUpdate::RemoveSnapshotRef {
+            ref_name: name.to_string(),
+        }],
+    }
 }
 
 /// Result of POSTing a prepared commit: accepted, or rejected with 409
@@ -817,6 +1311,30 @@ impl OverwriteEngine {
 pub enum CommitOutcome {
     Committed,
     Conflict(String),
+}
+
+/// Result of POSTing a multi-table transaction to the catalog. All three
+/// non-committed outcomes mean NOTHING was applied (the endpoint is
+/// all-or-nothing on the server).
+enum TxnCommitOutcome {
+    /// Every table change committed atomically.
+    Committed,
+    /// 409: a per-table requirement failed, or the catalog lost its own CAS
+    /// even after server-side retries. The whole transaction rolled back.
+    Conflict(String),
+    /// The catalog does not implement the endpoint; the caller must fall
+    /// back (ordered per-table commits, or a clean refusal).
+    Unsupported,
+}
+
+/// Result of [`OverwriteEngine::commit_pinned_multi`].
+pub enum MultiTableCommit {
+    /// All tables committed in ONE atomic catalog transaction (tables whose
+    /// ops net out to no change contribute nothing, per Postgres semantics).
+    Committed,
+    /// The catalog lacks `transactions/commit`; nothing was applied. The
+    /// caller decides: ordered per-table fallback, or strict refusal.
+    Unsupported,
 }
 
 /// A fully-prepared commit: all data/metadata files are already durable in
@@ -1826,6 +2344,199 @@ mod tests {
     use super::*;
     use arrow::array::{Float64Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
+
+    #[test]
+    fn multi_table_transaction_body_wraps_per_table_requirements() {
+        // N per-table CommitTableRequests (with their assert-ref-snapshot-id
+        // pins) become ONE {"table-changes": [...]} wire body, identifiers
+        // included — the exact CommitTransactionRequest shape Lakekeeper's
+        // POST /v1/{prefix}/transactions/commit expects.
+        let r1 = CommitTableRequest {
+            identifier: Some(TableIdent::from_strs(["ns", "t1"]).unwrap()),
+            requirements: vec![TableRequirement::RefSnapshotIdMatch {
+                r#ref: "main".to_string(),
+                snapshot_id: Some(123),
+            }],
+            updates: vec![],
+        };
+        let r2 = CommitTableRequest {
+            identifier: Some(TableIdent::from_strs(["ns", "t2"]).unwrap()),
+            requirements: vec![TableRequirement::RefSnapshotIdMatch {
+                r#ref: "main".to_string(),
+                snapshot_id: None,
+            }],
+            updates: vec![],
+        };
+        let body = transaction_request_body(&[&r1, &r2]);
+        let changes = body
+            .get("table-changes")
+            .and_then(|v| v.as_array())
+            .expect("body must carry a table-changes array");
+        assert_eq!(changes.len(), 2);
+        let str_at = |i: usize, ptr: &str| {
+            changes[i]
+                .pointer(ptr)
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+        assert_eq!(str_at(0, "/identifier/name").as_deref(), Some("t1"));
+        assert_eq!(str_at(0, "/identifier/namespace/0").as_deref(), Some("ns"));
+        assert_eq!(str_at(1, "/identifier/name").as_deref(), Some("t2"));
+        assert_eq!(
+            str_at(0, "/requirements/0/type").as_deref(),
+            Some("assert-ref-snapshot-id")
+        );
+        assert_eq!(str_at(0, "/requirements/0/ref").as_deref(), Some("main"));
+        assert_eq!(
+            changes[0]
+                .pointer("/requirements/0/snapshot-id")
+                .and_then(|v| v.as_i64()),
+            Some(123)
+        );
+        // A None pin ("ref must not exist") serializes as an EXPLICIT null,
+        // never omitted — omitting it would change the assertion's meaning.
+        assert!(changes[1]
+            .pointer("/requirements/0/snapshot-id")
+            .is_some_and(|v| v.is_null()));
+    }
+
+    #[test]
+    fn txn_endpoint_capability_interpretation() {
+        use reqwest::StatusCode;
+        // The endpoint answered the data-free probe: it exists. 400/422 are
+        // the expected request-level validation answers (Lakekeeper 0.13.1:
+        // 400 TableIdentifierRequiredForCommitTransaction); 2xx/409 also
+        // prove a handler is behind the route.
+        for s in [
+            StatusCode::OK,
+            StatusCode::NO_CONTENT,
+            StatusCode::BAD_REQUEST,
+            StatusCode::CONFLICT,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ] {
+            assert_eq!(txn_endpoint_capability(s), Some(true), "{s}");
+        }
+        // Routing-level "no such endpoint" answers.
+        for s in [
+            StatusCode::NOT_FOUND,
+            StatusCode::METHOD_NOT_ALLOWED,
+            StatusCode::NOT_IMPLEMENTED,
+        ] {
+            assert_eq!(txn_endpoint_capability(s), Some(false), "{s}");
+        }
+        // Indeterminate (catalog restart, gateway, auth): must NOT be
+        // cached either way — the caller re-probes next time.
+        for s in [
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::TOO_MANY_REQUESTS,
+        ] {
+            assert_eq!(txn_endpoint_capability(s), None, "{s}");
+        }
+    }
+
+    #[test]
+    fn branch_ref_request_builders_guard_and_anchor() {
+        let ident = TableIdent::from_strs(["demo", "trips"]).unwrap();
+        let uuid = Uuid::new_v4();
+
+        // create (forking main's head): uuid match + "ref must not exist"
+        // guard + main pinned to the captured head + set-snapshot-ref.
+        let create = serde_json::to_value(set_branch_ref_request(&ident, uuid, "dev", 42, true))
+            .expect("create request serializes");
+        assert_eq!(
+            create
+                .pointer("/requirements/0/type")
+                .and_then(|v| v.as_str()),
+            Some("assert-table-uuid")
+        );
+        assert_eq!(
+            create
+                .pointer("/requirements/1/type")
+                .and_then(|v| v.as_str()),
+            Some("assert-ref-snapshot-id")
+        );
+        assert_eq!(
+            create
+                .pointer("/requirements/1/ref")
+                .and_then(|v| v.as_str()),
+            Some("dev")
+        );
+        assert!(create
+            .pointer("/requirements/1/snapshot-id")
+            .is_some_and(|v| v.is_null()));
+        // The main anchor: assert-ref-snapshot-id main=<src>, making the
+        // fork point (and, across tables in create-all, the whole cut)
+        // consistent-or-nothing.
+        assert_eq!(
+            create
+                .pointer("/requirements/2/type")
+                .and_then(|v| v.as_str()),
+            Some("assert-ref-snapshot-id")
+        );
+        assert_eq!(
+            create
+                .pointer("/requirements/2/ref")
+                .and_then(|v| v.as_str()),
+            Some("main")
+        );
+        assert_eq!(
+            create
+                .pointer("/requirements/2/snapshot-id")
+                .and_then(|v| v.as_i64()),
+            Some(42)
+        );
+        assert_eq!(
+            create.pointer("/updates/0/action").and_then(|v| v.as_str()),
+            Some("set-snapshot-ref")
+        );
+        assert_eq!(
+            create
+                .pointer("/updates/0/ref-name")
+                .and_then(|v| v.as_str()),
+            Some("dev")
+        );
+        assert_eq!(
+            create
+                .pointer("/updates/0/snapshot-id")
+                .and_then(|v| v.as_i64()),
+            Some(42)
+        );
+
+        // create from an explicit --at-snapshot: the user chose the fork
+        // point, so NO main anchor is carried (main is free to move).
+        let create_at =
+            serde_json::to_value(set_branch_ref_request(&ident, uuid, "dev", 42, false))
+                .expect("at-snapshot create request serializes");
+        assert_eq!(
+            create_at
+                .pointer("/requirements")
+                .and_then(|v| v.as_array())
+                .map(Vec::len),
+            Some(2)
+        );
+        assert!(create_at.pointer("/requirements/2").is_none());
+
+        // drop: anchored at the current head + remove-snapshot-ref.
+        let drop = serde_json::to_value(remove_branch_ref_request(&ident, uuid, "dev", 42))
+            .expect("drop request serializes");
+        assert_eq!(
+            drop.pointer("/requirements/1/snapshot-id")
+                .and_then(|v| v.as_i64()),
+            Some(42)
+        );
+        assert_eq!(
+            drop.pointer("/updates/0/action").and_then(|v| v.as_str()),
+            Some("remove-snapshot-ref")
+        );
+        assert_eq!(
+            drop.pointer("/updates/0/ref-name").and_then(|v| v.as_str()),
+            Some("dev")
+        );
+    }
 
     fn stmt(kind: DmlKind, predicate: Option<&str>) -> DmlStatement {
         DmlStatement {

@@ -102,6 +102,66 @@ pub async fn list(opts: &CatalogOpts, table: &str) -> Result<()> {
     Ok(())
 }
 
+/// `icegres branch create-all <name>` — whole-lakehouse branch: set the ref
+/// on EVERY table in the catalog in ONE atomic multi-table transaction
+/// (Iceberg REST `transactions/commit`; requires a catalog that implements
+/// it, e.g. Lakekeeper). Each table carries the
+/// `assert-ref-snapshot-id <name>=null` creation guard AND pins `main` to
+/// the head captured when the table was loaded, so the command succeeds
+/// only if every captured head was still current at commit time: the cut is
+/// consistent-or-nothing — it can never show half of a concurrent commit,
+/// and any race (or an already-existing branch) fails the whole command
+/// with nothing applied (just retry). Tables without a snapshot cannot
+/// hold a ref and are skipped with a loud warning.
+pub async fn create_all(opts: &CatalogOpts, name: &str) -> Result<()> {
+    validate_name(name)?;
+    let (branched, skipped) = engine(opts)
+        .await?
+        .create_branch_all(name)
+        .await
+        .with_context(|| format!("failed to create whole-lakehouse branch {name:?}"))?;
+    for (ident, src) in &branched {
+        println!("created branch {name} on {ident} at snapshot {src}");
+    }
+    for ident in &skipped {
+        eprintln!(
+            "WARNING: skipped {ident} — it has no snapshot yet, and an Iceberg branch \
+             ref must point at one (write to it, then `icegres branch create {ident} \
+             {name}` to add it)"
+        );
+    }
+    println!(
+        "created branch {name} on {} table(s) in ONE atomic transaction (zero-copy \
+         snapshot refs; consistent-or-nothing cross-table cut — every table's main \
+         head was pinned as captured; {} snapshot-less table(s) skipped)",
+        branched.len(),
+        skipped.len()
+    );
+    Ok(())
+}
+
+/// `icegres branch drop-all <name>` — remove the ref from every table that
+/// has it in ONE atomic multi-table transaction (`main` is refused; tables
+/// without the ref are skipped; errors if no table has it).
+pub async fn drop_all(opts: &CatalogOpts, name: &str) -> Result<()> {
+    validate_name(name)?;
+    let (dropped, skipped) = engine(opts)
+        .await?
+        .drop_branch_all(name)
+        .await
+        .with_context(|| format!("failed to drop whole-lakehouse branch {name:?}"))?;
+    for (ident, head) in &dropped {
+        println!("dropped branch {name} on {ident} (was at snapshot {head})");
+    }
+    println!(
+        "dropped branch {name} from {} table(s) in ONE atomic transaction ({skipped} \
+         table(s) without the ref skipped; snapshots stay time-travel-readable until \
+         expiry)",
+        dropped.len()
+    );
+    Ok(())
+}
+
 /// `icegres branch drop <table> <name>`
 pub async fn drop(opts: &CatalogOpts, table: &str, name: &str) -> Result<()> {
     validate_name(name)?;

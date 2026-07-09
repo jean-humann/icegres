@@ -339,6 +339,27 @@ enum BranchCmd {
         /// Branch name to drop (`main` is refused).
         name: String,
     },
+    /// Create branch <name> on EVERY table in the catalog as ONE atomic
+    /// multi-table transaction — a consistent-or-nothing whole-lakehouse
+    /// cut: each table's request pins main to the head captured at load, so
+    /// a concurrent commit (or an already-existing branch) fails the whole
+    /// command with nothing applied; retry it. Requires a catalog
+    /// implementing transactions/commit, e.g. Lakekeeper.
+    CreateAll {
+        #[command(flatten)]
+        catalog: CatalogOpts,
+        /// Branch name to create on every table (must not exist anywhere).
+        name: String,
+    },
+    /// Drop branch <name> from every table that has it as ONE atomic
+    /// multi-table transaction (`main` is refused; tables without the ref
+    /// are skipped; errors if no table has it).
+    DropAll {
+        #[command(flatten)]
+        catalog: CatalogOpts,
+        /// Branch name to drop everywhere (`main` is refused).
+        name: String,
+    },
 }
 
 /// `icegres maintain` subcommands.
@@ -450,6 +471,8 @@ async fn main() -> Result<()> {
                 table,
                 name,
             } => branch::drop(&catalog, &table, &name).await,
+            BranchCmd::CreateAll { catalog, name } => branch::create_all(&catalog, &name).await,
+            BranchCmd::DropAll { catalog, name } => branch::drop_all(&catalog, &name).await,
         },
         Command::Maintain { cmd } => match cmd {
             MaintainCmd::ExpireSnapshots {

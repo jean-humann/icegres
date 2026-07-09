@@ -11,15 +11,24 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
 
 ## Transactions
 
-- **Multi-table transactions are not atomic across tables.** The Iceberg REST
-  protocol commits one table per request. A transaction touching N tables
-  issues N commits in deterministic (sorted) order after re-validating every
-  pin. If commit *k* fails after *k−1* succeeded, the COMMIT returns SQLSTATE
-  **`40003` (statement_completion_unknown)** naming exactly which tables
-  committed and which did not — **do not blindly retry** (that would
-  double-apply the committed tables). Single-table transactions are fully
-  atomic. Set `ICEGRES_TXN_STRICT=true` to refuse multi-table COMMITs up front
-  (`0A000`, nothing applied) and guarantee all-or-nothing.
+- **Multi-table transactions are atomic only when the catalog implements the
+  Iceberg REST multi-table transaction endpoint**
+  (`POST /v1/{prefix}/transactions/commit`). When it does — **verified
+  against Lakekeeper**, the assumed catalog — a COMMIT touching N tables is
+  ONE all-or-nothing catalog request carrying every table's
+  `assert-ref-snapshot-id` pin: every table commits or none does, and a
+  conflict is a clean, retryable **`40001`** with nothing applied. Support is
+  read from the catalog's `GET /v1/config` capability list (or probed once on
+  first use — 404/405/501 = unsupported) and cached. On a catalog WITHOUT the
+  endpoint, a transaction touching N tables falls back to N commits in
+  deterministic (sorted) order after re-validating every pin; if commit *k*
+  fails after *k−1* succeeded, the COMMIT returns SQLSTATE **`40003`
+  (statement_completion_unknown)** naming exactly which tables committed and
+  which did not — **do not blindly retry** (that would double-apply the
+  committed tables). Single-table transactions are always fully atomic.
+  `ICEGRES_TXN_STRICT=true` now only bites on catalogs without the endpoint:
+  it refuses such multi-table COMMITs up front (`0A000`, nothing applied);
+  with the endpoint, strict mode is satisfied by atomicity and never refuses.
 - **Concurrency is first-committer-wins, no auto-retry.** A COMMIT (or
   autocommit DML) whose pinned snapshot was moved by another writer returns
   **`40001` (serialization_failure)**; the application retries. Row counts were

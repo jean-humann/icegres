@@ -32,13 +32,18 @@
 //!
 //! # Honest limitations
 //!
-//! * **Multi-table transactions are NOT atomic across tables.** The Iceberg
-//!   REST protocol commits one table per request; a transaction touching N
-//!   tables issues N commits in deterministic (sorted) order after
-//!   re-validating every pin. If commit k fails after k-1 succeeded, the
-//!   error says exactly which tables committed and which did not — no
-//!   silent partial state. Single-table transactions (the common case) are
-//!   fully atomic.
+//! * **Multi-table transactions are atomic when the catalog implements the
+//!   Iceberg REST multi-table transaction endpoint**
+//!   (`POST /v1/{prefix}/transactions/commit` — Lakekeeper does): the whole
+//!   COMMIT becomes ONE all-or-nothing catalog request carrying every
+//!   table's pins; a conflict is a clean 40001 with nothing applied. On a
+//!   catalog WITHOUT the endpoint (probed once with a data-free request
+//!   BEFORE any data file is staged, then cached), a transaction
+//!   touching N tables falls back to N commits in deterministic (sorted)
+//!   order after re-validating every pin. If commit k fails after k-1
+//!   succeeded, the error (40003) says exactly which tables committed and
+//!   which did not — no silent partial state. Single-table transactions
+//!   (the common case) always use the per-table path and are fully atomic.
 //! * **In-transaction SELECT is served on the simple query protocol**
 //!   (psql, psycopg2). Extended-protocol SELECT inside a transaction is
 //!   rejected loudly: the hook API cannot see the portal's requested result
@@ -109,7 +114,7 @@ use crate::context::{CATALOG_NAME, DEFAULT_SCHEMA};
 use crate::dml;
 use crate::overwrite::{
     align_batch, apply_dml_to_batches, check_pk, pk_columns_of, quote_ident, DmlKind,
-    OverwriteEngine, TableOp,
+    MultiTableCommit, OverwriteEngine, TableOp,
 };
 
 // ---------------------------------------------------------------------------
@@ -589,10 +594,12 @@ pub struct TxnHook {
     registry: Arc<TxnRegistry>,
     engine: Arc<OverwriteEngine>,
     catalog: Arc<dyn Catalog>,
-    /// When true, a COMMIT that would touch more than one table is refused up
-    /// front (nothing applied) instead of being applied best-effort per-table.
-    /// Set via `ICEGRES_TXN_STRICT=true`. Trades multi-table transactions for a
-    /// guarantee that every COMMIT is all-or-nothing.
+    /// When true, a multi-table COMMIT that cannot be applied atomically
+    /// (the catalog lacks the `transactions/commit` endpoint) is refused
+    /// (nothing applied) instead of being applied best-effort per-table.
+    /// Set via `ICEGRES_TXN_STRICT=true`. On a catalog WITH the endpoint
+    /// strict mode never refuses: atomicity is provided by the single
+    /// all-or-nothing catalog transaction.
     strict: bool,
 }
 
@@ -666,25 +673,74 @@ impl TxnHook {
             .collect();
         idents.sort_by_key(|i| i.to_string());
 
-        // Strict mode: Iceberg REST commits are per-table, so a transaction
-        // spanning >1 table cannot be applied atomically. Rather than risk a
-        // partial apply, refuse before touching anything — the whole
-        // transaction rolls back (nothing was applied) with a clear
-        // feature_not_supported (0A000) error.
-        if self.strict && idents.len() > 1 {
-            let names: Vec<String> = idents.iter().map(|i| i.to_string()).collect();
-            return Err(user_err(
-                "0A000",
-                &format!(
-                    "strict transaction mode (ICEGRES_TXN_STRICT): COMMIT touches {} tables \
-                     [{}] but Iceberg REST commits are per-table and cannot be applied \
-                     atomically across tables; transaction rolled back (nothing applied). \
-                     Commit one table per transaction, or unset ICEGRES_TXN_STRICT to allow \
-                     best-effort ordered multi-table commits.",
-                    idents.len(),
-                    names.join(", ")
-                ),
-            ));
+        // Multi-table transaction: try ONE atomic all-or-nothing catalog
+        // commit (POST /v1/{prefix}/transactions/commit, Iceberg REST spec;
+        // Lakekeeper implements it). Per table it carries exactly the
+        // requirements/updates the per-table path would post, so semantics
+        // are unchanged except across tables: every table commits or none
+        // does — a conflict is a clean 40001 with nothing applied, and the
+        // 40003 partial-apply outcome below becomes unreachable. Single-
+        // table transactions never take this path (byte-identical behavior).
+        if idents.len() > 1 {
+            let batch: Vec<(&TableIdent, Option<i64>, &[TableOp])> = idents
+                .iter()
+                .map(|ident| {
+                    let t = &sess.tables[*ident];
+                    (*ident, t.pin_snapshot, t.ops.as_slice())
+                })
+                .collect();
+            match self.engine.commit_pinned_multi(&batch).await {
+                Ok(MultiTableCommit::Committed) => {
+                    return Ok(Response::TransactionEnd(Tag::new("COMMIT")));
+                }
+                Ok(MultiTableCommit::Unsupported) => {
+                    // Catalog lacks the endpoint. The capability was
+                    // resolved by a DATA-FREE probe before any table was
+                    // prepared, so nothing was applied AND nothing was
+                    // staged: strict mode refuses below having touched
+                    // nothing; otherwise fall through to the documented
+                    // ordered per-table path, which stages each table
+                    // exactly once (no double staging).
+                }
+                Err(e) => {
+                    // All-or-nothing: NOTHING was applied. Preserve the
+                    // underlying sqlstate (40001 serialization_failure for
+                    // conflicts) — retrying the whole transaction is safe.
+                    let base = dml::engine_error(&e);
+                    let msg = format!(
+                        "COMMIT failed, transaction rolled back (no changes were \
+                         applied): {}",
+                        err_message(&base)
+                    );
+                    return Err(with_message(base, msg));
+                }
+            }
+
+            // Strict mode: without the multi-table transaction endpoint a
+            // COMMIT spanning >1 table cannot be applied atomically. Rather
+            // than risk a partial apply, refuse before touching anything —
+            // literally: the missing capability was learned from the
+            // data-free probe, so no data file was written and no catalog
+            // state changed. The whole transaction rolls back with a clear
+            // feature_not_supported (0A000) error.
+            if self.strict {
+                let names: Vec<String> = idents.iter().map(|i| i.to_string()).collect();
+                return Err(user_err(
+                    "0A000",
+                    &format!(
+                        "strict transaction mode (ICEGRES_TXN_STRICT): COMMIT touches {} \
+                         tables [{}] but this catalog does not implement the multi-table \
+                         transaction endpoint (POST /v1/{{prefix}}/transactions/commit), so \
+                         the COMMIT cannot be applied atomically across tables; transaction \
+                         rolled back (nothing applied). Commit one table per transaction, \
+                         use a catalog with multi-table transactions (e.g. Lakekeeper), or \
+                         unset ICEGRES_TXN_STRICT to allow best-effort ordered multi-table \
+                         commits.",
+                        idents.len(),
+                        names.join(", ")
+                    ),
+                ));
+            }
         }
 
         let mut committed: Vec<String> = Vec::new();
@@ -1320,8 +1376,9 @@ fn user_err(code: &str, msg: &str) -> PgWireError {
 }
 
 /// Whether strict transaction mode is enabled (`ICEGRES_TXN_STRICT` truthy).
-/// In strict mode a COMMIT spanning more than one table is refused before any
-/// table is written, guaranteeing every COMMIT is all-or-nothing.
+/// In strict mode a COMMIT spanning more than one table is refused (before
+/// any table is written) unless the catalog can apply it atomically via the
+/// multi-table transaction endpoint — every COMMIT stays all-or-nothing.
 fn strict_txn_mode() -> bool {
     matches!(
         std::env::var("ICEGRES_TXN_STRICT").as_deref(),

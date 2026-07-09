@@ -520,6 +520,226 @@ assert_eq "loser txn's row absent, winner's row present" "0|1" \
   "$(q "select count(*) from demo.trips where trip_id = $TX_A + 100")|$(q "select count(*) from demo.trips where trip_id = $TX_C")"
 
 # ---------------------------------------------------------------------------
+# (j2) Atomic multi-table transactions (roadmap Phase 3): a COMMIT touching
+#      N tables is ONE all-or-nothing catalog request against Lakekeeper's
+#      POST /v1/{prefix}/transactions/commit. Both tables commit together
+#      (exactly one new snapshot each), and a staged conflict is a clean
+#      40001 with NEITHER table changed — the 40003 partial-apply outcome is
+#      unreachable on this path. Whole-lakehouse branches ride the same
+#      endpoint: create-all/drop-all set/remove the ref on EVERY table —
+#      tables in NESTED namespaces included, each request pinning main to
+#      the head captured at load (consistent-or-nothing cut) — in one
+#      atomic transaction.
+# ---------------------------------------------------------------------------
+log "(j2) atomic multi-table transactions + whole-lakehouse branches"
+
+# snap_count <table>: snapshot count of demo.<table> via the REST catalog.
+snap_count() {
+  curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/$1" \
+    | jq '[.metadata.snapshots[]?] | length'
+}
+
+q 'drop table if exists demo.e2e_mt_a' >/dev/null 2>&1 || true
+q 'drop table if exists demo.e2e_mt_b' >/dev/null 2>&1 || true
+q 'create table demo.e2e_mt_a (id bigint, v double)' >/dev/null
+q 'create table demo.e2e_mt_b (id bigint, v double)' >/dev/null
+
+# j2-1: a two-table COMMIT lands atomically: both rows visible from new
+# connections, exactly ONE new snapshot per table, and the server used the
+# multi-table transaction endpoint (not N ordered per-table commits).
+mt_atomic_before=$(grep -c 'transaction committed atomically via transactions/commit' "$SERVE_LOG" || true)
+snaps_a_before=$(snap_count e2e_mt_a)
+snaps_b_before=$(snap_count e2e_mt_b)
+"${PSQL[@]}" -q 2>"$E2E_DIR/mt-commit.err" <<EOF || { cat "$E2E_DIR/mt-commit.err" >&2; fail "multi-table txn COMMIT failed"; }
+BEGIN;
+insert into demo.e2e_mt_a values (1, 1.0);
+insert into demo.e2e_mt_b values (2, 2.0);
+COMMIT;
+EOF
+assert_eq "both tables visible from new connections after ONE COMMIT" "1|1" \
+  "$(q 'select count(*) from demo.e2e_mt_a')|$(q 'select count(*) from demo.e2e_mt_b')"
+assert_eq "exactly one new snapshot per table" \
+  "$((snaps_a_before + 1))|$((snaps_b_before + 1))" \
+  "$(snap_count e2e_mt_a)|$(snap_count e2e_mt_b)"
+mt_atomic_after=$(grep -c 'transaction committed atomically via transactions/commit' "$SERVE_LOG" || true)
+assert_eq "COMMIT went through the atomic transactions/commit endpoint" \
+  "$((mt_atomic_before + 1))" "$mt_atomic_after"
+
+# j2-2: staged conflict — a second writer commits to ONE touched table while
+# the transaction is open. COMMIT fails with 40001 (serialization_failure,
+# retryable) and NEITHER table changed: no partial apply, no 40003.
+snaps_a_before=$(snap_count e2e_mt_a)
+snaps_b_before=$(snap_count e2e_mt_b)
+( echo "BEGIN;"
+  echo "insert into demo.e2e_mt_a values (10, 10.0);"
+  echo "insert into demo.e2e_mt_b values (11, 11.0);"
+  sleep 3
+  echo "COMMIT;" ) | "${PSQL[@]}" -v VERBOSITY=verbose >"$E2E_DIR/mt-conflict.out" 2>&1 &
+MT_PID=$!
+sleep 1.5
+"${PSQL[@]}" -q -c 'insert into demo.e2e_mt_b values (777, 7.0)' \
+  || fail "concurrent autocommit INSERT failed"
+wait "$MT_PID" || true
+grep -q 'could not serialize access due to concurrent update' "$E2E_DIR/mt-conflict.out" \
+  || { cat "$E2E_DIR/mt-conflict.out" >&2; fail "multi-table conflict did not report a serialization failure"; }
+grep -q '40001' "$E2E_DIR/mt-conflict.out" \
+  || { cat "$E2E_DIR/mt-conflict.out" >&2; fail "multi-table conflict sqlstate is not 40001"; }
+grep -q 'no changes were applied' "$E2E_DIR/mt-conflict.out" \
+  || { cat "$E2E_DIR/mt-conflict.out" >&2; fail "conflict error does not state that nothing was applied"; }
+pass "staged conflict -> 40001 serialization_failure (all-or-nothing, retryable)"
+assert_eq "NEITHER table has the loser txn's rows; the winner's row landed" "0|0|1" \
+  "$(q 'select count(*) from demo.e2e_mt_a where id = 10')|$(q 'select count(*) from demo.e2e_mt_b where id = 11')|$(q 'select count(*) from demo.e2e_mt_b where id = 777')"
+assert_eq "conflicted COMMIT wrote no snapshot (only the winner's on table b)" \
+  "$snaps_a_before|$((snaps_b_before + 1))" \
+  "$(snap_count e2e_mt_a)|$(snap_count e2e_mt_b)"
+
+# j2-3: whole-lakehouse branches: create-all sets the ref on EVERY table in
+# ONE atomic transaction (per-table assert-ref-snapshot-id=null guard, plus
+# a main=<captured head> anchor per table so the cut is consistent-or-
+# nothing); drop-all removes it everywhere the same way. Tables in NESTED
+# namespaces are part of "every table": list_all_tables walks the namespace
+# tree (the REST list_namespaces answers one level per call), so a table in
+# demo_nested.child must get the ref too — before that fix it was silently
+# excluded from the cut.
+ALL_BR=e2e_all
+
+# Nested-namespace fixture: demo_nested.child.nested_t with ONE honest EMPTY
+# snapshot (an Iceberg branch ref must point at a snapshot; a real
+# zero-manifest manifest list is uploaded to the table's metadata dir and
+# committed via the REST API — no SQL surface reaches nested namespaces).
+NESTED_NS_URL="demo_nested%1Fchild" # %1F = REST spec namespace level separator
+NESTED_SNAP=424242424242
+nested_table_url() { echo "$CATALOG_URI/v1/$prefix/namespaces/$NESTED_NS_URL/tables/nested_t"; }
+# crashed-run cleanup, then (re)create parent + child namespaces and table
+curl -sf -X DELETE "$(nested_table_url)?purgeRequested=true" >/dev/null 2>&1 || true
+curl -sf -X POST "$CATALOG_URI/v1/$prefix/namespaces" -H 'Content-Type: application/json' \
+  -d '{"namespace":["demo_nested"]}' >/dev/null 2>&1 || true # may already exist
+curl -sf -X POST "$CATALOG_URI/v1/$prefix/namespaces" -H 'Content-Type: application/json' \
+  -d '{"namespace":["demo_nested","child"]}' >/dev/null 2>&1 || true
+curl -sf -X POST "$CATALOG_URI/v1/$prefix/namespaces/$NESTED_NS_URL/tables" \
+  -H 'Content-Type: application/json' -d '{
+  "name": "nested_t",
+  "schema": {"type":"struct","schema-id":0,"fields":[
+    {"id":1,"name":"id","required":false,"type":"long"}]}
+}' >/dev/null || fail "could not create demo_nested.child.nested_t via the REST catalog"
+nested_loc=$(curl -sf "$(nested_table_url)" | jq -r '.metadata.location')
+[[ "$nested_loc" == s3://lakehouse/* ]] || fail "unexpected nested table location: $nested_loc"
+# A valid EMPTY manifest list is an Avro OCF with a header (magic + writer
+# schema + null codec + sync marker) and zero data blocks.
+python3 - "$E2E_DIR/nested-empty-manifest-list.avro" <<'PYEOF' \
+  || fail "could not generate the empty manifest list"
+import json, os, sys
+schema = {"type": "record", "name": "manifest_file", "fields": [
+    {"name": "manifest_path", "type": "string", "field-id": 500},
+    {"name": "manifest_length", "type": "long", "field-id": 501},
+    {"name": "partition_spec_id", "type": "int", "field-id": 502},
+    {"name": "content", "type": "int", "field-id": 517},
+    {"name": "sequence_number", "type": "long", "field-id": 515},
+    {"name": "min_sequence_number", "type": "long", "field-id": 516},
+    {"name": "added_snapshot_id", "type": "long", "field-id": 503},
+    {"name": "added_files_count", "type": "int", "field-id": 504},
+    {"name": "existing_files_count", "type": "int", "field-id": 505},
+    {"name": "deleted_files_count", "type": "int", "field-id": 506},
+    {"name": "added_rows_count", "type": "long", "field-id": 512},
+    {"name": "existing_rows_count", "type": "long", "field-id": 513},
+    {"name": "deleted_rows_count", "type": "long", "field-id": 514},
+    {"name": "partitions", "field-id": 507, "type": ["null", {
+        "type": "array", "element-id": 508, "items": {
+            "type": "record", "name": "r508", "fields": [
+                {"name": "contains_null", "type": "boolean", "field-id": 509},
+                {"name": "contains_nan", "type": ["null", "boolean"], "field-id": 518},
+                {"name": "lower_bound", "type": ["null", "bytes"], "field-id": 510},
+                {"name": "upper_bound", "type": ["null", "bytes"], "field-id": 511}]},
+    }]},
+]}
+def vlong(n):  # Avro zigzag varint
+    n = (n << 1) ^ (n >> 63)
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+meta = {"avro.schema": json.dumps(schema).encode(),
+        "avro.codec": b"null", "format-version": b"2"}
+buf = b"Obj\x01" + vlong(len(meta))
+for k, v in meta.items():
+    buf += vlong(len(k.encode())) + k.encode() + vlong(len(v)) + v
+buf += vlong(0)        # end of the header metadata map
+buf += os.urandom(16)  # sync marker; zero data blocks follow
+open(sys.argv[1], "wb").write(buf)
+PYEOF
+aws --endpoint-url "$S3_ENDPOINT" s3 cp "$E2E_DIR/nested-empty-manifest-list.avro" \
+  "$nested_loc/metadata/snap-$NESTED_SNAP-0-e2e-empty.avro" >/dev/null \
+  || fail "could not upload the empty manifest list for demo_nested.child.nested_t"
+curl -sf -X POST "$(nested_table_url)" -H 'Content-Type: application/json' -d "{
+  \"requirements\": [{\"type\":\"assert-ref-snapshot-id\",\"ref\":\"main\",\"snapshot-id\":null}],
+  \"updates\": [
+    {\"action\":\"add-snapshot\",\"snapshot\":{
+      \"snapshot-id\": $NESTED_SNAP,
+      \"sequence-number\": 1,
+      \"timestamp-ms\": $(date +%s%3N),
+      \"manifest-list\": \"$nested_loc/metadata/snap-$NESTED_SNAP-0-e2e-empty.avro\",
+      \"summary\": {\"operation\":\"append\"},
+      \"schema-id\": 0
+    }},
+    {\"action\":\"set-snapshot-ref\",\"ref-name\":\"main\",
+     \"type\":\"branch\",\"snapshot-id\": $NESTED_SNAP}
+  ]
+}" >/dev/null || fail "could not commit the empty snapshot to demo_nested.child.nested_t"
+pass "nested-namespace fixture: demo_nested.child.nested_t with one (empty) snapshot"
+# The branch ref of the nested table, read via the REST catalog (the branch
+# CLI addresses <namespace>.<table> only; nested tables are asserted here).
+nested_ref() {
+  curl -sf "$(nested_table_url)" \
+    | jq -r ".metadata.refs.\"$ALL_BR\".\"snapshot-id\" // \"absent\""
+}
+
+"$BIN" branch drop-all "$ALL_BR" >/dev/null 2>&1 || true # crashed-run cleanup
+"$BIN" branch create-all "$ALL_BR" >"$E2E_DIR/branch-create-all.log" 2>&1 \
+  || { cat "$E2E_DIR/branch-create-all.log" >&2; fail "branch create-all failed"; }
+grep -q "ONE atomic transaction" "$E2E_DIR/branch-create-all.log" \
+  || fail "create-all output unexpected: $(cat "$E2E_DIR/branch-create-all.log")"
+for t in trips cities e2e_mt_a e2e_mt_b; do
+  "$BIN" branch list "demo.$t" 2>/dev/null | grep -q "^$ALL_BR	" \
+    || fail "branch $ALL_BR missing on demo.$t after create-all"
+done
+pass "branch create-all: ref present on every table (trips, cities, e2e_mt_a, e2e_mt_b)"
+grep -q "created branch $ALL_BR on demo_nested.child.nested_t at snapshot $NESTED_SNAP" \
+  "$E2E_DIR/branch-create-all.log" \
+  || fail "create-all output does not mention the nested table: $(cat "$E2E_DIR/branch-create-all.log")"
+assert_eq "create-all reached the NESTED namespace (ref on demo_nested.child.nested_t)" \
+  "$NESTED_SNAP" "$(nested_ref)"
+if "$BIN" branch create-all "$ALL_BR" >/dev/null 2>&1; then
+  fail "duplicate create-all was ACCEPTED (per-table assert-ref-snapshot-id=null must reject it)"
+fi
+pass "duplicate create-all rejected (all-or-nothing, nothing applied)"
+"$BIN" branch drop-all "$ALL_BR" >"$E2E_DIR/branch-drop-all.log" 2>&1 \
+  || { cat "$E2E_DIR/branch-drop-all.log" >&2; fail "branch drop-all failed"; }
+for t in trips cities e2e_mt_a e2e_mt_b; do
+  if "$BIN" branch list "demo.$t" 2>/dev/null | grep -q "^$ALL_BR	"; then
+    fail "branch $ALL_BR still on demo.$t after drop-all"
+  fi
+done
+pass "branch drop-all: ref removed from every table"
+assert_eq "drop-all removed the ref from the NESTED table too" \
+  "absent" "$(nested_ref)"
+if "$BIN" branch drop-all "$ALL_BR" >/dev/null 2>&1; then
+  fail "drop-all of a nonexistent branch was ACCEPTED (must error when no table has it)"
+fi
+pass "drop-all errors when no table has the branch"
+q 'drop table demo.e2e_mt_a' >/dev/null 2>&1 || true
+q 'drop table demo.e2e_mt_b' >/dev/null 2>&1 || true
+# Nested fixture cleanup: table (with purge — the empty manifest list is a
+# real file under its location), then child + parent namespaces.
+curl -sf -X DELETE "$(nested_table_url)?purgeRequested=true" >/dev/null 2>&1 || true
+curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/$NESTED_NS_URL" >/dev/null 2>&1 || true
+curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/demo_nested" >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
 # (k) Opt-in PK enforcement (SPEC B5): --enforce-pk + icegres.primary-key
 # ---------------------------------------------------------------------------
 log "(k) PK enforcement (--enforce-pk) on :$PK_PORT"
@@ -1366,49 +1586,72 @@ pass "expire-snapshots trims to newest-N, keeps head, is idempotent"
 q 'drop table demo.e2e_expire' >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
-# (u) Strict transaction mode (SPEC B4 hardening): ICEGRES_TXN_STRICT refuses
-# a multi-table COMMIT up front rather than applying it non-atomically.
+# (u) Strict transaction mode (SPEC B4 hardening): on a catalog WITH the
+# multi-table transaction endpoint (Lakekeeper), ICEGRES_TXN_STRICT is
+# satisfied by atomicity — a multi-table COMMIT succeeds as ONE atomic
+# request. Only when the catalog LACKS the endpoint (simulated with the
+# test-only ICEGRES_TXN_DISABLE_ATOMIC knob) does strict mode refuse up
+# front (0A000, nothing applied) instead of committing per-table.
 # ---------------------------------------------------------------------------
-log "(u) strict multi-table refusal (ICEGRES_TXN_STRICT) on :$STRICT_PORT"
-stop_pidfile_generic "$E2E_DIR/serve-strict.pid"
-: >"$E2E_DIR/serve-strict.log"
-ICEGRES_TXN_STRICT=true "$BIN" serve --host "$PG_HOST" --port "$STRICT_PORT" \
-  >>"$E2E_DIR/serve-strict.log" 2>&1 &
-echo $! >"$E2E_DIR/serve-strict.pid"
-strict_ready=0
-for _ in $(seq 1 60); do
-  if psql -h "$PG_HOST" -p "$STRICT_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
-    strict_ready=1; break
-  fi
-  sleep 0.5
-done
-[[ "$strict_ready" == 1 ]] || { tail -n 20 "$E2E_DIR/serve-strict.log" >&2; fail "strict server not ready on :$STRICT_PORT"; }
+log "(u) strict transaction mode (ICEGRES_TXN_STRICT) on :$STRICT_PORT"
+strict_start() { # strict_start [EXTRA_ENV=...]
+  stop_pidfile_generic "$E2E_DIR/serve-strict.pid"
+  : >"$E2E_DIR/serve-strict.log"
+  env "$@" ICEGRES_TXN_STRICT=true "$BIN" serve --host "$PG_HOST" --port "$STRICT_PORT" \
+    >>"$E2E_DIR/serve-strict.log" 2>&1 &
+  echo $! >"$E2E_DIR/serve-strict.pid"
+  local ready=0
+  for _ in $(seq 1 60); do
+    if psql -h "$PG_HOST" -p "$STRICT_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+      ready=1; break
+    fi
+    sleep 0.5
+  done
+  [[ "$ready" == 1 ]] \
+    || { tail -n 20 "$E2E_DIR/serve-strict.log" >&2; fail "strict server not ready on :$STRICT_PORT"; }
+}
 SQ=(psql -h "$PG_HOST" -p "$STRICT_PORT" -U postgres -d icegres)
+strict_start
 "${SQ[@]}" -tA -c 'drop table if exists demo.e2e_strict_a' >/dev/null 2>&1 || true
 "${SQ[@]}" -tA -c 'drop table if exists demo.e2e_strict_b' >/dev/null 2>&1 || true
 "${SQ[@]}" -tA -c 'create table demo.e2e_strict_a (id bigint)' >/dev/null
 "${SQ[@]}" -tA -c 'create table demo.e2e_strict_b (id bigint)' >/dev/null
-# Two-table transaction: strict mode must refuse the COMMIT and apply nothing.
-strict_out=$("${SQ[@]}" -v VERBOSITY=verbose 2>&1 <<'EOF'
+# u1: strict + supported catalog: the two-table COMMIT succeeds ATOMICALLY.
+strict_out=$("${SQ[@]}" -v ON_ERROR_STOP=1 2>&1 <<'EOF'
 BEGIN;
 insert into demo.e2e_strict_a values (1);
 insert into demo.e2e_strict_b values (2);
 COMMIT;
 EOF
+) || { echo "$strict_out" >&2; fail "strict multi-table COMMIT failed on a catalog WITH transactions/commit"; }
+echo "$strict_out" | grep -q "COMMIT" || fail "strict COMMIT tag missing: $strict_out"
+grep -q 'transaction committed atomically via transactions/commit' "$E2E_DIR/serve-strict.log" \
+  || fail "strict multi-table COMMIT did not use the atomic endpoint"
+assert_eq "strict mode + Lakekeeper: multi-table COMMIT applied atomically" "1|1" \
+  "$("${SQ[@]}" -tA -c 'select (select count(*) from demo.e2e_strict_a) as a, (select count(*) from demo.e2e_strict_b) as b')"
+# u2: catalog without the endpoint (simulated): strict refuses the COMMIT
+# up front and applies nothing.
+strict_start ICEGRES_TXN_DISABLE_ATOMIC=1
+strict_out=$("${SQ[@]}" -v VERBOSITY=verbose 2>&1 <<'EOF'
+BEGIN;
+insert into demo.e2e_strict_a values (3);
+insert into demo.e2e_strict_b values (4);
+COMMIT;
+EOF
 ) || true
 echo "$strict_out" | grep -q '0A000' \
-  || fail "strict multi-table COMMIT not refused with 0A000: $strict_out"
-pass "strict mode refuses multi-table COMMIT (0A000 feature_not_supported)"
-assert_eq "strict refusal applied nothing to either table (atomic rollback)" "0|0" \
+  || fail "strict multi-table COMMIT not refused with 0A000 without the endpoint: $strict_out"
+pass "strict mode refuses multi-table COMMIT when the catalog lacks the endpoint (0A000)"
+assert_eq "strict refusal applied nothing to either table (atomic rollback)" "1|1" \
   "$("${SQ[@]}" -tA -c 'select (select count(*) from demo.e2e_strict_a) as a, (select count(*) from demo.e2e_strict_b) as b')"
-# Single-table transaction still commits normally under strict mode.
+# u3: single-table transaction still commits normally under strict mode.
 "${SQ[@]}" 2>&1 <<'EOF' >/dev/null
 BEGIN;
 insert into demo.e2e_strict_a values (9);
 insert into demo.e2e_strict_a values (10);
 COMMIT;
 EOF
-assert_eq "strict mode still commits single-table transactions" "2" \
+assert_eq "strict mode still commits single-table transactions" "3" \
   "$("${SQ[@]}" -tA -c 'select count(*) from demo.e2e_strict_a')"
 "${SQ[@]}" -tA -c 'drop table demo.e2e_strict_a' >/dev/null 2>&1 || true
 "${SQ[@]}" -tA -c 'drop table demo.e2e_strict_b' >/dev/null 2>&1 || true

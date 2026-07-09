@@ -257,6 +257,8 @@ the BSL permits a deployer's internal use).
 
 ## 5. Phase 3 — multi-table atomicity and whole-lakehouse branches
 
+> **STATUS: shipped** — atomic multi-table COMMIT (40001-on-conflict, ordered/40003 fallback preserved for catalogs without the endpoint) and `icegres branch create-all`/`drop-all`, verified end-to-end against Lakekeeper 0.13.1 (e2e sections (j2)/(u)).
+
 The comparison doc scores Lakebase's whole-database branching and icegres'
 `40003` multi-table caveat as two separate gaps. They share one fix, and it
 is cheaper than it looks: the **Iceberg REST spec's multi-table transaction
@@ -276,8 +278,9 @@ Lakekeeper version in e2e, then adopt.)
   pins). Falls back to today's ordered-commit path on catalogs without the
   endpoint, preserving I3.
 - **Whole-lakehouse branches**: `icegres branch create-all <name>` sets the
-  ref on every table in one atomic transaction — a consistent cross-table
-  cut, which is the branch unit Lakebase brags about. `serve --branch` and
+  ref on every table in one atomic transaction, each table pinned to its
+  captured main head — a consistent-or-nothing cross-table cut, which is
+  the branch unit Lakebase brags about. `serve --branch` and
   `icegresd`'s `icegres@<branch>` routing already work per-ref and need no
   change. Tags give the same for PITR-style restore points; snapshot-expiry
   already preserves ref-reachable history.

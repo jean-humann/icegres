@@ -37,7 +37,7 @@ compatibility, and scale-to-zero economics on lakehouse data — leave
 | SELECT (full SQL via DataFusion) | snapshot-aware metadata cache, exact freshness (no TTL) | default |
 | INSERT | Iceberg `fast_append` commit per statement | default |
 | UPDATE / DELETE | copy-on-write overwrite snapshots — only files containing matched rows are rewritten (`src/overwrite.rs`) | default |
-| Transactions | BEGIN/COMMIT/ROLLBACK; snapshot-pinned reads, read-your-own-writes, COMMIT = ONE Iceberg snapshot, first-committer-wins (40001) (`src/txn.rs`) | default |
+| Transactions | BEGIN/COMMIT/ROLLBACK; snapshot-pinned reads, read-your-own-writes, COMMIT = ONE Iceberg snapshot per table — atomic ACROSS tables via the catalog's multi-table `transactions/commit` endpoint (Lakekeeper), first-committer-wins (40001) (`src/txn.rs`) | default |
 | Primary-key enforcement | opt-in NOT NULL + uniqueness checks (23502/23505) anchored to the commit snapshot | `--enforce-pk` + table property `icegres.primary-key` |
 | Authentication | SCRAM-SHA-256 (salted hashes in memory, 28P01 on failure) — managed add-on | `--auth-file` |
 | Authorization | Lakekeeper-style ReBAC: warehouse/namespace/table grants, roles, per-statement 42501 — managed add-on | `--authz-file` |
@@ -114,6 +114,8 @@ psql -h 127.0.0.1 -p 5439 -U postgres -d icegres
 | `icegres branch create <table> <name> [--at-snapshot <id>]` | Create a zero-copy branch: ONE metadata commit adding a snapshot ref at main's head (or `--at-snapshot`); no data copied. Fails if the branch exists (atomic via `assert-ref-snapshot-id = null`). |
 | `icegres branch list <table>` | List all snapshot refs (branches/tags) of a table with their head snapshot ids. |
 | `icegres branch drop <table> <name>` | Remove the ref only (`main` is refused); the branch's snapshots stay time-travel-readable until expiry. |
+| `icegres branch create-all <name>` | Whole-lakehouse branch: set the ref on EVERY table in the catalog in ONE atomic multi-table transaction (`POST /v1/{prefix}/transactions/commit`) — a consistent cross-table cut. Per-table `assert-ref-snapshot-id = null` guards make it all-or-nothing: if any table already has the branch, nothing is applied. Snapshot-less tables cannot hold a ref and are skipped with a loud warning. Requires a catalog implementing the endpoint (Lakekeeper does); errors cleanly otherwise. |
+| `icegres branch drop-all <name>` | Remove the ref from every table that has it in ONE atomic multi-table transaction (`main` refused; tables without the ref are skipped; errors if no table has it). |
 | `icegres maintain expire-snapshots <table> [--keep N]` | Trim table metadata to the newest `N` snapshots (default 10) **plus every snapshot still reachable from a branch/tag ref** — a metadata-only, live-safe REST commit (anchored with `assert-table-uuid` + `assert-ref-snapshot-id main=<head>`). Data/manifest files of the expired snapshots are left for a separate orphan-file GC. Long-lived tables need this so `$snapshots` and the per-open metadata JSON stop growing unbounded. |
 | `icegres sql -e '<query>'` | One-shot local execution against the catalog (debugging aid; no server involved). Honors `--enforce-pk`. |
 
@@ -142,7 +144,7 @@ environment variables:
 | `--write-buffer-ms` (serve) | `ICEGRES_WRITE_BUFFER_MS` | `0` (sync) | Opt-in buffered writes: INSERTs ack from an in-memory buffer, group-committed every N ms; unclean kill loses ≤N ms of acked writes (WARN on enable) |
 |  | `ICEGRES_WRITE_BUFFER_MAX_ROWS` | `50000` | Row threshold that forces an early flush in buffered mode |
 | `--tail-dir` (serve) | `ICEGRES_TAIL_DIR` | off | Durable local tail for buffered writes (requires `--write-buffer-ms > 0`): fsync'd per-table WAL appended BEFORE each buffered ack, replayed on boot — closes the unclean-kill loss window (node/disk loss still loses the tail) |
-|  | `ICEGRES_TXN_STRICT` | off | Refuse any multi-table `COMMIT` up front with `0A000` (nothing applied), guaranteeing every COMMIT is all-or-nothing. Off = best-effort ordered per-table commits (a partial apply reports `40003`, not the retryable `40001`). |
+|  | `ICEGRES_TXN_STRICT` | off | Only relevant on catalogs WITHOUT the multi-table `transactions/commit` endpoint (with it — e.g. Lakekeeper — multi-table COMMITs are always atomic and strict mode never bites): refuse a multi-table `COMMIT` up front with `0A000` (nothing applied) instead of best-effort ordered per-table commits (where a partial apply reports `40003`, not the retryable `40001`). |
 
 Logging uses `tracing` with an env filter: `RUST_LOG=debug icegres serve`.
 Every connection runs inside a correlation span (`conn` id + peer) so
@@ -407,11 +409,24 @@ select count(*) from demo."trips@4436304835314641572";  -- e.g. the seed snapsho
 `BEGIN` / `COMMIT` / `ROLLBACK` are real (`src/txn.rs`): reads inside a
 transaction are snapshot-pinned per table (snapshot isolation), writes are
 buffered in the session with read-your-own-writes overlays, and `COMMIT`
-composes everything into **one** Iceberg snapshot anchored at the pinned
-snapshot. Concurrency is first-committer-wins: if another writer committed
-to a touched table since the pin, `COMMIT` fails with SQLSTATE `40001`
-(retry the transaction). A statement error inside a transaction poisons it
-(`25P02`) and `COMMIT` then rolls back, like stock Postgres.
+composes everything into **one** Iceberg snapshot per table anchored at the
+pinned snapshot. Concurrency is first-committer-wins: if another writer
+committed to a touched table since the pin, `COMMIT` fails with SQLSTATE
+`40001` (retry the transaction). A statement error inside a transaction
+poisons it (`25P02`) and `COMMIT` then rolls back, like stock Postgres.
+
+**Multi-table COMMITs are atomic across tables** when the catalog
+implements the Iceberg REST multi-table transaction endpoint
+(`POST /v1/{prefix}/transactions/commit`) — verified against Lakekeeper,
+the assumed catalog: the whole COMMIT is ONE all-or-nothing catalog request
+carrying every table's `assert-ref-snapshot-id` pin, so every table commits
+or none does, and any conflict is a clean, retryable `40001` with nothing
+applied. Endpoint support is read from `GET /v1/config`'s capability list
+(or probed once on first use) and cached. On a catalog without the
+endpoint, multi-table COMMITs fall back to the documented ordered per-table
+path (a partial apply reports `40003` — see `docs/limitations.md`), and
+`ICEGRES_TXN_STRICT=true` refuses them up front (`0A000`, nothing applied);
+with the endpoint, strict mode is satisfied by atomicity and never refuses.
 
 ```sql
 begin;
@@ -492,7 +507,21 @@ icegres serve --branch dev --port 5440 &    # a second endpoint on the branch
 psql -h 127.0.0.1 -p 5440 -c "insert into demo.trips values (…)"  # commits to 'dev'
 icegres branch list demo.trips              # main + dev, diverged heads
 icegres branch drop demo.trips dev          # removes the ref only
+
+icegres branch create-all staging           # whole-lakehouse branch: EVERY table,
+                                            # ONE atomic multi-table transaction
+icegres branch drop-all staging             # atomic removal everywhere it exists
 ```
+
+`create-all`/`drop-all` are whole-lakehouse operations: one atomic
+`transactions/commit` request sets (or removes) the ref on every table, and
+each table's request additionally pins `main` to the head captured when the
+table was loaded, so the branch is a **consistent-or-nothing cross-table
+cut** — it can never capture half of a concurrent (even atomic multi-table)
+commit. If any table already has the branch (create-all), a concurrent
+commit races the cut, or the endpoint is missing, nothing is applied (a
+raced create-all is safe to just retry). `icegres serve --branch <name>`
+then serves that cut as one endpoint.
 
 Reads on a `--branch` server pin to the branch head; all writes (INSERT,
 UPDATE, DELETE, transactions) commit with `assert-ref-snapshot-id` on the
