@@ -147,6 +147,7 @@ environment variables:
 |  | `ICEGRES_WRITE_BUFFER_MAX_ROWS` | `50000` | Row threshold that forces an early flush in buffered mode |
 | `--tail-dir` (serve) | `ICEGRES_TAIL_DIR` | off | Durable local tail for buffered writes (requires `--write-buffer-ms > 0`): fsync'd per-table WAL appended BEFORE each buffered ack, replayed on boot — closes the unclean-kill loss window (node/disk loss still loses the tail) |
 | `--tail-url` (serve) | `ICEGRES_TAIL_URL` | off | Durable Postgres-backed tail for buffered writes (requires `--write-buffer-ms > 0`, mutually exclusive with `--tail-dir`): each buffered INSERT commits to a frames table in this Postgres database BEFORE its ack, replayed on boot — survives losing the compute node (durability = the tail database's fsync/replication); an unreachable tail database blocks buffered writes (statement errors, never silent loss) |
+| `--tail-quorum` (serve) | `ICEGRES_TAIL_QUORUM` | off | Quorum-replicated durable tail for buffered writes (requires `--write-buffer-ms > 0`, mutually exclusive with `--tail-dir`/`--tail-url`): exactly three `host:port` addresses of `icekeeperd` acceptors; each buffered INSERT is fsynced by 2 of 3 acceptors BEFORE its ack (Neon SafeKeeper's consensus, adapted — see NOTICE) — survives losing ANY single node incl. this one; fewer than 2 live acceptors blocks buffered writes; a competing server fences this one ("superseded by a newer server") |
 |  | `ICEGRES_TXN_STRICT` | off | Only relevant on catalogs WITHOUT the multi-table `transactions/commit` endpoint (with it — e.g. Lakekeeper — multi-table COMMITs are always atomic and strict mode never bites): refuse a multi-table `COMMIT` up front with `0A000` (nothing applied) instead of best-effort ordered per-table commits (where a partial apply reports `40003`, not the retryable `40001`). |
 
 Logging uses `tracing` with an env filter: `RUST_LOG=debug icegres serve`.
@@ -467,18 +468,20 @@ feature — and enabling it logs a WARN. Both halves of the contract are
 locked by e2e (kill-loss vs clean-shutdown-flush), and the union-read flush
 race is covered by `buffer.rs` unit tests.
 
-**Durable tail — two backends.** Buffered mode can attach a durable tail
+**Durable tail — three backends.** Buffered mode can attach a durable tail
 that every INSERT is appended to BEFORE its ack, replayed into the buffer
-on the next boot; the two backends hold the identical exactly-once protocol
-(the `icegres.tail-seq.<tail-id>` watermark stamped into each flush commit)
-and differ only in where the tail lives — i.e. in the durability class:
+on the next boot; the three backends hold the identical exactly-once
+protocol (the `icegres.tail-seq.<tail-id>` watermark stamped into each
+flush commit) and differ only in where the tail lives — i.e. in the
+durability class:
 
 | Backend | Flag | The tail lives in | Survives unclean kill | Survives node/disk loss | Ack cost |
 |---|---|---|---|---|---|
 | Local WAL | `--tail-dir <dir>` | fsync'd segments on this node's disk | yes | **no** — the tail dies with the disk | one local fsync (~3.2 ms p50 measured) |
-| Postgres | `--tail-url <postgres url>` | a `frames` table (schema `icegres_tail`, auto-created) in any Postgres database — the natural target is a dedicated DB on the instance already backing Lakekeeper | yes | **yes** — durability = the tail database's own fsync/replication | one INSERT round trip + commit (~1–3 ms to a same-box database) |
+| Postgres | `--tail-url <postgres url>` | a `frames` table (schema `icegres_tail`, auto-created) in any Postgres database — the natural target is a dedicated DB on the instance already backing Lakekeeper | yes | **yes** — durability = the tail database's own fsync/replication (a delegated single system) | one INSERT round trip + commit (~1–3 ms to a same-box database) |
+| Quorum (consensus) | `--tail-quorum h:p,h:p,h:p` | a replicated record log fsynced by three `icekeeperd` acceptor daemons (Neon SafeKeeper's proposer–acceptor consensus, adapted — see NOTICE and `src/quorum/`) | yes | **yes — any single node**, acceptor or compute, with no delegated single system: an ack means 2 of 3 independent disks hold the record | one LAN round trip + the slower of 2 acceptor fsyncs |
 
-The flags are mutually exclusive (one server writes ONE tail), and both
+The flags are mutually exclusive (one server writes ONE tail), and all
 require `--write-buffer-ms > 0`. For `--tail-url`: the identity behind the
 watermark key is minted once into the schema's `meta` table (same URL =
 same logical tail across restarts), and an unreachable tail database fails
@@ -496,6 +499,35 @@ are not yet supported (keep the tail database
 on localhost or a trusted segment), and fleet-SHARED tails — several
 computes overlaying one tail — are the roadmap's next increment, not this
 backend (docs/sota-roadmap.md §3).
+
+**The quorum backend in detail (`--tail-quorum h:p,h:p,h:p` + `icekeeperd`).**
+Consensus-class durability with no delegated single system: run exactly
+three acceptor daemons (`icekeeperd serve --port P --data-dir D`, the third
+binary in this crate) on independent nodes/disks, and every buffered
+INSERT's record is fsynced by 2 of the 3 BEFORE the client ack. The
+protocol is Neon SafeKeeper's proposer–acceptor algorithm adapted for the
+generic tail log (terms, persist-before-respond voting, term-history
+reconciliation, divergence truncation, the Raft commit rule — `src/quorum/`,
+attribution in NOTICE); the record framing is the same crc-framed segment
+machinery the local tail proved (`src/segment.rs`). Boot = an election:
+the server adopts the quorum's tail identity, wins a vote from 2 of 3,
+recovers the unfinished committed suffix from the most advanced acceptor,
+reconciles every acceptor's log to it, and replays the recovered rows into
+the buffer — so acked-but-uncommitted rows survive `kill -9` of the
+compute, loss of the compute NODE, or loss of any ONE acceptor. Two live
+acceptors = writes proceed; one live = statement errors and the tail
+poisons itself until restart (backpressure, never silent loss — and a
+timed-out record that may still commit later is never re-numbered).
+**Fencing replaces lock files:** a second icegres opening the same quorum
+wins a higher-term election, the first server's next INSERT fails with
+"superseded by a newer server (term X)", and the second recovers its
+unflushed acked rows — split-brain is structurally impossible, not
+advisory-locked away. Honest scope (docs/limitations.md): static 3-node
+membership (a replacement acceptor joins empty only via a fresh election),
+no TLS/auth between proposer and acceptors (trusted network segment only),
+proposer-driven catch-up only (no acceptor gossip), and the acceptors'
+log truncation (horizon) lags flushes by design — bounded, and the latest
+per-table watermark record is always retained as the replay sidecar.
 
 **The local backend in detail (`--tail-dir <dir>`)** closes the unclean-kill
 window without giving up the buffered ack (measured on the dev box: ~3.2 ms
@@ -526,8 +558,11 @@ foreign writer dropping the table property. The tail dir is single-writer
 Requires `--write-buffer-ms > 0` (refused at boot otherwise); verified
 standalone by `icegres/tests/tail_durability.sh` (kill -9 with the tail =
 zero loss, without = the documented loss, plus the no-double-apply and
-post-flush-restart sequence-floor cases — each proven for BOTH backends,
-sections 2–4 local and 6–8 Postgres). The Postgres backend's unit tests
+post-flush-restart sequence-floor cases — proven for ALL THREE backends:
+sections 2–4 local, 6–8 Postgres, 10 quorum incl. acceptor-kill and
+fencing; the quorum consensus core is additionally covered by in-process
+integration tests in `src/tail_quorum.rs` — 3 real acceptors on ephemeral
+ports, no shell needed). The Postgres backend's unit tests
 (`src/tail_pg.rs`) run live against `ICEGRES_TEST_PG_URL` (the local
 stack's `postgresql://lakekeeper:lakekeeper@127.0.0.1:5433/icegres_test`)
 and skip cleanly when it is unset.

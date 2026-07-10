@@ -31,12 +31,25 @@
 #      covered frames truncated (7); post-flush-restart sequence floor (8).
 #      Section 1 also proves --tail-url without buffered writes and
 #      --tail-dir + --tail-url together are refused at boot.
+#   10. The QUORUM tail backend (--tail-quorum, icegres/src/tail_quorum.rs +
+#      src/quorum/ + icekeeperd): three acceptor daemons on 5471-5473; the
+#      consensus-class durability contract — distinct startup WARN; acked
+#      rows survive kill -9 of the COMPUTE (replay from the acceptors);
+#      writes CONTINUE after kill -9 of ONE ACCEPTOR (quorum 2/3);
+#      exactly-once across commit -> kill -9 -> replay (watermark records
+#      honored); FENCING: a second icegres on the same quorum supersedes the
+#      first (its next INSERT fails with "superseded by a newer server"
+#      while the second serves — and recovers the first's unflushed acked
+#      rows). Section 1 also proves --tail-quorum without buffered writes
+#      and --tail-quorum + --tail-dir together are refused at boot.
 #
 # Non-destructive, self-contained, idempotent: creates/purges its own scratch
 # table demo.tail_durability_scratch via the REST catalog (never touches
-# demo.trips), its own tail dir under .e2e, and its own icegres_tail schema
-# in icegres_test. Uses port 5456 (left free: 5452 belongs to bench/parity.sh
-# D7, 5455 to e2e.sh THR_PORT).
+# demo.trips), its own tail dir under .e2e, its own icegres_tail schema in
+# icegres_test, and its own icekeeper data dirs under .e2e. Uses port 5456
+# for the main server, 5458 for the fencing second server, and 5471-5473 for
+# the icekeeperd acceptors (left free: 5452 belongs to bench/parity.sh D7,
+# 5455 to e2e.sh THR_PORT, 5457 to e2e.sh KY_PORT).
 # Standalone by design — NOT wired into e2e.sh (keep the gate stable).
 
 set -euo pipefail
@@ -55,7 +68,8 @@ export PGCONNECT_TIMEOUT=5
 # This harness owns its server config: a stray environment must not flip it.
 unset ICEGRES_AUTH_FILE ICEGRES_TLS_CERT ICEGRES_TLS_KEY
 unset ICEGRES_WRITE_BUFFER_MS ICEGRES_WRITE_BUFFER_MAX_ROWS ICEGRES_TAIL_DIR
-unset ICEGRES_TAIL_URL
+unset ICEGRES_TAIL_URL ICEGRES_TAIL_QUORUM ICEGRES_TAIL_QUORUM_TIMEOUT_MS
+unset ICEKEEPER_HOST ICEKEEPER_PORT ICEKEEPER_DATA_DIR ICEKEEPER_NODE_ID
 
 CATALOG_URI="http://127.0.0.1:8181/catalog"
 WAREHOUSE=lakehouse
@@ -171,14 +185,92 @@ start_server() {
   fail "server not ready on :$PG_PORT within 30s"
 }
 
+# --------------------------- quorum tail helpers ---------------------------
+# Three icekeeperd acceptors (section 10) on ports 5471-5473, data dirs and
+# pid files under RUN_DIR. Identity-checked like stop_server.
+KBIN="${ICEKEEPERD:-$ICEGRES_DIR/target/release/icekeeperd}"
+KEEPER_PORTS=(5471 5472 5473)
+KEEPER_BASE="$RUN_DIR/icekeeper"
+QUORUM_ADDRS="127.0.0.1:5471,127.0.0.1:5472,127.0.0.1:5473"
+
+keeper_ready() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && exec 3>&- 3<&-; }
+
+start_keeper() { # start_keeper <n: 1..3>
+  local n=$1 port=${KEEPER_PORTS[$((n - 1))]}
+  "$KBIN" serve --host 127.0.0.1 --port "$port" \
+    --data-dir "$KEEPER_BASE-$n" --node-id "$n" \
+    >>"$KEEPER_BASE-$n.log" 2>&1 &
+  echo $! >"$KEEPER_BASE-$n.pid"
+  for _ in $(seq 1 40); do
+    keeper_ready "$port" && return 0
+    kill -0 "$(cat "$KEEPER_BASE-$n.pid")" 2>/dev/null \
+      || { tail -n 30 "$KEEPER_BASE-$n.log" >&2; fail "icekeeperd $n exited during startup"; }
+    sleep 0.25
+  done
+  tail -n 30 "$KEEPER_BASE-$n.log" >&2
+  fail "icekeeperd $n not accepting on :$port within 10s"
+}
+
+stop_keeper() { # graceful, identity-checked
+  local n=$1 pidfile="$KEEPER_BASE-$1.pid" pid
+  if [[ -f "$pidfile" ]]; then
+    pid=$(cat "$pidfile")
+    if kill -0 "$pid" 2>/dev/null \
+        && [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == icekeeperd ]]; then
+      kill "$pid" 2>/dev/null || true
+      for _ in $(seq 1 20); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.25
+      done
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$pidfile"
+  fi
+}
+
+kill_keeper_9() { # the unclean acceptor kill under test
+  local n=$1 pid
+  pid=$(cat "$KEEPER_BASE-$n.pid")
+  kill -9 "$pid" 2>/dev/null || fail "could not SIGKILL icekeeperd $n (pid $pid)"
+  for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.25; done
+  kill -0 "$pid" 2>/dev/null && fail "icekeeperd $n survived SIGKILL"
+  rm -f "$KEEPER_BASE-$n.pid"
+}
+
+# The fencing second server (section 10e) on its own port + pid file.
+PG_PORT2=5458
+PID_FILE2="$RUN_DIR/tail-durability-2.pid"
+SERVE_LOG2="$RUN_DIR/tail-durability-serve-2.log"
+PSQL2=(psql -h "$PG_HOST" -p "$PG_PORT2" -U postgres -d icegres -v ON_ERROR_STOP=1)
+q2() { "${PSQL2[@]}" -tA -c "$1"; }
+
+stop_server2() {
+  if [[ -f "$PID_FILE2" ]]; then
+    local pid; pid=$(cat "$PID_FILE2")
+    if kill -0 "$pid" 2>/dev/null \
+        && [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == icegres ]]; then
+      kill "$pid" 2>/dev/null || true
+      for _ in $(seq 1 20); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.25
+      done
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE2"
+  fi
+}
+
 PREFIX=""
 cleanup() {
   stop_server
+  stop_server2
+  for n in 1 2 3; do stop_keeper "$n"; done
   [[ -n "$PREFIX" ]] && drop_scratch "$PREFIX"
   [[ -n "$PREFIX" ]] && curl -sf -X DELETE \
     "$CATALOG_URI/v1/$PREFIX/namespaces/demo/tables/tail_keyed_scratch?purgeRequested=true" \
     >/dev/null 2>&1 || true
-  rm -rf "$TAIL_DIR" "$RUN_DIR/tail-keyed-wal"
+  rm -rf "$TAIL_DIR" "$RUN_DIR/tail-keyed-wal" \
+    "$KEEPER_BASE-1" "$KEEPER_BASE-2" "$KEEPER_BASE-3"
   drop_pg_tail_schema
 }
 trap cleanup EXIT
@@ -241,6 +333,29 @@ set -e
 grep -q "cannot be used with" <<<"$noop_out" \
   || fail "unexpected refusal message: $noop_out"
 pass "--tail-dir + --tail-url refused at boot (exit $noop_rc)"
+rm -rf "$TAIL_DIR"
+
+log "(1d) --tail-quorum without --write-buffer-ms fails loudly"
+set +e
+noop_out=$(timeout 10 "$BIN" serve --host "$PG_HOST" --port "$PG_PORT" \
+  --write-buffer-ms 0 --tail-quorum "$QUORUM_ADDRS" 2>&1)
+noop_rc=$?
+set -e
+[[ $noop_rc -ne 0 ]] || fail "--tail-quorum with --write-buffer-ms 0 was accepted"
+grep -q "tail-quorum requires buffered writes" <<<"$noop_out" \
+  || fail "unexpected refusal message: $noop_out"
+pass "--tail-quorum without buffered writes refused at boot (exit $noop_rc)"
+
+log "(1e) --tail-quorum and --tail-dir together are refused (one process, ONE tail)"
+set +e
+noop_out=$(timeout 10 "$BIN" serve --host "$PG_HOST" --port "$PG_PORT" \
+  --write-buffer-ms "$BUF_MS" --tail-quorum "$QUORUM_ADDRS" --tail-dir "$TAIL_DIR" 2>&1)
+noop_rc=$?
+set -e
+[[ $noop_rc -ne 0 ]] || fail "--tail-quorum together with --tail-dir was accepted"
+grep -q "cannot be used with" <<<"$noop_out" \
+  || fail "unexpected refusal message: $noop_out"
+pass "--tail-quorum + --tail-dir refused at boot (exit $noop_rc)"
 rm -rf "$TAIL_DIR"
 
 # ---------------------------------------------------------------------------
@@ -501,5 +616,137 @@ pass "keyed routing is opt-in: no property = unchanged synchronous UPDATE"
 stop_server
 rm -rf "$KTAIL_DIR"
 drop_keyed_scratch
+
+# ---------------------------------------------------------------------------
+# 10. QUORUM tail backend (--tail-quorum, roadmap §3 backend 3): three
+#     icekeeperd acceptors, consensus-class durability. Fresh scratch table
+#     and fresh acceptor data dirs so counts start at 0.
+# ---------------------------------------------------------------------------
+log "(10) quorum tail: 3 icekeeperd acceptors + --tail-quorum"
+[[ -x "$KBIN" ]] || fail "icekeeperd not found at $KBIN (build with: cargo build --release)"
+for port in "${KEEPER_PORTS[@]}"; do
+  keeper_ready "$port" && fail "something else is listening on :$port — stop it first"
+done
+drop_scratch "$PREFIX"
+create_scratch "$PREFIX" || fail "could not re-create demo.$TABLE via REST catalog"
+rm -rf "$KEEPER_BASE-1" "$KEEPER_BASE-2" "$KEEPER_BASE-3"
+: >"$SERVE_LOG"
+for n in 1 2 3; do start_keeper "$n"; done
+pass "3 icekeeperd acceptors up on ${KEEPER_PORTS[*]}"
+
+start_server --tail-quorum "$QUORUM_ADDRS"
+strip_ansi <"$SERVE_LOG" | grep -q "durable quorum tail" \
+  || fail "startup WARN does not announce the quorum tail backend (log: $SERVE_LOG)"
+pass "startup WARN announces the quorum tail (consensus durability class)"
+
+# (10a) acked rows survive kill -9 of the COMPUTE: replay from the acceptors.
+log "(10a) quorum tail: acked rows survive an unclean COMPUTE kill"
+for i in 1 2 3; do
+  q "insert into demo.$TABLE (id, note) values ($i, 'quorum-survivor')" >/dev/null \
+    || fail "quorum-tailed INSERT $i failed"
+done
+assert_eq "acked rows readable via the union view (buffered, uncommitted)" "3" \
+  "$(q "select count(*) from demo.$TABLE")"
+ls "$KEEPER_BASE-1"/wal/*.seg >/dev/null 2>&1 \
+  || fail "no acceptor log segments on disk after acked INSERTs ($KEEPER_BASE-1/wal)"
+pass "acceptor log segments exist on disk before the kill"
+
+kill_9
+start_server --tail-quorum "$QUORUM_ADDRS"
+strip_ansi <"$SERVE_LOG" | grep -q "recovered .* rows for .* tables from the" \
+  || fail "restart log does not report a tail replay (log: $SERVE_LOG)"
+assert_eq "ALL acked rows present after kill -9 + quorum replay" "3" \
+  "$(q "select count(*) from demo.$TABLE")"
+pass "unclean COMPUTE kill lost NOTHING with --tail-quorum"
+
+# (10b) acked rows survive kill -9 of ONE ACCEPTOR: writes continue on 2/3.
+log "(10b) quorum tail: writes continue after an unclean ACCEPTOR kill (2/3)"
+kill_keeper_9 3
+for i in 11 12 13; do
+  q "insert into demo.$TABLE (id, note) values ($i, 'two-of-three')" >/dev/null \
+    || fail "INSERT $i failed with one acceptor down (quorum 2/3 must carry it)"
+done
+assert_eq "rows acked by the surviving 2/3 quorum" "6" \
+  "$(q "select count(*) from demo.$TABLE")"
+kill_9
+start_server --tail-quorum "$QUORUM_ADDRS"
+assert_eq "ALL acked rows survive compute kill WITH an acceptor down" "6" \
+  "$(q "select count(*) from demo.$TABLE")"
+pass "one acceptor down: writes continued AND acked rows survived kill -9"
+start_keeper 3 # bring it back; the proposer catches it up in the background
+
+# (10c) exactly-once: fence-forced flush commits + stamps the watermark;
+# the NEXT crash double-applies nothing.
+log "(10c) quorum tail: flush + watermark = exactly-once across a crash"
+q "delete from demo.$TABLE where id < 0" >/dev/null || fail "fence DELETE failed"
+assert_eq "rows COMMITTED by the fence-forced flush" "6" \
+  "$(q "select count(*) from demo.$TABLE")"
+kill_9
+start_server --tail-quorum "$QUORUM_ADDRS"
+assert_eq "no double-apply after commit + crash (watermark honored)" "6" \
+  "$(q "select count(*) from demo.$TABLE")"
+pass "exactly-once held across commit -> kill -9 -> replay (quorum tail)"
+
+# (10d) sequence floor: post-flush restart + new inserts survive a crash
+# (same trap as sections 4/8; the floor is seeded from the recovered
+# watermark records + the in-commit property).
+log "(10d) quorum tail seq floor: post-flush restart + new inserts survive"
+for i in 21 22 23; do
+  q "insert into demo.$TABLE (id, note) values ($i, 'quorum-second-gen')" >/dev/null \
+    || fail "quorum second-generation INSERT $i failed"
+done
+kill_9
+start_server --tail-quorum "$QUORUM_ADDRS"
+assert_eq "BOTH generations present after the second crash" "9" \
+  "$(q "select count(*) from demo.$TABLE")"
+pass "post-restart sequences cleared the persisted watermark (quorum tail)"
+q "delete from demo.$TABLE where id < 0" >/dev/null || fail "fence DELETE failed"
+assert_eq "second generation COMMITTED by the fence-forced flush" "9" \
+  "$(q "select count(*) from demo.$TABLE")"
+
+# (10e) FENCING: a second icegres on the SAME quorum runs a higher-term
+# election; the first server's next INSERT fails with the superseded error
+# while the second owns the log — and recovers the first's unflushed rows.
+log "(10e) quorum tail fencing: a second server supersedes the first"
+for i in 31 32; do
+  q "insert into demo.$TABLE (id, note) values ($i, 'pre-fence')" >/dev/null \
+    || fail "pre-fence INSERT $i failed"
+done
+: >"$SERVE_LOG2"
+"$BIN" serve --host "$PG_HOST" --port "$PG_PORT2" --write-buffer-ms "$BUF_MS" \
+  --tail-quorum "$QUORUM_ADDRS" >>"$SERVE_LOG2" 2>&1 &
+echo $! >"$PID_FILE2"
+for _ in $(seq 1 60); do
+  q2 "select 1" >/dev/null 2>&1 && break
+  kill -0 "$(cat "$PID_FILE2")" 2>/dev/null \
+    || { tail -n 30 "$SERVE_LOG2" >&2; fail "second server exited during startup"; }
+  sleep 0.5
+done
+q2 "select 1" >/dev/null 2>&1 || fail "second server not ready on :$PG_PORT2"
+strip_ansi <"$SERVE_LOG2" | grep -q "recovered .* rows for .* tables from the" \
+  || fail "second server did not replay the first's unflushed acked rows"
+assert_eq "second server recovered the first's acked rows" "11" \
+  "$(q2 "select count(*) from demo.$TABLE")"
+
+set +e
+fence_out=$("${PSQL[@]}" -c \
+  "insert into demo.$TABLE (id, note) values (99, 'must-fail')" 2>&1)
+fence_rc=$?
+set -e
+[[ $fence_rc -ne 0 ]] || fail "the fenced first server accepted an INSERT: $fence_out"
+grep -q "superseded by a newer server" <<<"$fence_out" \
+  || fail "unexpected fencing error: $fence_out"
+pass "first server's INSERT failed with the superseded error (fenced, no lock files)"
+
+q2 "insert into demo.$TABLE (id, note) values (41, 'post-fence')" >/dev/null \
+  || fail "the NEW owner's INSERT failed"
+q2 "delete from demo.$TABLE where id < 0" >/dev/null || fail "fence DELETE failed"
+assert_eq "the new owner serves and commits (old rows + its own)" "12" \
+  "$(q2 "select count(*) from demo.$TABLE")"
+pass "the second server owns the quorum log end to end"
+
+stop_server
+stop_server2
+for n in 1 2 3; do stop_keeper "$n"; done
 
 log "all assertions passed ($PASS_COUNT)"

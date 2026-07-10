@@ -187,18 +187,34 @@ Backends, in build order:
    > `LISTEN/NOTIFY`, flush leases, per-key arbitration — is the explicit
    > next increment; today the tail is single-writer/single-reader like
    > the local backend.
-3. **`quorum` — the SafeKeeper-class backend (future).** Here Neon changes
-   the math: the article's SafeKeeper **is Apache-2.0 Rust in
-   `neon/safekeeper/`** — the proposer–acceptor consensus
-   (`safekeeper.rs`), persisted acceptor state (`control_file.rs`), WAL
-   segment storage, and the full protocol spec. It is deeply shaped around
-   Postgres WAL framing (`postgres_ffi`, LSNs, timelines), so the realistic
-   reuse is a **fork that swaps the record format for tail entries** while
-   keeping the consensus state machine, term history, and recovery logic
-   verbatim — plus `desim`-style simulation tests. This is a large but
-   de-risked lift; it exists so deployments that reject the Postgres
-   dependency still get node-loss durability. An S3-Express segment backend
-   stays on the list for fully-serverless tails.
+3. **`quorum` — the SafeKeeper-class backend.**
+
+   > **STATUS: shipped.** `--tail-quorum h:p,h:p,h:p` + the `icekeeperd`
+   > acceptor daemon (third bin target). The fork happened exactly as
+   > planned: the consensus state machine, term history, divergence
+   > truncation, and recovery logic are adapted from
+   > `neon/safekeeper/src/safekeeper.rs` + `walproposer.c` (attribution in
+   > NOTICE and per-file headers in `src/quorum/`), with Postgres WAL
+   > framing swapped for the tail's own crc-framed record log
+   > (`src/segment.rs`, factored move-only from `tail.rs`). Persist-before-
+   > respond voting, single `term` field doubling as voted-term, the
+   > `(last_log_term, flush_lsn)` donor rule, and the Raft
+   > don't-commit-old-terms filter are implemented as in Neon; fencing by
+   > term supersedes lock files entirely ("superseded by a newer server").
+   > Watermark RECORDS in the replicated log replace the local sidecar
+   > file; buffer.rs needed ZERO changes — it is a third `TailStore`
+   > behind the existing trait. Verified by consensus unit tests (vote
+   > persistence across reboot, divergence truncation, stale-term fencing,
+   > donor/commit rules), in-process integration tests (3 real acceptors:
+   > one-down writes, two-down poison, kill+restart catch-up, proposer
+   > restart exact replay, competing-proposer fencing), and
+   > tail_durability.sh section 10.
+   > **Not yet (documented in docs/limitations.md):** dynamic membership
+   > (static 3 acceptors), TLS/auth between proposer and acceptors
+   > (trusted segment only), acceptor S3 offload, acceptor-to-acceptor
+   > gossip (proposer-driven catch-up only), `desim`-style simulation
+   > harness. An S3-Express segment backend stays on the list for
+   > fully-serverless tails.
 
 ### Exactly-once across crashes: the watermark lives in the lake
 
@@ -428,6 +444,7 @@ runs, not projections.
 |---|---|---|---|
 | 1 — durable tail, `local` backend | **shipped** | `--tail-dir`: fsync'd per-table WAL before every buffered ack, boot replay, lake-anchored watermark — closes the unclean-kill loss window (`feat: durable local tail`) | ~3.2 ms p50 tail ack (vs ~1.3 ms untailed, ~50–80 ms synchronous); durability suite 17/17 (SIGKILL replay, exactly-once across double crash) |
 | 1b — durable tail, `postgres` backend | **shipped — durability half** | `--tail-url`: node-loss-durable tail in any Postgres, one-writer advisory lock, same watermark protocol (`feat: Postgres tail backend`). The SHARED half (fleet overlays via LISTEN/NOTIFY, flush leases) is still open — see §3 | durability suite grew 17→33 assertions, PG sections mirroring every LocalWal proof; no benched metric regressed vs the phase-3 baseline |
+| 1c — durable tail, `quorum` backend | **shipped** | `--tail-quorum` + `icekeeperd`: consensus-class tail — 2-of-3 acceptor fsyncs before every buffered ack, election/recovery on boot, term fencing instead of lock files, same watermark protocol (SafeKeeper fork with attribution; see §3) | 31 consensus unit tests + 6 in-process integration tests (one-down/two-down/catch-up/replay/fencing) green in ~1 s; durability suite grew 50→~70 assertions (section 10: compute kill, acceptor kill, exactly-once, seq floor, fencing) |
 | 2 — hot rows: PK upserts on the tail | **shipped — single-compute half** | `icegres.primary-key` + `icegres.tail-upsert`: exact-PK UPDATE/DELETE ack from the tail, per-key LWW coalescing into ONE commit per window, union-read key suppression (`feat: keyed PK upserts`). Cross-compute arbitration + MoR deletion vectors still open (matrix-gated) | 9.5 ms p50 keyed ack vs ~71 ms synchronous COW (7.4×); 30 hot-row updates → 3 snapshots instead of 30; durability suite 33→50 assertions |
 | 3 — multi-table atomicity + whole-lakehouse branches | **shipped** | One `CommitTransactionRequest` per multi-table COMMIT (40001 on conflict, nothing applied; ordered/40003 fallback preserved) + `branch create-all`/`drop-all` atomic cross-table cuts (`feat: atomic multi-table transactions`) | verified live against Lakekeeper 0.13.1; e2e grew to 140 assertions incl. section (j2)/(u) contracts |
 | 4 — table health: compaction + orphan GC | **partial: orphan GC shipped; compaction gated** | `maintain remove-orphans`: object-store listing vs live-set diff, dry-run default, 72 h grace, fail-closed (this tree). The small-file *source* was fixed by Phase 1–2 cadence commits; bin-pack rewrite waits on the pinned iceberg-rust matrix gaining replace-files | orphan-GC e2e contract proven (dry-run deletes nothing; `--execute` removes exactly the reported set with rows/live files intact; rerun reports 0); e2e suite grew 153→163 assertions |

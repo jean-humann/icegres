@@ -177,6 +177,33 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
   LISTEN/NOTIFY, flush leases) are the roadmap's explicit next increment
   (docs/sota-roadmap.md §3), not this backend. Mutually exclusive with
   `--tail-dir`; requires `--write-buffer-ms > 0` or startup fails.
+- **`--tail-quorum` (consensus tail) removes the delegated single system —
+  its honest bounds are operational.** Three `icekeeperd` acceptors, ack =
+  2-of-3 fsyncs (Neon SafeKeeper's protocol, adapted — NOTICE): acked rows
+  survive losing ANY single node, including the compute. Bounds, stated
+  plainly. **Trusted network only**: there is no TLS and no authentication
+  between the proposer and the acceptors — anyone who can reach an
+  acceptor's port can read/replace the log; bind them to a private segment
+  (they default to 127.0.0.1). **Static membership**: exactly three
+  acceptors, no add/remove/replace protocol; a replacement acceptor with an
+  empty data dir joins only at the next election (server restart), and one
+  that missed an election and lagged below the proposer's retained log is
+  dropped from catch-up until the next election. **Fewer than two live
+  acceptors blocks buffered writes** — the statement errors and the tail
+  POISONS itself until restart (deliberate: a quorum-timeout record may
+  still become durable later, and re-numbering past it could double-apply;
+  the restart's election replays it exactly once — the classic ambiguous-
+  commit shape). **Horizon lag**: acceptors truncate their logs lazily (the
+  horizon piggybacks on later appends), so acceptor disk usage and boot
+  replay may briefly include already-covered frames — replay stays exact
+  via the watermark records + the in-commit property; the latest watermark
+  record per table is always retained (it IS the replay sidecar), and a
+  dormant table's blocking watermark is refreshed automatically once it
+  falls ~1 MiB behind the head. Each buffered ack pays one LAN round trip +
+  the slower of two acceptor fsyncs, under the buffer lock like the other
+  backends. Proposer-driven catch-up only (no acceptor-to-acceptor gossip),
+  no acceptor S3 offload. Mutually exclusive with `--tail-dir`/`--tail-url`;
+  requires `--write-buffer-ms > 0` or startup fails.
 
 - **Keyed tail upserts (`icegres.tail-upsert`, opt-in) shift semantics and
   have a real ack cost — both stated plainly.** On a table with

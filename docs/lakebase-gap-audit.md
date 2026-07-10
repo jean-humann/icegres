@@ -19,12 +19,12 @@ source of truth, foreign writers keep working).
 | # | Lakebase/LTAP capability (per the article) | icegres status after phases 1–4 |
 |---|---|---|
 | 1 | Real Postgres engine — full SQL, drivers, **extensions** work as-is | 🟡/⛔ pgwire + `pg_catalog` emulation verified against psql/ORMs/JDBC/ODBC/ADBC, but not Postgres: no extensions, no server-side cursors, extended-protocol SELECT limits in transactions. Full fidelity is a declared non-goal (becoming Postgres = becoming a worse Lakebase). |
-| 2 | SafeKeeper: commit = **Paxos-quorum** WAL ack; no single node's loss loses data | 🟡 The durable tail covers buffered writes: `--tail-dir` = this-disk durability (~3.2 ms ack), `--tail-url` = node-loss durability *delegated* to one Postgres instance's own fsync/replication. **No quorum consensus of our own** — the safekeeper-fork quorum backend is designed (roadmap §3 backend 3) and not started. Sync-path durability is the Iceberg commit itself (~50–80 ms), which needs no WAL tier. |
+| 2 | SafeKeeper: commit = **Paxos-quorum** WAL ack; no single node's loss loses data | ✅/🟡 The safekeeper-fork quorum backend SHIPPED (roadmap §3 backend 3): `--tail-quorum` + 3× `icekeeperd` acceptors — buffered acks are 2-of-3 quorum fsyncs of SafeKeeper's own consensus algorithm (adapted with attribution), with term fencing for leader takeover; no single node's loss loses acked data, no delegated system. Functional parity with SafeKeeper's core is substantially closed; still absent vs Neon: dynamic membership/generations, acceptor S3 offload + WAL backup, acceptor-to-acceptor gossip, TLS/auth between proposer and acceptors. `--tail-dir`/`--tail-url` remain the lighter-weight classes. Sync-path durability is the Iceberg commit itself (~50–80 ms), which needs no WAL tier. |
 | 3 | PageServer: WAL→page materialization, GetPage@LSN, page reconstruction | ⛔ No page tier exists to materialize — icegres data is *born* columnar in the lake. This is the deliberate architecture inversion (invariant I1), not an unbuilt feature. |
 | 4 | Read-cache hierarchy: buffer pool → **local NVMe file cache** → PageServer → object store | ❌ Real gap. icegres has snapshot-aware *metadata/manifest* caching + the OS page cache, but no managed local cache tier for Parquet footers/column chunks (the foyer-style NVMe cache from the architecture study §7.4). Matters as data outgrows RAM; invisible at current bench scale. |
 | 5 | Unlimited storage (data in object storage) | ✅ Same substrate by construction. |
 | 6 | Serverless, elastic compute; scale to zero; instant wake | 🟡 Scale-to-zero + wake-on-connect shipped and measured (~73–85 ms wake, 0.4 ms warm-pool connects via `icegresd`). **No autoscaling** (scale up/out under load) and `icegresd` itself is a single unsupervised process — the control plane is minimal by scope. (Note: Neon's autoscaling agent is proprietary control-plane code too — study, refuted claim #2.) |
-| 7 | Durable writes / zero data loss | 🟡 Sync path: yes (the commit is the durability event). Buffered path: closed by the tail (disk- or node-loss-class, backend-dependent), proven by 50 kill -9 e2e assertions. No quorum class (see #2). |
+| 7 | Durable writes / zero data loss | ✅ Sync path: yes (the commit is the durability event). Buffered path: closed by the tail up to CONSENSUS class — `--tail-quorum` survives any single node with no delegated system (see #2); disk-class (`--tail-dir`) and delegated node-loss-class (`--tail-url`) remain as lighter options. Proven by kill -9 durability suites for all three backends plus in-process quorum integration tests (acceptor kill, fencing, exact replay). |
 | 8 | Simpler HA: durable state in a replicated layer; failover without promoting a physical copy | 🟡 Stateless computes make replacement trivial and the durable tier (catalog + object store, plus the PG tail) delegates its own HA. But there is no automated failover orchestration: `icegresd` supervises crashes on one box only, and a tail-writer host death needs the documented (fast, but manual-ish) advisory-lock takeover. |
 | 9 | Instant branching/cloning — metadata-only, whole database, seconds | ✅ Per-table refs + **whole-lakehouse `branch create-all`/`drop-all`** (one atomic multi-table commit, consistent-or-nothing, nested namespaces included). Granularity note: a branch cut is at snapshot boundaries, not an arbitrary WAL LSN. |
 | 10 | Point-in-time recovery to any moment | 🟡 Time travel to any *retained snapshot*; in buffered mode snapshot cadence ≈ the flush window, so granularity converges on N ms. No arbitrary-LSN replay between snapshots (needs WAL history — see #2/#3). |
@@ -80,13 +80,19 @@ staging state to the lake, so the shapes differ even where the job rhymes;
 lifting code wholesale would have imported the inversion we exist to
 avoid. The one place the architectures genuinely coincide — a replicated
 log service with leader takeover — is exactly the item where the roadmap
-prescribes forking `neon/safekeeper` rather than rewriting it, and that
-item has not started.
+prescribed forking `neon/safekeeper` rather than rewriting it, and that
+fork has now shipped as the quorum tail backend (`src/quorum/`,
+`icekeeperd`, `--tail-quorum`): the consensus state machine, term-history
+reconciliation, divergence truncation, and commit rule are adapted from
+safekeeper.rs/walproposer.c with attribution (NOTICE), while the record
+format, segment storage, and TailStore mapping are icegres's own.
 
 ## 4. Verification trail for this audit
 
-Phase gates as merged: 141/141 unit tests, 163-assertion e2e,
-50/50 `tail_durability.sh` (both backends, kill -9 / double-crash /
-seq-floor proofs), per-phase A/B benchmarks with drift-controlled
+Phase gates as merged: 141/141 unit tests (+37 quorum consensus/
+integration tests with the quorum backend), 163-assertion e2e,
+50/50 `tail_durability.sh` (now grown by section 10's quorum proofs: all
+three backends, kill -9 / acceptor-kill / double-crash / seq-floor /
+fencing), per-phase A/B benchmarks with drift-controlled
 comparisons (`bench/`), measured numbers in roadmap §10. Every 🟡/❌
 above cites its roadmap STATUS line; none contradicts the shipped docs.

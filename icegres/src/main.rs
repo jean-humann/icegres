@@ -21,10 +21,17 @@ mod overwrite;
 /// feature). The open-source build carries no auth backend.
 #[cfg(feature = "managed")]
 mod pgauth;
+/// Consensus-class durable tail (`--tail-quorum`): the proposer/acceptor
+/// protocol adapted from Neon's safekeeper (see the module docs and NOTICE).
+mod quorum;
 mod scan;
 mod seed;
+/// Shared low-level segment/frame machinery (factored from `tail.rs`; also
+/// compiled into the `icekeeperd` binary).
+mod segment;
 mod tail;
 mod tail_pg;
+mod tail_quorum;
 mod traced;
 mod txn;
 
@@ -220,6 +227,29 @@ enum Command {
         /// supported. See icegres/src/tail_pg.rs. Off by default.
         #[arg(long, env = "ICEGRES_TAIL_URL", conflicts_with = "tail_dir")]
         tail_url: Option<String>,
+
+        /// Quorum-replicated durable tail for buffered writes (requires
+        /// --write-buffer-ms > 0; mutually exclusive with --tail-dir /
+        /// --tail-url): exactly three comma-separated `host:port` addresses
+        /// of `icekeeperd` acceptors. Every buffered INSERT's record is
+        /// fsynced by 2 of the 3 acceptors BEFORE its ack (Neon
+        /// SafeKeeper's consensus, adapted — see NOTICE), so acked rows
+        /// survive an unclean kill, losing this NODE, or losing ANY SINGLE
+        /// acceptor. Two live acceptors = writes proceed; one live =
+        /// statement errors (backpressure, never silent loss). A competing
+        /// icegres on the same quorum fences this one (its INSERTs fail
+        /// with "superseded by a newer server"). The quorum-ack timeout is
+        /// tunable via ICEGRES_TAIL_QUORUM_TIMEOUT_MS (default 10000, min
+        /// 1000): a stalled append first attempts one internal re-election,
+        /// then poisons the tail on a second timeout. Trusted network only
+        /// (no TLS/auth between proposer and acceptors yet). See
+        /// icegres/src/tail_quorum.rs. Off by default.
+        #[arg(
+            long,
+            env = "ICEGRES_TAIL_QUORUM",
+            conflicts_with_all = ["tail_dir", "tail_url"]
+        )]
+        tail_quorum: Option<String>,
 
         /// Acknowledge running an UNAUTHENTICATED listener on a non-loopback
         /// interface. Without this, binding a public address (e.g. 0.0.0.0)
@@ -467,6 +497,7 @@ async fn main() -> Result<()> {
             write_buffer_ms,
             tail_dir,
             tail_url,
+            tail_quorum,
             insecure,
         } => {
             let serve_opts = ServeOpts {
@@ -481,6 +512,7 @@ async fn main() -> Result<()> {
                 write_buffer_ms,
                 tail_dir,
                 tail_url,
+                tail_quorum,
                 insecure,
             };
             run_serve(&catalog, &host, port, serve_opts).await
@@ -565,6 +597,7 @@ struct ServeOpts {
     write_buffer_ms: u64,
     tail_dir: Option<PathBuf>,
     tail_url: Option<String>,
+    tail_quorum: Option<String>,
     insecure: bool,
 }
 
@@ -650,10 +683,29 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
              would be a no-op. Set --write-buffer-ms, or drop --tail-url."
         );
     }
-    // clap's conflicts_with already refuses the pair; keep a hard error for
+    if serve_opts.tail_quorum.is_some() && serve_opts.write_buffer_ms == 0 {
+        bail!(
+            "--tail-quorum requires buffered writes (--write-buffer-ms N with N > 0): the \
+             synchronous default commits every INSERT before its ack, so the durable tail \
+             would be a no-op. Set --write-buffer-ms, or drop --tail-quorum."
+        );
+    }
+    // clap's conflicts_with already refuses the pairs; keep a hard error for
     // programmatic callers (one process writes ONE tail).
-    if serve_opts.tail_dir.is_some() && serve_opts.tail_url.is_some() {
-        bail!("--tail-dir and --tail-url are mutually exclusive: a server writes ONE tail");
+    if [
+        serve_opts.tail_dir.is_some(),
+        serve_opts.tail_url.is_some(),
+        serve_opts.tail_quorum.is_some(),
+    ]
+    .iter()
+    .filter(|&&set| set)
+    .count()
+        > 1
+    {
+        bail!(
+            "--tail-dir, --tail-url, and --tail-quorum are mutually exclusive: a server \
+             writes ONE tail"
+        );
     }
     // Fail fast on TLS/auth misconfiguration BEFORE touching the catalog:
     // a server asked to be secure must never come up insecure.
@@ -736,16 +788,30 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
     // --tail-dir, a durable local WAL (tail.rs) closes the unclean-kill
     // loss window: fsync before every buffered ack, replay at boot.
     let write_buffer = if serve_opts.write_buffer_ms > 0 {
-        let tail_store: Option<Arc<dyn tail::TailStore>> =
-            match (&serve_opts.tail_dir, &serve_opts.tail_url) {
-                (Some(dir), None) => Some(Arc::new(tail::LocalWal::open(dir)?)),
-                // PgTail::open connects, takes the one-writer advisory
-                // lock, and ensures the schema — an unreachable/locked
-                // tail database fails startup loudly right here.
-                (None, Some(url)) => Some(Arc::new(tail_pg::PgTail::open(url)?)),
-                (None, None) => None,
-                (Some(_), Some(_)) => unreachable!("refused above"),
-            };
+        let tail_store: Option<Arc<dyn tail::TailStore>> = match (
+            &serve_opts.tail_dir,
+            &serve_opts.tail_url,
+            &serve_opts.tail_quorum,
+        ) {
+            (Some(dir), None, None) => Some(Arc::new(tail::LocalWal::open(dir)?)),
+            // PgTail::open connects, takes the one-writer advisory
+            // lock, and ensures the schema — an unreachable/locked
+            // tail database fails startup loudly right here.
+            (None, Some(url), None) => Some(Arc::new(tail_pg::PgTail::open(url)?)),
+            // QuorumTail::open runs the full election + recovery — an
+            // unreachable/unvotable quorum fails startup loudly right
+            // here.
+            (None, None, Some(spec)) => {
+                let addrs: Vec<String> = spec
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                Some(Arc::new(tail_quorum::QuorumTail::open(&addrs)?))
+            }
+            (None, None, None) => None,
+            _ => unreachable!("refused above"),
+        };
         let buf = Arc::new(buffer::WriteBuffer::new(
             catalog.clone(),
             engine.clone(),
@@ -764,6 +830,21 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
                  still loses acked-but-uncommitted rows. Other servers/readers see \
                  buffered rows only at the commit cadence; reads on this server union \
                  the buffer (read-your-writes holds locally)."
+            );
+        } else if let Some(spec) = &serve_opts.tail_quorum {
+            warn!(
+                write_buffer_ms = serve_opts.write_buffer_ms,
+                max_rows = buf.max_rows(),
+                tail_quorum = %spec,
+                "write buffering is ENABLED with a durable quorum tail (--tail-quorum): \
+                 INSERTs are fsynced by 2 of 3 icekeeperd acceptors BEFORE their ack and \
+                 un-flushed rows replay on the next boot against the same quorum, so an \
+                 unclean kill, losing this NODE, or losing ANY SINGLE acceptor — \
+                 including this one — loses NOTHING (quorum consensus, adapted from \
+                 Neon's safekeeper). Fewer than 2 live acceptors BLOCKS buffered writes \
+                 (statement errors — backpressure, never silent loss). Other \
+                 servers/readers see buffered rows only at the commit cadence; reads on \
+                 this server union the buffer (read-your-writes holds locally)."
             );
         } else if serve_opts.tail_url.is_some() {
             warn!(

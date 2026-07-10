@@ -30,6 +30,14 @@ path = "src/main.rs"
 name = "icegresd"
 path = "src/bin/icegresd.rs"
 
+# The quorum-tail acceptor daemon (roadmap §3 backend 3). Same pattern as
+# icegresd: a third bin target sharing the dependency graph but compiling
+# only its own file plus the `#[path]`-included consensus modules
+# (src/segment.rs + src/quorum/*) — none of the datafusion/iceberg stack.
+[[bin]]
+name = "icekeeperd"
+path = "src/bin/icekeeperd.rs"
+
 [dependencies]
 # Iceberg stack (all pinned to the same 0.9.1 — do not bump independently)
 iceberg = "=0.9.1"

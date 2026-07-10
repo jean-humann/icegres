@@ -111,7 +111,6 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
-use std::os::unix::io::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex as StdMutex;
 
@@ -120,6 +119,8 @@ use arrow::array::RecordBatch;
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use iceberg::TableIdent;
+
+use crate::segment::{frame_bytes, lock_dir_exclusive, sync_dir, write_atomic, LOG_KIND_TAIL};
 
 /// Prefix of the table property carrying the highest tail sequence a flush
 /// commit drained (the exactly-once watermark; see the module docs). The
@@ -439,7 +440,18 @@ impl LocalWal {
     pub fn open(root: &Path) -> Result<Self> {
         fs::create_dir_all(root)
             .with_context(|| format!("cannot create tail dir {}", root.display()))?;
-        let lock = lock_dir_exclusive(root)?;
+        let lock = lock_dir_exclusive(
+            root,
+            LOCK_FILE,
+            LOG_KIND_TAIL,
+            &format!(
+                "tail dir {} is LOCKED by another process — most likely another \
+                 `icegres serve` with the same --tail-dir. Two writers on one tail \
+                 dir would double-apply recovered rows and truncate each other's \
+                 segments; give each server its own directory.",
+                root.display()
+            ),
+        )?;
         check_or_create_format(root)?;
         let identity = load_or_create_identity(root)?;
         Ok(Self {
@@ -465,7 +477,7 @@ impl TailStore for LocalWal {
                 .with_context(|| format!("cannot create tail segment {}", path.display()))?;
             // Make the new directory entry itself durable before any frame
             // relies on it.
-            sync_dir(&entry.dir)?;
+            sync_dir(&entry.dir, LOG_KIND_TAIL)?;
             entry.next_segment += 1;
             entry.active = Some(ActiveSegment {
                 path,
@@ -679,39 +691,15 @@ impl TailStore for LocalWal {
         fs::create_dir_all(&dir)
             .map_err(anyhow::Error::from)
             .and_then(|()| {
-                write_atomic(&dir, &dir.join(WATERMARK_FILE), seq.to_string().as_bytes())
+                write_atomic(
+                    &dir,
+                    &dir.join(WATERMARK_FILE),
+                    seq.to_string().as_bytes(),
+                    LOG_KIND_TAIL,
+                )
             })
             .with_context(|| format!("cannot write tail watermark sidecar for {table} ({seq})"))
     }
-}
-
-/// Take the exclusive advisory lock on `<root>/.lock`. flock is per open
-/// file description, so even a second `LocalWal::open` in THIS process
-/// contends. The fd must stay open for the lock to hold — the caller keeps
-/// it in the struct for the process lifetime.
-fn lock_dir_exclusive(root: &Path) -> Result<File> {
-    let path = root.join(LOCK_FILE);
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-        .with_context(|| format!("cannot open tail lock file {}", path.display()))?;
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
-            bail!(
-                "tail dir {} is LOCKED by another process — most likely another \
-                 `icegres serve` with the same --tail-dir. Two writers on one tail \
-                 dir would double-apply recovered rows and truncate each other's \
-                 segments; give each server its own directory.",
-                root.display()
-            );
-        }
-        return Err(anyhow!(err).context(format!("cannot flock tail dir {}", root.display())));
-    }
-    Ok(file)
 }
 
 /// Check (or mint) the on-disk format marker `<root>/format`. Three cases:
@@ -749,7 +737,7 @@ fn check_or_create_format(root: &Path) -> Result<()> {
                     root.display()
                 );
             }
-            write_atomic(root, &path, expected.as_bytes())
+            write_atomic(root, &path, expected.as_bytes(), LOG_KIND_TAIL)
                 .with_context(|| format!("cannot persist tail format {}", path.display()))
         }
         Err(e) => {
@@ -780,31 +768,12 @@ fn load_or_create_identity(root: &Path) -> Result<String> {
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let id = uuid::Uuid::new_v4().to_string();
-            write_atomic(root, &path, id.as_bytes())
+            write_atomic(root, &path, id.as_bytes(), LOG_KIND_TAIL)
                 .with_context(|| format!("cannot persist tail identity {}", path.display()))?;
             Ok(id)
         }
         Err(e) => Err(anyhow!(e).context(format!("cannot read tail identity {}", path.display()))),
     }
-}
-
-/// Durably write `bytes` to `path` (inside `dir`): tmp file + fsync +
-/// rename + dir fsync, so a crash leaves either the old content or the new,
-/// never a torn file.
-fn write_atomic(dir: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| anyhow!("write_atomic target {} has no file name", path.display()))?;
-    let tmp = dir.join(format!(".{name}.tmp"));
-    (|| -> std::io::Result<()> {
-        let mut f = File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        fs::rename(&tmp, path)
-    })()
-    .with_context(|| format!("cannot write {} atomically", path.display()))?;
-    sync_dir(dir)
 }
 
 /// Read the per-table watermark sidecar. Garbage is a WARN + `None`, never
@@ -839,7 +808,7 @@ fn table_entry<'a>(
         let dir = root.join(table_dir_name(ident)?);
         fs::create_dir_all(&dir)
             .with_context(|| format!("cannot create tail table dir {}", dir.display()))?;
-        sync_dir(root)?;
+        sync_dir(root, LOG_KIND_TAIL)?;
         let scan = scan_table(&dir)?;
         tables.insert(
             ident.clone(),
@@ -930,28 +899,6 @@ pub(crate) fn parse_table_dir_name(name: &str) -> Option<TableIdent> {
     TableIdent::from_strs(parts).ok()
 }
 
-/// fsync a directory so freshly created/removed entries survive power loss.
-fn sync_dir(dir: &Path) -> Result<()> {
-    File::open(dir)
-        .and_then(|d| d.sync_all())
-        .with_context(|| format!("cannot fsync tail dir {}", dir.display()))
-}
-
-/// A frame's length header is a `u32`: a payload longer than `u32::MAX`
-/// would silently WRAP the header, producing an acked frame that can never
-/// replay (the scan reads a garbage length). Error instead, so the
-/// oversized statement fails loudly before any ack.
-fn check_frame_len(len: usize) -> Result<()> {
-    if len > u32::MAX as usize {
-        bail!(
-            "tail frame payload is {len} bytes, over the u32 frame-length limit \
-             ({}); split the statement into smaller inserts",
-            u32::MAX
-        );
-    }
-    Ok(())
-}
-
 /// The statement-atomic payload every tail backend stores:
 /// `[u8 format-version][u8 op][Arrow IPC stream of ALL batches]`. LocalWal
 /// wraps it in `[len][crc]` file framing plus the LE seq prefix;
@@ -1025,19 +972,15 @@ fn decode_ipc(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
     Ok(batches)
 }
 
-/// `[u32 len][u32 crc32(payload)][payload]`, payload = LE u64 seq + the
-/// versioned op payload of one statement ([`encode_op_payload`]).
+/// `[u32 len][u32 crc32(payload)][payload]` (the shared frame wrap,
+/// [`crate::segment::frame_bytes`]), payload = LE u64 seq + the versioned op
+/// payload of one statement ([`encode_op_payload`]).
 fn encode_frame(seq: u64, kind: TailOpKind, batches: &[RecordBatch]) -> Result<Vec<u8>> {
     let body = encode_op_payload(kind, batches)?;
     let mut payload = Vec::with_capacity(8 + body.len());
     payload.extend_from_slice(&seq.to_le_bytes());
     payload.extend_from_slice(&body);
-    check_frame_len(payload.len())?;
-    let mut frame = Vec::with_capacity(8 + payload.len());
-    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    frame.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
-    frame.extend_from_slice(&payload);
-    Ok(frame)
+    frame_bytes(&payload, LOG_KIND_TAIL)
 }
 
 fn decode_payload(payload: &[u8]) -> Result<(u64, TailOp)> {
@@ -1758,12 +1701,19 @@ mod tests {
     // frame. Boundary-tested through the factored check — no 4 GiB builds.
     #[test]
     fn frame_len_check_rejects_u32_overflow() {
-        assert!(check_frame_len(0).is_ok());
-        assert!(check_frame_len(u32::MAX as usize).is_ok());
-        let err = check_frame_len(u32::MAX as usize + 1).unwrap_err();
+        use crate::segment::check_frame_len;
+        assert!(check_frame_len(0, LOG_KIND_TAIL).is_ok());
+        assert!(check_frame_len(u32::MAX as usize, LOG_KIND_TAIL).is_ok());
+        let err = check_frame_len(u32::MAX as usize + 1, LOG_KIND_TAIL).unwrap_err();
         assert!(
             err.to_string().contains("frame-length limit"),
             "unexpected: {err:#}"
+        );
+        // FIX (I4): the factored message surfaces the ORIGINAL
+        // operator-visible text verbatim for the local tail.
+        assert!(
+            err.to_string().starts_with("tail frame payload is"),
+            "drifted operator-visible message: {err:#}"
         );
     }
 

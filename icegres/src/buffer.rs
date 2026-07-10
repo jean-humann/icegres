@@ -1071,17 +1071,19 @@ impl WriteBuffer {
                     "tail replay: dropped frames already covered by the committed \
                      watermark (crash landed between commit and truncate)"
                 );
-                // Best-effort disk cleanup of the covered frames.
-                if let Some(w) = watermark {
-                    if let Err(e) = tail.truncate(&ident, w) {
-                        tracing::warn!(
-                            table = %ident,
-                            upto_seq = w,
-                            "tail truncate of stale frames failed (harmless; the \
-                             watermark keeps replay exact): {e:#}"
-                        );
-                    }
-                }
+                // Best-effort disk cleanup of the covered frames — through
+                // the SAME watermark-record-then-truncate discipline as the
+                // flush path (FIX C1a). The boot path used to truncate from
+                // the LAKE property alone: with no watermark record ever
+                // written (the crash landed between the property stamp and
+                // record_watermark), the truncate deleted the table's ONLY
+                // records, the next restart replayed nothing for it, the
+                // sequence floor never applied, and freshly acked rows were
+                // silently dropped as already-committed. record_watermark
+                // BEFORE truncate retains the table's trace; a failed
+                // watermark record skips the truncate (bounded leak, zero
+                // loss — same rule as the flush path).
+                tail_truncate_covered(Some(tail.as_ref()), &ident, watermark);
             }
             let Some((max_seq, _)) = survivors.last() else {
                 continue;
@@ -2313,6 +2315,8 @@ mod tests {
         kinds: StdMutex<Vec<TailOpKind>>,
         truncates: StdMutex<Vec<(TableIdent, u64)>>,
         watermarks: StdMutex<Vec<(TableIdent, u64)>>,
+        /// Interleaved watermark/truncate call log (order assertions).
+        calls: StdMutex<Vec<String>>,
     }
 
     impl TailStore for MockTail {
@@ -2344,6 +2348,10 @@ mod tests {
         }
 
         fn truncate(&self, table: &TableIdent, upto_seq: u64) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("truncate:{upto_seq}"));
             self.truncates
                 .lock()
                 .unwrap()
@@ -2372,9 +2380,25 @@ mod tests {
             {
                 return Err(anyhow!("mock tail: watermark store on fire"));
             }
+            self.calls.lock().unwrap().push(format!("watermark:{seq}"));
             self.watermarks.lock().unwrap().push((table.clone(), seq));
             Ok(())
         }
+    }
+
+    // FIX (C1a): the covered-frame cleanup records the watermark BEFORE the
+    // truncate — the ORDER is the contract, not just both calls happening.
+    // The boot replay path now runs through this same helper, so a
+    // boot-time truncate can never delete a table's only frames without a
+    // watermark record retaining its trace (and with it the seq floor).
+    #[test]
+    fn covered_cleanup_records_watermark_before_truncate() {
+        let tail = MockTail::default();
+        tail_truncate_covered(Some(&tail), &ident(), Some(3));
+        assert_eq!(
+            *tail.calls.lock().unwrap(),
+            vec!["watermark:3".to_string(), "truncate:3".to_string()]
+        );
     }
 
     // Insert path: each STATEMENT is durably appended as one frame (all its
