@@ -880,8 +880,8 @@ bash tests/e2e.sh   # end-to-end test (idempotent; needs psql, curl, jq, aws)
 ```
 
 The harness starts the stack (`infra/scripts/up.sh`), builds, seeds, serves,
-and asserts exact results over psql — **104 assertions** across sections
-(a)–(o): seeded row counts, filters/aggregates/joins, `INSERT` over the wire
+and asserts exact results over psql — **163 assertions** across sections
+(a)–(y): seeded row counts, filters/aggregates/joins, `INSERT` over the wire
 (verified from new connections), Parquet files on RustFS + catalog
 registration via the Lakekeeper REST API, durability across a server
 restart, auth + TLS (wrong password/unknown user rejected,
