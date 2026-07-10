@@ -175,7 +175,10 @@ PREFIX=""
 cleanup() {
   stop_server
   [[ -n "$PREFIX" ]] && drop_scratch "$PREFIX"
-  rm -rf "$TAIL_DIR"
+  [[ -n "$PREFIX" ]] && curl -sf -X DELETE \
+    "$CATALOG_URI/v1/$PREFIX/namespaces/demo/tables/tail_keyed_scratch?purgeRequested=true" \
+    >/dev/null 2>&1 || true
+  rm -rf "$TAIL_DIR" "$RUN_DIR/tail-keyed-wal"
   drop_pg_tail_schema
 }
 trap cleanup EXIT
@@ -403,5 +406,100 @@ q "delete from demo.$TABLE where id < 0" >/dev/null || fail "fence DELETE failed
 assert_eq "second generation COMMITTED by the fence-forced flush" "6" \
   "$(q "select count(*) from demo.$TABLE")"
 stop_server
+
+# ---------------------------------------------------------------------------
+# 9. KEYED tail upserts (roadmap Phase 2): on a table with
+#    icegres.tail-upsert=true + icegres.primary-key, an exact-PK UPDATE or
+#    DELETE acks from the durable tail (no synchronous COW commit) and its
+#    keyed frame SURVIVES kill -9 — replay rebuilds the keyed map and the
+#    flush commits the FINAL value exactly once. Contrast: the same UPDATE
+#    on a table WITHOUT the property still takes the fence+sync path (a
+#    snapshot per statement).
+# ---------------------------------------------------------------------------
+log "(9) keyed tail: UPDATE/DELETE ack from the tail and survive kill -9"
+KTABLE=tail_keyed_scratch
+kt_snap_count() {
+  curl -sf "$CATALOG_URI/v1/$PREFIX/namespaces/demo/tables/$KTABLE" \
+    | jq '[.metadata.snapshots[]?] | length'
+}
+drop_keyed_scratch() {
+  curl -sf -X DELETE \
+    "$CATALOG_URI/v1/$PREFIX/namespaces/demo/tables/$KTABLE?purgeRequested=true" \
+    >/dev/null 2>&1 || true
+}
+drop_keyed_scratch
+curl -sf -X POST "$CATALOG_URI/v1/$PREFIX/namespaces/demo/tables" \
+  -H 'Content-Type: application/json' -d @- <<'JSON' >/dev/null
+{
+  "name": "tail_keyed_scratch",
+  "schema": {
+    "type": "struct",
+    "schema-id": 0,
+    "fields": [
+      {"id": 1, "name": "id", "required": false, "type": "long"},
+      {"id": 2, "name": "val", "required": false, "type": "string"}
+    ]
+  },
+  "properties": {"icegres.primary-key": "id", "icegres.tail-upsert": "true"}
+}
+JSON
+KTAIL_DIR="$RUN_DIR/tail-keyed-wal"
+rm -rf "$KTAIL_DIR"
+start_server --tail-dir "$KTAIL_DIR"
+
+# Seed a committed row (fence = a non-keyed DML that matches nothing).
+q "insert into demo.$KTABLE values (1, 'before'), (2, 'other')" >/dev/null
+q "delete from demo.$KTABLE where id < -1" >/dev/null
+assert_eq "seed committed (one snapshot)" "1" "$(kt_snap_count)"
+
+# (9a) keyed UPDATE: fast ack, NO commit, survives kill -9.
+kt_tag=$("${PSQL[@]}" -c "update demo.$KTABLE set val = 'after' where id = 1" \
+  | tr -d '[:space:]')
+assert_eq "keyed UPDATE answers the standard tag" "UPDATE1" "$kt_tag"
+assert_eq "keyed UPDATE made NO snapshot (acked from the tail)" "1" "$(kt_snap_count)"
+assert_eq "union read sees the updated value mid-window" "after" \
+  "$(q "select val from demo.$KTABLE where id = 1")"
+kill_9
+start_server --tail-dir "$KTAIL_DIR"
+assert_eq "UPDATED value survives kill -9 + replay, exactly once" "after|1" \
+  "$(q "select val from demo.$KTABLE where id = 1")|$(q \
+    "select count(*) from demo.$KTABLE where id = 1")"
+q "delete from demo.$KTABLE where id < -1" >/dev/null # flush the replayed op
+assert_eq "flush committed the update as ONE snapshot" "2" "$(kt_snap_count)"
+assert_eq "committed value is the update, exactly once" "after|1" \
+  "$(q "select val from demo.$KTABLE where id = 1")|$(q \
+    "select count(*) from demo.$KTABLE where id = 1")"
+pass "keyed UPDATE: tail-acked, crash-safe, exactly-once"
+
+# (9b) keyed DELETE: fast ack, crash, replay -> row gone.
+kt_tag=$("${PSQL[@]}" -c "delete from demo.$KTABLE where id = 2" | tr -d '[:space:]')
+assert_eq "keyed DELETE answers the standard tag" "DELETE1" "$kt_tag"
+assert_eq "keyed DELETE made NO snapshot" "2" "$(kt_snap_count)"
+assert_eq "union read hides the deleted row mid-window" "0" \
+  "$(q "select count(*) from demo.$KTABLE where id = 2")"
+kill_9
+start_server --tail-dir "$KTAIL_DIR"
+assert_eq "deleted row STAYS gone after kill -9 + replay" "0" \
+  "$(q "select count(*) from demo.$KTABLE where id = 2")"
+q "delete from demo.$KTABLE where id < -1" >/dev/null
+assert_eq "flush committed the delete" "3" "$(kt_snap_count)"
+assert_eq "row gone from the lake" "0" \
+  "$(q "select count(*) from demo.$KTABLE where id = 2")"
+pass "keyed DELETE: tail-acked, crash-safe, exactly-once"
+
+# (9c) contrast: WITHOUT icegres.tail-upsert the same statement shape still
+# takes the fence+synchronous path — one snapshot per UPDATE, immediately.
+before=$(curl -sf "$CATALOG_URI/v1/$PREFIX/namespaces/demo/tables/$TABLE" \
+  | jq '[.metadata.snapshots[]?] | length')
+q "update demo.$TABLE set note = 'sync-path' where id = 11" >/dev/null
+after=$(curl -sf "$CATALOG_URI/v1/$PREFIX/namespaces/demo/tables/$TABLE" \
+  | jq '[.metadata.snapshots[]?] | length')
+assert_eq "table WITHOUT the property commits synchronously (fence path)" \
+  "$((before + 1))" "$after"
+pass "keyed routing is opt-in: no property = unchanged synchronous UPDATE"
+
+stop_server
+rm -rf "$KTAIL_DIR"
+drop_keyed_scratch
 
 log "all assertions passed ($PASS_COUNT)"

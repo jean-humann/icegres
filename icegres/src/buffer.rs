@@ -52,6 +52,34 @@
 //!   with the INSERT's commit deferred to the fence.
 //! * **Time travel excluded by design**: `table@snapshot` reads are
 //!   point-in-time views of committed history and never see the buffer.
+//! * **Keyed tail upserts (Phase 2, docs/sota-roadmap.md §4)**: a table
+//!   with `icegres.primary-key` + `icegres.tail-upsert = "true"` (and a
+//!   durable tail attached) additionally acks exact-PK-equality autocommit
+//!   UPDATE/DELETE from the tail instead of fencing: the statement resolves
+//!   the key's current row through the union view, fsyncs ONE keyed frame,
+//!   and records the op in a per-table keyed map (per-key last-writer-wins
+//!   within the window). **Tail sequence order is the total order for a
+//!   key**: a plain INSERT on a keyed-activated table routes each row whose
+//!   key currently has a keyed-map entry into a NEWER upsert entry (live
+//!   path and boot replay run the SAME routing inside
+//!   [`BufferState::append`]), so a delete-then-reinsert of one key in one
+//!   window leaves the row present with the inserted values. The flusher
+//!   coalesces the map into the SAME window commit as pending inserts
+//!   (`[Append(pending), Delete(keys), Append(replacements)]` — pending
+//!   appends fold through the later delete, and by the routing above such
+//!   an append is always OLDER than the keyed op that folds it away), and
+//!   the overlay gains key suppression: committed rows and older buffered
+//!   layers whose key has a newer keyed op are hidden (cache.rs applies the
+//!   committed-side filter via `KeySuppressExec`). Anything not exactly
+//!   keyed-shaped falls back to the fence path — which, on a
+//!   keyed-activated table, runs its flush + synchronous execution under
+//!   the SAME per-table keyed-serial lock a keyed read-modify-write holds
+//!   across its union-read → tail-frame window (and an explicit-txn COMMIT
+//!   touching keyed-activated tables acquires those locks in sorted ident
+//!   order), so a committed synchronous write can never be clobbered by a
+//!   keyed statement's stale full-row image. Lock ORDER (deadlock-critical):
+//!   keyed-serial → `flush_lock` → the tables mutex; a keyed-serial lock is
+//!   never acquired while holding either of the others.
 //!
 //! # Union-read correctness (no duplicates, no lost rows)
 //!
@@ -83,12 +111,13 @@
 //! generation anyway. Buffer memory is therefore bounded by rows inserted
 //! in the last `FLUSHED_GC` window.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context as _, Result};
-use arrow::array::RecordBatch;
+use arrow::array::{BooleanArray, RecordBatch};
+use arrow::compute::filter_record_batch;
 use arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use async_trait::async_trait;
 use datafusion::common::ParamValues;
@@ -104,10 +133,14 @@ use iceberg::spec::TableMetadata;
 use iceberg::{Catalog, TableIdent};
 
 use crate::dml;
+use crate::keyed;
 use crate::overwrite::{
-    align_batch, prepare_commit, CommitOutcome, OverwriteEngine, TableOp, MAX_COMMIT_ATTEMPTS,
+    align_batch, apply_dml_to_batches, pk_columns_of, prepare_commit, quote_ident, CommitOutcome,
+    DmlKind, DmlStatement, OverwriteEngine, TableOp, MAX_COMMIT_ATTEMPTS,
 };
-use crate::tail::{drop_stale_frames, effective_watermark, parse_watermark_property, TailStore};
+use crate::tail::{
+    drop_stale_frames, effective_watermark, parse_watermark_property, TailOp, TailOpKind, TailStore,
+};
 use crate::txn::{insert_target, plan_insert_rows, TxnRegistry};
 
 /// Flush early once a table has this many pending buffered rows (bounds
@@ -119,10 +152,69 @@ const DEFAULT_MAX_ROWS: usize = 50_000;
 /// collection (see the union-read correctness protocol in the module docs).
 const FLUSHED_GC: Duration = Duration::from_secs(30);
 
+/// What a buffered keyed op does to its key (Phase 2, keyed tail upserts).
+#[derive(Clone)]
+pub(crate) enum KeyedKind {
+    /// The key's full replacement row (one row, canonical schema).
+    Upsert(RecordBatch),
+    /// The key is deleted.
+    Delete,
+}
+
+/// One buffered keyed op: the key's PK values (one-row batch of the PK
+/// columns in canonical types — the flusher's SQL-literal source and the
+/// tail delete payload) plus what happens to the key.
+#[derive(Clone)]
+pub(crate) struct KeyedOp {
+    key_row: RecordBatch,
+    kind: KeyedKind,
+}
+
+/// A keyed map entry: the op plus a per-table monotonic stamp. The stamp is
+/// what makes flush snapshots drain EXACTLY what they committed — a key
+/// overwritten after the snapshot keeps its newer entry pending
+/// (last-writer-wins), and a conflicted flush merges back without ever
+/// clobbering a later write.
+struct KeyedEntry {
+    stamp: u64,
+    op: KeyedOp,
+}
+
+/// Per-table keyed state (present once the first keyed op lands).
+struct KeyedState {
+    /// The declared `icegres.primary-key` columns (canonical names).
+    pk_cols: Vec<String>,
+    /// Encoded PK -> latest op (per-key last-writer-wins within the window).
+    entries: HashMap<Vec<u8>, KeyedEntry>,
+    next_stamp: u64,
+}
+
+/// How a flushed generation's commit is recognizable in scan metadata —
+/// the overlay excludes the generation exactly when the metadata a scan
+/// just loaded provably contains its rows.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum GenCommit {
+    /// The normal case: the generation was committed as this snapshot id;
+    /// metadata containing the snapshot contains the rows.
+    Snapshot(i64),
+    /// The prepare-time already-committed guard's case (an earlier
+    /// AMBIGUOUS flush of these rows actually landed, snapshot id unknown):
+    /// the rows are committed at-or-before tail watermark `mark`, so
+    /// metadata whose OWN tail watermark property is `>= mark` contains
+    /// them — exact, with no snapshot-id guess that could postdate the
+    /// real commit and double-count rows for scans of intermediate
+    /// snapshots.
+    CoveredByWatermark(u64),
+}
+
 /// One committed-but-possibly-not-yet-observed flush generation.
 struct FlushedGen {
-    snapshot_id: i64,
+    commit: GenCommit,
     batches: Vec<RecordBatch>,
+    /// The keyed ops this generation committed (key, stamp, op) — scans
+    /// whose metadata predates the commit still need their suppression and
+    /// upsert rows; a conflicted post merges them back stamp-aware.
+    keyed: Vec<(Vec<u8>, u64, KeyedOp)>,
     committed_at: Instant,
 }
 
@@ -134,6 +226,9 @@ struct TableBuf {
     /// Acked rows not yet handed to a catalog commit, in insert order.
     pending: Vec<RecordBatch>,
     pending_rows: usize,
+    /// Keyed tail ops of the current window (Phase 2); `None` until the
+    /// first keyed op touches the table.
+    keyed: Option<KeyedState>,
     /// Committed generations kept until every scan can see them (GC'd).
     flushed: Vec<FlushedGen>,
     /// Highest durable-tail sequence reflected in this buffer (None when no
@@ -143,10 +238,38 @@ struct TableBuf {
     tail_high: Option<u64>,
 }
 
+/// Keyed suppression a scan must apply to its committed data (and that the
+/// overlay's own rows were already filtered by, layer-aware): every key
+/// with a buffered update or delete hides its committed row.
+pub struct OverlaySuppress {
+    pub pk_cols: Vec<String>,
+    pub keys: Arc<HashSet<Vec<u8>>>,
+}
+
 /// The overlay a scan must union with its committed data (see cache.rs).
+/// `batches` are ready to serve as-is (keyed suppression between buffer
+/// layers is already applied); `suppress` — when present — must additionally
+/// filter the committed scan (cache.rs wraps it in a `KeySuppressExec`).
 pub struct Overlay {
     pub schema: ArrowSchemaRef,
     pub batches: Vec<RecordBatch>,
+    pub suppress: Option<OverlaySuppress>,
+}
+
+/// A consistent snapshot of one table's pending work (append prefix +
+/// keyed ops + the tail watermark), taken under one lock acquisition.
+struct PendingSnapshot {
+    batches: Vec<RecordBatch>,
+    n_batches: usize,
+    /// `(key, stamp, op)` sorted by stamp (arrival order).
+    keyed: Vec<(Vec<u8>, u64, KeyedOp)>,
+    tail_mark: Option<u64>,
+}
+
+impl PendingSnapshot {
+    fn is_empty(&self) -> bool {
+        self.n_batches == 0 && self.keyed.is_empty()
+    }
 }
 
 /// The pure in-memory buffer bookkeeping — the union-read state machine
@@ -196,6 +319,7 @@ impl BufferState {
                     schema,
                     pending: Vec::new(),
                     pending_rows: 0,
+                    keyed: None,
                     flushed: Vec::new(),
                     tail_high: None,
                 },
@@ -210,14 +334,17 @@ impl BufferState {
             // ONE append for the whole statement (all batches in one frame,
             // one fsync, one sequence): all-or-nothing by construction — a
             // failure leaves NO durable frame (tail.rs rolls back partial
-            // bytes), so rows of a failed statement can never replay.
+            // bytes), so rows of a failed statement can never replay. The
+            // frame stays a plain Append even when rows are routed into
+            // upsert entries below: boot replay pushes Append frames back
+            // through THIS function in sequence order, so the same routing
+            // rebuilds the identical split.
             if !aligned.is_empty() {
-                entry.tail_high = Some(tail.append(ident, &aligned)?);
+                entry.tail_high = Some(tail.append(ident, TailOpKind::Append, &aligned)?);
             }
         }
         let rows: usize = aligned.iter().map(|b| b.num_rows()).sum();
-        entry.pending.extend(aligned);
-        entry.pending_rows += rows;
+        route_appends(entry, aligned)?;
         Ok((rows, entry.pending_rows))
     }
 
@@ -234,75 +361,328 @@ impl BufferState {
 
     fn has_pending(&self) -> bool {
         let tables = self.tables.lock().expect("write-buffer lock poisoned");
-        tables.values().any(|t| !t.pending.is_empty())
+        tables.values().any(|t| {
+            !t.pending.is_empty() || t.keyed.as_ref().is_some_and(|k| !k.entries.is_empty())
+        })
     }
 
-    /// Idents with pending rows (flush work list).
+    /// Idents with pending rows or keyed ops (flush work list).
     fn pending_idents(&self) -> Vec<TableIdent> {
         let tables = self.tables.lock().expect("write-buffer lock poisoned");
         tables
             .iter()
-            .filter(|(_, t)| !t.pending.is_empty())
+            .filter(|(_, t)| {
+                !t.pending.is_empty() || t.keyed.as_ref().is_some_and(|k| !k.entries.is_empty())
+            })
             .map(|(ident, _)| ident.clone())
             .collect()
     }
 
-    /// Snapshot the current pending prefix WITHOUT removing it (rows stay
-    /// readable through the union while the commit is in flight). Returns
-    /// `(batches, batch_count, tail_mark)` where `tail_mark` is the highest
-    /// durable-tail sequence the snapshot covers (the commit's watermark;
-    /// `None` without a tail) — taken under the same lock as the batches,
-    /// so it is exact for this snapshot.
-    fn snapshot_pending(&self, ident: &TableIdent) -> (Vec<RecordBatch>, usize, Option<u64>) {
-        let tables = self.tables.lock().expect("write-buffer lock poisoned");
-        match tables.get(ident) {
-            Some(entry) => (entry.pending.clone(), entry.pending.len(), entry.tail_high),
-            None => (Vec::new(), 0, None),
-        }
-    }
-
-    /// The union overlay for one table: all pending rows plus every committed
-    /// generation the scan's metadata cannot see yet. `is_committed(S)` is the
-    /// caller's snapshot-membership test (real code: does the just-loaded
-    /// metadata contain `S`?). `None` when there is nothing to add.
-    fn overlay_with(
-        &self,
-        ident: &TableIdent,
-        is_committed: impl Fn(i64) -> bool,
-    ) -> Option<Overlay> {
+    /// The current keyed op for `key`: `Some(Some(row))` = buffered upsert
+    /// (row = the key's current value), `Some(None)` = buffered delete,
+    /// `None` = no keyed entry (resolve through the union view instead).
+    fn keyed_lookup(&self, ident: &TableIdent, key: &[u8]) -> Option<Option<RecordBatch>> {
         let tables = self.tables.lock().expect("write-buffer lock poisoned");
         let entry = tables.get(ident)?;
-        let mut batches: Vec<RecordBatch> = entry.pending.clone();
-        for flushed_gen in &entry.flushed {
-            if !is_committed(flushed_gen.snapshot_id) {
-                batches.extend(flushed_gen.batches.iter().cloned());
-            }
-        }
-        if batches.is_empty() {
-            return None;
-        }
-        Some(Overlay {
-            schema: entry.schema.clone(),
-            batches,
+        let keyed = entry.keyed.as_ref()?;
+        keyed.entries.get(key).map(|e| match &e.op.kind {
+            KeyedKind::Upsert(row) => Some(row.clone()),
+            KeyedKind::Delete => None,
         })
     }
 
-    fn drop_pending_prefix(&self, ident: &TableIdent, n_batches: usize) {
+    /// Record one keyed op: durable tail append FIRST (under this lock, so
+    /// keyed seq order == map order — the watermark invariant), then the
+    /// map insert (per-key last-writer-wins). Creates the table entry /
+    /// keyed state on first touch. Returns `(keyed_entries, pending_rows)`
+    /// for the flush-kick heuristic.
+    #[allow(clippy::too_many_arguments)]
+    fn keyed_write(
+        &self,
+        ident: &TableIdent,
+        schema_if_first: Option<ArrowSchemaRef>,
+        pk_cols: &[String],
+        key: Vec<u8>,
+        op: KeyedOp,
+        tail: Option<&dyn TailStore>,
+    ) -> Result<(usize, usize)> {
+        let mut tables = self.tables.lock().expect("write-buffer lock poisoned");
+        if !tables.contains_key(ident) {
+            let schema = schema_if_first
+                .ok_or_else(|| anyhow!("write-buffer schema for {ident} disappeared"))?;
+            tables.insert(
+                ident.clone(),
+                TableBuf {
+                    schema,
+                    pending: Vec::new(),
+                    pending_rows: 0,
+                    keyed: None,
+                    flushed: Vec::new(),
+                    tail_high: None,
+                },
+            );
+        }
+        let entry = tables.get_mut(ident).expect("just ensured present");
+        if entry.keyed.is_none() {
+            entry.keyed = Some(KeyedState {
+                pk_cols: pk_cols.to_vec(),
+                entries: HashMap::new(),
+                next_stamp: 1,
+            });
+        }
+        // S3: a pk_cols mismatch is only fatal while keys encoded under the
+        // OLD declaration are still buffered (live entries, or flushed
+        // generations whose keyed ops still overlay/merge back) — those keys
+        // would no longer address the same rows. Otherwise the property
+        // legitimately changed between windows: refresh and proceed instead
+        // of failing keyed ops until restart.
+        let old_keys_buffered = entry.keyed.as_ref().is_some_and(|k| !k.entries.is_empty())
+            || entry.flushed.iter().any(|g| !g.keyed.is_empty());
+        let keyed = entry.keyed.as_mut().expect("just ensured present");
+        if keyed.pk_cols != pk_cols {
+            if old_keys_buffered {
+                // The primary-key property changed while keyed ops were
+                // pending: the buffered keys would no longer address the
+                // same rows.
+                bail_pk_changed(ident, &keyed.pk_cols, pk_cols)?;
+            }
+            keyed.pk_cols = pk_cols.to_vec();
+        }
+        if let Some(tail) = tail {
+            let (kind, frame): (TailOpKind, &RecordBatch) = match &op.kind {
+                KeyedKind::Upsert(row) => (TailOpKind::Upsert, row),
+                KeyedKind::Delete => (TailOpKind::Delete, &op.key_row),
+            };
+            entry.tail_high = Some(tail.append(ident, kind, std::slice::from_ref(frame))?);
+        }
+        let stamp = keyed.next_stamp;
+        keyed.next_stamp += 1;
+        keyed.entries.insert(key, KeyedEntry { stamp, op });
+        Ok((keyed.entries.len(), entry.pending_rows))
+    }
+
+    /// Snapshot the current pending prefix AND keyed map WITHOUT removing
+    /// anything (rows stay readable through the union while the commit is
+    /// in flight; new writes land behind/over the snapshot). The tail mark
+    /// is taken under the same lock, so it is exact for this snapshot.
+    fn snapshot_pending(&self, ident: &TableIdent) -> PendingSnapshot {
+        let tables = self.tables.lock().expect("write-buffer lock poisoned");
+        match tables.get(ident) {
+            Some(entry) => {
+                let mut keyed: Vec<(Vec<u8>, u64, KeyedOp)> = match &entry.keyed {
+                    Some(k) => k
+                        .entries
+                        .iter()
+                        .map(|(key, e)| (key.clone(), e.stamp, e.op.clone()))
+                        .collect(),
+                    None => Vec::new(),
+                };
+                keyed.sort_by_key(|(_, stamp, _)| *stamp);
+                PendingSnapshot {
+                    batches: entry.pending.clone(),
+                    n_batches: entry.pending.len(),
+                    keyed,
+                    tail_mark: entry.tail_high,
+                }
+            }
+            None => PendingSnapshot {
+                batches: Vec::new(),
+                n_batches: 0,
+                keyed: Vec::new(),
+                tail_mark: None,
+            },
+        }
+    }
+
+    /// The union overlay for one table: pending rows, keyed upsert rows, and
+    /// every committed generation the scan's metadata cannot see yet —
+    /// layered so newer keyed ops suppress older layers' rows for the same
+    /// key (and a layer's own keyed ops suppress its own appended rows,
+    /// exactly as the flush composes them). `is_committed` is the caller's
+    /// test of whether the scan's metadata already contains a generation
+    /// (by snapshot membership, or — for a generation parked by the
+    /// already-committed guard — by the metadata's own tail watermark; see
+    /// [`GenCommit`]). `None` when there is nothing to add or suppress.
+    fn overlay_with(
+        &self,
+        ident: &TableIdent,
+        is_committed: impl Fn(&GenCommit) -> bool,
+    ) -> Result<Option<Overlay>> {
+        let tables = self.tables.lock().expect("write-buffer lock poisoned");
+        let Some(entry) = tables.get(ident) else {
+            return Ok(None);
+        };
+        struct Layer {
+            appends: Vec<RecordBatch>,
+            upserts: Vec<RecordBatch>,
+            keys: HashSet<Vec<u8>>,
+        }
+        let mut layers: Vec<Layer> = Vec::new();
+        for flushed_gen in &entry.flushed {
+            if is_committed(&flushed_gen.commit) {
+                continue;
+            }
+            layers.push(Layer {
+                appends: flushed_gen.batches.clone(),
+                upserts: flushed_gen
+                    .keyed
+                    .iter()
+                    .filter_map(|(_, _, op)| match &op.kind {
+                        KeyedKind::Upsert(row) => Some(row.clone()),
+                        KeyedKind::Delete => None,
+                    })
+                    .collect(),
+                keys: flushed_gen
+                    .keyed
+                    .iter()
+                    .map(|(k, _, _)| k.clone())
+                    .collect(),
+            });
+        }
+        layers.push(Layer {
+            appends: entry.pending.clone(),
+            upserts: entry
+                .keyed
+                .iter()
+                .flat_map(|k| k.entries.values())
+                .filter_map(|e| match &e.op.kind {
+                    KeyedKind::Upsert(row) => Some(row.clone()),
+                    KeyedKind::Delete => None,
+                })
+                .collect(),
+            keys: entry
+                .keyed
+                .iter()
+                .flat_map(|k| k.entries.keys().cloned())
+                .collect(),
+        });
+        // Fast path (no keyed ops anywhere): plain concatenation, no
+        // suppression — byte-for-byte the pre-Phase-2 overlay.
+        if layers.iter().all(|l| l.keys.is_empty()) {
+            let batches: Vec<RecordBatch> = layers.into_iter().flat_map(|l| l.appends).collect();
+            if batches.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(Overlay {
+                schema: entry.schema.clone(),
+                batches,
+                suppress: None,
+            }));
+        }
+        // The keyed state struct survives flushes (only its entries drain),
+        // so keyed layers imply it exists — but a missing PK set must fail
+        // loudly, never mis-serve.
+        let pk_cols = entry
+            .keyed
+            .as_ref()
+            .map(|k| k.pk_cols.clone())
+            .ok_or_else(|| anyhow!("keyed generations without keyed state for {ident}"))?;
+        // suffix_keys[i] = keys of every layer NEWER than i.
+        let n = layers.len();
+        let mut suffix: Vec<HashSet<Vec<u8>>> = vec![HashSet::new(); n];
+        for i in (0..n.saturating_sub(1)).rev() {
+            let mut s = suffix[i + 1].clone();
+            s.extend(layers[i + 1].keys.iter().cloned());
+            suffix[i] = s;
+        }
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        for (i, layer) in layers.iter().enumerate() {
+            // A layer's own keyed ops suppress its own appends (the flush
+            // composes [Append, Delete-by-key, Append-upserts], folding the
+            // delete over the appends); newer layers suppress everything.
+            let mut own_and_newer = suffix[i].clone();
+            own_and_newer.extend(layer.keys.iter().cloned());
+            for b in &layer.appends {
+                let filtered = keyed::suppress_batch(b, &pk_cols, &own_and_newer)?;
+                if filtered.num_rows() > 0 {
+                    batches.push(filtered);
+                }
+            }
+            for u in &layer.upserts {
+                let filtered = keyed::suppress_batch(u, &pk_cols, &suffix[i])?;
+                if filtered.num_rows() > 0 {
+                    batches.push(filtered);
+                }
+            }
+        }
+        let mut all_keys: HashSet<Vec<u8>> = HashSet::new();
+        for layer in &layers {
+            all_keys.extend(layer.keys.iter().cloned());
+        }
+        if batches.is_empty() && all_keys.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Overlay {
+            schema: entry.schema.clone(),
+            batches,
+            suppress: (!all_keys.is_empty()).then(|| OverlaySuppress {
+                pk_cols,
+                keys: Arc::new(all_keys),
+            }),
+        }))
+    }
+
+    fn drop_pending_prefix(
+        &self,
+        ident: &TableIdent,
+        n_batches: usize,
+        keyed: &[(Vec<u8>, u64, KeyedOp)],
+    ) {
         let mut tables = self.tables.lock().expect("write-buffer lock poisoned");
         if let Some(entry) = tables.get_mut(ident) {
             let dropped: Vec<RecordBatch> = entry.pending.drain(..n_batches).collect();
             entry.pending_rows -= dropped.iter().map(|b| b.num_rows()).sum::<usize>();
+            drain_keyed_snapshot(entry, keyed);
         }
     }
 
-    fn move_pending_to_flushed(&self, ident: &TableIdent, n_batches: usize, snapshot_id: i64) {
+    fn move_pending_to_flushed(
+        &self,
+        ident: &TableIdent,
+        n_batches: usize,
+        keyed: &[(Vec<u8>, u64, KeyedOp)],
+        snapshot_id: i64,
+    ) {
+        self.move_pending_to_flushed_gen(ident, n_batches, keyed, GenCommit::Snapshot(snapshot_id));
+    }
+
+    /// L3: park a generation the prepare-time already-committed guard
+    /// proved committed by an EARLIER ambiguous flush — its snapshot id is
+    /// unknown, so it is tagged with the covering tail watermark instead of
+    /// a guessed (possibly too-young) snapshot that would hide the rows
+    /// from scans of intermediate snapshots and double-count them for
+    /// scans at the guessed head.
+    fn move_pending_to_flushed_covered(
+        &self,
+        ident: &TableIdent,
+        n_batches: usize,
+        keyed: &[(Vec<u8>, u64, KeyedOp)],
+        mark: u64,
+    ) {
+        self.move_pending_to_flushed_gen(
+            ident,
+            n_batches,
+            keyed,
+            GenCommit::CoveredByWatermark(mark),
+        );
+    }
+
+    fn move_pending_to_flushed_gen(
+        &self,
+        ident: &TableIdent,
+        n_batches: usize,
+        keyed: &[(Vec<u8>, u64, KeyedOp)],
+        commit: GenCommit,
+    ) {
         let mut tables = self.tables.lock().expect("write-buffer lock poisoned");
         if let Some(entry) = tables.get_mut(ident) {
             let batches: Vec<RecordBatch> = entry.pending.drain(..n_batches).collect();
             entry.pending_rows -= batches.iter().map(|b| b.num_rows()).sum::<usize>();
+            drain_keyed_snapshot(entry, keyed);
             entry.flushed.push(FlushedGen {
-                snapshot_id,
+                commit,
                 batches,
+                keyed: keyed.to_vec(),
                 committed_at: Instant::now(),
             });
         }
@@ -314,7 +694,7 @@ impl BufferState {
             let Some(pos) = entry
                 .flushed
                 .iter()
-                .position(|g| g.snapshot_id == snapshot_id)
+                .position(|g| g.commit == GenCommit::Snapshot(snapshot_id))
             else {
                 return;
             };
@@ -328,6 +708,19 @@ impl BufferState {
             let mut restored = flushed_gen.batches;
             restored.append(&mut entry.pending);
             entry.pending = restored;
+            // Keyed merge-back, last-writer-wins: a key updated AFTER the
+            // snapshot keeps its newer entry — only absent keys restore
+            // (with their original stamps, still unique and older than any
+            // current stamp by construction).
+            if !flushed_gen.keyed.is_empty() {
+                let keyed = entry
+                    .keyed
+                    .as_mut()
+                    .expect("keyed generation implies keyed state");
+                for (key, stamp, op) in flushed_gen.keyed {
+                    keyed.entries.entry(key).or_insert(KeyedEntry { stamp, op });
+                }
+            }
         }
     }
 
@@ -338,6 +731,138 @@ impl BufferState {
             entry.flushed.retain(&keep);
         }
     }
+}
+
+/// Route one statement's aligned append batches into the table buffer
+/// (L2 — tail sequence order is the total order for keyed keys): a row
+/// whose PK currently has a keyed-map entry supersedes it as a NEWER
+/// Upsert entry (stamped now, i.e. at this statement's position in the
+/// per-table sequence order); rows without a map entry stay plain pending
+/// appends. Multi-row statements split accordingly. Tables without
+/// buffered keyed ops take the plain-append fast path and pay nothing.
+/// Live inserts and boot replay both land here (via
+/// [`BufferState::append`]), so replay rebuilds the identical routing by
+/// construction.
+fn route_appends(entry: &mut TableBuf, aligned: Vec<RecordBatch>) -> Result<()> {
+    if entry.keyed.as_ref().is_none_or(|k| k.entries.is_empty()) {
+        entry.pending_rows += aligned.iter().map(|b| b.num_rows()).sum::<usize>();
+        entry.pending.extend(aligned);
+        return Ok(());
+    }
+    let keyed = entry.keyed.as_mut().expect("checked above");
+    for batch in aligned {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let keys = keyed::encode_batch_keys(&batch, &keyed.pk_cols)?;
+        let hit: Vec<bool> = keys.iter().map(|k| keyed.entries.contains_key(k)).collect();
+        if hit.iter().all(|h| !h) {
+            entry.pending_rows += batch.num_rows();
+            entry.pending.push(batch);
+            continue;
+        }
+        let key_rows = keyed::project_key_rows(&batch, &keyed.pk_cols)?;
+        for (row, key) in keys.iter().enumerate().filter(|&(r, _)| hit[r]) {
+            let stamp = keyed.next_stamp;
+            keyed.next_stamp += 1;
+            keyed.entries.insert(
+                key.clone(),
+                KeyedEntry {
+                    stamp,
+                    op: KeyedOp {
+                        key_row: key_rows.slice(row, 1),
+                        kind: KeyedKind::Upsert(batch.slice(row, 1)),
+                    },
+                },
+            );
+        }
+        if hit.iter().all(|h| *h) {
+            continue;
+        }
+        let mask = BooleanArray::from_iter(hit.iter().map(|h| Some(!h)));
+        let filtered = filter_record_batch(&batch, &mask)
+            .map_err(|e| anyhow!("cannot split a routed insert batch: {e}"))?;
+        // The invariant the overlay's own-keys-suppress-own-appends rule
+        // and the flush's fold-through-delete rely on: a row entering
+        // `pending` never carries a key with a CURRENT map entry — every
+        // keyed-map entry is therefore strictly NEWER than any pending
+        // append of its key.
+        debug_assert!(
+            keyed::encode_batch_keys(&filtered, &keyed.pk_cols)
+                .map(|ks| ks.iter().all(|k| !keyed.entries.contains_key(k)))
+                .unwrap_or(false),
+            "a pending append must never carry a keyed-map key"
+        );
+        entry.pending_rows += filtered.num_rows();
+        entry.pending.push(filtered);
+    }
+    Ok(())
+}
+
+/// Remove exactly the snapshotted keyed entries from the live map: an entry
+/// is removed only when its stamp still matches — a key overwritten after
+/// the snapshot keeps its NEWER entry pending (it is not covered by the
+/// commit being accounted for).
+fn drain_keyed_snapshot(entry: &mut TableBuf, keyed: &[(Vec<u8>, u64, KeyedOp)]) {
+    if keyed.is_empty() {
+        return;
+    }
+    let Some(state) = entry.keyed.as_mut() else {
+        return;
+    };
+    for (key, stamp, _) in keyed {
+        if state.entries.get(key).is_some_and(|e| e.stamp == *stamp) {
+            state.entries.remove(key);
+        }
+    }
+}
+
+/// The `icegres.primary-key` property changed while keyed ops were pending
+/// for the table — fail the statement loudly (the buffered keys would no
+/// longer address the same rows). Cold path, factored for the error text.
+fn bail_pk_changed(ident: &TableIdent, had: &[String], now: &[String]) -> Result<()> {
+    Err(anyhow!(
+        "the primary key of {ident} changed from {had:?} to {now:?} while keyed tail \
+         ops were pending; flush the buffer (any fenced statement) before changing \
+         the {} property",
+        crate::overwrite::PK_PROPERTY
+    ))
+}
+
+/// Per-table keyed serialization locks (L1). One lock per keyed-activated
+/// table serializes every keyed read-modify-write's union-read → tail-frame
+/// window against (a) other keyed statements on the table, (b) the fenced
+/// synchronous UPDATE/DELETE path, and (c) explicit-txn COMMITs touching
+/// the table — so a committed synchronous write can never fall between a
+/// keyed statement's read and its frame and be clobbered by the stale
+/// full-row image at flush.
+///
+/// Lock ORDER (deadlock-critical, documented in the module docs): a
+/// keyed-serial lock is acquired FIRST — before `flush_lock` (the fenced
+/// path flushes while holding it) and before the tables mutex; neither is
+/// ever held while acquiring keyed-serial. Multi-table COMMITs acquire
+/// their keyed-serial locks in sorted ident order.
+#[derive(Default)]
+struct KeyedSerial {
+    locks: StdMutex<HashMap<TableIdent, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl KeyedSerial {
+    /// Get-or-create the table's lock (cloning the `Arc` so the caller can
+    /// `lock().await` without holding the map mutex).
+    fn lock_for(&self, ident: &TableIdent) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.locks.lock().expect("keyed-serial lock poisoned");
+        locks
+            .entry(ident.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+}
+
+/// One cached keyed-activation decision (S5), keyed by metadata location.
+struct ActivationEntry {
+    metadata_location: Option<String>,
+    activated: bool,
 }
 
 /// Shared in-memory write buffer + its flush machinery. Constructed once
@@ -354,6 +879,24 @@ pub struct WriteBuffer {
     tail: Option<Arc<dyn TailStore>>,
     /// Serializes flushes (background cadence vs. forced fences).
     flush_lock: tokio::sync::Mutex<()>,
+    /// Per-table keyed serialization (L1; see [`KeyedSerial`]).
+    keyed_serial: KeyedSerial,
+    /// S5 — per-table keyed-activation cache, so the fallback path never
+    /// pays a per-statement catalog `load_table` for tables that never
+    /// opted in. The caching rule: an entry is recorded from every place a
+    /// fresh `load_table` is otherwise unavoidable — a keyed-shaped
+    /// statement's own activation load, the fenced sync path's one-time
+    /// resolution, a buffered INSERT's first-touch schema load, boot
+    /// replay, and every scan's snapshot check (cache.rs calls
+    /// [`note_activation`](Self::note_activation) whenever it rebuilds its
+    /// provider from fresh metadata, which any commit — local or foreign —
+    /// triggers). It is invalidated wholesale by property-changing DDL
+    /// through this server (the BufferHook fence arm); a property flipped
+    /// by a FOREIGN writer is picked up by the next scan's rebuild. Staleness
+    /// is fail-safe in both directions: a stale "not activated" routes to
+    /// the always-correct synchronous path; a stale "activated" costs one
+    /// keyed-path load that re-checks the live property and re-records.
+    activation: StdMutex<HashMap<TableIdent, ActivationEntry>>,
     /// Wakes the flusher early when `max_rows` is hit.
     kick: tokio::sync::Notify,
 }
@@ -378,8 +921,64 @@ impl WriteBuffer {
             state: BufferState::default(),
             tail,
             flush_lock: tokio::sync::Mutex::new(()),
+            keyed_serial: KeyedSerial::default(),
+            activation: StdMutex::new(HashMap::new()),
             kick: tokio::sync::Notify::new(),
         }
+    }
+
+    /// The per-table keyed serialization lock (L1; see [`KeyedSerial`]).
+    /// `pub(crate)` so the transaction hook can serialize its COMMIT
+    /// against in-flight keyed read-modify-writes.
+    pub(crate) fn keyed_serial_lock(&self, ident: &TableIdent) -> Arc<tokio::sync::Mutex<()>> {
+        self.keyed_serial.lock_for(ident)
+    }
+
+    /// Record the keyed-activation decision fresh table metadata implies
+    /// (S5 — see the `activation` field for the caching rule). Cheap and
+    /// idempotent: an unchanged metadata location short-circuits.
+    pub fn note_activation(
+        &self,
+        ident: &TableIdent,
+        metadata_location: Option<&str>,
+        metadata: &TableMetadata,
+    ) {
+        let mut map = self.activation.lock().expect("activation lock poisoned");
+        if let Some(entry) = map.get(ident) {
+            if metadata_location.is_some()
+                && entry.metadata_location.as_deref() == metadata_location
+            {
+                return;
+            }
+        }
+        let activated =
+            keyed::property_is_true(metadata.properties().get(keyed::TAIL_UPSERT_PROPERTY));
+        map.insert(
+            ident.clone(),
+            ActivationEntry {
+                metadata_location: metadata_location.map(str::to_string),
+                activated,
+            },
+        );
+    }
+
+    /// The cached keyed-activation decision, if any (S5).
+    fn cached_activation(&self, ident: &TableIdent) -> Option<bool> {
+        self.activation
+            .lock()
+            .expect("activation lock poisoned")
+            .get(ident)
+            .map(|e| e.activated)
+    }
+
+    /// Drop every cached activation decision (S5): called by the fence arm
+    /// for property-changing DDL, so an `ALTER TABLE ... tail-upsert`
+    /// through this server takes effect on the very next statement.
+    pub fn invalidate_activation(&self) {
+        self.activation
+            .lock()
+            .expect("activation lock poisoned")
+            .clear();
     }
 
     pub fn max_rows(&self) -> usize {
@@ -441,6 +1040,8 @@ impl WriteBuffer {
                     ));
                 }
             };
+            // A load we pay anyway: record the activation decision (S5).
+            self.note_activation(&ident, table.metadata_location(), table.metadata());
             // Watermark = max(own namespaced property, local sidecar): the
             // sidecar survives a foreign writer dropping the property; the
             // property survives a crash before the sidecar write.
@@ -490,15 +1091,53 @@ impl WriteBuffer {
                 schema_to_arrow_schema(table.metadata().current_schema())
                     .map_err(|e| anyhow!("schema conversion failed for {ident}: {e}"))?,
             );
-            let batches: Vec<RecordBatch> = survivors.into_iter().flat_map(|(_, b)| b).collect();
-            // No tail here: the rows are already durable. align_batch inside
-            // fails loudly if the table's schema evolved past the frames.
-            let (rows, _) = self
-                .state
-                .append(&ident, Some(schema), &batches, None)
-                .with_context(|| format!("tail replay: cannot re-buffer rows for {ident}"))?;
+            // Keyed frames need the table's PK declaration to rebuild the
+            // map. Read it lazily (only when a keyed frame appears) so
+            // plain-append tables replay exactly as before.
+            let mut pk_cols: Option<Vec<String>> = None;
+            let mut rows_here = 0usize;
+            // Process frames IN SEQUENCE ORDER: appends re-enter `pending`,
+            // keyed ops rebuild the map last-writer-wins. No tail below:
+            // the frames are already durable. align_batch fails loudly if
+            // the table's schema evolved past the frames.
+            for (seq, op) in survivors {
+                match op {
+                    TailOp::Append(batches) => {
+                        let (rows, _) = self
+                            .state
+                            .append(&ident, Some(schema.clone()), &batches, None)
+                            .with_context(|| {
+                                format!("tail replay: cannot re-buffer rows for {ident}")
+                            })?;
+                        rows_here += rows;
+                    }
+                    TailOp::Upsert(_) | TailOp::Delete(_) => {
+                        let pk = match &pk_cols {
+                            Some(pk) => pk.clone(),
+                            None => {
+                                let pk = pk_columns_of(&table)?.ok_or_else(|| {
+                                    anyhow!(
+                                        "tail replay: {ident} holds keyed frames (acked \
+                                     updates/deletes) but declares no {} property; \
+                                     restore the property, or delete the table's tail \
+                                     state to acknowledge losing them",
+                                        crate::overwrite::PK_PROPERTY
+                                    )
+                                })?;
+                                pk_cols = Some(pk.clone());
+                                pk
+                            }
+                        };
+                        rows_here += self
+                            .replay_keyed_frame(&ident, &schema, &pk, seq, op)
+                            .with_context(|| {
+                                format!("tail replay: cannot re-buffer keyed op for {ident}")
+                            })?;
+                    }
+                }
+            }
             self.state.note_tail_high(&ident, max_seq);
-            recovered_rows += rows;
+            recovered_rows += rows_here;
             recovered_tables += 1;
         }
         tracing::info!(
@@ -508,6 +1147,69 @@ impl WriteBuffer {
              durable tail; the flusher will commit them"
         );
         Ok(())
+    }
+
+    /// Rebuild one keyed tail frame into the keyed map (boot replay; frames
+    /// arrive in sequence order, so plain map insertion IS last-writer-wins).
+    /// Returns the number of keyed ops applied.
+    fn replay_keyed_frame(
+        &self,
+        ident: &TableIdent,
+        schema: &ArrowSchemaRef,
+        pk_cols: &[String],
+        _seq: u64,
+        op: TailOp,
+    ) -> Result<usize> {
+        let mut applied = 0usize;
+        match op {
+            TailOp::Upsert(batches) => {
+                for batch in batches {
+                    let aligned = align_batch(&batch, schema)?;
+                    let key_rows = keyed::project_key_rows(&aligned, pk_cols)?;
+                    let keys = keyed::encode_batch_keys(&aligned, pk_cols)?;
+                    for (row, key) in keys.into_iter().enumerate() {
+                        let op = KeyedOp {
+                            key_row: key_rows.slice(row, 1),
+                            kind: KeyedKind::Upsert(aligned.slice(row, 1)),
+                        };
+                        self.state.keyed_write(
+                            ident,
+                            Some(schema.clone()),
+                            pk_cols,
+                            key,
+                            op,
+                            None,
+                        )?;
+                        applied += 1;
+                    }
+                }
+            }
+            TailOp::Delete(batches) => {
+                for batch in batches {
+                    // Key-only frame: re-align by name onto the canonical PK
+                    // types (schema evolution fails loudly, like align_batch).
+                    let key_batch = keyed::align_key_batch(&batch, schema, pk_cols)?;
+                    let keys = keyed::encode_batch_keys(&key_batch, pk_cols)?;
+                    for (row, key) in keys.into_iter().enumerate() {
+                        let op = KeyedOp {
+                            key_row: key_batch.slice(row, 1),
+                            kind: KeyedKind::Delete,
+                        };
+                        self.state.keyed_write(
+                            ident,
+                            Some(schema.clone()),
+                            pk_cols,
+                            key,
+                            op,
+                            None,
+                        )?;
+                        applied += 1;
+                    }
+                }
+            }
+            TailOp::Append(_) => unreachable!("the caller routes append frames"),
+        }
+        Ok(applied)
     }
 
     /// Start the background group-commit task: flush every `interval`, or
@@ -546,6 +1248,8 @@ impl WriteBuffer {
                 .load_table(ident)
                 .await
                 .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?;
+            // A load we pay anyway: record the activation decision (S5).
+            self.note_activation(ident, table.metadata_location(), table.metadata());
             Some(Arc::new(
                 schema_to_arrow_schema(table.metadata().current_schema())
                     .map_err(|e| anyhow!("schema conversion failed for {ident}: {e}"))?,
@@ -563,15 +1267,308 @@ impl WriteBuffer {
         Ok(rows)
     }
 
+    /// Keyed tail path for one autocommit UPDATE/DELETE (Phase 2,
+    /// docs/sota-roadmap.md §4). `Ok(None)` = not eligible — the caller
+    /// falls back to the unchanged fence-then-synchronous path. Eligible =
+    /// the statement is an exact-PK-equality UPDATE (literal SETs) or
+    /// DELETE, AND the table opts in (`icegres.tail-upsert=true` + declared
+    /// `icegres.primary-key` of renderable types), AND a durable tail is
+    /// attached. The ack is: resolve the key's current row through the same
+    /// union view a scan sees, apply the statement, fsync ONE keyed frame
+    /// to the tail, insert into the keyed map — no Iceberg commit until the
+    /// flush window closes.
+    pub async fn try_keyed_dml(
+        &self,
+        stmt: &Statement,
+        ctx: &SessionContext,
+    ) -> Result<Option<Response>> {
+        // Activation requires a durable tail (acked keyed ops must survive
+        // an unclean kill exactly like buffered inserts).
+        if self.tail.is_none() {
+            return Ok(None);
+        }
+        let Some(cand) = keyed::parse_keyed_candidate(stmt) else {
+            return Ok(None);
+        };
+        // S5: a cached "not activated" decision skips the catalog load
+        // entirely — an exact-PK-shaped sync DML on a never-opted table
+        // costs no new per-statement catalog round trip (see the
+        // `activation` field for the caching rule).
+        if self.cached_activation(&cand.ident) == Some(false) {
+            return Ok(None);
+        }
+        // Activation gate against the live table (also loads the metadata
+        // the union read below anchors to).
+        let table = match self.catalog.load_table(&cand.ident).await {
+            Ok(t) => t,
+            // Unknown table etc.: let the normal path produce the error.
+            Err(_) => return Ok(None),
+        };
+        self.note_activation(&cand.ident, table.metadata_location(), table.metadata());
+        if !keyed::property_is_true(
+            table
+                .metadata()
+                .properties()
+                .get(keyed::TAIL_UPSERT_PROPERTY),
+        ) {
+            return Ok(None);
+        }
+        // The table opted in: a broken PK declaration is now a loud error,
+        // not a silent fallback.
+        let Some(pk_cols) = pk_columns_of(&table)? else {
+            return Ok(None);
+        };
+        // WHERE must bind EVERY PK column exactly once and nothing else
+        // (S1: quoted identifiers bind only on an exact-case match); SET
+        // must not move the key.
+        if cand.eq.len() != pk_cols.len() {
+            return Ok(None);
+        }
+        for pk in &pk_cols {
+            let bound = cand
+                .eq
+                .iter()
+                .filter(|(c, _)| keyed::key_col_matches(c, pk))
+                .count();
+            if bound != 1 {
+                return Ok(None);
+            }
+        }
+        if cand
+            .assigned
+            .iter()
+            .any(|a| pk_cols.iter().any(|p| p.eq_ignore_ascii_case(a)))
+        {
+            return Ok(None);
+        }
+        let schema = Arc::new(
+            schema_to_arrow_schema(table.metadata().current_schema())
+                .map_err(|e| anyhow!("schema conversion failed for {}: {e}", cand.ident))?,
+        );
+        let pk_idx = keyed::pk_indices(&schema, &pk_cols)?;
+        if pk_idx
+            .iter()
+            .any(|&i| !keyed::key_type_supported(schema.field(i).data_type()))
+        {
+            return Ok(None);
+        }
+        // The key in canonical types. A literal the PK type cannot represent
+        // falls back — the synchronous path surfaces the same cast error the
+        // planner would.
+        let Ok(key_batch) = keyed::literals_to_key_batch(&cand.eq, &pk_cols, &schema) else {
+            return Ok(None);
+        };
+        let key = keyed::encode_batch_keys(&key_batch, &pk_cols)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("empty key batch"))?;
+        // S2: validate the statement against the schema BEFORE the key
+        // lookup, exactly as the sync path does at prepare time — an
+        // unknown SET column or un-castable SET literal errors identically
+        // whether or not the key matches (never a silent `UPDATE 0`).
+        crate::overwrite::validate_dml_against_schema(&cand.dml, &schema)
+            .await
+            .with_context(|| format!("DML against {} failed", cand.ident))?;
+
+        // L1: serialize this read-modify-write PER TABLE — against other
+        // keyed statements AND against the fenced synchronous path / txn
+        // COMMITs on keyed-activated tables (which take the same lock), so
+        // nothing can commit between the union read below and the tail
+        // frame and then be clobbered by our stale full-row image at flush.
+        let serial = self.keyed_serial.lock_for(&cand.ident);
+        let _rmw = serial.lock().await;
+        let predicate = cand
+            .dml
+            .predicate
+            .as_deref()
+            .expect("keyed candidates always carry a predicate");
+        // Resolve the key's current row: the keyed map is the newest layer
+        // (fast path, no IO); otherwise read through the same union view a
+        // scan sees (committed + pending + unseen flushed generations, with
+        // keyed suppression applied by the scan path itself).
+        let current: Vec<RecordBatch> = match self.state.keyed_lookup(&cand.ident, &key) {
+            Some(Some(row)) => vec![row],
+            Some(None) => Vec::new(), // deleted earlier in this window
+            None => {
+                let from = match &cand.dml.alias {
+                    Some(alias) => format!(
+                        "{}.{} AS {}",
+                        quote_ident(&cand.dml.namespace),
+                        quote_ident(&cand.dml.table),
+                        quote_ident(alias)
+                    ),
+                    None => format!(
+                        "{}.{}",
+                        quote_ident(&cand.dml.namespace),
+                        quote_ident(&cand.dml.table)
+                    ),
+                };
+                let sql = format!("SELECT * FROM {from} WHERE ({predicate}) LIMIT 2");
+                let df = ctx
+                    .sql(&sql)
+                    .await
+                    .map_err(|e| anyhow!("keyed lookup for {} failed to plan: {e}", cand.ident))?;
+                df.collect()
+                    .await
+                    .map_err(|e| anyhow!("keyed lookup for {} failed: {e}", cand.ident))?
+            }
+        };
+        let current_rows: usize = current.iter().map(|b| b.num_rows()).sum();
+        if current_rows == 0 {
+            // Missing key: 0 rows affected, nothing stored (same answer the
+            // synchronous path gives).
+            return Ok(Some(Response::Execution(Tag::new(cand.tag).with_rows(0))));
+        }
+        if current_rows > 1 {
+            // Duplicate keys exist (declaration != enforcement): only the
+            // synchronous path is honest about multi-row effects.
+            return Ok(None);
+        }
+        let nonempty: Vec<RecordBatch> = current.into_iter().filter(|b| b.num_rows() > 0).collect();
+        let current_row = align_batch(
+            &arrow::compute::concat_batches(&nonempty[0].schema(), &nonempty)
+                .map_err(|e| anyhow!("cannot assemble the current row: {e}"))?,
+            &schema,
+        )?;
+        let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+        let kind = match &cand.dml.kind {
+            DmlKind::Delete => {
+                // S1: re-evaluate the ORIGINAL predicate against the
+                // resolved current row exactly as the UPDATE branch does —
+                // any residual divergence between key derivation and the
+                // engine's comparison semantics becomes an honest DELETE 0
+                // instead of deleting a row sync would not match.
+                let (matched, out) =
+                    apply_dml_to_batches(&cand.dml, &columns, vec![current_row.clone()]).await?;
+                if matched == 0 {
+                    return Ok(Some(Response::Execution(Tag::new(cand.tag).with_rows(0))));
+                }
+                let rows_out: usize = out.iter().map(|b| b.num_rows()).sum();
+                anyhow::ensure!(
+                    matched == 1 && rows_out == 0,
+                    "keyed DELETE row accounting mismatch: 1 row in, {matched} matched, \
+                     {rows_out} out"
+                );
+                KeyedKind::Delete
+            }
+            DmlKind::Update { .. } => {
+                let (matched, out) =
+                    apply_dml_to_batches(&cand.dml, &columns, vec![current_row.clone()]).await?;
+                if matched == 0 {
+                    // The predicate re-evaluated false on the resolved row
+                    // (e.g. a cast quirk): honest 0-row answer.
+                    return Ok(Some(Response::Execution(Tag::new(cand.tag).with_rows(0))));
+                }
+                let rows_out: usize = out.iter().map(|b| b.num_rows()).sum();
+                anyhow::ensure!(
+                    rows_out == 1,
+                    "keyed UPDATE row accounting mismatch: 1 row in, {rows_out} out"
+                );
+                let replacement = align_batch(
+                    &arrow::compute::concat_batches(&out[0].schema(), &out)
+                        .map_err(|e| anyhow!("cannot assemble the replacement row: {e}"))?,
+                    &schema,
+                )?;
+                KeyedKind::Upsert(replacement)
+            }
+        };
+        // Durable tail append + map insert, under the buffer lock (ordering
+        // vs. inserts) — the statement's ack rides on this succeeding.
+        let (keyed_total, pending_rows) = self.state.keyed_write(
+            &cand.ident,
+            Some(schema),
+            &pk_cols,
+            key,
+            KeyedOp {
+                key_row: key_batch,
+                kind,
+            },
+            self.tail.as_deref(),
+        )?;
+        if keyed_total + pending_rows >= self.max_rows {
+            self.kick.notify_one();
+        }
+        Ok(Some(Response::Execution(Tag::new(cand.tag).with_rows(1))))
+    }
+
+    /// L1(b): the fenced synchronous UPDATE/DELETE arm for KEYED-ACTIVATED
+    /// tables. `Ok(None)` = the table is not keyed-activated (or the
+    /// statement is a shape the DML hook must reject itself) — the caller
+    /// falls through to the plain fence + DmlHook path unchanged. When it
+    /// IS activated, the fence flush and the synchronous execution run
+    /// under the table's keyed-serial lock, so no keyed read-modify-write
+    /// can slip its union read between them and later clobber this
+    /// statement's committed effect with a stale full-row image.
+    pub async fn try_serialized_sync_dml(&self, stmt: &Statement) -> Result<Option<Response>> {
+        // Without a tail no table can be keyed-activated on this server —
+        // nothing to serialize against.
+        if self.tail.is_none() {
+            return Ok(None);
+        }
+        // Unsupported shapes fall through so DmlHook produces its own
+        // rejection (identical errors, nothing executed => no race).
+        let Ok(Some((dml, tag))) = crate::dml::translate(stmt) else {
+            return Ok(None);
+        };
+        let Ok(ident) = TableIdent::from_strs([dml.namespace.as_str(), dml.table.as_str()]) else {
+            return Ok(None);
+        };
+        let activated = match self.cached_activation(&ident) {
+            Some(a) => a,
+            // Unknown table: resolve once (amortized — the decision is
+            // cached under the caching rule on the `activation` field;
+            // never-opted tables pay no per-statement load).
+            None => match self.catalog.load_table(&ident).await {
+                Ok(t) => {
+                    self.note_activation(&ident, t.metadata_location(), t.metadata());
+                    keyed::property_is_true(
+                        t.metadata().properties().get(keyed::TAIL_UPSERT_PROPERTY),
+                    )
+                }
+                Err(_) => return Ok(None),
+            },
+        };
+        if !activated {
+            return Ok(None);
+        }
+        // Keyed-serial FIRST, then the fence flush (which takes flush_lock)
+        // — the documented lock order. Held across the synchronous commit.
+        let serial = self.keyed_serial.lock_for(&ident);
+        let _serial = serial.lock().await;
+        if self.state.has_pending() {
+            self.flush_now()
+                .await
+                .context("write-buffer flush (required before this statement) failed")?;
+        }
+        let outcome = self.engine.execute(&dml).await?;
+        Ok(Some(Response::Execution(
+            Tag::new(tag).with_rows(outcome.rows as usize),
+        )))
+    }
+
     /// The union overlay for one table against the committed metadata a
     /// scan just loaded: all pending rows plus committed generations that
     /// metadata cannot see yet. `None` when there is nothing to add
     /// (fast path — scans are unchanged when the buffer is idle).
-    pub fn overlay(&self, ident: &TableIdent, metadata: &TableMetadata) -> Option<Overlay> {
+    pub fn overlay(&self, ident: &TableIdent, metadata: &TableMetadata) -> Result<Option<Overlay>> {
+        // L3: a watermark-tagged generation (parked by the prepare-time
+        // already-committed guard) is contained in metadata exactly when
+        // the metadata's OWN tail watermark property covers its mark.
+        let scan_mark = self.tail.as_deref().and_then(|t| {
+            parse_watermark_property(
+                ident,
+                metadata
+                    .properties()
+                    .get(t.watermark_property())
+                    .map(String::as_str),
+            )
+        });
         // A generation `S` is "committed" (and so already in the scan's data)
         // exactly when the just-loaded metadata contains it.
-        self.state
-            .overlay_with(ident, |s| metadata.snapshot_by_id(s).is_some())
+        self.state.overlay_with(ident, |commit| match commit {
+            GenCommit::Snapshot(s) => metadata.snapshot_by_id(*s).is_some(),
+            GenCommit::CoveredByWatermark(mark) => scan_mark.is_some_and(|w| w >= *mark),
+        })
     }
 
     /// Synchronously flush every table's pending rows (ordering fence /
@@ -598,9 +1595,17 @@ impl WriteBuffer {
         self.state.has_pending()
     }
 
-    /// Group-commit one table's pending rows as ONE snapshot, with bounded
-    /// optimistic-concurrency retries (fresh metadata per attempt, exactly
-    /// like autocommit INSERT).
+    /// Group-commit one table's pending rows AND coalesced keyed ops as ONE
+    /// snapshot, with bounded optimistic-concurrency retries (fresh metadata
+    /// per attempt, exactly like autocommit INSERT). Keyed ops compose as
+    /// `[Append(pending), Delete(all keyed keys), Append(upsert rows)]` —
+    /// appends fold through the later delete, and by the insert-routing
+    /// invariant (L2, [`route_appends`]) a pending append whose key has a
+    /// keyed entry is always OLDER than that entry, so the fold only ever
+    /// erases rows a later keyed op superseded — exactly as the overlay
+    /// hides them (an insert acked AFTER the keyed op became the key's
+    /// upsert row instead and survives); N updates to one hot row become
+    /// ONE file rewrite.
     async fn flush_table(&self, ident: &TableIdent) -> Result<()> {
         // Rotate the tail ONCE per flush, before the commit is built: new
         // appends land in a fresh segment, so a successful commit can delete
@@ -612,15 +1617,22 @@ impl WriteBuffer {
         }
         let mut conflicts: Vec<String> = Vec::new();
         for attempt in 1..=MAX_COMMIT_ATTEMPTS {
-            // Snapshot the current pending prefix WITHOUT removing it: the
-            // rows must stay readable through the union view while the
-            // commit is in flight. New inserts append behind the prefix.
+            // Snapshot the current pending prefix + keyed map WITHOUT
+            // removing anything: the rows must stay readable through the
+            // union view while the commit is in flight. New inserts append
+            // behind the prefix; newer keyed writes overwrite by stamp.
             // `tail_mark` is the generation's exact watermark (taken under
             // the same lock, see snapshot_pending).
-            let (batches, n_batches, tail_mark) = self.state.snapshot_pending(ident);
-            if n_batches == 0 {
+            let snap = self.state.snapshot_pending(ident);
+            if snap.is_empty() {
                 return Ok(());
             }
+            let PendingSnapshot {
+                batches,
+                n_batches,
+                keyed: keyed_snapshot,
+                tail_mark,
+            } = snap;
             // LOAD-BEARING: reload the table metadata on EVERY attempt. The
             // fresh properties feed the generation_already_committed guard
             // below, and the fresh snapshot pins the commit's
@@ -635,8 +1647,42 @@ impl WriteBuffer {
                 .await
                 .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?;
             let pk = self.engine.pk_columns(&table)?;
-            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-            let ops = [TableOp::Append(batches)];
+            let rows: usize =
+                batches.iter().map(|b| b.num_rows()).sum::<usize>() + keyed_snapshot.len();
+            // Compose the window: pending inserts first, then ONE delete
+            // covering every keyed key (updated AND deleted), then the
+            // replacement rows of the upserts. `prepare_commit` folds each
+            // Append through every LATER Dml op, so ordering is semantic.
+            let mut ops: Vec<TableOp> = Vec::with_capacity(3);
+            if !batches.is_empty() {
+                ops.push(TableOp::Append(batches));
+            }
+            if !keyed_snapshot.is_empty() {
+                let key_rows: Vec<RecordBatch> = keyed_snapshot
+                    .iter()
+                    .map(|(_, _, op)| op.key_row.clone())
+                    .collect();
+                let keys_batch = arrow::compute::concat_batches(&key_rows[0].schema(), &key_rows)
+                    .map_err(|e| anyhow!("cannot concatenate keyed keys: {e}"))?;
+                let predicate = keyed::render_keys_predicate(&keys_batch)?;
+                ops.push(TableOp::Dml(DmlStatement {
+                    kind: DmlKind::Delete,
+                    namespace: ident.namespace().clone().inner().join("."),
+                    table: ident.name().to_string(),
+                    alias: None,
+                    predicate: Some(predicate),
+                }));
+                let upserts: Vec<RecordBatch> = keyed_snapshot
+                    .iter()
+                    .filter_map(|(_, _, op)| match &op.kind {
+                        KeyedKind::Upsert(row) => Some(row.clone()),
+                        KeyedKind::Delete => None,
+                    })
+                    .collect();
+                if !upserts.is_empty() {
+                    ops.push(TableOp::Append(upserts));
+                }
+            }
             // Record the drained tail sequence in the SAME atomic commit
             // (the exactly-once watermark boot replay filters against),
             // under THIS tail's namespaced key only. Never regress a
@@ -657,11 +1703,15 @@ impl WriteBuffer {
                     // error + failed disambiguation reload re-queued it).
                     // Re-posting would double-apply the rows. Run the
                     // Committed-arm bookkeeping instead: park the rows as a
-                    // flushed generation tagged with a snapshot this
-                    // metadata already contains (new scans exclude it;
-                    // in-flight ones still see the rows until GC), then
-                    // sidecar + truncate the covered tail frames — the
-                    // reload-failure residual heals on the next flush.
+                    // flushed generation tagged "covered at-or-before
+                    // watermark <mark>" (L3) — NOT with a guessed snapshot
+                    // id: the guard's branch head may POSTDATE the real
+                    // commit, and a scan of an intermediate snapshot (own
+                    // watermark < mark) must still overlay these rows while
+                    // one at-or-past the real commit (watermark >= mark)
+                    // must exclude them. Then sidecar + truncate the
+                    // covered tail frames — the reload-failure residual
+                    // heals on the next flush.
                     if generation_already_committed(prev, mark) {
                         tracing::warn!(
                             table = %ident,
@@ -672,19 +1722,12 @@ impl WriteBuffer {
                              tail watermark (an earlier ambiguous flush LANDED); \
                              skipping the post instead of double-applying"
                         );
-                        let seen_snapshot = table
-                            .metadata()
-                            .snapshot_for_ref(self.engine.branch())
-                            .map(|s| s.snapshot_id())
-                            .or_else(|| table.metadata().current_snapshot_id());
-                        match seen_snapshot {
-                            Some(s) => self.state.move_pending_to_flushed(ident, n_batches, s),
-                            // No snapshot in the metadata at all (cannot
-                            // happen when the watermark was stamped by a
-                            // snapshot commit, but stay safe): the rows are
-                            // committed — drop them outright.
-                            None => self.state.drop_pending_prefix(ident, n_batches),
-                        }
+                        self.state.move_pending_to_flushed_covered(
+                            ident,
+                            n_batches,
+                            &keyed_snapshot,
+                            mark,
+                        );
                         tail_truncate_covered(self.tail.as_deref(), ident, tail_mark);
                         return Ok(());
                     }
@@ -703,11 +1746,12 @@ impl WriteBuffer {
             .await
             .map_err(|e| anyhow!("buffered flush of {ident} failed to prepare: {e:#}"))?
             else {
-                // Zero net rows (shouldn't happen for a non-empty append
-                // list, but handle it: drop the prefix, nothing to commit).
-                // The covered tail frames also net zero rows on any future
+                // Zero net rows (e.g. a keyed delete of keys absent
+                // everywhere): drop the snapshot, nothing to commit. The
+                // covered tail frames also net zero rows on any future
                 // replay, so forgetting them without a commit is safe.
-                self.state.drop_pending_prefix(ident, n_batches);
+                self.state
+                    .drop_pending_prefix(ident, n_batches, &keyed_snapshot);
                 tail_truncate_covered(self.tail.as_deref(), ident, tail_mark);
                 return Ok(());
             };
@@ -715,7 +1759,7 @@ impl WriteBuffer {
             // Tag the prefix as flushed(S) BEFORE posting: see the module
             // docs for why this ordering makes the union race-free.
             self.state
-                .move_pending_to_flushed(ident, n_batches, snapshot_id);
+                .move_pending_to_flushed(ident, n_batches, &keyed_snapshot, snapshot_id);
             match self.engine.post_prepared(ident, &prepared).await {
                 Ok(CommitOutcome::Committed) => {
                     // The commit carries the watermark, so the covered tail
@@ -883,8 +1927,11 @@ fn tail_truncate_covered(tail: Option<&dyn TailStore>, ident: &TableIdent, mark:
 ///
 /// * autocommit INSERT (no open transaction, PK enforcement off) is acked
 ///   from the buffer;
-/// * ordering fences (UPDATE/DELETE, BEGIN, DDL, PK-enforced INSERT) flush
-///   synchronously and fall through (`None`) to their normal handler;
+/// * autocommit UPDATE/DELETE by exact PK equality on an opted-in keyed
+///   table (`icegres.tail-upsert`) is acked from the keyed tail;
+/// * ordering fences (non-keyed UPDATE/DELETE, BEGIN, DDL, PK-enforced
+///   INSERT) flush synchronously and fall through (`None`) to their normal
+///   handler;
 /// * everything else (SELECT, SET/SHOW, COMMIT/ROLLBACK, statements on a
 ///   connection with an open transaction) passes through untouched — reads
 ///   get buffer visibility via the union in `cache.rs`, transactions flushed
@@ -956,20 +2003,66 @@ impl BufferHook {
             | Statement::ShowStatus { .. }
             | Statement::Commit { .. }
             | Statement::Rollback { .. } => None,
-            // Everything else — UPDATE/DELETE, BEGIN, DDL, PK-enforced
-            // INSERT, COPY, ... — is an ordering fence: acked rows must be
-            // committed before it runs on its normal path.
-            _ => {
-                if self.buffer.has_pending() {
-                    if let Err(e) = self.buffer.flush_now().await {
-                        return Some(Err(dml::engine_error(&anyhow!(
-                            "write-buffer flush (required before this statement) failed: {e:#}"
-                        ))));
+            // UPDATE/DELETE: exact-PK-equality statements on an opted-in
+            // table (icegres.tail-upsert + icegres.primary-key, durable
+            // tail attached) ack from the keyed tail — no fence, no COW
+            // commit until the flush window. Anything else on a
+            // keyed-ACTIVATED table runs fence + synchronous execution
+            // under the table's keyed-serial lock (L1 — a concurrent keyed
+            // RMW must not clobber the committed sync write); anything else
+            // again (incl. bind parameters, which the DML engine rejects
+            // downstream) falls through to the fence below.
+            Statement::Update { .. } | Statement::Delete(_) => {
+                let has_params = params.is_some_and(|p| match p {
+                    ParamValues::List(l) => !l.is_empty(),
+                    ParamValues::Map(m) => !m.is_empty(),
+                });
+                if !has_params {
+                    match self.buffer.try_keyed_dml(stmt, shared).await {
+                        Ok(Some(resp)) => return Some(Ok(resp)),
+                        Ok(None) => {} // not keyed-shaped: sync path below
+                        Err(e) => return Some(Err(dml::engine_error(&e))),
+                    }
+                    match self.buffer.try_serialized_sync_dml(stmt).await {
+                        Ok(Some(resp)) => return Some(Ok(resp)),
+                        Ok(None) => {} // not keyed-activated: plain fence
+                        Err(e) => return Some(Err(dml::engine_error(&e))),
                     }
                 }
-                None
+                self.fence().await
+            }
+            // Everything else — BEGIN, DDL, PK-enforced INSERT, COPY, ... —
+            // is an ordering fence: acked rows must be committed before it
+            // runs on its normal path. Property-changing DDL additionally
+            // invalidates the keyed-activation cache (S5), so an
+            // `ALTER TABLE ... icegres.tail-upsert` through this server is
+            // honored by the very next statement.
+            _ => {
+                if matches!(
+                    stmt,
+                    Statement::AlterTable { .. }
+                        | Statement::Drop { .. }
+                        | Statement::CreateTable(_)
+                ) {
+                    self.buffer.invalidate_activation();
+                }
+                self.fence().await
             }
         }
+    }
+
+    /// The ordering fence: force a synchronous flush of every pending row
+    /// and keyed op, then fall through (`None`) to the statement's normal
+    /// handler. A flush failure is the statement's error.
+    async fn fence(&self) -> Option<PgWireResult<Response>> {
+        if self.buffer.has_pending() {
+            if let Err(e) = self.buffer.flush_now().await {
+                return Some(Err(dml::engine_error(&anyhow!(
+                    "write-buffer flush (required before this statement) failed: {e:#}"
+                ))));
+            }
+        }
+        None
     }
 }
 
@@ -1037,6 +2130,13 @@ mod tests {
         RecordBatch::try_new(sch.clone(), vec![Arc::new(Int64Array::from(vals.to_vec()))]).unwrap()
     }
 
+    /// The old 3-tuple view of a pending snapshot (most tests only need
+    /// the append side).
+    fn snap3(st: &BufferState) -> (Vec<RecordBatch>, usize, Option<u64>) {
+        let s = st.snapshot_pending(&ident());
+        (s.batches, s.n_batches, s.tail_mark)
+    }
+
     /// Flatten an overlay's batches into the id column, in order.
     fn ids(ov: &Overlay) -> Vec<i64> {
         let mut out = Vec::new();
@@ -1068,6 +2168,7 @@ mod tests {
         assert!(st.has_pending());
         let ov = st
             .overlay_with(&ident(), |_| false)
+            .unwrap()
             .expect("pending rows present");
         assert_eq!(ids(&ov), vec![1, 2, 3]);
     }
@@ -1082,19 +2183,23 @@ mod tests {
         let sch = schema();
         st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[1, 2])], None)
             .unwrap();
-        let (_batches, n, _) = st.snapshot_pending(&ident());
+        let (_batches, n, _) = snap3(&st);
         assert_eq!(n, 1); // one batch
         let s: i64 = 4242;
-        st.move_pending_to_flushed(&ident(), n, s);
+        st.move_pending_to_flushed(&ident(), n, &[], s);
         // No pending rows left; the rows now live only in flushed(S).
         assert!(!st.has_pending());
         // Scan whose metadata already contains S: committed scan has the rows,
         // so the overlay must add NOTHING.
-        assert!(st.overlay_with(&ident(), |x| x == s).is_none());
+        assert!(st
+            .overlay_with(&ident(), |c| *c == GenCommit::Snapshot(s))
+            .unwrap()
+            .is_none());
         // Scan whose metadata predates S: the committed scan lacks the rows,
         // so the overlay must supply them from the flushed generation.
         let ov = st
             .overlay_with(&ident(), |_| false)
+            .unwrap()
             .expect("unseen flushed gen");
         assert_eq!(ids(&ov), vec![1, 2]);
     }
@@ -1111,21 +2216,27 @@ mod tests {
             .unwrap();
         st.append(&ident(), None, &[batch(&sch, &[2])], None)
             .unwrap();
-        let (_b, n, _) = st.snapshot_pending(&ident());
+        let (_b, n, _) = snap3(&st);
         assert_eq!(n, 2);
         let s: i64 = 99;
-        st.move_pending_to_flushed(&ident(), n, s);
+        st.move_pending_to_flushed(&ident(), n, &[], s);
         // A new insert C=[3] lands while the commit is "in flight".
         st.append(&ident(), None, &[batch(&sch, &[3])], None)
             .unwrap();
         // Commit conflicts: restore the flushed prefix to the front.
         st.move_flushed_back_to_pending(&ident(), s);
         // Row accounting and order: [1,2] restored ahead of [3].
-        let ov = st.overlay_with(&ident(), |_| false).expect("rows present");
+        let ov = st
+            .overlay_with(&ident(), |_| false)
+            .unwrap()
+            .expect("rows present");
         assert_eq!(ids(&ov), vec![1, 2, 3]);
         // And with the (now-abandoned) S considered committed, the flushed gen
         // is gone from flushed (it was moved back), so all three are pending.
-        let ov2 = st.overlay_with(&ident(), |x| x == s).expect("rows present");
+        let ov2 = st
+            .overlay_with(&ident(), |c| *c == GenCommit::Snapshot(s))
+            .unwrap()
+            .expect("rows present");
         assert_eq!(ids(&ov2), vec![1, 2, 3]);
     }
 
@@ -1142,10 +2253,10 @@ mod tests {
             None,
         )
         .unwrap();
-        let (_b, n, _) = st.snapshot_pending(&ident());
-        st.drop_pending_prefix(&ident(), n);
+        let (_b, n, _) = snap3(&st);
+        st.drop_pending_prefix(&ident(), n, &[]);
         assert!(!st.has_pending());
-        assert!(st.overlay_with(&ident(), |_| false).is_none());
+        assert!(st.overlay_with(&ident(), |_| false).unwrap().is_none());
     }
 
     // GC drops flushed generations by predicate (real code: older than
@@ -1156,15 +2267,18 @@ mod tests {
         let sch = schema();
         st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[7])], None)
             .unwrap();
-        let (_b, n, _) = st.snapshot_pending(&ident());
+        let (_b, n, _) = snap3(&st);
         let s: i64 = 5;
-        st.move_pending_to_flushed(&ident(), n, s);
+        st.move_pending_to_flushed(&ident(), n, &[], s);
         // Keep-everything predicate: generation survives, still overlays.
         st.retain_flushed(|_| true);
-        assert_eq!(ids(&st.overlay_with(&ident(), |_| false).unwrap()), vec![7]);
+        assert_eq!(
+            ids(&st.overlay_with(&ident(), |_| false).unwrap().unwrap()),
+            vec![7]
+        );
         // Drop-everything predicate (stands in for "too old"): gone.
         st.retain_flushed(|_| false);
-        assert!(st.overlay_with(&ident(), |_| false).is_none());
+        assert!(st.overlay_with(&ident(), |_| false).unwrap().is_none());
     }
 
     // pending_idents reports only tables with pending rows; moving to flushed
@@ -1177,8 +2291,8 @@ mod tests {
         st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[1])], None)
             .unwrap();
         assert_eq!(st.pending_idents(), vec![ident()]);
-        let (_b, n, _) = st.snapshot_pending(&ident());
-        st.move_pending_to_flushed(&ident(), n, 1);
+        let (_b, n, _) = snap3(&st);
+        st.move_pending_to_flushed(&ident(), n, &[], 1);
         assert!(st.pending_idents().is_empty()); // pending drained into flushed
     }
 
@@ -1195,15 +2309,23 @@ mod tests {
         fail_watermarks: std::sync::atomic::AtomicBool,
         /// (table, seq, batch_count, total_rows) per STATEMENT append.
         appends: StdMutex<Vec<(TableIdent, u64, usize, usize)>>,
+        /// Op kind per append, aligned with `appends`.
+        kinds: StdMutex<Vec<TailOpKind>>,
         truncates: StdMutex<Vec<(TableIdent, u64)>>,
         watermarks: StdMutex<Vec<(TableIdent, u64)>>,
     }
 
     impl TailStore for MockTail {
-        fn append(&self, table: &TableIdent, batches: &[RecordBatch]) -> Result<u64> {
+        fn append(
+            &self,
+            table: &TableIdent,
+            kind: TailOpKind,
+            batches: &[RecordBatch],
+        ) -> Result<u64> {
             if self.fail_appends.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(anyhow!("mock tail: disk on fire"));
             }
+            self.kinds.lock().unwrap().push(kind);
             let seq = self
                 .next_seq
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -1277,7 +2399,7 @@ mod tests {
             *tail.appends.lock().unwrap(),
             vec![(ident(), 1, 2, 3), (ident(), 2, 1, 1)]
         );
-        let (_batches, n, mark) = st.snapshot_pending(&ident());
+        let (_batches, n, mark) = snap3(&st);
         assert_eq!((n, mark), (3, Some(2)));
     }
 
@@ -1302,7 +2424,7 @@ mod tests {
         assert!(!st.has_pending());
         assert!(tail.appends.lock().unwrap().is_empty());
         // The mark never moved either: no watermark could cover the failure.
-        assert_eq!(st.snapshot_pending(&ident()).2, None);
+        assert_eq!(snap3(&st).2, None);
     }
 
     // The flush success path truncates at exactly the generation's mark
@@ -1323,10 +2445,10 @@ mod tests {
         .unwrap();
         st.append(&ident(), None, &[batch(&sch, &[2])], Some(&tail))
             .unwrap();
-        let (_batches, n, mark) = st.snapshot_pending(&ident());
+        let (_batches, n, mark) = snap3(&st);
         assert_eq!((n, mark), (2, Some(2)));
         // ... prepare + post succeed (mocked away), then:
-        st.move_pending_to_flushed(&ident(), n, 7);
+        st.move_pending_to_flushed(&ident(), n, &[], 7);
         tail_truncate_covered(Some(&tail), &ident(), mark);
         assert_eq!(*tail.truncates.lock().unwrap(), vec![(ident(), 2)]);
         // The covered watermark was recorded in the sidecar (second gate)
@@ -1373,11 +2495,11 @@ mod tests {
         st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[5])], None)
             .unwrap();
         st.note_tail_high(&ident(), 41);
-        let (_batches, n, mark) = st.snapshot_pending(&ident());
+        let (_batches, n, mark) = snap3(&st);
         assert_eq!((n, mark), (1, Some(41)));
         // note_tail_high never regresses the mark.
         st.note_tail_high(&ident(), 12);
-        assert_eq!(st.snapshot_pending(&ident()).2, Some(41));
+        assert_eq!(snap3(&st).2, Some(41));
     }
 
     // FIX (r3-1): a FRAMELESS tail dir whose table cannot load from the
@@ -1390,11 +2512,19 @@ mod tests {
         let tail = MockTail::default();
         // Sidecar 7 → floor 8: the next handed-out seq clears the watermark.
         apply_sidecar_seq_floor(&tail, &ident(), Some(7)).unwrap();
-        assert_eq!(tail.append(&ident(), &[batch(&sch, &[1])]).unwrap(), 8);
+        assert_eq!(
+            tail.append(&ident(), TailOpKind::Append, &[batch(&sch, &[1])])
+                .unwrap(),
+            8
+        );
         // No sidecar: nothing to floor from, and no error either.
         let bare = MockTail::default();
         apply_sidecar_seq_floor(&bare, &ident(), None).unwrap();
-        assert_eq!(bare.append(&ident(), &[batch(&sch, &[1])]).unwrap(), 1);
+        assert_eq!(
+            bare.append(&ident(), TailOpKind::Append, &[batch(&sch, &[1])])
+                .unwrap(),
+            1
+        );
     }
 
     // FIX (r3-5): the prepare-time already-committed guard fires exactly
@@ -1424,8 +2554,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(total0, 3);
-        let (_b, n, _) = st.snapshot_pending(&ident());
-        st.move_pending_to_flushed(&ident(), n, 1);
+        let (_b, n, _) = snap3(&st);
+        st.move_pending_to_flushed(&ident(), n, &[], 1);
         // Appending after the move must not corrupt the count.
         let (_r2, total1) = st
             .append(&ident(), None, &[batch(&sch, &[4])], None)
@@ -1433,7 +2563,643 @@ mod tests {
         assert_eq!(total1, 1); // only the new row is pending
         st.move_flushed_back_to_pending(&ident(), 1);
         // Back to 4 pending rows, in order.
-        let ov = st.overlay_with(&ident(), |_| false).unwrap();
+        let ov = st.overlay_with(&ident(), |_| false).unwrap().unwrap();
         assert_eq!(ids(&ov), vec![1, 2, 3, 4]);
+    }
+
+    // -----------------------------------------------------------------------
+    // PHASE 2 — keyed tail state: per-key last-writer-wins, layered overlay
+    // suppression, stamp-exact snapshot drain/restore, replay rebuild.
+    // -----------------------------------------------------------------------
+
+    use arrow::array::StringArray;
+
+    /// Two-column schema (id PK, val payload) for the keyed tests.
+    fn kschema() -> ArrowSchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("val", DataType::Utf8, true),
+        ]))
+    }
+
+    fn pk() -> Vec<String> {
+        vec!["id".to_string()]
+    }
+
+    fn krow(id: i64, val: &str) -> RecordBatch {
+        RecordBatch::try_new(
+            kschema(),
+            vec![
+                Arc::new(Int64Array::from(vec![id])),
+                Arc::new(StringArray::from(vec![val])),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn kbatch(rows: &[(i64, &str)]) -> RecordBatch {
+        RecordBatch::try_new(
+            kschema(),
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn key_row(id: i64) -> RecordBatch {
+        krow(id, "").project(&[0]).unwrap()
+    }
+
+    fn key_of(id: i64) -> Vec<u8> {
+        keyed::encode_batch_keys(&key_row(id), &pk())
+            .unwrap()
+            .remove(0)
+    }
+
+    fn write_upsert(st: &BufferState, id: i64, val: &str, tail: Option<&dyn TailStore>) {
+        st.keyed_write(
+            &ident(),
+            Some(kschema()),
+            &pk(),
+            key_of(id),
+            KeyedOp {
+                key_row: key_row(id),
+                kind: KeyedKind::Upsert(krow(id, val)),
+            },
+            tail,
+        )
+        .unwrap();
+    }
+
+    fn write_delete(st: &BufferState, id: i64, tail: Option<&dyn TailStore>) {
+        st.keyed_write(
+            &ident(),
+            Some(kschema()),
+            &pk(),
+            key_of(id),
+            KeyedOp {
+                key_row: key_row(id),
+                kind: KeyedKind::Delete,
+            },
+            tail,
+        )
+        .unwrap();
+    }
+
+    fn upserted_val(st: &BufferState, id: i64) -> String {
+        let row = st
+            .keyed_lookup(&ident(), &key_of(id))
+            .expect("entry present")
+            .expect("entry is an upsert");
+        row.column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0)
+            .to_string()
+    }
+
+    fn vals(ov: &Overlay) -> Vec<(i64, String)> {
+        let mut out = Vec::new();
+        for b in &ov.batches {
+            let row_ids = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let vs = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+            for r in 0..b.num_rows() {
+                out.push((row_ids.value(r), vs.value(r).to_string()));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    // Keyed map LWW ordering: update-then-update keeps the second value,
+    // update-then-delete deletes, delete-then-insert(=upsert) resurrects —
+    // exactly what replay's in-seq-order rebuild produces too (boot replay
+    // pushes keyed frames through this same keyed_write path in sequence
+    // order).
+    #[test]
+    fn keyed_map_lww_ordering() {
+        let st = BufferState::default();
+        // update then update: second wins.
+        write_upsert(&st, 1, "v1", None);
+        write_upsert(&st, 1, "v2", None);
+        assert_eq!(upserted_val(&st, 1), "v2");
+        // update then delete: deleted.
+        write_delete(&st, 1, None);
+        assert!(st
+            .keyed_lookup(&ident(), &key_of(1))
+            .expect("entry present")
+            .is_none());
+        // delete then insert = upsert: the row is back.
+        write_upsert(&st, 1, "v3", None);
+        assert_eq!(upserted_val(&st, 1), "v3");
+        // Unknown key: no entry.
+        assert!(st.keyed_lookup(&ident(), &key_of(9)).is_none());
+        // Keyed entries count as pending work.
+        assert!(st.has_pending());
+        assert_eq!(st.pending_idents(), vec![ident()]);
+    }
+
+    // Overlay suppression: a pending INSERT of a key that is then
+    // keyed-deleted disappears from the overlay; a keyed upsert both adds
+    // its new row AND suppresses the committed row (via `suppress`).
+    #[test]
+    fn overlay_suppresses_keyed_rows() {
+        let st = BufferState::default();
+        // Pending inserts id=1,2.
+        st.append(
+            &ident(),
+            Some(kschema()),
+            &[kbatch(&[(1, "x"), (2, "y")])],
+            None,
+        )
+        .unwrap();
+        // Keyed delete of 1 (and its committed twin), keyed update of 3.
+        write_delete(&st, 1, None);
+        write_upsert(&st, 3, "new", None);
+        let ov = st.overlay_with(&ident(), |_| false).unwrap().unwrap();
+        // Pending id=1 is hidden; id=2 survives; upsert row id=3 unions in.
+        assert_eq!(
+            vals(&ov),
+            vec![(2, "y".to_string()), (3, "new".to_string())]
+        );
+        // The committed scan must suppress BOTH keyed keys.
+        let sup = ov.suppress.expect("keyed suppression present");
+        assert_eq!(sup.pk_cols, pk());
+        assert!(sup.keys.contains(&key_of(1)));
+        assert!(sup.keys.contains(&key_of(3)));
+        assert!(!sup.keys.contains(&key_of(2)));
+    }
+
+    // A keyed flushed(S) generation overlays for scans whose metadata
+    // predates S (rows + suppression) and vanishes once S is committed;
+    // a NEWER pending keyed op suppresses the older generation's row.
+    #[test]
+    fn keyed_flushed_generation_layering() {
+        let st = BufferState::default();
+        write_upsert(&st, 1, "v1", None);
+        let snap = st.snapshot_pending(&ident());
+        assert_eq!(snap.keyed.len(), 1);
+        let s: i64 = 77;
+        st.move_pending_to_flushed(&ident(), 0, &snap.keyed, s);
+        // Metadata predating S: the generation supplies row AND suppression.
+        let ov = st.overlay_with(&ident(), |_| false).unwrap().unwrap();
+        assert_eq!(vals(&ov), vec![(1, "v1".to_string())]);
+        assert!(ov.suppress.unwrap().keys.contains(&key_of(1)));
+        // Metadata containing S: nothing to add or suppress.
+        assert!(st
+            .overlay_with(&ident(), |c| *c == GenCommit::Snapshot(s))
+            .unwrap()
+            .is_none());
+        // A newer pending upsert of the same key hides the gen's row.
+        write_upsert(&st, 1, "v2", None);
+        let ov = st.overlay_with(&ident(), |_| false).unwrap().unwrap();
+        assert_eq!(vals(&ov), vec![(1, "v2".to_string())]);
+    }
+
+    // Stamp-exact drain: a key overwritten AFTER the flush snapshot keeps
+    // its newer entry through the drain, and a conflict merge-back never
+    // clobbers it; an un-overwritten key drains and restores cleanly.
+    #[test]
+    fn keyed_snapshot_drain_respects_later_writes() {
+        let st = BufferState::default();
+        write_upsert(&st, 1, "v1", None);
+        let snap = st.snapshot_pending(&ident());
+        // The key is overwritten while the commit is in flight.
+        write_upsert(&st, 1, "v2", None);
+        st.move_pending_to_flushed(&ident(), 0, &snap.keyed, 5);
+        // The NEWER entry survived the drain.
+        assert_eq!(upserted_val(&st, 1), "v2");
+        // Conflict merge-back must NOT resurrect v1 over v2.
+        st.move_flushed_back_to_pending(&ident(), 5);
+        assert_eq!(upserted_val(&st, 1), "v2");
+        // Contrast: an un-overwritten key drains away and restores on
+        // conflict.
+        let st2 = BufferState::default();
+        write_delete(&st2, 4, None);
+        let snap = st2.snapshot_pending(&ident());
+        st2.move_pending_to_flushed(&ident(), 0, &snap.keyed, 6);
+        assert!(st2.keyed_lookup(&ident(), &key_of(4)).is_none());
+        st2.move_flushed_back_to_pending(&ident(), 6);
+        assert!(st2
+            .keyed_lookup(&ident(), &key_of(4))
+            .expect("restored")
+            .is_none());
+    }
+
+    // Keyed ops are durably appended to the tail (correct op kinds) BEFORE
+    // entering the map, and share the table's tail mark with inserts.
+    #[test]
+    fn keyed_tail_frames_precede_map() {
+        let st = BufferState::default();
+        let tail = MockTail::default();
+        st.append(
+            &ident(),
+            Some(kschema()),
+            &[kbatch(&[(1, "x")])],
+            Some(&tail),
+        )
+        .unwrap();
+        write_upsert(&st, 2, "u", Some(&tail));
+        write_delete(&st, 3, Some(&tail));
+        assert_eq!(
+            *tail.kinds.lock().unwrap(),
+            vec![TailOpKind::Append, TailOpKind::Upsert, TailOpKind::Delete]
+        );
+        // One shared per-table mark covering all three statements.
+        assert_eq!(st.snapshot_pending(&ident()).tail_mark, Some(3));
+        // A failing tail keeps the op OUT of the map (nothing acked from
+        // memory alone).
+        tail.fail_appends
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = st
+            .keyed_write(
+                &ident(),
+                Some(kschema()),
+                &pk(),
+                key_of(9),
+                KeyedOp {
+                    key_row: key_row(9),
+                    kind: KeyedKind::Delete,
+                },
+                Some(&tail),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("disk on fire"));
+        assert!(st.keyed_lookup(&ident(), &key_of(9)).is_none());
+    }
+
+    // Composite keys flow through the same map/overlay machinery.
+    #[test]
+    fn composite_keys_roundtrip_through_state() {
+        let comp_schema: ArrowSchemaRef = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Utf8, false),
+            Field::new("val", DataType::Utf8, true),
+        ]));
+        let comp_pk = vec!["a".to_string(), "b".to_string()];
+        let row = RecordBatch::try_new(
+            comp_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["eu"])),
+                Arc::new(StringArray::from(vec!["v"])),
+            ],
+        )
+        .unwrap();
+        let key_row = row.project(&[0, 1]).unwrap();
+        let key = keyed::encode_batch_keys(&key_row, &comp_pk)
+            .unwrap()
+            .remove(0);
+        let st = BufferState::default();
+        st.keyed_write(
+            &ident(),
+            Some(comp_schema),
+            &comp_pk,
+            key.clone(),
+            KeyedOp {
+                key_row,
+                kind: KeyedKind::Upsert(row),
+            },
+            None,
+        )
+        .unwrap();
+        assert!(st
+            .keyed_lookup(&ident(), &key)
+            .expect("entry present")
+            .is_some());
+        let ov = st.overlay_with(&ident(), |_| false).unwrap().unwrap();
+        assert_eq!(ov.batches.len(), 1);
+        let sup = ov.suppress.unwrap();
+        assert_eq!(sup.pk_cols, comp_pk);
+        assert!(sup.keys.contains(&key));
+        // A different composite value does not collide.
+        let other = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int64, false),
+                Field::new("b", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["us"])),
+            ],
+        )
+        .unwrap();
+        let other_key = keyed::encode_batch_keys(&other, &comp_pk)
+            .unwrap()
+            .remove(0);
+        assert!(!sup.keys.contains(&other_key));
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX (L2): seq order is the total order for keyed keys — a plain
+    // INSERT of a key with a live keyed-map entry routes into a NEWER
+    // upsert entry instead of a pending append the older keyed op would
+    // fold away.
+    // -----------------------------------------------------------------------
+
+    // delete-then-insert of one key in one window: the row is PRESENT with
+    // the inserted values; a multi-row insert splits (map-hit rows become
+    // upserts, the rest stay plain appends); the tail frame stays a plain
+    // Append (replay re-routes through the same code).
+    #[test]
+    fn insert_after_keyed_delete_resurrects_key() {
+        let st = BufferState::default();
+        let tail = MockTail::default();
+        write_delete(&st, 1, Some(&tail));
+        // Mid-window the key is deleted.
+        assert!(st
+            .keyed_lookup(&ident(), &key_of(1))
+            .expect("entry present")
+            .is_none());
+        // Plain INSERT of keys 1 (map hit -> upsert) and 2 (plain append).
+        st.append(
+            &ident(),
+            Some(kschema()),
+            &[kbatch(&[(1, "back"), (2, "new")])],
+            Some(&tail),
+        )
+        .unwrap();
+        // The statement's tail frame is a plain Append — replay routes it
+        // through the same code path.
+        assert_eq!(
+            *tail.kinds.lock().unwrap(),
+            vec![TailOpKind::Delete, TailOpKind::Append]
+        );
+        // The key's entry is now the newer upsert (LWW by arrival order).
+        assert_eq!(upserted_val(&st, 1), "back");
+        // Overlay: both rows visible, key 1 via the upsert side.
+        let ov = st.overlay_with(&ident(), |_| false).unwrap().unwrap();
+        assert_eq!(
+            vals(&ov),
+            vec![(1, "back".to_string()), (2, "new".to_string())]
+        );
+        // Row 2 went to pending (exactly one plain pending row).
+        let snap = st.snapshot_pending(&ident());
+        let pending_rows: usize = snap.batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(pending_rows, 1);
+        assert_eq!(snap.keyed.len(), 1);
+    }
+
+    // insert-then-delete of one key in one window: the row is ABSENT (the
+    // append is OLDER than the keyed op, so folding it away is correct).
+    #[test]
+    fn insert_then_keyed_delete_removes_row() {
+        let st = BufferState::default();
+        st.append(&ident(), Some(kschema()), &[kbatch(&[(1, "x")])], None)
+            .unwrap();
+        write_delete(&st, 1, None);
+        let ov = st
+            .overlay_with(&ident(), |_| false)
+            .unwrap()
+            .expect("suppression still present");
+        assert!(vals(&ov).is_empty(), "the inserted row must be hidden");
+        assert!(ov.suppress.expect("suppression").keys.contains(&key_of(1)));
+    }
+
+    // Replay rebuilds the identical state: pushing the same frames in
+    // sequence order through the SAME entry points (keyed_write for keyed
+    // frames, append for Append frames — exactly what replay_tail does)
+    // yields the same overlay and the same keyed map as the live path.
+    #[test]
+    fn replay_routing_rebuilds_identical_state() {
+        let build = |st: &BufferState| {
+            write_upsert(st, 3, "u3", None);
+            write_delete(st, 1, None);
+            st.append(
+                &ident(),
+                Some(kschema()),
+                &[kbatch(&[(1, "back"), (2, "plain")])],
+                None,
+            )
+            .unwrap();
+        };
+        let live = BufferState::default();
+        build(&live);
+        let replayed = BufferState::default();
+        build(&replayed);
+        let ov_live = live.overlay_with(&ident(), |_| false).unwrap().unwrap();
+        let ov_replay = replayed.overlay_with(&ident(), |_| false).unwrap().unwrap();
+        assert_eq!(vals(&ov_live), vals(&ov_replay));
+        assert_eq!(
+            vals(&ov_live),
+            vec![
+                (1, "back".to_string()),
+                (2, "plain".to_string()),
+                (3, "u3".to_string())
+            ]
+        );
+        let sup_live = ov_live.suppress.expect("suppression");
+        let sup_replay = ov_replay.suppress.expect("suppression");
+        assert_eq!(*sup_live.keys, *sup_replay.keys);
+        assert_eq!(upserted_val(&live, 1), upserted_val(&replayed, 1));
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX (S3): a pk_cols mismatch is fatal only while old-key state is
+    // buffered; with an empty map (and no keyed flushed generations) the
+    // declaration refreshes and keyed ops keep working.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn pk_change_refreshes_when_no_keyed_state_buffered() {
+        let st = BufferState::default();
+        // With a live entry, a changed PK declaration fails loudly.
+        write_upsert(&st, 1, "v1", None);
+        let err = st
+            .keyed_write(
+                &ident(),
+                Some(kschema()),
+                &["val".to_string()],
+                key_of(9),
+                KeyedOp {
+                    key_row: key_row(9),
+                    kind: KeyedKind::Delete,
+                },
+                None,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("primary key"));
+        // Drain the window (flush success bookkeeping): entries empty, but
+        // the flushed generation still holds old-key ops — still fatal.
+        let snap = st.snapshot_pending(&ident());
+        st.move_pending_to_flushed(&ident(), 0, &snap.keyed, 5);
+        let err = st
+            .keyed_write(
+                &ident(),
+                Some(kschema()),
+                &["val".to_string()],
+                key_of(9),
+                KeyedOp {
+                    key_row: key_row(9),
+                    kind: KeyedKind::Delete,
+                },
+                None,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("primary key"));
+        // GC the generation: now the change is safe — pk_cols refresh and
+        // the op lands under the new declaration.
+        st.retain_flushed(|_| false);
+        let new_pk = vec!["val".to_string()];
+        let row = krow(7, "k");
+        let key_row_new = row.project(&[1]).unwrap();
+        let new_key = keyed::encode_batch_keys(&key_row_new, &new_pk)
+            .unwrap()
+            .remove(0);
+        st.keyed_write(
+            &ident(),
+            Some(kschema()),
+            &new_pk,
+            new_key.clone(),
+            KeyedOp {
+                key_row: key_row_new,
+                kind: KeyedKind::Upsert(row),
+            },
+            None,
+        )
+        .unwrap();
+        assert!(st
+            .keyed_lookup(&ident(), &new_key)
+            .expect("entry present")
+            .is_some());
+        // Suppression now encodes under the NEW declaration.
+        let ov = st.overlay_with(&ident(), |_| false).unwrap().unwrap();
+        assert_eq!(ov.suppress.unwrap().pk_cols, new_pk);
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX (L3): a generation parked by the prepare-time already-committed
+    // guard is tagged with the covering WATERMARK, and the overlay excludes
+    // it exactly when the scan metadata's own tail watermark covers the
+    // mark — no snapshot-id guess.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn covered_generation_excluded_exactly_by_watermark() {
+        let st = BufferState::default();
+        let sch = schema();
+        st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[1, 2])], None)
+            .unwrap();
+        let (_b, n, _) = snap3(&st);
+        st.move_pending_to_flushed_covered(&ident(), n, &[], 7);
+        assert!(!st.has_pending());
+        let with_mark = |scan_mark: Option<u64>| {
+            st.overlay_with(&ident(), |c| match c {
+                GenCommit::Snapshot(_) => false,
+                GenCommit::CoveredByWatermark(mark) => scan_mark.is_some_and(|w| w >= *mark),
+            })
+            .unwrap()
+        };
+        // A scan whose metadata carries NO watermark (or one below the
+        // mark) predates the commit: the overlay must supply the rows.
+        assert_eq!(ids(&with_mark(None).expect("rows")), vec![1, 2]);
+        assert_eq!(ids(&with_mark(Some(6)).expect("rows")), vec![1, 2]);
+        // At or past the mark the committed scan has the rows: excluded.
+        assert!(with_mark(Some(7)).is_none());
+        assert!(with_mark(Some(9)).is_none());
+        // Snapshot-membership never excludes a watermark-tagged generation.
+        assert_eq!(
+            ids(&st
+                .overlay_with(&ident(), |c| matches!(c, GenCommit::Snapshot(_)))
+                .unwrap()
+                .expect("rows")),
+            vec![1, 2]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX (L1): the per-table keyed-serial lock makes a keyed
+    // read-modify-write and a fenced synchronous write on the same key
+    // mutually exclusive — the fenced write's effect always survives (the
+    // RMW either sees it or blocks until it is visible). Modeled with the
+    // real lock structure and BufferState; the "lake" is a mock cell.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn keyed_serial_lock_serializes_rmw_against_fenced_write() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let serial = KeyedSerial::default();
+        // Same table -> same lock; different table -> different lock.
+        let l1 = serial.lock_for(&ident());
+        let l2 = serial.lock_for(&ident());
+        assert!(Arc::ptr_eq(&l1, &l2));
+        let other = TableIdent::from_strs(["demo", "other"]).unwrap();
+        assert!(!Arc::ptr_eq(&l1, &serial.lock_for(&other)));
+
+        // The interleaving the lock forbids: RMW reads the committed value,
+        // a fenced write commits, the RMW then frames its (now stale) full
+        // row. With both critical sections under the table's lock, they
+        // cannot overlap and the fenced increment always survives.
+        let st = Arc::new(BufferState::default());
+        let committed = Arc::new(StdMutex::new(10i64)); // the "lake" row
+        let in_critical = Arc::new(AtomicBool::new(false));
+        let overlapped = Arc::new(AtomicBool::new(false));
+
+        // RMW task (try_keyed_dml's shape): lock; read; dawdle; write the
+        // full-row image derived from the read into the keyed map.
+        let rmw = {
+            let (lock, st, committed) = (l1.clone(), st.clone(), committed.clone());
+            let (in_critical, overlapped) = (in_critical.clone(), overlapped.clone());
+            tokio::spawn(async move {
+                let _g = lock.lock().await;
+                if in_critical.swap(true, Ordering::SeqCst) {
+                    overlapped.store(true, Ordering::SeqCst);
+                }
+                let seen = *committed.lock().unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                write_upsert(&st, 1, &format!("v{}", seen + 100), None);
+                in_critical.store(false, Ordering::SeqCst);
+            })
+        };
+        // Give the RMW time to enter its critical section first.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        // Fenced-sync task (try_serialized_sync_dml's shape): lock; "fence
+        // flush" the keyed map into the lake; apply the sync increment.
+        let fenced = {
+            let (lock, st, committed) = (l1.clone(), st.clone(), committed.clone());
+            let (in_critical, overlapped) = (in_critical.clone(), overlapped.clone());
+            tokio::spawn(async move {
+                let _g = lock.lock().await;
+                if in_critical.swap(true, Ordering::SeqCst) {
+                    overlapped.store(true, Ordering::SeqCst);
+                }
+                // Fence: drain the keyed map into the committed cell (what
+                // flush_now does), THEN apply the synchronous write on top.
+                let snap = st.snapshot_pending(&ident());
+                if let Some((_, _, op)) = snap.keyed.first() {
+                    if let KeyedKind::Upsert(row) = &op.kind {
+                        let v = row
+                            .column(1)
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .unwrap()
+                            .value(0)
+                            .trim_start_matches('v')
+                            .parse::<i64>()
+                            .unwrap();
+                        *committed.lock().unwrap() = v;
+                    }
+                    st.drop_pending_prefix(&ident(), 0, &snap.keyed);
+                }
+                *committed.lock().unwrap() += 1;
+                in_critical.store(false, Ordering::SeqCst);
+            })
+        };
+        rmw.await.unwrap();
+        fenced.await.unwrap();
+        assert!(
+            !overlapped.load(Ordering::SeqCst),
+            "critical sections must never overlap"
+        );
+        // RMW entered first: it framed 10+100=110, the fence flushed it,
+        // and the sync increment applied ON TOP — the fenced write's effect
+        // survives (committed 111, keyed map drained).
+        assert_eq!(*committed.lock().unwrap(), 111);
+        assert!(st.keyed_lookup(&ident(), &key_of(1)).is_none());
     }
 }

@@ -159,6 +159,48 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
   (docs/sota-roadmap.md §3), not this backend. Mutually exclusive with
   `--tail-dir`; requires `--write-buffer-ms > 0` or startup fails.
 
+- **Keyed tail upserts (`icegres.tail-upsert`, opt-in) shift semantics and
+  have a real ack cost — both stated plainly.** On a table with
+  `icegres.primary-key` + `icegres.tail-upsert=true` under buffered mode
+  with a tail, exact-PK `UPDATE`/`DELETE` acks are a read-modify-write:
+  one catalog `load_table` + one union-view point lookup + one tail fsync
+  (~9.5 ms p50 measured vs ~71 ms synchronous — better, but not the ~1.5 ms
+  of a buffered INSERT; the lookup is the price of returning honest row
+  counts and a full replacement row). Routing is **exact-PK-equality
+  only**: every PK column bound once by `=` with a literal (AND-composed
+  for composite keys), literal SET values, no other predicates, no
+  `RETURNING`/joins/subqueries/binds, PK columns never assigned; PK types
+  limited to Iceberg `int`/`long`/`string`/`boolean`/`date`; and the key
+  must currently match at most one row (declaration is not enforcement —
+  duplicate keys fall back). Anything else silently takes the unchanged
+  fence-then-synchronous path — on a keyed-activated table that fenced
+  path (and an explicit-txn COMMIT touching the table) serializes with
+  in-flight keyed statements, so a committed synchronous write is never
+  clobbered by a concurrent keyed statement's stale row image. **Within a
+  flush window the table trades snapshot-isolation-per-statement for
+  per-key last-writer-wins in ack (tail-sequence) order**: N writes to a
+  key net to the newest one in the single window commit — a plain INSERT
+  of `k` acked after a keyed delete/update of `k` becomes the key's newest
+  version (a delete-then-reinsert in one window leaves the row present
+  with the inserted values), and one acked before it loses, exactly as
+  wall-clock ack order suggests. Statement-time row counts reflect the
+  union view at ack time; the flush re-resolves against fresh metadata, so
+  a foreign commit racing the window resolves by commit order (acks were
+  tail-time, not commit-exact). Flush conflicts retry internally (WARN
+  with attempt counters) — an acked keyed op never surfaces a `40001` and
+  is never silently lost (it stays tail-durable until a commit covers it).
+  Scans on a table with buffered keyed ops pay a per-scan key-suppression
+  filter (row-encoding the PK columns of committed and buffered rows);
+  explicit transactions, time travel, and metadata tables are unaffected.
+  The tail's on-disk payload is format v2 (op-discriminated); a pre-v2
+  tail dir/schema is refused loudly at open — recover it with the version
+  that wrote it, or delete it to acknowledge the loss. **Arrow Flight SQL
+  is out of scope for keyed routing**: `flight-serve` is a separate
+  process with no write buffer and no tail — it executes every DML
+  synchronously, so keyed routing never applies there, its row counts are
+  sync-exact, and it sees another server's in-window keyed ops only at
+  the commit cadence (the existing cross-server freshness rule).
+
 ## Transport / security
 
 - **Arrow Flight SQL TLS is in-process** (`flight-serve --tls-cert/--tls-key`),

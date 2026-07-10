@@ -12,6 +12,7 @@ mod compat;
 mod context;
 mod dml;
 mod flight;
+mod keyed;
 mod maintain;
 mod metrics;
 mod ops;
@@ -824,10 +825,12 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
 
 /// The icegres query-hook chain, in order:
 /// 1. [`buffer::BufferHook`] (only with `--write-buffer-ms > 0`) — buffered
-///    autocommit INSERT ack + ordering fences (flush before UPDATE/DELETE/
-///    BEGIN/DDL). Must run first so a fence flush happens before the fenced
-///    statement's own handler; it defers to TxnHook for any connection with
-///    an open transaction.
+///    autocommit INSERT ack, keyed tail UPDATE/DELETE ack (Phase 2: exact-PK
+///    statements on `icegres.tail-upsert` tables with a durable tail), and
+///    ordering fences (flush before non-keyed UPDATE/DELETE/BEGIN/DDL). Must
+///    run first so a fence flush happens before the fenced statement's own
+///    handler; it defers to TxnHook for any connection with an open
+///    transaction.
 /// 2. [`compat::CompatHook`] — ORM/driver pg_catalog compatibility rewrites
 ///    (SPEC A8). Must run before TxnHook: ORMs reflect inside a
 ///    driver-opened transaction, and the rewritten introspection SQL reads
@@ -866,16 +869,23 @@ fn query_hooks(
             context::DEFAULT_SCHEMA.to_string(),
         )));
     }
-    if let Some(buf) = write_buffer {
+    if let Some(buf) = &write_buffer {
         hooks.push(Arc::new(buffer::BufferHook::new(
-            buf,
+            buf.clone(),
             registry.clone(),
             enforce_pk,
         )));
     }
     hooks.push(Arc::new(compat::CompatHook));
     hooks.push(Arc::new(ops::CopyOutHook));
-    hooks.push(Arc::new(TxnHook::new(registry, engine.clone(), catalog)));
+    // The buffer handle lets COMMIT serialize against in-flight keyed
+    // read-modify-writes on keyed-activated tables (buffer.rs, fix L1).
+    hooks.push(Arc::new(TxnHook::new(
+        registry,
+        engine.clone(),
+        catalog,
+        write_buffer,
+    )));
     hooks.push(Arc::new(SetShowHook));
     hooks.push(Arc::new(dml::DmlHook::new(engine)));
     hooks.push(Arc::new(compat::InsertTagHook));

@@ -155,8 +155,16 @@ makes this operable from ONE public port:
   snapshot under first-committer-wins. Two writers updating the same
   table concurrently means one eats a `40001` retry; N writers hammering
   the same row serialize at ~50–60 ms per winner with retry storms for
-  the rest. This is Tier 1 work. Symptom to watch: 40001 rate climbing
-  with writer concurrency.
+  the rest. Symptom to watch: 40001 rate climbing with writer
+  concurrency. **Opt-in mitigation (roadmap Phase 2, shipped):** for
+  upsert-shaped traffic, keyed tail upserts (`icegres.tail-upsert` +
+  `icegres.primary-key` + `--write-buffer-ms` + a durable tail) ack
+  exact-PK UPDATE/DELETE from the tail in ~9.5 ms p50 and coalesce per
+  key into ONE commit per flush window — no per-statement snapshots, no
+  client-visible 40001 for acked keyed ops (see `icegres/README.md`
+  "Hot rows" and docs/limitations.md for the LWW semantics trade).
+  Lock choreography (`SELECT ... FOR UPDATE`) and sub-ms SLOs remain
+  Tier 1 work.
 - **High-QPS single-table synchronous writers.** Every sync commit is an
   Iceberg REST commit: one table sustains on the order of **~15–20
   commits/s** (1000 ms / ~55 ms), regardless of how many computes you

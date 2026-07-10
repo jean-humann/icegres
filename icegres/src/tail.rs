@@ -62,11 +62,18 @@
 //! ([`TailStore::rotate`]) so a successful commit can delete whole covered
 //! segments ([`TailStore::truncate`]) instead of head-truncating a live
 //! file. Each frame is `[u32 len][u32 crc32(payload)][payload]` where the
-//! payload is the little-endian `u64` sequence number followed by the Arrow
-//! IPC stream encoding of ALL batches of ONE statement (schema per frame —
-//! simple and self-describing; fine for v1's per-statement volumes). One
-//! statement = one frame = one fsync = one sequence number, so a statement
-//! is durable all-or-nothing: a mid-statement failure can never leave a
+//! payload is the little-endian `u64` sequence number followed by the
+//! shared versioned op payload ([`encode_op_payload`]): one format-version
+//! byte ([`TAIL_PAYLOAD_FORMAT`]), one op byte (append / keyed upsert /
+//! keyed delete, [`TailOpKind`]), then the Arrow IPC stream encoding of ALL
+//! batches of ONE statement (schema per frame — simple and
+//! self-describing; fine for per-statement volumes). A `<dir>/format`
+//! marker pins the version: a dir written by an incompatible layout —
+//! including the pre-v2 unversioned one — is refused loudly at open, and a
+//! crc-valid frame in a foreign format aborts replay loudly instead of
+//! being truncated away as corruption ([`TailFormatError`]). One statement
+//! = one frame = one fsync = one sequence number, so a statement is
+//! durable all-or-nothing: a mid-statement failure can never leave a
 //! replayable prefix of a statement the client was told failed.
 //!
 //! # Failed appends never poison the segment
@@ -124,6 +131,103 @@ pub const TAIL_SEQ_PROPERTY_PREFIX: &str = "icegres.tail-seq.";
 /// Name of the per-tail identity file under the tail dir.
 const IDENTITY_FILE: &str = "identity";
 
+/// Name of the on-disk format marker file under the tail dir. Holds the
+/// ASCII payload-format version ([`TAIL_PAYLOAD_FORMAT`]); a dir written by
+/// an incompatible version is refused at open (never silently mis-replayed).
+const FORMAT_FILE: &str = "format";
+
+/// Version byte every tail payload starts with (shared by ALL backends —
+/// LocalWal frames and the Postgres `frames.payload` column). Version 2
+/// introduced the keyed-op discriminator (Phase 2); the pre-versioned v1
+/// layout (raw Arrow IPC after the seq) is detected — IPC streams start with
+/// `0xFF`/a length byte, never `2` — and refused with a loud error.
+pub(crate) const TAIL_PAYLOAD_FORMAT: u8 = 2;
+
+/// Payload op discriminator: what one acked statement did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TailOpKind {
+    /// Plain INSERT append (body: all batches of the statement).
+    Append,
+    /// Keyed upsert (body: the full replacement row(s), canonical schema;
+    /// PK columns are read from the batch itself).
+    Upsert,
+    /// Keyed delete (body: key-column-only row(s); schema self-describes).
+    Delete,
+}
+
+impl TailOpKind {
+    fn to_byte(self) -> u8 {
+        match self {
+            TailOpKind::Append => 0,
+            TailOpKind::Upsert => 1,
+            TailOpKind::Delete => 2,
+        }
+    }
+
+    fn from_byte(b: u8) -> Result<Self> {
+        match b {
+            0 => Ok(TailOpKind::Append),
+            1 => Ok(TailOpKind::Upsert),
+            2 => Ok(TailOpKind::Delete),
+            other => bail!("unknown tail op discriminator {other}"),
+        }
+    }
+}
+
+/// One decoded tail frame: the op kind plus its row payload.
+#[derive(Debug, Clone)]
+pub enum TailOp {
+    /// See [`TailOpKind::Append`].
+    Append(Vec<RecordBatch>),
+    /// See [`TailOpKind::Upsert`].
+    Upsert(Vec<RecordBatch>),
+    /// See [`TailOpKind::Delete`].
+    Delete(Vec<RecordBatch>),
+}
+
+// Accessors used by the unit tests of both tail backends (the production
+// replay paths match the variants directly, hence the dead-code allowance
+// on the non-test build).
+#[allow(dead_code)]
+impl TailOp {
+    pub fn kind(&self) -> TailOpKind {
+        match self {
+            TailOp::Append(_) => TailOpKind::Append,
+            TailOp::Upsert(_) => TailOpKind::Upsert,
+            TailOp::Delete(_) => TailOpKind::Delete,
+        }
+    }
+
+    pub fn batches(&self) -> &[RecordBatch] {
+        match self {
+            TailOp::Append(b) | TailOp::Upsert(b) | TailOp::Delete(b) => b,
+        }
+    }
+}
+
+/// A tail payload whose format version byte is not [`TAIL_PAYLOAD_FORMAT`].
+/// Typed so replay can tell "incompatible format" (a LOUD abort — the frames
+/// hold acked writes some other version can read) apart from ordinary torn-
+/// frame corruption (expected after power loss, truncated with a WARN).
+#[derive(Debug)]
+pub struct TailFormatError {
+    pub found: u8,
+}
+
+impl std::fmt::Display for TailFormatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "tail payload has format version byte {} (expected {TAIL_PAYLOAD_FORMAT}); \
+             this tail was written by an incompatible icegres version (the pre-v2 \
+             layout has no version byte at all). Recover the frames with the version \
+             that wrote them, or delete the tail dir/schema to acknowledge losing them",
+            self.found
+        )
+    }
+}
+impl std::error::Error for TailFormatError {}
+
 /// Name of the exclusive-lock file under the tail dir.
 const LOCK_FILE: &str = ".lock";
 
@@ -139,8 +243,8 @@ const WATERMARK_FILE: &str = "watermark";
 /// watermark and the next crash-replay silently drops acked rows.
 pub struct ReplayedTable {
     pub ident: TableIdent,
-    /// `(seq, batches-of-one-statement)` in sequence order; may be empty.
-    pub frames: Vec<(u64, Vec<RecordBatch>)>,
+    /// `(seq, op-of-one-statement)` in sequence order; may be empty.
+    pub frames: Vec<(u64, TailOp)>,
     /// The local watermark sidecar, if present and parseable.
     pub sidecar_watermark: Option<u64>,
 }
@@ -150,12 +254,13 @@ pub struct ReplayedTable {
 /// commit lands — the tail is never a second source of truth, only the gap
 /// between the ack and the commit.
 pub trait TailStore: Send + Sync {
-    /// Durably (fsync) append ONE STATEMENT's batches for `table` as a
-    /// single frame; returns the monotonic per-table sequence number. Must
-    /// not return before the bytes are on disk — the caller acks the INSERT
+    /// Durably (fsync) append ONE STATEMENT's op for `table` as a single
+    /// frame; returns the monotonic per-table sequence number. Must not
+    /// return before the bytes are on disk — the caller acks the statement
     /// on the strength of this. All-or-nothing: on error no partial frame
-    /// survives (see the module docs). `batches` must be non-empty.
-    fn append(&self, table: &TableIdent, batches: &[RecordBatch]) -> Result<u64>;
+    /// survives (see the module docs). `batches` must be non-empty; its
+    /// meaning depends on `kind` (see [`TailOpKind`]).
+    fn append(&self, table: &TableIdent, kind: TailOpKind, batches: &[RecordBatch]) -> Result<u64>;
 
     /// Segment-management hint called at flush start: seal the active
     /// segment so a later [`truncate`](TailStore::truncate) can delete it
@@ -335,6 +440,7 @@ impl LocalWal {
         fs::create_dir_all(root)
             .with_context(|| format!("cannot create tail dir {}", root.display()))?;
         let lock = lock_dir_exclusive(root)?;
+        check_or_create_format(root)?;
         let identity = load_or_create_identity(root)?;
         Ok(Self {
             root: root.to_path_buf(),
@@ -346,7 +452,7 @@ impl LocalWal {
 }
 
 impl TailStore for LocalWal {
-    fn append(&self, table: &TableIdent, batches: &[RecordBatch]) -> Result<u64> {
+    fn append(&self, table: &TableIdent, kind: TailOpKind, batches: &[RecordBatch]) -> Result<u64> {
         let mut tables = self.tables.lock().expect("tail lock poisoned");
         let entry = table_entry(&self.root, &mut tables, table)?;
         if entry.active.is_none() {
@@ -372,7 +478,7 @@ impl TailStore for LocalWal {
         // The whole frame is built in memory FIRST so a failure can only
         // ever leave partial bytes of one contiguous write — which the
         // rollback below erases.
-        let frame = encode_frame(seq, batches)?;
+        let frame = encode_frame(seq, kind, batches)?;
         let (write_res, good_len, path) = {
             let active = entry.active.as_mut().expect("just ensured active");
             let res = active
@@ -608,6 +714,50 @@ fn lock_dir_exclusive(root: &Path) -> Result<File> {
     Ok(file)
 }
 
+/// Check (or mint) the on-disk format marker `<root>/format`. Three cases:
+///
+/// * marker holds [`TAIL_PAYLOAD_FORMAT`] — proceed;
+/// * marker holds anything else — LOUD error (incompatible version);
+/// * marker absent: a dir that already has an identity was written by the
+///   pre-versioned v1 layout — LOUD error (its frames may hold acked rows
+///   this build cannot decode); a fresh dir gets the marker minted.
+fn check_or_create_format(root: &Path) -> Result<()> {
+    let path = root.join(FORMAT_FILE);
+    let expected = TAIL_PAYLOAD_FORMAT.to_string();
+    match fs::read_to_string(&path) {
+        Ok(s) => {
+            let found = s.trim();
+            if found != expected {
+                bail!(
+                    "tail dir {} declares on-disk format {found:?}, but this icegres \
+                     reads/writes format {expected:?}. Recover its frames with the \
+                     version that wrote them, or delete the directory to acknowledge \
+                     losing them.",
+                    root.display()
+                );
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if root.join(IDENTITY_FILE).exists() {
+                bail!(
+                    "tail dir {} has an identity but NO format marker: it was written \
+                     by a pre-v{TAIL_PAYLOAD_FORMAT} icegres (unversioned frame \
+                     layout) and its frames may hold acked rows this build cannot \
+                     decode. Recover them with the version that wrote them, or delete \
+                     the directory to acknowledge losing them.",
+                    root.display()
+                );
+            }
+            write_atomic(root, &path, expected.as_bytes())
+                .with_context(|| format!("cannot persist tail format {}", path.display()))
+        }
+        Err(e) => {
+            Err(anyhow!(e).context(format!("cannot read tail format marker {}", path.display())))
+        }
+    }
+}
+
 /// Load the persisted tail identity from `<root>/identity`, minting and
 /// durably persisting (tmp + rename + fsync) a fresh UUIDv4 on first open.
 /// A corrupt identity file is a loud error: silently minting a NEW identity
@@ -802,14 +952,45 @@ fn check_frame_len(len: usize) -> Result<()> {
     Ok(())
 }
 
-/// Arrow IPC stream encoding of ALL batches of ONE statement — the
-/// statement-atomic payload every tail backend stores (schema per payload:
-/// simple and self-describing, fine for v1's per-statement volumes).
-/// LocalWal wraps it in `[len][crc]` file framing plus the LE seq prefix;
+/// The statement-atomic payload every tail backend stores:
+/// `[u8 format-version][u8 op][Arrow IPC stream of ALL batches]`. LocalWal
+/// wraps it in `[len][crc]` file framing plus the LE seq prefix;
 /// `tail_pg.rs` stores it verbatim as a `BYTEA` column (Postgres' own page
 /// checksums/WAL replace the torn-write machinery). `pub(crate)` so the
 /// backends share ONE payload format and frames stay interchangeable.
-pub(crate) fn encode_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>> {
+pub(crate) fn encode_op_payload(kind: TailOpKind, batches: &[RecordBatch]) -> Result<Vec<u8>> {
+    let ipc = encode_ipc(batches)?;
+    let mut out = Vec::with_capacity(2 + ipc.len());
+    out.push(TAIL_PAYLOAD_FORMAT);
+    out.push(kind.to_byte());
+    out.extend_from_slice(&ipc);
+    Ok(out)
+}
+
+/// Undo [`encode_op_payload`]. A wrong format version is a typed
+/// [`TailFormatError`] (replay aborts loudly — see the type's docs).
+pub(crate) fn decode_op_payload(bytes: &[u8]) -> Result<TailOp> {
+    let (&version, rest) = bytes
+        .split_first()
+        .ok_or_else(|| anyhow!("tail payload is empty"))?;
+    if version != TAIL_PAYLOAD_FORMAT {
+        return Err(anyhow!(TailFormatError { found: version }));
+    }
+    let (&op, ipc) = rest
+        .split_first()
+        .ok_or_else(|| anyhow!("tail payload is missing its op byte"))?;
+    let kind = TailOpKind::from_byte(op)?;
+    let batches = decode_ipc(ipc)?;
+    Ok(match kind {
+        TailOpKind::Append => TailOp::Append(batches),
+        TailOpKind::Upsert => TailOp::Upsert(batches),
+        TailOpKind::Delete => TailOp::Delete(batches),
+    })
+}
+
+/// Arrow IPC stream encoding of ALL batches of ONE statement (schema per
+/// payload: simple and self-describing, fine for per-statement volumes).
+fn encode_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>> {
     let first = batches
         .first()
         .ok_or_else(|| anyhow!("tail frame needs at least one batch"))?;
@@ -832,7 +1013,7 @@ pub(crate) fn encode_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>> {
 
 /// Undo [`encode_ipc`]: every batch of one statement, in order. An empty
 /// stream is an error — a tail frame is never rowless.
-pub(crate) fn decode_ipc(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
+fn decode_ipc(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
     let reader = StreamReader::try_new(std::io::Cursor::new(bytes), None)
         .map_err(|e| anyhow!("tail frame IPC header invalid: {e}"))?;
     let batches: Vec<RecordBatch> = reader
@@ -844,13 +1025,13 @@ pub(crate) fn decode_ipc(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
     Ok(batches)
 }
 
-/// `[u32 len][u32 crc32(payload)][payload]`, payload = LE u64 seq + Arrow
-/// IPC stream bytes of ALL batches of one statement ([`encode_ipc`]).
-fn encode_frame(seq: u64, batches: &[RecordBatch]) -> Result<Vec<u8>> {
-    let ipc = encode_ipc(batches)?;
-    let mut payload = Vec::with_capacity(8 + ipc.len());
+/// `[u32 len][u32 crc32(payload)][payload]`, payload = LE u64 seq + the
+/// versioned op payload of one statement ([`encode_op_payload`]).
+fn encode_frame(seq: u64, kind: TailOpKind, batches: &[RecordBatch]) -> Result<Vec<u8>> {
+    let body = encode_op_payload(kind, batches)?;
+    let mut payload = Vec::with_capacity(8 + body.len());
     payload.extend_from_slice(&seq.to_le_bytes());
-    payload.extend_from_slice(&ipc);
+    payload.extend_from_slice(&body);
     check_frame_len(payload.len())?;
     let mut frame = Vec::with_capacity(8 + payload.len());
     frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -859,17 +1040,17 @@ fn encode_frame(seq: u64, batches: &[RecordBatch]) -> Result<Vec<u8>> {
     Ok(frame)
 }
 
-fn decode_payload(payload: &[u8]) -> Result<(u64, Vec<RecordBatch>)> {
+fn decode_payload(payload: &[u8]) -> Result<(u64, TailOp)> {
     if payload.len() < 8 {
         bail!("payload shorter than its sequence header");
     }
     let seq = u64::from_le_bytes(payload[..8].try_into().expect("8 bytes"));
-    let batches = decode_ipc(&payload[8..])?;
-    Ok((seq, batches))
+    let op = decode_op_payload(&payload[8..])?;
+    Ok((seq, op))
 }
 
 struct SegmentScan {
-    frames: Vec<(u64, Vec<RecordBatch>)>,
+    frames: Vec<(u64, TailOp)>,
     /// Highest sequence recovered (None = no valid frames).
     max_seq: Option<u64>,
     /// The segment ended in an invalid frame (now truncated away).
@@ -925,7 +1106,7 @@ fn scan_segment(path: &Path) -> Result<SegmentScan> {
             data.truncate(good as usize);
         }
     }
-    let mut frames: Vec<(u64, Vec<RecordBatch>)> = Vec::new();
+    let mut frames: Vec<(u64, TailOp)> = Vec::new();
     let mut off: usize = 0;
     let mut good_end: usize = 0;
     let mut bad: Option<String> = None;
@@ -950,6 +1131,17 @@ fn scan_segment(path: &Path) -> Result<SegmentScan> {
         }
         match decode_payload(payload) {
             Ok(frame) => frames.push(frame),
+            // A crc-VALID frame in a foreign format is not torn-write
+            // corruption — it is a whole tail written by an incompatible
+            // version, and truncating it away would silently discard acked
+            // rows. Abort replay loudly instead (belt to the format-marker
+            // braces at open).
+            Err(e) if e.is::<TailFormatError>() => {
+                return Err(e.context(format!(
+                    "tail segment {} holds an incompatible frame",
+                    path.display()
+                )));
+            }
             Err(e) => {
                 bad = Some(format!("{e:#}"));
                 break;
@@ -991,7 +1183,7 @@ fn scan_segment(path: &Path) -> Result<SegmentScan> {
 }
 
 struct TableScan {
-    frames: Vec<(u64, Vec<RecordBatch>)>,
+    frames: Vec<(u64, TailOp)>,
     sealed: Vec<SealedSegment>,
     next_seq: u64,
     next_segment: u64,
@@ -1016,7 +1208,7 @@ fn scan_table(dir: &Path) -> Result<TableScan> {
         }
     }
     seg_paths.sort();
-    let mut frames: Vec<(u64, Vec<RecordBatch>)> = Vec::new();
+    let mut frames: Vec<(u64, TailOp)> = Vec::new();
     let mut sealed: Vec<SealedSegment> = Vec::new();
     let mut next_segment: u64 = 1;
     // Segment whose scan ended in a bad frame; later segments must prove
@@ -1136,12 +1328,13 @@ mod tests {
             .to_vec()
     }
 
-    /// Replay flattened to `(ident, seq, batches)` triples, in order.
+    /// Replay flattened to `(ident, seq, batches)` triples, in order
+    /// (op kinds asserted separately where they matter).
     fn replay_frames(wal: &LocalWal) -> Vec<(TableIdent, u64, Vec<RecordBatch>)> {
         let mut out = Vec::new();
         for table in wal.replay().unwrap() {
-            for (seq, batches) in table.frames {
-                out.push((table.ident.clone(), seq, batches));
+            for (seq, op) in table.frames {
+                out.push((table.ident.clone(), seq, op.batches().to_vec()));
             }
         }
         out
@@ -1165,8 +1358,16 @@ mod tests {
     fn frame_roundtrip_through_replay() {
         let root = temp_root("roundtrip");
         let wal = LocalWal::open(&root).unwrap();
-        assert_eq!(wal.append(&ident(), &[batch(&[1, 2])]).unwrap(), 1);
-        assert_eq!(wal.append(&ident(), &[batch(&[3])]).unwrap(), 2);
+        assert_eq!(
+            wal.append(&ident(), TailOpKind::Append, &[batch(&[1, 2])])
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            wal.append(&ident(), TailOpKind::Append, &[batch(&[3])])
+                .unwrap(),
+            2
+        );
         drop(wal);
         let wal2 = LocalWal::open(&root).unwrap();
         let frames = replay_frames(&wal2);
@@ -1177,7 +1378,11 @@ mod tests {
         assert_eq!(frames[1].1, 2);
         assert_eq!(ids(&frames[1].2[0]), vec![3]);
         // Sequence numbering resumes above the recovered frames.
-        assert_eq!(wal2.append(&ident(), &[batch(&[4])]).unwrap(), 3);
+        assert_eq!(
+            wal2.append(&ident(), TailOpKind::Append, &[batch(&[4])])
+                .unwrap(),
+            3
+        );
     }
 
     // A multi-batch statement is ONE frame (one seq, one fsync) and replay
@@ -1187,7 +1392,11 @@ mod tests {
         let root = temp_root("stmt-frame");
         let wal = LocalWal::open(&root).unwrap();
         let seq = wal
-            .append(&ident(), &[batch(&[1]), batch(&[2, 3]), batch(&[4])])
+            .append(
+                &ident(),
+                TailOpKind::Append,
+                &[batch(&[1]), batch(&[2, 3]), batch(&[4])],
+            )
             .unwrap();
         assert_eq!(seq, 1);
         drop(wal);
@@ -1205,10 +1414,13 @@ mod tests {
     fn multi_segment_replay_preserves_seq_order() {
         let root = temp_root("order");
         let wal = LocalWal::open(&root).unwrap();
-        wal.append(&ident(), &[batch(&[1])]).unwrap();
-        wal.append(&ident(), &[batch(&[2])]).unwrap();
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[1])])
+            .unwrap();
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[2])])
+            .unwrap();
         wal.rotate(&ident()).unwrap();
-        wal.append(&ident(), &[batch(&[3])]).unwrap();
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[3])])
+            .unwrap();
         assert_eq!(seg_files(&root).len(), 2);
         drop(wal);
         let wal2 = LocalWal::open(&root).unwrap();
@@ -1222,9 +1434,12 @@ mod tests {
     fn torn_final_frame_recovers_earlier_frames() {
         let root = temp_root("torn");
         let wal = LocalWal::open(&root).unwrap();
-        wal.append(&ident(), &[batch(&[1])]).unwrap();
-        wal.append(&ident(), &[batch(&[2])]).unwrap();
-        wal.append(&ident(), &[batch(&[3])]).unwrap();
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[1])])
+            .unwrap();
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[2])])
+            .unwrap();
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[3])])
+            .unwrap();
         drop(wal);
         // Tear the final frame: chop a few bytes off the segment.
         let seg = seg_files(&root).pop().unwrap();
@@ -1247,9 +1462,12 @@ mod tests {
     fn corrupt_middle_frame_stops_replay_there() {
         let root = temp_root("corrupt");
         let wal = LocalWal::open(&root).unwrap();
-        wal.append(&ident(), &[batch(&[1])]).unwrap();
-        wal.append(&ident(), &[batch(&[2])]).unwrap();
-        wal.append(&ident(), &[batch(&[3])]).unwrap();
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[1])])
+            .unwrap();
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[2])])
+            .unwrap();
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[3])])
+            .unwrap();
         drop(wal);
         let seg = seg_files(&root).pop().unwrap();
         let mut data = fs::read(&seg).unwrap();
@@ -1270,10 +1488,13 @@ mod tests {
     fn truncate_deletes_only_covered_segments() {
         let root = temp_root("truncate");
         let wal = LocalWal::open(&root).unwrap();
-        wal.append(&ident(), &[batch(&[1])]).unwrap();
-        wal.append(&ident(), &[batch(&[2])]).unwrap();
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[1])])
+            .unwrap();
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[2])])
+            .unwrap();
         wal.rotate(&ident()).unwrap();
-        wal.append(&ident(), &[batch(&[3])]).unwrap();
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[3])])
+            .unwrap();
         assert_eq!(seg_files(&root).len(), 2);
         // Commit covered seqs 1..=2: the sealed segment goes, seq 3 stays.
         wal.truncate(&ident(), 2).unwrap();
@@ -1321,7 +1542,11 @@ mod tests {
         assert!(tables[0].frames.is_empty());
         // ... and the floor takes effect on the next append.
         wal.ensure_seq_floor(&ident(), 11).unwrap();
-        assert_eq!(wal.append(&ident(), &[batch(&[1])]).unwrap(), 11);
+        assert_eq!(
+            wal.append(&ident(), TailOpKind::Append, &[batch(&[1])])
+                .unwrap(),
+            11
+        );
     }
 
     // FIX 1(b), the end-to-end shape of the seq-restart bug: append 1..3,
@@ -1333,7 +1558,8 @@ mod tests {
         let root = temp_root("floor-restart");
         let wal = LocalWal::open(&root).unwrap();
         for v in 1..=3i64 {
-            wal.append(&ident(), &[batch(&[v])]).unwrap();
+            wal.append(&ident(), TailOpKind::Append, &[batch(&[v])])
+                .unwrap();
         }
         wal.rotate(&ident()).unwrap();
         wal.truncate(&ident(), 3).unwrap(); // the flush committed 1..=3
@@ -1345,11 +1571,13 @@ mod tests {
         let tables = wal2.replay().unwrap();
         assert!(tables.iter().all(|t| t.frames.is_empty()));
         wal2.ensure_seq_floor(&ident(), 4).unwrap(); // watermark 3 + 1
-        let seq = wal2.append(&ident(), &[batch(&[10])]).unwrap();
+        let seq = wal2
+            .append(&ident(), TailOpKind::Append, &[batch(&[10])])
+            .unwrap();
         assert!(seq >= 4, "post-restart seq {seq} must clear the watermark");
         drop(wal2);
         let wal3 = LocalWal::open(&root).unwrap();
-        let frames: Vec<(u64, Vec<RecordBatch>)> = wal3
+        let frames: Vec<(u64, TailOp)> = wal3
             .replay()
             .unwrap()
             .into_iter()
@@ -1362,7 +1590,7 @@ mod tests {
         );
         assert_eq!(survivors.len(), 1);
         assert_eq!(survivors[0].0, seq);
-        assert_eq!(ids(&survivors[0].1[0]), vec![10]);
+        assert_eq!(ids(&survivors[0].1.batches()[0]), vec![10]);
     }
 
     // FIX 2: the rollback helper erases a failed append's partial bytes —
@@ -1372,8 +1600,10 @@ mod tests {
     fn rollback_erases_partial_append_bytes() {
         let root = temp_root("rollback");
         let wal = LocalWal::open(&root).unwrap();
-        wal.append(&ident(), &[batch(&[1])]).unwrap();
-        wal.append(&ident(), &[batch(&[2])]).unwrap();
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[1])])
+            .unwrap();
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[2])])
+            .unwrap();
         drop(wal);
         let seg = seg_files(&root).pop().unwrap();
         let good_len = fs::metadata(&seg).unwrap().len();
@@ -1388,7 +1618,11 @@ mod tests {
         let frames = replay_frames(&wal2);
         assert_eq!(frames.iter().map(|f| f.1).collect::<Vec<_>>(), vec![1, 2]);
         // No truncation WARN path was needed: the bytes were already gone.
-        assert_eq!(wal2.append(&ident(), &[batch(&[3])]).unwrap(), 3);
+        assert_eq!(
+            wal2.append(&ident(), TailOpKind::Append, &[batch(&[3])])
+                .unwrap(),
+            3
+        );
     }
 
     // FIX 2, poisoned path: sealing the active segment (the exact move the
@@ -1399,7 +1633,8 @@ mod tests {
     fn poisoned_seal_forces_fresh_segment() {
         let root = temp_root("poison");
         let wal = LocalWal::open(&root).unwrap();
-        wal.append(&ident(), &[batch(&[1])]).unwrap();
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[1])])
+            .unwrap();
         {
             // Same code path the poisoned-append arm takes: seal_active.
             let mut tables = wal.tables.lock().unwrap();
@@ -1407,7 +1642,8 @@ mod tests {
             seal_active(entry);
             assert!(entry.active.is_none(), "poisoned handle never reused");
         }
-        wal.append(&ident(), &[batch(&[2])]).unwrap();
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[2])])
+            .unwrap();
         assert_eq!(seg_files(&root).len(), 2, "second frame in a fresh segment");
         drop(wal);
         let wal2 = LocalWal::open(&root).unwrap();
@@ -1457,7 +1693,8 @@ mod tests {
     fn sidecar_watermark_roundtrip() {
         let root = temp_root("sidecar");
         let wal = LocalWal::open(&root).unwrap();
-        wal.append(&ident(), &[batch(&[1])]).unwrap();
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[1])])
+            .unwrap();
         wal.record_watermark(&ident(), 7).unwrap();
         wal.record_watermark(&ident(), 5).unwrap(); // lower: must not regress
         drop(wal);
@@ -1538,15 +1775,17 @@ mod tests {
     fn poison_marker_clamps_ghost_frame() {
         let root = temp_root("poison-marker");
         let wal = LocalWal::open(&root).unwrap();
-        wal.append(&ident(), &[batch(&[1])]).unwrap();
-        wal.append(&ident(), &[batch(&[2])]).unwrap();
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[1])])
+            .unwrap();
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[2])])
+            .unwrap();
         drop(wal);
         let seg = seg_files(&root).pop().unwrap();
         let good_len = fs::metadata(&seg).unwrap().len();
         // The ghost: a fully crc-valid frame for seq 3, persisted by the
         // failing disk even though the append was reported failed (so the
         // statement was NOT acked and seq 3 was handed out again).
-        let ghost = encode_frame(3, &[batch(&[99])]).unwrap();
+        let ghost = encode_frame(3, TailOpKind::Append, &[batch(&[99])]).unwrap();
         let mut f = OpenOptions::new().append(true).open(&seg).unwrap();
         f.write_all(&ghost).unwrap();
         drop(f);
@@ -1562,7 +1801,11 @@ mod tests {
         // seq 3 is free again for the statement that really owns it.
         assert_eq!(fs::metadata(&seg).unwrap().len(), good_len);
         assert!(!poison_marker_path(&seg).exists());
-        assert_eq!(wal2.append(&ident(), &[batch(&[3])]).unwrap(), 3);
+        assert_eq!(
+            wal2.append(&ident(), TailOpKind::Append, &[batch(&[3])])
+                .unwrap(),
+            3
+        );
     }
 
     // FIX (r3-4b): a later segment whose first frame is CONTIGUOUS with
@@ -1573,13 +1816,18 @@ mod tests {
     fn contiguous_segments_survive_bad_frame() {
         let root = temp_root("contig");
         let wal = LocalWal::open(&root).unwrap();
-        wal.append(&ident(), &[batch(&[1])]).unwrap();
-        wal.append(&ident(), &[batch(&[2])]).unwrap();
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[1])])
+            .unwrap();
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[2])])
+            .unwrap();
         wal.rotate(&ident()).unwrap();
-        wal.append(&ident(), &[batch(&[3])]).unwrap();
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[3])])
+            .unwrap();
         wal.rotate(&ident()).unwrap();
-        wal.append(&ident(), &[batch(&[4])]).unwrap();
-        wal.append(&ident(), &[batch(&[5])]).unwrap();
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[4])])
+            .unwrap();
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[5])])
+            .unwrap();
         drop(wal);
         let segs = seg_files(&root);
         assert_eq!(segs.len(), 3);
@@ -1608,15 +1856,19 @@ mod tests {
     fn gapped_segment_behind_bad_frame_is_deleted() {
         let root = temp_root("gap");
         let wal = LocalWal::open(&root).unwrap();
-        wal.append(&ident(), &[batch(&[1])]).unwrap();
-        wal.append(&ident(), &[batch(&[2])]).unwrap();
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[1])])
+            .unwrap();
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[2])])
+            .unwrap();
         wal.rotate(&ident()).unwrap();
-        wal.append(&ident(), &[batch(&[3])]).unwrap();
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[3])])
+            .unwrap();
         wal.rotate(&ident()).unwrap();
         // seg3 starts at seq 7: seqs 4-6 are a real hole behind seg2's
         // (about to be planted) bad frame.
         wal.ensure_seq_floor(&ident(), 7).unwrap();
-        wal.append(&ident(), &[batch(&[7])]).unwrap();
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[7])])
+            .unwrap();
         drop(wal);
         let segs = seg_files(&root);
         assert_eq!(segs.len(), 3);
@@ -1630,5 +1882,109 @@ mod tests {
             vec![1, 2, 3]
         );
         assert_eq!(seg_files(&root).len(), 2, "the gapped segment is deleted");
+    }
+
+    // PHASE 2: the op discriminator round-trips through the file framing
+    // and a process restart — Append/Upsert/Delete come back as themselves,
+    // in sequence order, batches intact.
+    #[test]
+    fn op_discriminator_roundtrips_through_replay() {
+        let root = temp_root("op-kinds");
+        let wal = LocalWal::open(&root).unwrap();
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[1])])
+            .unwrap();
+        wal.append(&ident(), TailOpKind::Upsert, &[batch(&[2])])
+            .unwrap();
+        wal.append(&ident(), TailOpKind::Delete, &[batch(&[3])])
+            .unwrap();
+        drop(wal);
+        let wal2 = LocalWal::open(&root).unwrap();
+        let tables = wal2.replay().unwrap();
+        assert_eq!(tables.len(), 1);
+        let kinds: Vec<(u64, TailOpKind)> = tables[0]
+            .frames
+            .iter()
+            .map(|(seq, op)| (*seq, op.kind()))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (1, TailOpKind::Append),
+                (2, TailOpKind::Upsert),
+                (3, TailOpKind::Delete)
+            ]
+        );
+        assert_eq!(ids(&tables[0].frames[1].1.batches()[0]), vec![2]);
+    }
+
+    // PHASE 2: a payload in the pre-versioned v1 layout (raw Arrow IPC after
+    // the seq — first byte 0xFF, the IPC continuation marker) is rejected
+    // with the TYPED format error, never silently decoded or truncated away.
+    #[test]
+    fn version_byte_rejects_v1_payload() {
+        // A v1 payload body was the raw IPC stream: rebuild one.
+        let mut v1 = Vec::new();
+        {
+            let mut w = StreamWriter::try_new(&mut v1, &schema()).unwrap();
+            w.write(&batch(&[7])).unwrap();
+            w.finish().unwrap();
+        }
+        let err = decode_op_payload(&v1).unwrap_err();
+        let fmt = err
+            .downcast_ref::<TailFormatError>()
+            .expect("typed format error");
+        assert_eq!(fmt.found, 0xFF, "v1 payloads start with the IPC marker");
+        assert!(err.to_string().contains("incompatible icegres version"));
+        // And the v2 payload round-trips.
+        let v2 = encode_op_payload(TailOpKind::Upsert, &[batch(&[7])]).unwrap();
+        let op = decode_op_payload(&v2).unwrap();
+        assert_eq!(op.kind(), TailOpKind::Upsert);
+        assert_eq!(ids(&op.batches()[0]), vec![7]);
+        // Unknown FUTURE version: also refused.
+        let mut v9 = v2.clone();
+        v9[0] = 9;
+        let err = decode_op_payload(&v9).unwrap_err();
+        assert_eq!(err.downcast_ref::<TailFormatError>().unwrap().found, 9);
+    }
+
+    // PHASE 2: a tail dir with an identity but no format marker (the exact
+    // shape a pre-v2 icegres leaves) is refused at OPEN — before any frame
+    // could be mis-read or truncated. A marker with a foreign version is
+    // refused too; a fresh dir mints the marker and reopens cleanly.
+    #[test]
+    fn old_layout_dir_is_refused_at_open() {
+        let root = temp_root("old-layout");
+        // Fresh dir: marker minted, persists across reopen.
+        let wal = LocalWal::open(&root).unwrap();
+        drop(wal);
+        assert_eq!(
+            fs::read_to_string(root.join(FORMAT_FILE)).unwrap().trim(),
+            TAIL_PAYLOAD_FORMAT.to_string()
+        );
+        LocalWal::open(&root).unwrap();
+
+        // Old layout: identity present, no marker.
+        let old = temp_root("old-layout-v1");
+        fs::write(old.join(IDENTITY_FILE), uuid::Uuid::new_v4().to_string()).unwrap();
+        let err = match LocalWal::open(&old) {
+            Ok(_) => panic!("old-layout dir must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("NO format marker"),
+            "unexpected: {err:#}"
+        );
+
+        // Foreign version marker.
+        let foreign = temp_root("old-layout-foreign");
+        fs::write(foreign.join(FORMAT_FILE), "99").unwrap();
+        let err = match LocalWal::open(&foreign) {
+            Ok(_) => panic!("foreign-format dir must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("declares on-disk format"),
+            "unexpected: {err:#}"
+        );
     }
 }

@@ -1853,4 +1853,113 @@ PY
 fi
 
 # ---------------------------------------------------------------------------
+# (x) Keyed tail upserts (roadmap Phase 2, docs/sota-roadmap.md §4): on a
+# table with icegres.tail-upsert=true + icegres.primary-key, an exact-PK
+# UPDATE acks from the durable tail instead of a synchronous COW commit.
+# Proven here: 20 sequential UPDATEs to ONE hot row ack fast, produce ZERO
+# intermediate snapshots, and net exactly ONE composed commit at the flush;
+# a mid-window SELECT sees the newest value through the union read; time
+# travel to the pre-update snapshot still shows the old value (never
+# overlaid). Port 5457 (5456 belongs to tail_durability.sh).
+# ---------------------------------------------------------------------------
+KY_PORT=5457
+KY_PID="$E2E_DIR/serve-keyed.pid"
+KY_LOG="$E2E_DIR/serve-keyed.log"
+KY_TAIL="$E2E_DIR/keyed-tail-wal"
+KY_MS=600000 # only fences flush: every commit below is one the test forced
+KYQ=(psql -h "$PG_HOST" -p "$KY_PORT" -U postgres -d icegres -v ON_ERROR_STOP=1 -tA)
+ky_snap_count() {
+  curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_keyed"     | jq '[.metadata.snapshots[]?] | length'
+}
+# The fence: any non-keyed DML forces a synchronous flush first (this one
+# then matches nothing and commits nothing itself).
+ky_flush() { "${KYQ[@]}" -c 'delete from demo.e2e_keyed where id < -1' >/dev/null; }
+log "(x) keyed tail upserts (Phase 2) on :$KY_PORT"
+stop_pidfile_generic "$KY_PID"
+if "${KYQ[@]}" -c 'select 1' >/dev/null 2>&1; then fail "something is already listening on :$KY_PORT"; fi
+rm -rf "$KY_TAIL"
+: >"$KY_LOG"
+curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_keyed?purgeRequested=true" >/dev/null 2>&1 || true
+curl -sf -X POST "$CATALOG_URI/v1/$prefix/namespaces/demo/tables" \
+  -H 'Content-Type: application/json' -d @- <<'JSON' >/dev/null
+{
+  "name": "e2e_keyed",
+  "schema": {
+    "type": "struct",
+    "schema-id": 0,
+    "fields": [
+      {"id": 1, "name": "id", "required": false, "type": "long"},
+      {"id": 2, "name": "val", "required": false, "type": "string"}
+    ]
+  },
+  "properties": {"icegres.primary-key": "id", "icegres.tail-upsert": "true"}
+}
+JSON
+"$BIN" serve --host "$PG_HOST" --port "$KY_PORT" --write-buffer-ms "$KY_MS" \
+  --tail-dir "$KY_TAIL" >>"$KY_LOG" 2>&1 &
+echo $! >"$KY_PID"
+ky_ready=0
+for _ in $(seq 1 60); do
+  if "${KYQ[@]}" -c 'select 1' >/dev/null 2>&1; then ky_ready=1; break; fi
+  sleep 0.5
+done
+[[ "$ky_ready" == 1 ]] || { tail -n 20 "$KY_LOG" >&2; fail "keyed server not ready on :$KY_PORT"; }
+
+# Seed one committed row, note the pre-update snapshot for time travel.
+"${KYQ[@]}" -c "insert into demo.e2e_keyed values (1, 'before')" >/dev/null
+ky_flush
+assert_eq "seed flush produced the first snapshot" "1" "$(ky_snap_count)"
+KY_SNAP1=$(curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_keyed" \
+  | jq -r '.metadata."current-snapshot-id"')
+
+# 20 sequential hot-row UPDATEs: each acks UPDATE 1 without a commit.
+ky_t0=$(date +%s%N)
+for i in $(seq 1 20); do
+  ky_tag=$(psql -h "$PG_HOST" -p "$KY_PORT" -U postgres -d icegres -c \
+    "update demo.e2e_keyed set val = 'v$i' where id = 1" | tr -d '[:space:]')
+  [[ "$ky_tag" == "UPDATE1" ]] || fail "keyed UPDATE $i answered [$ky_tag], expected UPDATE 1"
+done
+ky_ms=$(( ($(date +%s%N) - ky_t0) / 1000000 ))
+pass "20 sequential keyed UPDATEs acked (total ${ky_ms} ms ≈ $((ky_ms / 20)) ms/stmt incl. psql startup)"
+assert_eq "mid-window SELECT sees the NEWEST value (union read)" "v20" \
+  "$("${KYQ[@]}" -c 'select val from demo.e2e_keyed where id = 1')"
+assert_eq "no per-statement snapshots: still only the seed commit" "1" "$(ky_snap_count)"
+
+# One flush -> ONE coalesced commit carrying the final value.
+ky_flush
+assert_eq "one flush window = ONE snapshot for 20 updates" "2" "$(ky_snap_count)"
+assert_eq "post-flush value is the last write" "v20" \
+  "$("${KYQ[@]}" -c 'select val from demo.e2e_keyed where id = 1')"
+assert_eq "exactly one row for the key (no duplicates)" "1" \
+  "$("${KYQ[@]}" -c 'select count(*) from demo.e2e_keyed')"
+
+# (L2) Ack order is the total order for a key: a keyed DELETE followed by a
+# plain INSERT of the SAME key in the SAME window leaves the row PRESENT
+# with the inserted values — the later insert becomes the key's newest
+# version instead of being folded away by the coalesced delete.
+ky_tag=$(psql -h "$PG_HOST" -p "$KY_PORT" -U postgres -d icegres -c \
+  "delete from demo.e2e_keyed where id = 1" | tr -d '[:space:]')
+[[ "$ky_tag" == "DELETE1" ]] || fail "keyed DELETE answered [$ky_tag], expected DELETE 1"
+assert_eq "keyed DELETE hides the row mid-window (union read)" "0" \
+  "$("${KYQ[@]}" -c 'select count(*) from demo.e2e_keyed where id = 1')"
+"${KYQ[@]}" -c "insert into demo.e2e_keyed values (1, 'reborn')" >/dev/null
+assert_eq "same-window re-INSERT after the keyed DELETE is visible (union)" "reborn|1" \
+  "$("${KYQ[@]}" -c 'select val from demo.e2e_keyed where id = 1')|$("${KYQ[@]}" \
+    -c 'select count(*) from demo.e2e_keyed where id = 1')"
+assert_eq "delete-then-reinsert made no mid-window snapshots" "2" "$(ky_snap_count)"
+ky_flush
+assert_eq "flush committed the delete-then-reinsert as ONE snapshot" "3" "$(ky_snap_count)"
+assert_eq "committed row survives the same-window delete-then-reinsert, exactly once" "reborn|1" \
+  "$("${KYQ[@]}" -c 'select val from demo.e2e_keyed where id = 1')|$("${KYQ[@]}" \
+    -c 'select count(*) from demo.e2e_keyed where id = 1')"
+
+# Time travel predates the updates and never sees the buffer.
+assert_eq "time travel to the pre-update snapshot shows the OLD value" "before" \
+  "$("${KYQ[@]}" -c "select val from demo.\"e2e_keyed@$KY_SNAP1\" where id = 1")"
+
+stop_pidfile_generic "$KY_PID"
+rm -rf "$KY_TAIL"
+curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_keyed?purgeRequested=true" >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
 log "all assertions passed ($PASS_COUNT)"

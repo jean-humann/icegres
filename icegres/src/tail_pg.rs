@@ -66,14 +66,17 @@
 //! Everything lives in one schema (default `icegres_tail`) so a shared
 //! database stays tidy and a test can use a throwaway schema:
 //!
-//! * `meta(singleton, identity)` — one row holding the tail identity UUID
+//! * `meta(singleton, identity, format)` — one row holding the tail
+//!   identity UUID and the payload format version (a pre-v2 schema, which
+//!   lacks the column entirely, is refused loudly at open)
 //!   (the `<dir>/identity` equivalent), minted client-side on first open
 //!   with `ON CONFLICT DO NOTHING` so a racing first boot keeps exactly one.
 //! * `frames(table_key, seq, payload, PRIMARY KEY (table_key, seq))` —
 //!   one row per STATEMENT: `table_key` is the same percent-encoded
 //!   `<ns>.<table>` string LocalWal uses for directory names
-//!   (`tail::table_dir_name`), `payload` the same statement-atomic Arrow
-//!   IPC stream (`tail::encode_ipc`) — the file framing's crc/torn-write
+//!   (`tail::table_dir_name`), `payload` the same statement-atomic
+//!   versioned op payload (`tail::encode_op_payload`: format byte + op
+//!   discriminator + Arrow IPC stream) — the file framing's crc/torn-write
 //!   machinery is dropped because Postgres' own WAL and page checksums
 //!   already guarantee an INSERT is all-or-nothing.
 //! * `watermarks(table_key, seq)` — the sidecar; also what floors sequence
@@ -104,8 +107,8 @@ use iceberg::TableIdent;
 use tokio_postgres::{Client, NoTls, Statement};
 
 use crate::tail::{
-    decode_ipc, encode_ipc, parse_table_dir_name, table_dir_name, ReplayedTable, TailStore,
-    TAIL_SEQ_PROPERTY_PREFIX,
+    decode_op_payload, encode_op_payload, parse_table_dir_name, table_dir_name, ReplayedTable,
+    TailOp, TailOpKind, TailStore, TAIL_PAYLOAD_FORMAT, TAIL_SEQ_PROPERTY_PREFIX,
 };
 
 /// Schema every production tail lives in (tests pass their own throwaway
@@ -150,9 +153,9 @@ enum Job {
     },
 }
 
-/// One table's decoded frames: `(seq, batches-of-one-statement)` in
-/// sequence order — the shape [`ReplayedTable::frames`] carries.
-type TableFrames = Vec<(u64, Vec<RecordBatch>)>;
+/// One table's decoded frames: `(seq, op-of-one-statement)` in sequence
+/// order — the shape [`ReplayedTable::frames`] carries.
+type TableFrames = Vec<(u64, TailOp)>;
 
 /// Raw replay rows as they leave the database; decoding (table keys, IPC
 /// payloads) happens on the caller's thread, not the connection's.
@@ -278,11 +281,11 @@ impl Drop for PgTail {
 }
 
 impl TailStore for PgTail {
-    fn append(&self, table: &TableIdent, batches: &[RecordBatch]) -> Result<u64> {
+    fn append(&self, table: &TableIdent, kind: TailOpKind, batches: &[RecordBatch]) -> Result<u64> {
         let key = table_dir_name(table)?;
         // Encode BEFORE consuming anything: an unencodable statement fails
         // with no seq minted and no round trip made.
-        let payload = encode_ipc(batches)?;
+        let payload = encode_op_payload(kind, batches)?;
         let mut map = self.next_seq.lock().expect("tail-pg seq lock poisoned");
         let entry = map.entry(table.clone()).or_insert(1);
         let seq = *entry;
@@ -308,12 +311,12 @@ impl TailStore for PgTail {
         for (key, seq, payload) in raw.frames {
             let seq = u64::try_from(seq)
                 .map_err(|_| anyhow!("tail-pg frame for {key:?} holds a negative seq {seq}"))?;
-            let batches = decode_ipc(&payload).with_context(|| {
+            let op = decode_op_payload(&payload).with_context(|| {
                 format!("tail-pg frame {key:?}/{seq} does not decode (its rows hold acked writes)")
             })?;
             match by_key.last_mut() {
-                Some((k, frames)) if *k == key => frames.push((seq, batches)),
-                _ => by_key.push((key, vec![(seq, batches)])),
+                Some((k, frames)) if *k == key => frames.push((seq, op)),
+                _ => by_key.push((key, vec![(seq, op)])),
             }
         }
         let mut watermarks: HashMap<String, u64> = HashMap::new();
@@ -597,12 +600,14 @@ async fn open_connection(url: &str, schema: &str) -> Result<(Client, Sql, InitSt
     }
 
     let q = format!("\"{schema}\""); // safe: validate_schema_name ran first
+    let fmt = TAIL_PAYLOAD_FORMAT;
     client
         .batch_execute(&format!(
             "CREATE SCHEMA IF NOT EXISTS {q};
              CREATE TABLE IF NOT EXISTS {q}.meta (
                  singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
-                 identity  text    NOT NULL
+                 identity  text    NOT NULL,
+                 format    int     NOT NULL DEFAULT {fmt}
              );
              CREATE TABLE IF NOT EXISTS {q}.frames (
                  table_key text   NOT NULL,
@@ -631,11 +636,32 @@ async fn open_connection(url: &str, schema: &str) -> Result<(Client, Sql, InitSt
         )
         .await
         .context("cannot mint the tail identity")?;
-    let identity: String = client
-        .query_one(&format!("SELECT identity FROM {q}.meta"), &[])
+    // Read identity AND format in one statement: a pre-v2 schema has no
+    // `format` column at all, so the SELECT itself fails there — refuse
+    // loudly instead of mis-decoding unversioned frames.
+    let meta_row = client
+        .query_one(&format!("SELECT identity, format FROM {q}.meta"), &[])
         .await
-        .context("cannot read the tail identity")?
-        .get(0);
+        .with_context(|| {
+            format!(
+                "cannot read the tail identity/format from {q}.meta — if the error names a \
+                 missing \"format\" column, this tail schema was written by a \
+                 pre-v{TAIL_PAYLOAD_FORMAT} icegres (unversioned frame layout) and its \
+                 frames may hold acked rows this build cannot decode. Recover them with \
+                 the version that wrote them, or DROP SCHEMA {q} CASCADE to acknowledge \
+                 losing them"
+            )
+        })?;
+    let identity: String = meta_row.get(0);
+    let format: i32 = meta_row.get(1);
+    if format != i32::from(TAIL_PAYLOAD_FORMAT) {
+        bail!(
+            "tail schema {q} declares on-disk format {format}, but this icegres \
+             reads/writes format {TAIL_PAYLOAD_FORMAT}. Recover its frames with the \
+             version that wrote them, or DROP SCHEMA {q} CASCADE to acknowledge \
+             losing them."
+        );
+    }
     let identity = identity.trim().to_string();
     // A corrupt identity is a loud error (same as LocalWal): silently
     // minting a NEW one would orphan every watermark the old one stamped.
@@ -951,10 +977,22 @@ mod tests {
             "on",
             "the tail session must run with synchronous_commit = on"
         );
-        assert_eq!(tail.append(&ident("t1"), &[batch(&[1, 2])]).unwrap(), 1);
-        assert_eq!(tail.append(&ident("t1"), &[batch(&[3])]).unwrap(), 2);
+        assert_eq!(
+            tail.append(&ident("t1"), TailOpKind::Append, &[batch(&[1, 2])])
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            tail.append(&ident("t1"), TailOpKind::Append, &[batch(&[3])])
+                .unwrap(),
+            2
+        );
         // A second table numbers from 1: sequences are per-table.
-        assert_eq!(tail.append(&ident("t2"), &[batch(&[9])]).unwrap(), 1);
+        assert_eq!(
+            tail.append(&ident("t2"), TailOpKind::Append, &[batch(&[9])])
+                .unwrap(),
+            1
+        );
         drop(tail);
         let tail2 = PgTail::open_with_schema(&url, &guard.schema).unwrap();
         let mut replayed = tail2.replay().unwrap();
@@ -963,13 +1001,23 @@ mod tests {
         assert_eq!(replayed[0].ident, ident("t1"));
         let seqs: Vec<u64> = replayed[0].frames.iter().map(|(s, _)| *s).collect();
         assert_eq!(seqs, vec![1, 2]);
-        assert_eq!(ids(&replayed[0].frames[0].1[0]), vec![1, 2]);
-        assert_eq!(ids(&replayed[0].frames[1].1[0]), vec![3]);
+        assert_eq!(ids(&replayed[0].frames[0].1.batches()[0]), vec![1, 2]);
+        assert_eq!(ids(&replayed[0].frames[1].1.batches()[0]), vec![3]);
         assert_eq!(replayed[1].ident, ident("t2"));
-        assert_eq!(ids(&replayed[1].frames[0].1[0]), vec![9]);
+        assert_eq!(ids(&replayed[1].frames[0].1.batches()[0]), vec![9]);
         // Numbering resumes above the recovered frames after the restart.
-        assert_eq!(tail2.append(&ident("t1"), &[batch(&[4])]).unwrap(), 3);
-        assert_eq!(tail2.append(&ident("t2"), &[batch(&[10])]).unwrap(), 2);
+        assert_eq!(
+            tail2
+                .append(&ident("t1"), TailOpKind::Append, &[batch(&[4])])
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            tail2
+                .append(&ident("t2"), TailOpKind::Append, &[batch(&[10])])
+                .unwrap(),
+            2
+        );
     }
 
     // A multi-batch statement is ONE frame (one seq, one INSERT, one
@@ -981,7 +1029,11 @@ mod tests {
         let guard = SchemaGuard::new(&url, "stmt");
         let tail = PgTail::open_with_schema(&url, &guard.schema).unwrap();
         let seq = tail
-            .append(&ident("t"), &[batch(&[1]), batch(&[2, 3]), batch(&[4])])
+            .append(
+                &ident("t"),
+                TailOpKind::Append,
+                &[batch(&[1]), batch(&[2, 3]), batch(&[4])],
+            )
             .unwrap();
         assert_eq!(seq, 1);
         drop(tail);
@@ -993,7 +1045,7 @@ mod tests {
             1,
             "3 batches = 1 statement = 1 frame"
         );
-        let per_batch: Vec<Vec<i64>> = replayed[0].frames[0].1.iter().map(ids).collect();
+        let per_batch: Vec<Vec<i64>> = replayed[0].frames[0].1.batches().iter().map(ids).collect();
         assert_eq!(per_batch, vec![vec![1], vec![2, 3], vec![4]]);
     }
 
@@ -1004,7 +1056,8 @@ mod tests {
         let guard = SchemaGuard::new(&url, "truncate");
         let tail = PgTail::open_with_schema(&url, &guard.schema).unwrap();
         for v in 1..=3i64 {
-            tail.append(&ident("t"), &[batch(&[v])]).unwrap();
+            tail.append(&ident("t"), TailOpKind::Append, &[batch(&[v])])
+                .unwrap();
         }
         tail.truncate(&ident("t"), 2).unwrap();
         let replayed = tail.replay().unwrap();
@@ -1036,7 +1089,12 @@ mod tests {
         assert_eq!(replayed[0].sidecar_watermark, Some(5));
         // The seed alone (no ensure_seq_floor call) already clears the
         // watermark: the next append cannot land under it.
-        assert_eq!(tail2.append(&ident("t"), &[batch(&[10])]).unwrap(), 6);
+        assert_eq!(
+            tail2
+                .append(&ident("t"), TailOpKind::Append, &[batch(&[10])])
+                .unwrap(),
+            6
+        );
     }
 
     // ensure_seq_floor bumps the next sequence and never lowers it.
@@ -1046,9 +1104,17 @@ mod tests {
         let guard = SchemaGuard::new(&url, "floor");
         let tail = PgTail::open_with_schema(&url, &guard.schema).unwrap();
         tail.ensure_seq_floor(&ident("t"), 10).unwrap();
-        assert_eq!(tail.append(&ident("t"), &[batch(&[1])]).unwrap(), 10);
+        assert_eq!(
+            tail.append(&ident("t"), TailOpKind::Append, &[batch(&[1])])
+                .unwrap(),
+            10
+        );
         tail.ensure_seq_floor(&ident("t"), 5).unwrap(); // lower: no-op
-        assert_eq!(tail.append(&ident("t"), &[batch(&[2])]).unwrap(), 11);
+        assert_eq!(
+            tail.append(&ident("t"), TailOpKind::Append, &[batch(&[2])])
+                .unwrap(),
+            11
+        );
     }
 
     // The identity is minted once and persists across reopens, so the
@@ -1107,6 +1173,69 @@ mod tests {
         assert!(
             reopened.is_some(),
             "lock must release once the holder is gone"
+        );
+    }
+
+    // PHASE 2: keyed op kinds round-trip through the BYTEA payload and a
+    // reopen — Upsert/Delete come back as themselves in seq order.
+    #[test]
+    fn keyed_op_kinds_roundtrip() {
+        let Some(url) = test_url() else { return };
+        let guard = SchemaGuard::new(&url, "opkinds");
+        let tail = PgTail::open_with_schema(&url, &guard.schema).unwrap();
+        tail.append(&ident("t"), TailOpKind::Append, &[batch(&[1])])
+            .unwrap();
+        tail.append(&ident("t"), TailOpKind::Upsert, &[batch(&[2])])
+            .unwrap();
+        tail.append(&ident("t"), TailOpKind::Delete, &[batch(&[3])])
+            .unwrap();
+        drop(tail);
+        let tail2 = PgTail::open_with_schema(&url, &guard.schema).unwrap();
+        let replayed = tail2.replay().unwrap();
+        assert_eq!(replayed.len(), 1);
+        let kinds: Vec<(u64, TailOpKind)> = replayed[0]
+            .frames
+            .iter()
+            .map(|(seq, op)| (*seq, op.kind()))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (1, TailOpKind::Append),
+                (2, TailOpKind::Upsert),
+                (3, TailOpKind::Delete)
+            ]
+        );
+        assert_eq!(ids(&replayed[0].frames[1].1.batches()[0]), vec![2]);
+    }
+
+    // PHASE 2: a pre-v2 tail schema (meta without the format column — the
+    // exact shape an older icegres leaves) is refused loudly at open.
+    #[test]
+    fn old_schema_without_format_column_is_refused() {
+        let Some(url) = test_url() else { return };
+        let guard = SchemaGuard::new(&url, "oldschema");
+        // Hand-build the pre-v2 schema shape.
+        admin_exec(
+            &url,
+            &format!(
+                "CREATE SCHEMA \"{s}\";
+                 CREATE TABLE \"{s}\".meta (
+                     singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+                     identity  text    NOT NULL
+                 );
+                 INSERT INTO \"{s}\".meta (singleton, identity)
+                 VALUES (true, '00000000-0000-0000-0000-000000000000');",
+                s = guard.schema
+            ),
+        );
+        let err = match PgTail::open_with_schema(&url, &guard.schema) {
+            Ok(_) => panic!("a pre-v2 tail schema must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("identity/format"),
+            "unexpected error: {err:#}"
         );
     }
 }

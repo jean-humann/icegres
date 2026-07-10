@@ -45,6 +45,7 @@ compatibility, and scale-to-zero economics on lakehouse data — leave
 | Time travel | read-only snapshot-pinned queries | `demo."trips@<snapshot_id>"` |
 | Zero-copy branches | Neon-style branch-per-endpoint over Iceberg snapshot refs (`src/branch.rs`) | `icegres branch create/list/drop`, `serve --branch` |
 | Buffered writes (opt-in) | Moonlink-style group commit: ~1.5 ms INSERT ack, union reads, ≤N ms durability window, WARN on enable (`src/buffer.rs`) | `--write-buffer-ms N` (default 0 = synchronous) |
+| Keyed tail upserts (opt-in) | Hot-row `UPDATE`/`DELETE` by exact PK ack from the durable tail (~9.5 ms p50 vs ~71 ms sync), coalesced per key into ONE commit per flush window (`src/keyed.rs`, `src/buffer.rs`) | table properties `icegres.primary-key` + `icegres.tail-upsert=true`, with `--write-buffer-ms > 0` and a tail backend |
 | Scale-to-zero | clean exit after N idle seconds; stateless compute | `--idle-shutdown-secs` |
 | Wake-on-connect control plane | `icegresd`: pgwire-aware proxy that spawns computes on connect, routes `icegres@<branch>` dbnames to per-branch computes, supervises crashes with capped backoff, keeps a warm session pool (`--pool-size`, sub-ms connects; session pooling only — no transaction pooling, no cross-client reuse) | `icegresd serve` / `icegresd status` |
 | Health endpoint | HTTP 200 liveness | `--health-port` |
@@ -529,6 +530,76 @@ sections 2–4 local and 6–8 Postgres). The Postgres backend's unit tests
 (`src/tail_pg.rs`) run live against `ICEGRES_TEST_PG_URL` (the local
 stack's `postgresql://lakekeeper:lakekeeper@127.0.0.1:5433/icegres_test`)
 and skip cleanly when it is unset.
+
+### Hot rows: keyed tail upserts (`icegres.tail-upsert`, opt-in)
+
+Roadmap Phase 2 (docs/sota-roadmap.md §4). On an opted-in table, an
+autocommit `UPDATE ... WHERE <exact PK equality>` (literal SET values) or
+`DELETE ... WHERE <exact PK equality>` skips the synchronous copy-on-write
+commit entirely: the statement resolves the key's current row through the
+same union view a scan sees, fsyncs ONE keyed frame to the durable tail,
+and acks. The flusher coalesces every keyed op of the window per key
+(last-writer-wins) and applies them as ONE composed COW commit — N updates
+to a hot row become one file rewrite per flush window instead of N
+serialized ~55–70 ms commits with `40001` storms, and an acked keyed op is
+never exposed to a client-visible `40001` (flush conflicts with foreign
+writers retry internally; the rows stay tail-durable meanwhile).
+
+**Measured on the dev box** (`--write-buffer-ms 200 --tail-dir`, 30
+sequential UPDATEs to one committed row, psycopg2, autocommit):
+
+| Path | UPDATE ack p50 | min / p90 | Snapshots produced |
+|---|---|---|---|
+| Keyed tail (this feature) | **9.5 ms** | 8.2 / 15.0 ms | 3 (one per 200 ms window) |
+| Synchronous COW (same table shape, no property) | 71.1 ms | 59.7 / 106.7 ms | 30 (one per statement) |
+
+The ~9.5 ms is one catalog `load_table` (activation + read anchor) + one
+union-view point lookup + one tail fsync — the documented read-modify-write
+cost of the ack (`docs/limitations.md`).
+
+**Activation matrix — ALL of these, or the statement silently takes the
+unchanged fence-then-synchronous path (never an error):**
+
+| Requirement | How |
+|---|---|
+| Declared primary key | table property `icegres.primary-key = "col[,col...]"` |
+| Keyed-tail opt-in | table property `icegres.tail-upsert = "true"` |
+| Buffered writes | `--write-buffer-ms N` with `N > 0` |
+| A durable tail | `--tail-dir <dir>` or `--tail-url <postgres url>` |
+| Statement shape | exact equality on ALL PK columns with literals (AND-composed for composite keys), no other predicates, no `RETURNING`/joins/subqueries/bind parameters; UPDATE additionally: literal SET values, PK columns not assigned |
+| PK column types | Iceberg `int`/`long`/`string`/`boolean`/`date` |
+| Key cardinality | the key currently matches at most ONE row (duplicate keys fall back to the sync path) |
+
+Durability and crash recovery ride the existing tail machinery: one keyed
+statement = one fsync'd tail frame (op-discriminated payload, format v2),
+replayed in sequence order into the keyed map on boot, truncated by the
+same watermark protocol as inserts. Reads on this server merge lake + tail
+by key: committed rows (and older buffered layers) whose key was updated or
+deleted are suppressed and the newest buffered version unions in;
+time-travel (`table@snapshot`) and metadata tables stay point-in-time pure.
+**Semantics shift, stated plainly (docs/limitations.md):** within a flush
+window a keyed table trades snapshot-isolation-per-statement for per-key
+last-writer-wins **in ack (tail-sequence) order** — a plain INSERT of a
+key acked after a keyed delete/update of that key becomes its newest
+version (delete-then-reinsert in one window leaves the row present with
+the inserted values), and one acked before it loses, exactly as wall-clock
+ack order suggests. Explicit `BEGIN…COMMIT` keeps today's
+fence-flush-then-sync path (serialized per table against in-flight keyed
+statements, so a committed synchronous write can never be clobbered by a
+keyed statement's stale row image), and `--enforce-pk` composes: enforced
+INSERTs still fence, keyed updates still work (a keyed upsert is
+delete-then-insert of one key, so uniqueness is inherent). **Flight SQL is
+out of scope:** `flight-serve` is a separate process with no write buffer
+or tail — it executes DML synchronously, keyed routing never applies
+there, its counts are sync-exact, and it sees another server's in-window
+keyed ops at the commit cadence like any cross-server reader. Verified end
+to end by `icegres/tests/tail_durability.sh`
+section 9 (keyed UPDATE/DELETE ack fast, survive kill -9, commit exactly
+once; fence path proven for tables without the property) and
+`icegres/tests/e2e.sh` section (x) (20 hot-row UPDATEs = zero
+mid-window snapshots + ONE composed commit; union read sees the newest
+value mid-window; delete-then-reinsert of one key in one window leaves the
+row present with the inserted values; time travel unaffected).
 
 ### Zero-copy branches (`icegres branch`, `serve --branch`)
 

@@ -1415,6 +1415,44 @@ pub async fn apply_dml_to_batches(
     }
 }
 
+/// Validate a DML statement against a table schema exactly as the sync
+/// path does, WITHOUT touching any rows: [`DmlSql::new`] (unknown SET
+/// column → the identical `column "..." of relation "..." does not exist`
+/// error) plus, for UPDATE, a zero-row planning/execution probe of the same
+/// rewrite SQL the per-file evaluation runs (an unplannable SET expression
+/// → the identical plan error; a merely un-castable literal passes here
+/// exactly as sync passes it when no row matches). Shared with the keyed
+/// fast path (buffer.rs `try_keyed_dml`) so a missing-key UPDATE still
+/// errors exactly as the synchronous path would instead of answering
+/// `UPDATE 0` for a statement sync rejects.
+pub(crate) async fn validate_dml_against_schema(
+    stmt: &DmlStatement,
+    schema: &ArrowSchemaRef,
+) -> Result<()> {
+    let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+    let sql = DmlSql::new(stmt, columns.iter().map(String::as_str))?;
+    let Some(rewrite_sql) = &sql.rewrite else {
+        return Ok(()); // DELETE: no SET list to validate
+    };
+    let ctx = SessionContext::new_with_config(
+        SessionConfig::new().with_default_catalog_and_schema(CATALOG_NAME, &stmt.namespace),
+    );
+    let table_ref =
+        datafusion::sql::TableReference::partial(stmt.namespace.as_str(), stmt.table.as_str());
+    let empty = RecordBatch::new_empty(schema.clone());
+    let mem = MemTable::try_new(schema.clone(), vec![vec![empty]])
+        .map_err(|e| anyhow!("failed to build in-memory eval table: {e}"))?;
+    ctx.register_table(table_ref, Arc::new(mem))
+        .map_err(|e| anyhow!("failed to register eval table: {e}"))?;
+    ctx.sql(rewrite_sql)
+        .await
+        .map_err(|e| anyhow!("failed to plan UPDATE rewrite ({rewrite_sql}): {e}"))?
+        .collect()
+        .await
+        .map_err(|e| anyhow!("failed to compute UPDATE rewrite: {e}"))?;
+    Ok(())
+}
+
 /// Classification of one file's (or buffered batch set's) rows against a
 /// DML statement.
 enum FileFate {
@@ -2596,6 +2634,68 @@ mod tests {
         );
         let err = DmlSql::new(&s, ["trip_id"].into_iter()).unwrap_err();
         assert!(err.to_string().contains("does not exist"));
+    }
+
+    // FIX (S2): the shared schema-only validation raises the EXACT error
+    // the sync path raises for an unknown SET column (it IS DmlSql::new's
+    // error) regardless of whether any row matches — which is what lets the
+    // keyed fast path (buffer.rs) validate a missing-key UPDATE identically
+    // to the synchronous path before answering.
+    #[tokio::test]
+    async fn validate_dml_matches_sync_validation_without_rows() {
+        let schema: ArrowSchemaRef = Arc::new(Schema::new(vec![
+            Field::new("trip_id", DataType::Int64, true),
+            Field::new("fare", DataType::Float64, true),
+        ]));
+        // Unknown SET column: identical text to the sync path's eager
+        // DmlSql::new validation inside prepare_commit.
+        let s = stmt(
+            DmlKind::Update {
+                assignments: vec![("nope".into(), "'x'".into())],
+            },
+            Some("trip_id = 7"),
+        );
+        let err = validate_dml_against_schema(&s, &schema)
+            .await
+            .unwrap_err()
+            .to_string();
+        let sync_err = DmlSql::new(&s, ["trip_id", "fare"].into_iter())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, sync_err);
+        assert_eq!(err, "column \"nope\" of relation \"trips\" does not exist");
+        // Un-castable SET literal on a NON-matching key: the sync path does
+        // NOT error here either (matched == 0 short-circuits before the
+        // rewrite runs; even when it runs, CASE type unification widens to
+        // Utf8 and the failure only materializes when a MATCHED row's value
+        // must cast back) — the probe evaluates the same rewrite SQL over
+        // zero rows and therefore accepts exactly what sync accepts.
+        let s = stmt(
+            DmlKind::Update {
+                assignments: vec![("fare".into(), "'not-a-number'".into())],
+            },
+            Some("trip_id = 7"),
+        );
+        validate_dml_against_schema(&s, &schema).await.unwrap();
+        // A structurally invalid SET expression, though, errors before any
+        // key lookup — same as sync's plan-time failure.
+        let s = stmt(
+            DmlKind::Update {
+                assignments: vec![("fare".into(), "no_such_col + 1".into())],
+            },
+            Some("trip_id = 7"),
+        );
+        assert!(validate_dml_against_schema(&s, &schema).await.is_err());
+        // A valid UPDATE and any DELETE pass.
+        let s = stmt(
+            DmlKind::Update {
+                assignments: vec![("fare".into(), "99.9".into())],
+            },
+            Some("trip_id = 7"),
+        );
+        validate_dml_against_schema(&s, &schema).await.unwrap();
+        let s = stmt(DmlKind::Delete, Some("trip_id = 7"));
+        validate_dml_against_schema(&s, &schema).await.unwrap();
     }
 
     #[test]

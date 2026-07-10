@@ -594,6 +594,13 @@ pub struct TxnHook {
     registry: Arc<TxnRegistry>,
     engine: Arc<OverwriteEngine>,
     catalog: Arc<dyn Catalog>,
+    /// Buffered-write mode (`--write-buffer-ms`), when enabled: COMMIT
+    /// serializes against in-flight keyed read-modify-writes on every
+    /// keyed-activated touched table via the buffer's per-table
+    /// keyed-serial locks (buffer.rs, fix L1) — without this, a keyed
+    /// statement's union read could predate this COMMIT and its stale
+    /// full-row image would clobber the committed change at flush time.
+    buffer: Option<Arc<crate::buffer::WriteBuffer>>,
     /// When true, a multi-table COMMIT that cannot be applied atomically
     /// (the catalog lacks the `transactions/commit` endpoint) is refused
     /// (nothing applied) instead of being applied best-effort per-table.
@@ -608,11 +615,13 @@ impl TxnHook {
         registry: Arc<TxnRegistry>,
         engine: Arc<OverwriteEngine>,
         catalog: Arc<dyn Catalog>,
+        buffer: Option<Arc<crate::buffer::WriteBuffer>>,
     ) -> Self {
         Self {
             registry,
             engine,
             catalog,
+            buffer,
             strict: strict_txn_mode(),
         }
     }
@@ -672,6 +681,34 @@ impl TxnHook {
             .map(|(ident, _)| ident)
             .collect();
         idents.sort_by_key(|i| i.to_string());
+
+        // L1(c): serialize this COMMIT against in-flight keyed
+        // read-modify-writes on every KEYED-ACTIVATED touched table, held
+        // across the whole commit. Activation comes from the PIN-TIME
+        // metadata (zero extra catalog calls; a property change since the
+        // pin moves the metadata and conflicts the pin's CAS anyway).
+        // Locks are acquired in the already-sorted ident order, so
+        // concurrent multi-table COMMITs cannot deadlock; non-activated
+        // tables acquire nothing.
+        let mut _keyed_serial_guards = Vec::new();
+        if let Some(buffer) = &self.buffer {
+            let keyed_locks: Vec<_> = idents
+                .iter()
+                .filter(|ident| {
+                    crate::keyed::property_is_true(
+                        sess.tables[**ident]
+                            .pinned
+                            .metadata()
+                            .properties()
+                            .get(crate::keyed::TAIL_UPSERT_PROPERTY),
+                    )
+                })
+                .map(|ident| buffer.keyed_serial_lock(ident))
+                .collect();
+            for lock in keyed_locks {
+                _keyed_serial_guards.push(lock.lock_owned().await);
+            }
+        }
 
         // Multi-table transaction: try ONE atomic all-or-nothing catalog
         // commit (POST /v1/{prefix}/transactions/commit, Iceberg REST spec;

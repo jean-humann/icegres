@@ -230,6 +230,24 @@ protocol only Databricks' own engines speak. Parity, not deficit.
 
 ## 4. Phase 2 — hot rows: PK upserts on the tail
 
+> **STATUS: shipped — the single-compute half.** Tables opt in via
+> `icegres.primary-key` + `icegres.tail-upsert = "true"` (buffered mode +
+> a durable tail required). Exact-PK autocommit `UPDATE`/`DELETE` write a
+> keyed, op-discriminated frame to the tail (payload format v2) and ack in
+> ~9.5 ms p50 measured (vs ~71 ms synchronous COW); the flusher coalesces
+> per key (LWW — ack/tail-sequence order is the total order per key, so a
+> same-window plain re-INSERT after a keyed delete wins and resurrects the
+> row) and composes pending inserts + one delete-by-keys + the
+> replacement rows into ONE COW commit per window; scans merge lake + tail
+> by key (`KeySuppressExec` + layered overlay); replay rebuilds the keyed
+> map in sequence order through the same routing as the live path; the
+> fenced sync path and txn COMMITs serialize per table against in-flight
+> keyed read-modify-writes. Verified by `tail_durability.sh` §9 and
+> `e2e.sh` §(x). **Not yet:** cross-compute row locks / shared-tail arbitration
+> (single-writer tails only, like Phase 1), merge-on-read deletion vectors
+> (blocked on the dependency matrix), point-lookup short-circuit through
+> the keyed map, non-literal SET expressions.
+
 With a durable shared tail, hot-row traffic stops being a COW problem:
 
 - Tables opt in via the existing `icegres.primary-key` property (+
