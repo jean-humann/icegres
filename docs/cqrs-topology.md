@@ -63,6 +63,15 @@ workload classes on the same single-copy tables:
    **~7 ms p50** (point 6.9 / filtered 6.8 / aggregate 7.2 / join
    9.9 ms; ~380 qps over 8 connections on 4 cores). Freshness is exact:
    every scan checks the current snapshot, no TTL, no staleness window.
+   Opt-in `--freshness-ms N` trades that exactness for latency, boundedly:
+   scans skip the per-scan catalog check (point lookup **~4.4 ms p50**,
+   repeated identical statements **~2.8–3.6 ms** via the physical-plan
+   cache); this server's own writes stay read-your-own-writes exact, and
+   commits from OTHER computes become visible within ~N ms + one refresh
+   round trip — tables refresh concurrently with a per-table timeout, so a
+   slow table delays only itself (staleness age exported on `/metrics`,
+   sampled at refresher pass start). Suited to read-mostly API computes;
+   leave it off where cross-compute exactness matters.
 2. **Buffered event writes** (`--write-buffer-ms N`, opt-in) — telemetry,
    audit logs, clickstream, anything append-only and loss-tolerant for
    ≤ N ms: INSERT acks at **~1.3–1.5 ms p50** from the in-memory buffer,
@@ -130,6 +139,8 @@ makes this operable from ONE public port:
 | buffered INSERT ack (`--write-buffer-ms 100`) | ~1.3–1.5 ms | same + R6.4 acceptance |
 | freshness, buffered mode (same server, new conn) | ~8–10 ms (p95 bimodal ~80 ms) | same |
 | freshness, synchronous mode (any reader) | ~60–73 ms | same |
+| API read latency with `--freshness-ms 25` (point, distinct literals / repeated point / repeated filtered agg) | 4.4 / 3.6 / 2.8 ms | `ICEGRES_QUERY_TIMING` 30-query probe, this tree |
+| cross-compute visibility bound with `--freshness-ms 25` | ~N ms + 1 refresh round trip, per table (a slow table delays only itself, up to its min(4·N, 2 s) refresh timeout); measured ≤ 45 ms end-to-end incl. poll granularity | e2e §(z) |
 | cold start, direct `icegres serve` | ~45 ms | same |
 | wake-after-idle through icegresd | ~73 ms (manual probes 85–96 ms) | `cold_start_via_proxy_ms`, D5 |
 | warm-pool connect via icegresd | 0.44 ms (p95 0.66 ms) | `connect_via_proxy_ms` |
@@ -140,6 +151,7 @@ makes this operable from ONE public port:
 | workload | tier / mode | why |
 |---|---|---|
 | API point reads, dashboards' hot queries | Tier 2 default serve | ~7 ms reads, exact freshness, ORM-compatible |
+| Read-mostly API computes that tolerate ~tens-of-ms staleness from OTHER writers | Tier 2 + `--freshness-ms 25` | ~4.4 ms point reads (2.8–3.6 ms repeated shapes); own writes stay exact; staleness bounded per table (~N ms + 1 refresh round trip; a slow table delays only itself) + gauged on `/metrics` |
 | Event/telemetry ingest (append-only, loss-tolerant ≤N ms) | Tier 2 + `--write-buffer-ms` on a dedicated compute | 1.5 ms ack, ~40× cheaper than sync; group commit amortizes the REST round-trip |
 | Orders/state transitions (moderate rate, must be durable + atomic) | Tier 2 default serve, transactions | 50–60 ms durable commit, snapshot isolation, 40001 conflict semantics |
 | Bulk load / backfill | Tier 2, multi-row INSERT batches (or direct Iceberg writers) | ~1 ms/row amortized at batch 100; engines can write via the catalog directly |

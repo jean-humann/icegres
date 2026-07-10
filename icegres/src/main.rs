@@ -12,6 +12,7 @@ mod compat;
 mod context;
 mod dml;
 mod flight;
+mod freshness;
 mod keyed;
 mod maintain;
 mod metrics;
@@ -21,6 +22,7 @@ mod overwrite;
 /// feature). The open-source build carries no auth backend.
 #[cfg(feature = "managed")]
 mod pgauth;
+mod plancache;
 /// Consensus-class durable tail (`--tail-quorum`): the proposer/acceptor
 /// protocol adapted from Neon's safekeeper (see the module docs and NOTICE).
 mod quorum;
@@ -32,6 +34,7 @@ mod segment;
 mod tail;
 mod tail_pg;
 mod tail_quorum;
+mod timing;
 mod traced;
 mod txn;
 
@@ -185,6 +188,29 @@ enum Command {
         /// loudly. Default: main.
         #[arg(long, env = "ICEGRES_BRANCH", default_value = "main")]
         branch: String,
+
+        /// Bounded-staleness reads: with N > 0, scans serve the cached
+        /// table snapshot with NO per-scan catalog round trip (reclaiming
+        /// the ~2-3 ms freshness check that dominates read latency) while
+        /// ONE background task polls the catalog every N ms (tables
+        /// refreshed concurrently, up to 8 in flight) and swaps the cached
+        /// snapshot on change. TRADE-OFF: commits from OTHER writers become
+        /// visible within ~N ms plus one refresh round trip instead of
+        /// immediately; a slow table delays only ITSELF — its refresh is
+        /// retry-free, bounded by a per-table timeout of min(4*N, 2000) ms,
+        /// and retried on the next pass, never holding up other tables'
+        /// freshness. That is why the default is 0 (exact freshness,
+        /// semantics unchanged) and enabling it logs a WARN. THIS server's
+        /// own writes stay read-your-own-writes exact (synchronous
+        /// invalidation on every local write path). During a catalog outage
+        /// reads keep serving the last refreshed snapshot (set
+        /// ICEGRES_STALE_READ_ON_CATALOG_ERROR=0 to fail loudly instead);
+        /// worst-case age is the icegres_freshness_age_ms gauge on /metrics
+        /// (sampled at refresher pass start, so a healthy value reads ~N).
+        /// Also enables the physical-plan cache for repeated statements
+        /// (see icegres/src/freshness.rs and icegres/src/plancache.rs).
+        #[arg(long, env = "ICEGRES_FRESHNESS_MS", default_value_t = 0)]
+        freshness_ms: u64,
 
         /// Moonlink-style buffered writes: with N > 0, INSERTs acknowledge
         /// after appending to an in-memory buffer and a background task
@@ -493,6 +519,7 @@ async fn main() -> Result<()> {
             auth_file,
             authz_file,
             branch,
+            freshness_ms,
             enforce_pk,
             write_buffer_ms,
             tail_dir,
@@ -508,6 +535,7 @@ async fn main() -> Result<()> {
                 auth_file,
                 authz_file,
                 branch,
+                freshness_ms,
                 enforce_pk,
                 write_buffer_ms,
                 tail_dir,
@@ -593,6 +621,7 @@ struct ServeOpts {
     auth_file: Option<PathBuf>,
     authz_file: Option<PathBuf>,
     branch: String,
+    freshness_ms: u64,
     enforce_pk: bool,
     write_buffer_ms: u64,
     tail_dir: Option<PathBuf>,
@@ -880,13 +909,40 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
         None
     };
 
+    // Bounded-staleness reads (--freshness-ms, freshness.rs). Default 0 =
+    // exact freshness, byte-identical semantics and code path.
+    if serve_opts.freshness_ms > 0 {
+        warn!(
+            freshness_ms = serve_opts.freshness_ms,
+            "bounded-staleness reads are ENABLED (--freshness-ms): scans serve the cached \
+             snapshot with NO per-scan catalog check; commits from OTHER writers become \
+             visible within ~{} ms plus one refresh round trip — a slow table delays only \
+             itself (retry-free per-table refresh timeout min(4*N, 2000) ms; the next pass \
+             retries), never other tables (exact freshness is the default, --freshness-ms \
+             0). THIS server's own writes remain read-your-own-writes exact via synchronous \
+             invalidation. During a catalog outage reads keep serving the last refreshed \
+             snapshot (ICEGRES_STALE_READ_ON_CATALOG_ERROR=0 fails loudly instead) — \
+             worst-case age is the icegres_freshness_age_ms gauge on /metrics (sampled at \
+             refresher pass start; healthy ~N).",
+            serve_opts.freshness_ms
+        );
+    }
+
     let ctx = context::build_session_context_with(
         catalog.clone(),
         None,
         write_buffer.clone(),
         branch.clone(),
+        serve_opts.freshness_ms,
     )
     .await?;
+
+    // Spawn the per-server refresher AFTER the context registered every
+    // table with the freshness registry (tables created later register
+    // lazily and are picked up on the refresher's next pass).
+    if serve_opts.freshness_ms > 0 {
+        freshness::spawn_refresher(std::time::Duration::from_millis(serve_opts.freshness_ms));
+    }
 
     setup_pg_catalog(
         &ctx,
@@ -923,6 +979,7 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
         write_buffer,
         serve_opts.enforce_pk,
         authorizer,
+        serve_opts.freshness_ms > 0,
     );
 
     info!(listen_addr = %format!("{host}:{port}"), "starting pgwire server");
@@ -973,6 +1030,15 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
 /// 7. [`compat::InsertTagHook`] — fall-through: plain autocommit INSERTs get
 ///    a proper `INSERT 0 n` command tag on the extended protocol (SPEC A9,
 ///    JDBC `executeUpdate()`); every specialized INSERT path above ran first.
+/// 8. [`plancache::PlanCacheHook`] (only with `--freshness-ms > 0`) —
+///    physical-plan cache for repeated simple-protocol SELECT shapes
+///    (plancache.rs). After every specialized hook (it must only see plain
+///    autocommit SELECTs) and before the timing hook (so timing measures
+///    the cached path when both are enabled).
+/// 9. [`timing::TimingHook`] — diagnostic per-stage read timing, active only
+///    with `ICEGRES_QUERY_TIMING=1`. LAST so it only ever sees plain SELECTs
+///    that would fall through to the default handler.
+#[allow(clippy::too_many_arguments)]
 fn query_hooks(
     engine: Arc<OverwriteEngine>,
     registry: Arc<TxnRegistry>,
@@ -980,8 +1046,9 @@ fn query_hooks(
     write_buffer: Option<Arc<buffer::WriteBuffer>>,
     enforce_pk: bool,
     authorizer: Option<authz::SharedAuthorizer>,
+    plan_cache: bool,
 ) -> Vec<Arc<dyn QueryHook>> {
-    let mut hooks: Vec<Arc<dyn QueryHook>> = Vec::with_capacity(7);
+    let mut hooks: Vec<Arc<dyn QueryHook>> = Vec::with_capacity(8);
     // Observe-only: count every wire statement (falls through, never changes
     // behavior). First so it sees all statements including denied ones.
     hooks.push(Arc::new(metrics::MetricsHook));
@@ -1013,6 +1080,15 @@ fn query_hooks(
     hooks.push(Arc::new(SetShowHook));
     hooks.push(Arc::new(dml::DmlHook::new(engine)));
     hooks.push(Arc::new(compat::InsertTagHook));
+    // Physical-plan cache (plancache.rs); only registered in freshness mode
+    // (--freshness-ms > 0), where a cache hit is sound without a per-scan
+    // catalog check. Keeps the default-mode hook chain untouched.
+    if plan_cache {
+        hooks.push(Arc::new(plancache::PlanCacheHook::new()));
+    }
+    // Diagnostic per-stage timing (timing.rs); inert unless
+    // ICEGRES_QUERY_TIMING=1. Must stay last.
+    hooks.push(Arc::new(timing::TimingHook::new()));
     hooks
 }
 

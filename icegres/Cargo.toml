@@ -121,6 +121,13 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 async-trait = "0.1"
 
+# Test-only: tokio's paused clock (`#[tokio::test(start_paused = true)]`) so
+# the freshness refresher supervisor's respawn window (60 s) is testable in
+# milliseconds. Dev-dependency feature unification applies to test builds
+# only — the shipped binary's tokio feature set above is unchanged.
+[dev-dependencies]
+tokio = { version = "1.52", features = ["test-util"] }
+
 # Resource hygiene: symbols stripped from the release binary (rust symbol tables
 # on the datafusion+iceberg graph are enormous). binary_size_mb and rss are
 # gated metrics (bench/gate.sh). lto = "thin" was measured and rejected: the

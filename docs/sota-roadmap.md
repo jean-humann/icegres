@@ -449,3 +449,20 @@ runs, not projections.
 | 3 — multi-table atomicity + whole-lakehouse branches | **shipped** | One `CommitTransactionRequest` per multi-table COMMIT (40001 on conflict, nothing applied; ordered/40003 fallback preserved) + `branch create-all`/`drop-all` atomic cross-table cuts (`feat: atomic multi-table transactions`) | verified live against Lakekeeper 0.13.1; e2e grew to 140 assertions incl. section (j2)/(u) contracts |
 | 4 — table health: compaction + orphan GC | **partial: orphan GC shipped; compaction gated** | `maintain remove-orphans`: object-store listing vs live-set diff, dry-run default, 72 h grace, fail-closed (this tree). The small-file *source* was fixed by Phase 1–2 cadence commits; bin-pack rewrite waits on the pinned iceberg-rust matrix gaining replace-files | orphan-GC e2e contract proven (dry-run deletes nothing; `--execute` removes exactly the reported set with rows/live files intact; rerun reports 0); e2e suite grew 153→163 assertions |
 | 5 — secondary index tier | **deferred by design** | none — the §7 bar stands: build against real scale evidence, not the feature list | point lookups measured at 6.9 ms with no index object; no workload has beaten that bar yet |
+| latency — sub-5 ms reads (freshness refresher + plan cache) | **shipped (opt-in)** | `--freshness-ms N`: per-server background refresher replaces the per-scan catalog check (bounded staleness for foreign writers, read-your-own-writes exact via synchronous invalidation on every local commit path; staleness gauge on `/metrics`) + physical-plan LRU for repeated statement shapes, version-validated per table, overlay/time-travel/volatile-expr excluded (`src/freshness.rs`, `src/plancache.rs`, this tree) | `ICEGRES_QUERY_TIMING` 30-query p50s at `--freshness-ms 25`: point lookup 7.38 → **4.41 ms** (target < 5 ms met; per-scan freshness stage 2.9 ms → 0), repeated point lookup **3.57 ms**, repeated filtered aggregate 6.91 → **2.79 ms**; default mode byte-identical (7.38/6.91 ms re-measured on the same binary) |
+
+## 11. Latency track (post-roadmap increments)
+
+- **Sub-5 ms reads — SHIPPED.** `--freshness-ms N` background refresher
+  (bounded parallelism, retry-free per-table timeouts, supervised +
+  self-healing, worst-case staleness gauge) + plan cache (LRU, planning-
+  state-keyed, overlay-safe). Measured: point lookup 7.4 → **3.4 ms p50 /
+  4.3 ms p95** at `--freshness-ms 25`; repeated statements ~2.8 ms;
+  default (0) byte-identical exact freshness. e2e §(z); the per-stage
+  timing instrumentation (`ICEGRES_QUERY_TIMING=1`) ships with it.
+- **Sub-10 ms durable writes — QUEUED.** Full scope in
+  `write-latency-scope.md`: write-path instrumentation, tail-ack
+  group-fsync + quorum pipelining + bench ladder legs, keyed RMW fast
+  path (< 7 ms via the read machinery), sync-path parallel uploads
+  (~30–40 ms honest target — sub-10 sync commits are physically
+  impossible on object storage; the tail IS the sub-10 write path).

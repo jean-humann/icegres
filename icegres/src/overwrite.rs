@@ -1053,7 +1053,28 @@ impl OverwriteEngine {
 
     /// POST the commit to the REST catalog. 2xx = committed, 409 = conflict
     /// (caller retries), anything else = hard error.
+    ///
+    /// Every local commit attempt flows through here (sync DML, PK-enforced
+    /// INSERT, transaction COMMIT's per-table fallback, buffer flush,
+    /// branch/maintenance commits), so this is where freshness mode's
+    /// read-your-own-writes invalidation lives: after the POST completes
+    /// the table's cached snapshot is invalidated (freshness.rs) so the
+    /// next read on this server observes the commit synchronously.
+    /// Invalidation is unconditional — a transport error is AMBIGUOUS (the
+    /// commit may have landed) and even a clean 409 costs at most one extra
+    /// catalog check on the next scan. No-op in default mode.
     async fn post_commit(
+        &self,
+        namespace: &str,
+        table: &str,
+        request: &CommitTableRequest,
+    ) -> Result<CommitOutcome> {
+        let result = self.post_commit_inner(namespace, table, request).await;
+        crate::freshness::invalidate_key(&crate::freshness::commit_key(namespace, table));
+        result
+    }
+
+    async fn post_commit_inner(
         &self,
         namespace: &str,
         table: &str,
@@ -1174,6 +1195,25 @@ impl OverwriteEngine {
     /// or the catalog CAS lost) with NOTHING applied. Skips the wire
     /// entirely when support is already known to be absent.
     async fn post_transaction(&self, requests: &[&CommitTableRequest]) -> Result<TxnCommitOutcome> {
+        let result = self.post_transaction_inner(requests).await;
+        // Freshness-mode read-your-own-writes: same unconditional
+        // invalidation as post_commit, for every table the transaction
+        // touched (skipped for capability-probe requests, which carry no
+        // identifier). No-op in default mode.
+        if !matches!(result, Ok(TxnCommitOutcome::Unsupported)) {
+            for request in requests {
+                if let Some(ident) = &request.identifier {
+                    crate::freshness::invalidate_key(&crate::freshness::table_key(ident));
+                }
+            }
+        }
+        result
+    }
+
+    async fn post_transaction_inner(
+        &self,
+        requests: &[&CommitTableRequest],
+    ) -> Result<TxnCommitOutcome> {
         if !self.probe_txn_endpoint().await? {
             return Ok(TxnCommitOutcome::Unsupported);
         }

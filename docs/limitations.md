@@ -247,6 +247,56 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
   sync-exact, and it sees another server's in-window keyed ops only at
   the commit cadence (the existing cross-server freshness rule).
 
+## Bounded-staleness reads (opt-in, `--freshness-ms`)
+
+- **`--freshness-ms N` with `N > 0` trades exact freshness for read latency,
+  boundedly.** Default (`0`) keeps today's contract byte-identical: every
+  scan performs one catalog `load_table` (~2–3 ms locally) and observes the
+  catalog's current snapshot with no staleness window. With `N > 0`, scans
+  serve the cached snapshot with no catalog round trip and ONE background
+  task per server re-polls every mounted table each `N` ms, refreshing
+  tables concurrently (up to 8 in flight) with a retry-free per-table
+  timeout of min(4·`N`, 2 s) — the next pass is the retry — so a slow or
+  stalled table delays only its OWN visibility, never other tables'. What
+  stays EXACT: this server's own writes (every local commit path — sync
+  DML, PK-enforced INSERT, transaction COMMIT, buffer flush, plain INSERT —
+  synchronously invalidates the table, so the next local read loads fresh
+  metadata), time travel (`table@snapshot`), and branch-pinned reads
+  (snapshot-addressed, immutable). What becomes BOUNDED: commits by OTHER
+  writers (other icegres servers, Spark, any catalog committer) are visible
+  within ~`N` ms plus one refresh round trip (up to that table's refresh
+  timeout when the catalog is slow for it). Enabling the mode logs a WARN
+  stating the bound.
+- **Catalog outage under freshness mode serves stale by default, visibly —
+  with an explicit fail-loud opt-out.** The refresher keeps serving the
+  last refreshed snapshot (reads do not start failing), WARNs rate-limited,
+  and exports the worst-case staleness age as the
+  `icegres_freshness_age_ms` gauge on `/metrics` — alert on it. The gauge
+  is sampled at each refresher pass START (the age a read could have
+  observed just before that pass refreshed), so a healthy value reads
+  ≈ `N` ms and it grows monotonically through an outage; the refresher runs
+  under a supervisor whose watchdog keeps the gauge growing even if the
+  refresher task itself dies (and respawns it, budgeted per minute). Two
+  honest edges of stale-serving: read-your-own-writes can regress to
+  last-snapshot for a write that committed in the instant before the
+  catalog became unreachable (the post-write refresh cannot complete), and
+  in buffered mode (`--write-buffer-ms > 0`) an outage longer than the 30 s
+  flushed-overlay GC window can temporarily hide rows flushed just before
+  the outage until the catalog returns. `ICEGRES_STALE_READ_ON_CATALOG_ERROR`
+  controls the trade in BOTH modes: default mode fails reads during an
+  outage unless it is set truthy; freshness mode serves stale unless it is
+  set to `0`/`false` — the explicit fail-loud override for deployments
+  where erroring beats silently regressing read-your-own-writes.
+- **The physical-plan cache only hits under `--freshness-ms > 0`, and only
+  for repeated *identical* statements.** A hit must be sound without a
+  catalog check, so it requires the freshness contract; and Iceberg plans
+  bake in plan-time file pruning, so a plan for `id = 5` is not reusable
+  for `id = 6` — statements that vary literals re-plan every time (the
+  extended protocol's prepared statements already reuse their logical plan
+  upstream). Overlay-bearing (buffered) tables, time-travel/metadata
+  tables, and non-immutable expressions (`now()`, `random()`, …) are never
+  cached.
+
 ## Transport / security
 
 - **Arrow Flight SQL TLS is in-process** (`flight-serve --tls-cert/--tls-key`),

@@ -179,6 +179,8 @@ cleanup() {
   stop_pidfile_generic "$E2E_DIR/serve-obs.pid"
   stop_pidfile_generic "$E2E_DIR/serve-thr.pid"
   stop_pidfile_generic "$E2E_DIR/flight-tls.pid"
+  stop_pidfile_generic "$E2E_DIR/serve-fresh.pid"
+  stop_pidfile_generic "$E2E_DIR/serve-freshbuf.pid"
   stop_icegresd
 }
 trap cleanup EXIT
@@ -2059,6 +2061,139 @@ grep -q 'found 0 orphan file(s)' "$E2E_DIR/orphan-rerun.log" \
   || { cat "$E2E_DIR/orphan-rerun.log" >&2; fail "rerun should find zero orphans"; }
 pass "orphan GC: dry-run/execute/rerun contract holds ($orphan_n orphans reclaimed)"
 q 'drop table demo.e2e_orphan' >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
+# (z) bounded-staleness freshness mode (--freshness-ms) + plan cache
+#     Contract under test (icegres/src/freshness.rs, plancache.rs):
+#       - a FOREIGN commit (the default server on :$PG_PORT is a different
+#         server process committing through the catalog) becomes visible on
+#         the freshness server within a bounded window (deadline >> N);
+#       - this server's OWN writes are visible immediately (single attempt,
+#         new connection — read-your-own-writes stays exact): buffered ack,
+#         sync DML, and plain INSERT paths;
+#       - the staleness gauge + plan-cache counters are exported on /metrics,
+#         and a repeated identical SELECT hits the plan cache;
+#       - the overlay trap: on a server with BOTH --freshness-ms and
+#         --write-buffer-ms, plans over overlay-bearing tables are NEVER
+#         cached (hits stay 0) and buffered rows are visible on repeated
+#         reads;
+#       - default mode (--freshness-ms 0) is untouched — every assertion in
+#         sections (a)..(y) above ran against default-mode servers.
+# ---------------------------------------------------------------------------
+FR_PORT=5458
+FR_HEALTH=8092
+FR_MS=25
+FR_PID="$E2E_DIR/serve-fresh.pid"
+FR_LOG="$E2E_DIR/serve-fresh.log"
+log "(z) freshness refresher (--freshness-ms $FR_MS) + plan cache on :$FR_PORT"
+stop_pidfile_generic "$FR_PID"
+if psql -h "$PG_HOST" -p "$FR_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+  fail "something is already listening on :$FR_PORT — stop it first"
+fi
+: >"$FR_LOG"
+"$BIN" serve --host "$PG_HOST" --port "$FR_PORT" --freshness-ms "$FR_MS" \
+  --health-port "$FR_HEALTH" >>"$FR_LOG" 2>&1 &
+echo $! >"$FR_PID"
+fr_ready=0
+for _ in $(seq 1 60); do
+  if psql -h "$PG_HOST" -p "$FR_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+    fr_ready=1; break
+  fi
+  sleep 0.5
+done
+[[ "$fr_ready" == 1 ]] || { tail -n 20 "$FR_LOG" >&2; fail "freshness server not ready on :$FR_PORT"; }
+FQ=(psql -h "$PG_HOST" -p "$FR_PORT" -U postgres -d icegres -tA)
+
+# The enabled mode must announce the staleness trade loudly.
+grep -q "bounded-staleness reads are ENABLED" "$FR_LOG" \
+  || fail "freshness server did not log the bounded-staleness WARN (log: $FR_LOG)"
+pass "startup WARN present (bounded-staleness contract stated)"
+
+fr_base=$(( $(q 'select coalesce(max(trip_id), 0) from demo.trips') + 1 ))
+(( fr_base >= 900000 )) || fr_base=970000
+
+# --- z1: a FOREIGN commit becomes visible within a bounded window ---
+# Warm the freshness server's cache first so the foreign write lands on an
+# already-fresh (fast-path) table, then poll with a deadline (10 s >> 25 ms).
+assert_eq "freshness server serves the seeded rows" "280" \
+  "$("${FQ[@]}" -c 'select count(*) from demo.trips where trip_id between 1 and 280')"
+q "insert into demo.trips (trip_id, city, distance_km, fare, ts)
+   values ($fr_base, 'Fresh City', 9.99, 19.99, TIMESTAMP '2026-07-10 00:00:00')" >/dev/null
+fr_seen=""
+fr_t0=$(date +%s%N)
+for _ in $(seq 1 200); do
+  if [[ "$("${FQ[@]}" -c "select count(*) from demo.trips where trip_id = $fr_base")" == "1" ]]; then
+    fr_seen=1; break
+  fi
+  sleep 0.05
+done
+fr_ms=$(( ($(date +%s%N) - fr_t0) / 1000000 ))
+[[ "$fr_seen" == 1 ]] || fail "foreign commit not visible on the freshness server within 10 s (bound is ~${FR_MS} ms)"
+pass "foreign commit visible on the freshness server within ${fr_ms} ms (deadline 10000 ms >> ${FR_MS} ms bound)"
+
+# --- z2: OWN writes visible immediately (read-your-own-writes exact) ---
+# Plain INSERT: one attempt, new connection, no polling.
+"${FQ[@]}" -c "insert into demo.trips (trip_id, city, distance_km, fare, ts)
+  values ($((fr_base + 1)), 'Fresh City', 1.0, 2.0, TIMESTAMP '2026-07-10 00:00:01')" >/dev/null
+assert_eq "own INSERT visible immediately (no refresh wait)" "1" \
+  "$("${FQ[@]}" -c "select count(*) from demo.trips where trip_id = $((fr_base + 1))")"
+# Sync copy-on-write DML: same contract.
+"${FQ[@]}" -c "update demo.trips set fare = 42.5 where trip_id = $((fr_base + 1))" >/dev/null
+assert_eq "own UPDATE visible immediately (no refresh wait)" "42.5" \
+  "$("${FQ[@]}" -c "select fare from demo.trips where trip_id = $((fr_base + 1))")"
+
+# --- z3: /metrics gauge + plan-cache hit on a repeated identical SELECT ---
+if command -v curl >/dev/null 2>&1; then
+  "${FQ[@]}" -c 'select count(*) from demo.cities' >/dev/null
+  "${FQ[@]}" -c 'select count(*) from demo.cities' >/dev/null
+  FR_M=$(curl -s "http://$PG_HOST:$FR_HEALTH/metrics")
+  echo "$FR_M" | grep -q '^icegres_freshness_age_ms ' || fail "freshness age gauge missing from /metrics"
+  fr_hits=$(echo "$FR_M" | awk '/^icegres_plan_cache_hits_total /{print $2}')
+  [[ -n "$fr_hits" && "$fr_hits" -ge 1 ]] \
+    || fail "repeated identical SELECT did not hit the plan cache (hits=${fr_hits:-none})"
+  pass "staleness gauge exported; repeated SELECT hit the plan cache (hits=$fr_hits)"
+else
+  log "    SKIPPED /metrics assertions: curl not available"
+fi
+stop_pidfile_generic "$FR_PID"
+
+# --- z4: the overlay trap — buffered tables are excluded from the cache ---
+FRB_PORT=5460
+FRB_HEALTH=8093
+FRB_PID="$E2E_DIR/serve-freshbuf.pid"
+FRB_LOG="$E2E_DIR/serve-freshbuf.log"
+stop_pidfile_generic "$FRB_PID"
+: >"$FRB_LOG"
+"$BIN" serve --host "$PG_HOST" --port "$FRB_PORT" --freshness-ms "$FR_MS" \
+  --write-buffer-ms 2000 --health-port "$FRB_HEALTH" >>"$FRB_LOG" 2>&1 &
+echo $! >"$FRB_PID"
+frb_ready=0
+for _ in $(seq 1 60); do
+  if psql -h "$PG_HOST" -p "$FRB_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+    frb_ready=1; break
+  fi
+  sleep 0.5
+done
+[[ "$frb_ready" == 1 ]] || { tail -n 20 "$FRB_LOG" >&2; fail "freshness+buffer server not ready on :$FRB_PORT"; }
+FRBQ=(psql -h "$PG_HOST" -p "$FRB_PORT" -U postgres -d icegres -tA)
+# A buffered INSERT acks from the overlay; two immediate identical reads
+# must BOTH see it. A cached plan baking the (pre-insert) overlay would
+# serve a stale row set on the second read — the load-bearing overlay trap.
+"${FRBQ[@]}" -c "insert into demo.trips (trip_id, city, distance_km, fare, ts)
+  values ($((fr_base + 2)), 'Fresh City', 3.0, 4.0, TIMESTAMP '2026-07-10 00:00:02')" >/dev/null
+frb_sql="select count(*) from demo.trips where trip_id = $((fr_base + 2))"
+assert_eq "buffered row visible on first read (union view)" "1" "$("${FRBQ[@]}" -c "$frb_sql")"
+assert_eq "buffered row visible on repeated identical read (no stale cached plan)" "1" \
+  "$("${FRBQ[@]}" -c "$frb_sql")"
+if command -v curl >/dev/null 2>&1; then
+  frb_hits=$(curl -s "http://$PG_HOST:$FRB_HEALTH/metrics" | awk '/^icegres_plan_cache_hits_total /{print $2}')
+  assert_eq "overlay-bearing tables never hit the plan cache" "0" "$frb_hits"
+fi
+stop_pidfile_generic "$FRB_PID"
+
+# Cleanup: remove the rows this section appended (via the default server).
+q "delete from demo.trips where trip_id in ($fr_base, $((fr_base + 1)), $((fr_base + 2)))" >/dev/null
+pass "freshness section cleanup (rows removed)"
 
 # ---------------------------------------------------------------------------
 log "all assertions passed ($PASS_COUNT)"

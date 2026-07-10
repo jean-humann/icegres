@@ -73,6 +73,7 @@ use iceberg_datafusion::{to_datafusion_error, IcebergStaticTableProvider};
 use tracing::warn;
 
 use crate::buffer::WriteBuffer;
+use crate::freshness::TableFreshness;
 
 /// Per-attempt timeout for a catalog `load_table` from
 /// `ICEGRES_CATALOG_TIMEOUT_MS` (default 5000; `0` = no timeout).
@@ -100,19 +101,45 @@ fn catalog_retries() -> u32 {
     })
 }
 
-/// When `ICEGRES_STALE_READ_ON_CATALOG_ERROR` is set truthy, a read whose
-/// catalog `load_table` fails (after timeout+retries) serves the last cached
-/// snapshot instead of erroring — availability over freshness. Default OFF
-/// because it can serve stale data during a catalog outage (bounded-stale
-/// reads), which changes the exact-freshness contract.
-fn stale_read_enabled() -> bool {
-    static S: OnceLock<bool> = OnceLock::new();
-    *S.get_or_init(
-        || match std::env::var("ICEGRES_STALE_READ_ON_CATALOG_ERROR") {
-            Ok(raw) => matches!(raw.trim(), "1" | "true" | "on" | "yes"),
-            Err(_) => false,
-        },
-    )
+/// Tri-state parse of `ICEGRES_STALE_READ_ON_CATALOG_ERROR`: unset → `None`
+/// (mode default applies), truthy → `Some(true)`, any other set value
+/// (`0`, `false`, ...) → `Some(false)` — an EXPLICIT fail-loud override.
+fn parse_stale_read_override(raw: Option<&str>) -> Option<bool> {
+    raw.map(|r| matches!(r.trim(), "1" | "true" | "on" | "yes"))
+}
+
+/// Whether a scan whose catalog `load_table` fails (after timeout+retries)
+/// serves the last cached snapshot instead of erroring. See
+/// [`stale_read_policy`] for the decision table.
+fn stale_read_on_catalog_error(freshness_enabled: bool) -> bool {
+    static S: OnceLock<Option<bool>> = OnceLock::new();
+    let override_ = *S.get_or_init(|| {
+        parse_stale_read_override(
+            std::env::var("ICEGRES_STALE_READ_ON_CATALOG_ERROR")
+                .ok()
+                .as_deref(),
+        )
+    });
+    stale_read_policy(override_, freshness_enabled)
+}
+
+/// Stale-serve-on-catalog-error policy (availability vs fail-loud), pure so
+/// the matrix is unit-testable:
+///
+/// * Default mode (`--freshness-ms 0`), env unset: FAIL LOUD — serving
+///   stale would silently change the exact-freshness contract.
+/// * Freshness mode (`--freshness-ms > 0`), env unset: SERVE STALE — the
+///   contract is already bounded staleness, the refresher rides out the
+///   outage, and the staleness is visible on the `icegres_freshness_age_ms`
+///   gauge (availability by default).
+/// * `ICEGRES_STALE_READ_ON_CATALOG_ERROR` set overrides BOTH ways: truthy
+///   opts default mode into stale serving; falsy (`=0`) forces fail-loud
+///   even in freshness mode — the explicit opt-out for deployments where a
+///   local write followed by an outage must ERROR rather than silently
+///   regress read-your-own-writes to the last snapshot
+///   (docs/limitations.md documents both modes).
+fn stale_read_policy(override_: Option<bool>, freshness_enabled: bool) -> bool {
+    override_.unwrap_or(freshness_enabled)
 }
 
 /// `catalog.load_table` with a bounded per-attempt timeout and bounded
@@ -156,7 +183,7 @@ async fn load_table_with_retry(
 /// snapshot id. Any commit (append, schema change, ...) moves the metadata
 /// location; the snapshot id is kept as a belt-and-braces fallback for
 /// catalogs that do not report a location.
-type MetadataVersion = (Option<String>, Option<i64>);
+pub(crate) type MetadataVersion = (Option<String>, Option<i64>);
 
 fn metadata_version(table: &Table) -> MetadataVersion {
     (
@@ -172,6 +199,24 @@ struct CachedSnapshot {
     /// union read needs it to decide which flushed generations this
     /// committed view already contains (buffer.rs).
     metadata: iceberg::spec::TableMetadataRef,
+    /// Freshness write-generation observed BEFORE the catalog load that
+    /// produced this snapshot (freshness.rs). Guards concurrent installs:
+    /// a slow load that began before a local write's invalidation must not
+    /// clobber a snapshot installed by a later (post-commit) load. Always 0
+    /// in default mode, where every scan reloads anyway.
+    loaded_gen: u64,
+}
+
+/// Which caller is loading table metadata (`load_current`): the scan path
+/// gets the bounded timeout+retries from `ICEGRES_CATALOG_TIMEOUT_MS`/
+/// `ICEGRES_CATALOG_RETRIES` and the optional stale-serve fallback; the
+/// background refresher gets ONE retry-free attempt (its next pass is the
+/// retry, and freshness.rs bounds the call with its own short per-table
+/// timeout) whose error propagates to the refresher's failure accounting.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoadPath {
+    Scan,
+    Refresher,
 }
 
 /// A [`TableProvider`] that serves scans from a cached, snapshot-pinned
@@ -195,6 +240,12 @@ pub struct CachingTableProvider {
     /// without the ref fails loudly at scan time (never silently falls back
     /// to main). `None` = default mode, scans unchanged.
     branch: Option<String>,
+    /// Bounded-staleness mode (`--freshness-ms`, freshness.rs): when fresh,
+    /// scans serve the cached provider with NO catalog round trip; the
+    /// background refresher and local-write invalidation keep it honest.
+    /// `None` = default mode, every scan pays the exact-freshness catalog
+    /// check — byte-identical to the historical path.
+    freshness: Option<Arc<TableFreshness>>,
 }
 
 impl std::fmt::Debug for CachingTableProvider {
@@ -212,6 +263,7 @@ impl CachingTableProvider {
         write_delegate: Arc<dyn TableProvider>,
         write_buffer: Option<Arc<WriteBuffer>>,
         branch: Option<String>,
+        freshness: Option<Arc<TableFreshness>>,
     ) -> Self {
         let schema = write_delegate.schema();
         Self {
@@ -222,29 +274,121 @@ impl CachingTableProvider {
             cached: RwLock::new(None),
             write_buffer,
             branch,
+            freshness,
         }
+    }
+
+    /// The freshness-registry key for this table (freshness.rs, plan cache).
+    pub(crate) fn table_key(&self) -> String {
+        crate::freshness::table_key(&self.ident)
+    }
+
+    /// The metadata version a cached physical plan over this table may be
+    /// reused at (plancache.rs). `Some(version)` ONLY when a plan-cache hit
+    /// is sound without any catalog round trip: freshness mode is on, the
+    /// cache is currently fresh, and the table carries no per-scan write-
+    /// buffer overlay (a cached plan must never bake in a stale overlay —
+    /// the scope's overlay trap). `None` in default mode, so the plan cache
+    /// can never bypass the exact per-scan freshness check.
+    pub(crate) fn plan_cache_version(&self) -> Option<MetadataVersion> {
+        if !plan_cache_eligible(self.freshness.is_some(), self.write_buffer.is_some()) {
+            return None;
+        }
+        let f = self.freshness.as_ref()?;
+        if !f.is_fresh() {
+            return None;
+        }
+        let guard = crate::freshness::recover("cache lock", self.cached.read());
+        guard.as_ref().map(|c| c.version.clone())
+    }
+
+    /// Refresh the cached provider from the catalog (background refresher
+    /// path, freshness.rs): ONE retry-free `load_table` round trip that
+    /// swaps the cached provider on metadata change and marks the cache
+    /// fresh — unless a local write invalidated it mid-load (generation
+    /// guard). Unlike the scan path this neither retries (the refresher's
+    /// next pass IS the retry) nor falls back to the cached snapshot on
+    /// error (the cache is simply left as-is and the error propagates so
+    /// the refresher can count and WARN about it); the refresher bounds the
+    /// call with its own short per-table timeout. Background loads are also
+    /// excluded from the `ICEGRES_QUERY_TIMING` stage records: stage
+    /// `freshness` means per-SCAN catalog work only.
+    pub(crate) async fn refresh(&self) -> iceberg::Result<()> {
+        self.load_current(LoadPath::Refresher).await.map(|_| ())
     }
 
     /// Return a provider for the table's *current* snapshot — the head of
     /// the configured branch (`main` by default) — plus the metadata it
-    /// serves, reusing the cached one (and its warm manifest cache) when the
-    /// metadata is unchanged. Costs one REST `load_table` round trip per
-    /// call.
+    /// serves. In freshness mode ([`TableFreshness`]) a fresh cache is
+    /// served directly with NO catalog round trip; otherwise (default mode,
+    /// or a stale/invalidated cache) this costs one REST `load_table` round
+    /// trip, reusing the cached provider (and its warm manifest cache) when
+    /// the metadata is unchanged.
     async fn current_provider(
         &self,
     ) -> iceberg::Result<(
         Arc<IcebergStaticTableProvider>,
         iceberg::spec::TableMetadataRef,
     )> {
-        let fresh = match load_table_with_retry(&self.catalog, &self.ident).await {
+        if let Some(f) = &self.freshness {
+            if f.is_fresh() {
+                let guard = crate::freshness::recover("cache lock", self.cached.read());
+                if let Some(cached) = guard.as_ref() {
+                    return Ok((cached.provider.clone(), cached.metadata.clone()));
+                }
+            }
+        }
+        self.load_current(LoadPath::Scan).await
+    }
+
+    /// The synchronous load path: one catalog `load_table`, snapshot-change
+    /// detection, and cache install. The `path` decides the load strategy —
+    /// scans get the bounded timeout+retries (and the stale-serve fallback
+    /// per [`stale_read_policy`]) plus the `ICEGRES_QUERY_TIMING` stage
+    /// record; the background refresher gets one retry-free attempt whose
+    /// error propagates (see [`Self::refresh`]).
+    async fn load_current(
+        &self,
+        path: LoadPath,
+    ) -> iceberg::Result<(
+        Arc<IcebergStaticTableProvider>,
+        iceberg::spec::TableMetadataRef,
+    )> {
+        // Freshness generation observed BEFORE the load: completing the
+        // load only marks the cache fresh if no local write invalidated it
+        // in between (freshness.rs module docs).
+        let load_token = self.freshness.as_ref().map(|f| f.begin_load());
+        // Stage (a) of the ICEGRES_QUERY_TIMING breakdown (timing.rs): the
+        // per-scan catalog round trip that gives exact freshness. The
+        // `Instant::now()` itself is skipped when timing is off.
+        let load_started =
+            (path == LoadPath::Scan && crate::timing::enabled()).then(std::time::Instant::now);
+        let loaded = match path {
+            LoadPath::Scan => load_table_with_retry(&self.catalog, &self.ident).await,
+            // Refresher: a single retry-free attempt. The refresher applies
+            // its own short per-table timeout around this call and its next
+            // pass is the retry — the scan path's timeout×retries config
+            // must not stack up here, where one stalled table used to drag
+            // every table's refresh behind it.
+            LoadPath::Refresher => self.catalog.load_table(&self.ident).await,
+        };
+        let fresh = match loaded {
             Ok(t) => t,
             Err(e) => {
-                // Catalog unreachable after timeout+retries. Optionally fall
-                // back to the last cached snapshot (bounded-stale read) so
-                // reads stay available during a catalog outage; otherwise the
-                // error propagates loudly.
-                if stale_read_enabled() {
-                    let guard = self.cached.read().expect("cache lock poisoned");
+                // Scan path, catalog unreachable after timeout+retries:
+                // optionally fall back to the last cached snapshot
+                // (bounded-stale read) so reads stay available during a
+                // catalog outage; otherwise the error propagates loudly.
+                // Freshness mode serves stale by DEFAULT (its contract is
+                // already bounded staleness, the refresher rides the outage
+                // out, and the staleness is visible on the
+                // icegres_freshness_age_ms gauge), but
+                // ICEGRES_STALE_READ_ON_CATALOG_ERROR=0 explicitly opts
+                // into fail-loud even there — see stale_read_policy.
+                // The refresher path never falls back: its caller counts
+                // the failure and the cache is simply left as-is.
+                if path == LoadPath::Scan && stale_read_on_catalog_error(self.freshness.is_some()) {
+                    let guard = crate::freshness::recover("cache lock", self.cached.read());
                     if let Some(cached) = guard.as_ref() {
                         warn!(
                             ident = %self.ident,
@@ -257,6 +401,9 @@ impl CachingTableProvider {
                 return Err(e);
             }
         };
+        if let Some(started) = load_started {
+            crate::timing::record("freshness", started.elapsed());
+        }
         // S5 (buffer.rs): every scan pays this `load_table` anyway — record
         // the keyed-activation decision so the write path's fallback never
         // needs its own per-statement catalog call, and so a property
@@ -287,9 +434,13 @@ impl CachingTableProvider {
             None => metadata_version(&fresh),
         };
         {
-            let guard = self.cached.read().expect("cache lock poisoned");
+            let guard = crate::freshness::recover("cache lock", self.cached.read());
             if let Some(cached) = guard.as_ref() {
                 if cached.version == version {
+                    // The load proved the cached snapshot is still current.
+                    if let (Some(f), Some(token)) = (&self.freshness, load_token) {
+                        f.complete_load(token);
+                    }
                     return Ok((cached.provider.clone(), cached.metadata.clone()));
                 }
             }
@@ -301,12 +452,30 @@ impl CachingTableProvider {
             ),
             None => Arc::new(IcebergStaticTableProvider::try_new_from_table(fresh).await?),
         };
-        let mut guard = self.cached.write().expect("cache lock poisoned");
-        *guard = Some(CachedSnapshot {
-            version,
-            provider: provider.clone(),
-            metadata: metadata.clone(),
-        });
+        let loaded_gen = load_token.unwrap_or(0);
+        {
+            let mut guard = crate::freshness::recover("cache lock", self.cached.write());
+            // Generation-guarded install (freshness mode): a slow load that
+            // began before a local write's invalidation must not overwrite a
+            // snapshot installed by a later (post-commit) load — otherwise a
+            // "fresh" cache could serve pre-write data. In default mode both
+            // generations are 0 and this is the historical unconditional
+            // install.
+            let stale_straggler = guard
+                .as_ref()
+                .is_some_and(|existing| existing.loaded_gen > loaded_gen);
+            if !stale_straggler {
+                *guard = Some(CachedSnapshot {
+                    version,
+                    provider: provider.clone(),
+                    metadata: metadata.clone(),
+                    loaded_gen,
+                });
+            }
+        }
+        if let (Some(f), Some(token)) = (&self.freshness, load_token) {
+            f.complete_load(token);
+        }
         Ok((provider, metadata))
     }
 }
@@ -417,9 +586,162 @@ impl TableProvider for CachingTableProvider {
                 self.ident
             )));
         }
-        self.write_delegate
+        let plan = self
+            .write_delegate
             .insert_into(state, input, insert_op)
-            .await
+            .await?;
+        // Freshness mode: the upstream provider commits when this plan is
+        // EXECUTED, so wrap it to invalidate the cached snapshot as its
+        // stream completes — a plan-time invalidation could be cleared by a
+        // refresher poll that loaded pre-commit metadata (freshness.rs).
+        match &self.freshness {
+            Some(f) => Ok(Arc::new(MarkStaleExec::new(plan, f.clone()))),
+            None => Ok(plan),
+        }
+    }
+}
+
+/// Whether a physical plan over a table may be cached (plancache.rs):
+/// freshness mode must be on (a plan-cache hit skips the per-scan catalog
+/// check, which is only sound under the bounded-staleness contract) and the
+/// table must carry no write-buffer overlay (overlays are per-scan state;
+/// a cached plan would bake a stale one in).
+pub(crate) fn plan_cache_eligible(freshness_enabled: bool, has_overlay_source: bool) -> bool {
+    freshness_enabled && !has_overlay_source
+}
+
+/// Wraps an INSERT execution plan so the table's freshness cache is
+/// invalidated when the plan's stream finishes — i.e. after the upstream
+/// provider's Iceberg commit has happened (or failed ambiguously; an extra
+/// invalidation only costs one synchronous catalog check on the next scan).
+struct MarkStaleExec {
+    inner: Arc<dyn ExecutionPlan>,
+    freshness: Arc<TableFreshness>,
+    properties: datafusion::physical_plan::PlanProperties,
+}
+
+impl MarkStaleExec {
+    fn new(inner: Arc<dyn ExecutionPlan>, freshness: Arc<TableFreshness>) -> Self {
+        let properties = inner.properties().clone();
+        Self {
+            inner,
+            freshness,
+            properties,
+        }
+    }
+}
+
+impl std::fmt::Debug for MarkStaleExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MarkStaleExec").finish_non_exhaustive()
+    }
+}
+
+impl datafusion::physical_plan::DisplayAs for MarkStaleExec {
+    fn fmt_as(
+        &self,
+        _t: datafusion::physical_plan::DisplayFormatType,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        write!(f, "MarkStaleExec")
+    }
+}
+
+impl ExecutionPlan for MarkStaleExec {
+    fn name(&self) -> &str {
+        "MarkStaleExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.inner]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let [child]: [Arc<dyn ExecutionPlan>; 1] = children
+            .try_into()
+            .map_err(|_| DataFusionError::Internal("MarkStaleExec expects one child".into()))?;
+        Ok(Arc::new(MarkStaleExec::new(child, self.freshness.clone())))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion::execution::TaskContext>,
+    ) -> DFResult<datafusion::execution::SendableRecordBatchStream> {
+        let inner = self.inner.execute(partition, context)?;
+        Ok(Box::pin(MarkStaleStream {
+            inner,
+            freshness: self.freshness.clone(),
+            polled: false,
+            invalidated: false,
+        }))
+    }
+}
+
+struct MarkStaleStream {
+    inner: datafusion::execution::SendableRecordBatchStream,
+    freshness: Arc<TableFreshness>,
+    /// Any poll was started: the wrapped insert may have issued its catalog
+    /// commit request (the drop guard's trigger condition).
+    polled: bool,
+    /// A poll returned `Ready`: the on-poll invalidation already ran, so the
+    /// drop guard has nothing left to do.
+    invalidated: bool,
+}
+
+impl futures::Stream for MarkStaleStream {
+    type Item = DFResult<datafusion::arrow::record_batch::RecordBatch>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.polled = true;
+        let poll = std::pin::Pin::new(&mut self.inner).poll_next(cx);
+        // The insert sink commits before it emits its count batch (and the
+        // stream then ends): invalidate on every yielded item AND at stream
+        // end so the commit can never be observed by a fresh-path scan
+        // before the invalidation lands. Idempotent and cheap (one atomic).
+        if matches!(poll, std::task::Poll::Ready(_)) {
+            self.invalidated = true;
+            self.freshness.invalidate();
+        }
+        poll
+    }
+}
+
+impl Drop for MarkStaleStream {
+    /// Drop guard for a stream abandoned mid-poll (client disconnect while
+    /// the INSERT executes): once the inner stream has been polled, the
+    /// upstream insert may have issued its catalog commit request, and that
+    /// commit can still LAND after the drop — with no `Ready` ever observed,
+    /// the on-poll invalidation would never run and a "fresh" cache could
+    /// keep serving pre-write data. Ambiguous outcomes must invalidate (the
+    /// same rule as the on-poll path): a false positive costs one
+    /// synchronous catalog check on the next scan; a miss silently breaks
+    /// the freshness contract. A never-polled stream cannot have started the
+    /// commit, so dropping it clean keeps the cache fresh.
+    fn drop(&mut self) {
+        if self.polled && !self.invalidated {
+            self.freshness.invalidate();
+        }
+    }
+}
+
+impl datafusion::execution::RecordBatchStream for MarkStaleStream {
+    fn schema(&self) -> ArrowSchemaRef {
+        self.inner.schema()
     }
 }
 
@@ -586,6 +908,10 @@ pub struct CachingSchemaProvider {
     /// [`CachingTableProvider`]. Explicit `table@snapshot` time travel and
     /// metadata tables are unaffected (they address snapshots directly).
     branch: Option<String>,
+    /// Bounded-staleness mode (`--freshness-ms > 0`): every plain-table
+    /// provider gets a [`TableFreshness`] and is registered with the
+    /// process-global refresher/invalidation registry (freshness.rs).
+    freshness_enabled: bool,
 }
 
 /// Parse a `<table>@<snapshot_id>` time-travel reference. Returns the base
@@ -615,6 +941,7 @@ impl CachingSchemaProvider {
         namespace: NamespaceIdent,
         write_buffer: Option<Arc<WriteBuffer>>,
         branch: Option<String>,
+        freshness_enabled: bool,
     ) -> DFResult<Self> {
         let mut map = HashMap::new();
         for name in inner.table_names() {
@@ -623,16 +950,15 @@ impl CachingSchemaProvider {
             }
             if let Some(write_delegate) = inner.table(&name).await? {
                 let ident = TableIdent::new(namespace.clone(), name.clone());
-                map.insert(
-                    name,
-                    Arc::new(CachingTableProvider::new(
-                        catalog.clone(),
-                        ident,
-                        write_delegate,
-                        write_buffer.clone(),
-                        branch.clone(),
-                    )),
+                let provider = Self::build_provider(
+                    catalog.clone(),
+                    ident,
+                    write_delegate,
+                    write_buffer.clone(),
+                    branch.clone(),
+                    freshness_enabled,
                 );
+                map.insert(name, provider);
             }
         }
         Ok(Self {
@@ -643,7 +969,36 @@ impl CachingSchemaProvider {
             pinned: PinnedCache::new(),
             write_buffer,
             branch,
+            freshness_enabled,
         })
+    }
+
+    /// Build one caching table provider and, in freshness mode, register it
+    /// with the global refresher/invalidation registry (freshness.rs).
+    fn build_provider(
+        catalog: Arc<dyn Catalog>,
+        ident: TableIdent,
+        write_delegate: Arc<dyn TableProvider>,
+        write_buffer: Option<Arc<WriteBuffer>>,
+        branch: Option<String>,
+        freshness_enabled: bool,
+    ) -> Arc<CachingTableProvider> {
+        let freshness = freshness_enabled.then(|| Arc::new(TableFreshness::new()));
+        let key = freshness
+            .is_some()
+            .then(|| crate::freshness::table_key(&ident));
+        let provider = Arc::new(CachingTableProvider::new(
+            catalog,
+            ident,
+            write_delegate,
+            write_buffer,
+            branch,
+            freshness.clone(),
+        ));
+        if let (Some(key), Some(freshness)) = (key, freshness) {
+            crate::freshness::register(key, freshness, &provider);
+        }
+        provider
     }
 
     /// Resolve a `table@snapshot_id` time-travel reference to a read-only
@@ -721,13 +1076,14 @@ impl SchemaProvider for CachingSchemaProvider {
         match self.inner.table(name).await? {
             Some(write_delegate) => {
                 let ident = TableIdent::new(self.namespace.clone(), name.to_string());
-                let provider = Arc::new(CachingTableProvider::new(
+                let provider = Self::build_provider(
                     self.catalog.clone(),
                     ident,
                     write_delegate,
                     self.write_buffer.clone(),
                     self.branch.clone(),
-                ));
+                    self.freshness_enabled,
+                );
                 self.cached
                     .write()
                     .expect("cache lock poisoned")
@@ -751,6 +1107,13 @@ impl SchemaProvider for CachingSchemaProvider {
             .write()
             .expect("cache lock poisoned")
             .remove(name);
+        // DDL fence (freshness mode): a dropped table's provider leaves the
+        // refresher registry invalidated, so neither the freshness fast
+        // path nor a cached plan can ever serve it again.
+        if self.freshness_enabled {
+            let ident = TableIdent::new(self.namespace.clone(), name.to_string());
+            crate::freshness::deregister(&crate::freshness::table_key(&ident));
+        }
         self.inner.deregister_table(name)
     }
 }
@@ -819,6 +1182,99 @@ mod tests {
         assert!(evicted.iter().all(|k| k.starts_with("trips@")));
         // All 20 cities entries untouched.
         assert_eq!(map.keys().filter(|k| k.starts_with("cities@")).count(), 20);
+    }
+
+    #[test]
+    fn plan_cache_excludes_overlay_bearing_tables_and_default_mode() {
+        // The overlay trap (scope, load-bearing): a buffered/keyed table's
+        // overlay is per-scan state, so a plan over it must NEVER be cached
+        // — even in freshness mode.
+        assert!(!plan_cache_eligible(true, true));
+        // Default mode (--freshness-ms 0): a plan-cache hit would skip the
+        // exact per-scan freshness check, so nothing is eligible.
+        assert!(!plan_cache_eligible(false, false));
+        assert!(!plan_cache_eligible(false, true));
+        // Freshness mode without an overlay is the one cacheable shape.
+        assert!(plan_cache_eligible(true, false));
+    }
+
+    #[test]
+    fn stale_read_policy_matrix() {
+        // Env unset: mode default — freshness mode serves stale
+        // (availability; the contract is already bounded staleness), exact
+        // mode fails loud (stale would change the exactness contract).
+        assert!(stale_read_policy(None, true));
+        assert!(!stale_read_policy(None, false));
+        // Explicit truthy: stale-serve everywhere (incl. default mode).
+        assert!(stale_read_policy(Some(true), false));
+        assert!(stale_read_policy(Some(true), true));
+        // Explicit falsy (=0): fail-loud even in freshness mode — the
+        // opt-out for deployments where RYW after a local write + outage
+        // must error, never silently regress (docs/limitations.md).
+        assert!(!stale_read_policy(Some(false), true));
+        assert!(!stale_read_policy(Some(false), false));
+    }
+
+    #[test]
+    fn stale_read_env_parses_as_tristate() {
+        assert_eq!(parse_stale_read_override(None), None);
+        assert_eq!(parse_stale_read_override(Some("1")), Some(true));
+        assert_eq!(parse_stale_read_override(Some(" true ")), Some(true));
+        assert_eq!(parse_stale_read_override(Some("0")), Some(false));
+        assert_eq!(parse_stale_read_override(Some("off")), Some(false));
+        assert_eq!(parse_stale_read_override(Some("")), Some(false));
+    }
+
+    /// A MarkStaleStream over a forever-pending inner stream, standing in
+    /// for an INSERT whose commit request is in flight.
+    fn pending_markstale(freshness: Arc<TableFreshness>) -> MarkStaleStream {
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        let schema: ArrowSchemaRef = Arc::new(datafusion::arrow::datatypes::Schema::empty());
+        let inner: datafusion::execution::SendableRecordBatchStream = Box::pin(
+            RecordBatchStreamAdapter::new(schema, futures::stream::pending()),
+        );
+        MarkStaleStream {
+            inner,
+            freshness,
+            polled: false,
+            invalidated: false,
+        }
+    }
+
+    #[test]
+    fn markstale_stream_dropped_mid_poll_invalidates() {
+        use futures::Stream;
+        let f = Arc::new(TableFreshness::new());
+        f.complete_load(f.begin_load());
+        assert!(f.is_fresh());
+        let mut stream = pending_markstale(f.clone());
+        // First poll returns Pending — the commit request may have been
+        // issued — then the client disconnects and the stream is dropped
+        // without ever observing completion.
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(std::pin::Pin::new(&mut stream)
+            .poll_next(&mut cx)
+            .is_pending());
+        drop(stream);
+        assert!(
+            !f.is_fresh(),
+            "a stream dropped after a started poll must invalidate — the commit may still land"
+        );
+    }
+
+    #[test]
+    fn markstale_stream_dropped_unpolled_stays_fresh() {
+        // Never polled = the insert never started executing = no commit
+        // could have been issued: the drop guard must NOT invalidate.
+        let f = Arc::new(TableFreshness::new());
+        f.complete_load(f.begin_load());
+        let stream = pending_markstale(f.clone());
+        drop(stream);
+        assert!(
+            f.is_fresh(),
+            "an unpolled dropped stream must not invalidate"
+        );
     }
 
     #[test]

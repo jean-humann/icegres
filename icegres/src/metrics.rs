@@ -43,6 +43,23 @@ pub struct Metrics {
     /// Summed wall-clock of completed pgwire queries, in milliseconds. Divide
     /// by `queries_total` for a rolling average latency.
     pub query_duration_ms_total: AtomicU64,
+    /// Worst-case staleness age across freshness-managed tables, in
+    /// milliseconds (gauge, freshness.rs): per-table time since the last
+    /// successful catalog load, maximized over the mounted table set and
+    /// sampled at the START of each refresher pass — the age a read could
+    /// have observed just before that pass refreshed, so a HEALTHY gauge
+    /// reads ≈ the `--freshness-ms` interval (not the near-zero sawtooth
+    /// minimum right after a refresh). Grows monotonically while the
+    /// catalog is unreachable, and the refresher supervisor's watchdog
+    /// keeps it growing even if the refresher task itself dies. Stays 0 in
+    /// default mode (`--freshness-ms 0`).
+    pub freshness_age_ms: AtomicU64,
+    /// Physical-plan cache hits (plancache.rs; the cache is active only
+    /// with `--freshness-ms > 0`).
+    pub plan_cache_hits_total: AtomicU64,
+    /// Physical-plan cache misses — including statements that turned out
+    /// not to be cacheable (volatile expressions, non-cacheable tables).
+    pub plan_cache_misses_total: AtomicU64,
 }
 
 /// The process-global metrics registry.
@@ -61,6 +78,9 @@ impl Metrics {
         let qif = self.queries_in_flight.load(Ordering::Relaxed);
         let qs = self.queries_slow_total.load(Ordering::Relaxed);
         let qd = self.query_duration_ms_total.load(Ordering::Relaxed);
+        let fa = self.freshness_age_ms.load(Ordering::Relaxed);
+        let pch = self.plan_cache_hits_total.load(Ordering::Relaxed);
+        let pcm = self.plan_cache_misses_total.load(Ordering::Relaxed);
         format!(
             "# HELP icegres_queries_total Wire statements handled.\n\
              # TYPE icegres_queries_total counter\n\
@@ -83,7 +103,21 @@ impl Metrics {
              icegres_queries_slow_total {qs}\n\
              # HELP icegres_query_duration_ms_total Summed query wall-clock (ms).\n\
              # TYPE icegres_query_duration_ms_total counter\n\
-             icegres_query_duration_ms_total {qd}\n"
+             icegres_query_duration_ms_total {qd}\n\
+             # HELP icegres_freshness_age_ms Worst-case staleness age across \
+             freshness-managed tables (ms): time since each table's last \
+             successful catalog load, sampled at refresher pass START, so a \
+             healthy value reads about the --freshness-ms interval; keeps \
+             growing during catalog outages or if the refresher dies; 0 when \
+             --freshness-ms is 0.\n\
+             # TYPE icegres_freshness_age_ms gauge\n\
+             icegres_freshness_age_ms {fa}\n\
+             # HELP icegres_plan_cache_hits_total Physical-plan cache hits.\n\
+             # TYPE icegres_plan_cache_hits_total counter\n\
+             icegres_plan_cache_hits_total {pch}\n\
+             # HELP icegres_plan_cache_misses_total Physical-plan cache misses.\n\
+             # TYPE icegres_plan_cache_misses_total counter\n\
+             icegres_plan_cache_misses_total {pcm}\n"
         )
     }
 }
