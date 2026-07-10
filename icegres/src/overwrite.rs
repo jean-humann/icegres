@@ -919,9 +919,9 @@ impl OverwriteEngine {
     /// commit timestamp plus every snapshot that is still reachable from a
     /// branch/tag ref (so time-travel over live refs and the current head
     /// never break). Metadata-only: the removed snapshots' data/manifest
-    /// files are left in object storage — a separate orphan-file GC reclaims
-    /// them — but they drop out of table metadata so `$snapshots` shrinks and
-    /// metadata stops growing unbounded. Anchored with `assert-table-uuid`
+    /// files are left in object storage — `icegres maintain remove-orphans`
+    /// (maintain.rs) reclaims them — but they drop out of table metadata so
+    /// `$snapshots` shrinks and metadata stops growing unbounded. Anchored with `assert-table-uuid`
     /// and a `assert-ref-snapshot-id main=<head>` guard so a snapshot written
     /// concurrently is never expired out from under the writer. Returns the
     /// number of snapshots removed.

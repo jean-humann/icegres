@@ -117,7 +117,8 @@ psql -h 127.0.0.1 -p 5439 -U postgres -d icegres
 | `icegres branch drop <table> <name>` | Remove the ref only (`main` is refused); the branch's snapshots stay time-travel-readable until expiry. |
 | `icegres branch create-all <name>` | Whole-lakehouse branch: set the ref on EVERY table in the catalog in ONE atomic multi-table transaction (`POST /v1/{prefix}/transactions/commit`) — a consistent cross-table cut. Per-table `assert-ref-snapshot-id = null` guards make it all-or-nothing: if any table already has the branch, nothing is applied. Snapshot-less tables cannot hold a ref and are skipped with a loud warning. Requires a catalog implementing the endpoint (Lakekeeper does); errors cleanly otherwise. |
 | `icegres branch drop-all <name>` | Remove the ref from every table that has it in ONE atomic multi-table transaction (`main` refused; tables without the ref are skipped; errors if no table has it). |
-| `icegres maintain expire-snapshots <table> [--keep N]` | Trim table metadata to the newest `N` snapshots (default 10) **plus every snapshot still reachable from a branch/tag ref** — a metadata-only, live-safe REST commit (anchored with `assert-table-uuid` + `assert-ref-snapshot-id main=<head>`). Data/manifest files of the expired snapshots are left for a separate orphan-file GC. Long-lived tables need this so `$snapshots` and the per-open metadata JSON stop growing unbounded. |
+| `icegres maintain expire-snapshots <table> [--keep N]` | Trim table metadata to the newest `N` snapshots (default 10) **plus every snapshot still reachable from a branch/tag ref** — a metadata-only, live-safe REST commit (anchored with `assert-table-uuid` + `assert-ref-snapshot-id main=<head>`). Data/manifest files of the expired snapshots are left for `maintain remove-orphans` to reclaim. Long-lived tables need this so `$snapshots` and the per-open metadata JSON stop growing unbounded. |
+| `icegres maintain remove-orphans <table> [--older-than-hours N] [--execute] [--unsafe-grace]` | Orphan-file GC — the storage half of expiry: lists the table's S3 prefix, subtracts the LIVE set (every data file, manifest, and manifest list reachable from EVERY retained snapshot — all branches/tags, DELETED manifest entries included — plus the current metadata JSON, the metadata log, and statistics files), and reports the rest. **Dry-run by default** (count + bytes + up to 20 sample paths); `--execute` deletes. Only objects older than `--older-than-hours` (default 72) plus a fixed 15-minute clock-skew allowance are eligible — the grace window is THE guard for in-flight commits, ours or a foreign writer's; `--execute` also verifies real host-vs-store skew with a write/stat/delete probe under `metadata/` (abort beyond the allowance). `--execute` with a sub-1h window is refused without `--unsafe-grace` (quiescent tables only — concurrent writers WILL lose in-flight files). Fails closed: unreadable table metadata or any unreadable manifest aborts the whole run, a recorded path outside the listed bucket aborts the whole run (liveness unverifiable), unknown-age objects are never deleted, unrecognized objects under the prefix are skipped with a WARN, and a mid-run commit re-derives the live set (a UUID change aborts). |
 | `icegres sql -e '<query>'` | One-shot local execution against the catalog (debugging aid; no server involved). Honors `--enforce-pk`. |
 
 ### Configuration
@@ -635,6 +636,43 @@ branch ref, so endpoints on different branches never conflict and nothing
 can leak onto `main`. A table without the ref fails loudly — no silent
 fallback. Both branches share every file below the fork point; only new
 commits diverge.
+
+### Table maintenance (`icegres maintain`)
+
+Every commit adds a snapshot forever; long-lived tables need two periodic
+maintenance passes, both safe against a live serving endpoint:
+
+```sh
+# 1. Trim metadata: keep the newest 50 snapshots + everything a ref points at
+icegres maintain expire-snapshots demo.trips --keep 50
+
+# 2. Reclaim the bytes expiry stranded: dry-run first, then delete
+icegres maintain remove-orphans demo.trips                  # report only
+icegres maintain remove-orphans demo.trips --execute        # delete (72h grace)
+```
+
+`expire-snapshots` is metadata-only (one anchored REST commit); `remove-orphans`
+is the storage half: it lists the table's S3 prefix, subtracts everything any
+retained snapshot/ref still references (data files, manifests, manifest lists —
+including files named by DELETED manifest entries — plus the metadata-JSON log
+and statistics files), and deletes the rest. The guard model, plainly: the
+grace window (`--older-than-hours`, default 72) is THE guard for in-flight
+commits — from icegres or any foreign writer — whose files exist in storage
+but not yet in the catalog; a fixed 15-minute clock-skew allowance is folded
+into the cutoff, and `--execute` verifies the real host-vs-store skew with a
+tiny write/stat/delete probe under `metadata/` (abort beyond the allowance;
+probe failure aborts too). `--execute` with a grace window under 1 h is
+refused unless `--unsafe-grace` asserts the table is quiescent — that flag is
+for quiescent tables only (e.g. tests); concurrent writers WILL lose in-flight
+files. It fails closed on anything ambiguous: unreadable metadata or manifests
+abort the run, a recorded file path outside the listed bucket aborts the run
+(liveness cannot be verified against a listing that cannot see it),
+unknown-age objects and unrecognized files are never deleted, and a commit
+landing mid-run re-derives the live set. There is still no `compact` command
+(pinned iceberg-rust 0.9.1
+has no rewrite-files action — see `docs/limitations.md`); buffered/tail mode
+already keeps file sizes healthy by group-committing per window instead of
+per statement.
 
 ### Works with your ORM/BI tool
 

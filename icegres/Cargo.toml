@@ -76,6 +76,16 @@ futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
+# Orphan-file GC (`icegres maintain remove-orphans`, src/maintain.rs) needs an
+# object-store LISTING, which the pinned iceberg-rust 0.9.1 FileIO does not
+# expose (delete/exists/read/write only). opendal 0.55.0 with services-s3 is
+# ALREADY compiled into the binary at exactly this version (dependency of
+# iceberg-storage-opendal 0.9.1, which enables services-s3 itself), so this
+# direct dep adds no new code and changes nothing in Cargo.lock beyond listing
+# it as a dependency of icegres. The S3 operator is built from the same
+# CatalogOpts S3 settings context.rs feeds to FileIO (path-style forced,
+# config-load/EC2-metadata disabled).
+opendal = { version = "=0.55.0", features = ["services-s3"] }
 # PEM parsing for --tls-cert/--tls-key. Already in the tree transitively via
 # datafusion-postgres; rustls itself is reached through pgwire's re-export of
 # tokio_rustls so no second rustls version can drift in.

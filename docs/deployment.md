@@ -191,7 +191,7 @@ protect them like `.pgpass`.
 
 ---
 
-## 8. Table maintenance (snapshot expiry)
+## 8. Table maintenance (snapshot expiry + orphan GC)
 
 Every write adds an Iceberg snapshot forever; unbounded, `$snapshots` and the
 metadata JSON the catalog re-reads on every table open grow without limit. Run
@@ -204,12 +204,53 @@ icegres maintain expire-snapshots demo.trips --keep 50
 It is a metadata-only, live-safe REST commit (keeps the newest `--keep` by
 commit time plus every snapshot still reachable from a branch/tag ref; anchored
 so a concurrent write can never strand a ref). Schedule it as a `CronJob`
-running the same image with the `maintain expire-snapshots` command. The
-expired snapshots' data/manifest files are left in object storage for a
-separate orphan-file GC — see `docs/limitations.md`.
+running the same image with the `maintain expire-snapshots` command.
+
+Expiry strands the expired snapshots' data/manifest files in object storage;
+the GC step reclaims them:
+
+```bash
+# dry-run first: prints orphan count + bytes + sample paths, deletes nothing
+icegres maintain remove-orphans demo.trips
+# then delete; only objects older than the grace window are eligible
+icegres maintain remove-orphans demo.trips --execute --older-than-hours 72
+```
+
+`remove-orphans` lists the table's S3 prefix and deletes only what NO retained
+snapshot, branch, or tag references (data files, manifests, manifest lists —
+including files still named by DELETED manifest entries — the metadata-JSON
+log, and statistics files all count as live). The guard model, plainly:
+
+- **The grace window IS the in-flight-commit guard.** Keep the default
+  72-hour `--older-than-hours` in production: only an object's young age
+  protects files written by commits — icegres' own or a foreign writer's
+  (Spark, Trino) — that have not landed in the catalog yet; shrink it only
+  on tables no foreign engine writes to.
+- **Clock skew is covered by allowance + probe.** A fixed 15-minute
+  clock-skew allowance is folded into the cutoff (effective cutoff =
+  now − grace − 15 min), and `--execute` measures the real host-vs-store
+  skew by writing, stat'ing, and deleting a tiny probe object under the
+  table's `metadata/` prefix — the run aborts if the skew exceeds the
+  allowance (or if the probe itself fails).
+- **`--unsafe-grace` is for quiescent tables only** (e.g. test rigs): it
+  permits `--execute` with a sub-1-hour grace window and drops the skew
+  allowance. On a table with concurrent writers it WILL lose in-flight
+  files — never pass it in a production CronJob.
+- **Foreign-bucket references abort.** If table metadata records a file
+  path outside the listed bucket (bucket aliases, endpoint rewrites), the
+  run aborts: liveness cannot be verified against a listing that cannot
+  see the file.
+
+The command fails closed everywhere else too (unreadable metadata or
+manifests abort the run; unknown-age or unrecognized objects are never
+deleted), so a failed run leaves everything in place and is safe to re-run.
+Schedule it as a second `CronJob` after the expiry one — expiry first, GC
+after — per hot table.
 
 There is intentionally no `compact` command yet (pinned iceberg-rust 0.9.1 has
-no rewrite-files action); drop-and-reseed remains the canonicalization path.
+no rewrite-files action); drop-and-reseed remains the canonicalization path,
+and buffered/tail mode's per-window group commits keep new files well-sized at
+the source.
 
 ---
 

@@ -396,6 +396,39 @@ enum MaintainCmd {
         #[arg(long, default_value_t = 10)]
         keep: usize,
     },
+    /// Orphan-file GC: list the table's storage prefix, subtract every file
+    /// still reachable from ANY retained snapshot/ref (plus metadata JSONs
+    /// and statistics files), and report — or with --execute, delete — the
+    /// rest. Dry-run by default. Unknown-age or unrecognized objects are
+    /// never deleted; an unreadable manifest — or a recorded file path
+    /// outside the listed bucket, whose liveness cannot be verified —
+    /// aborts the whole run.
+    RemoveOrphans {
+        #[command(flatten)]
+        catalog: CatalogOpts,
+        /// Target table: <table> or <namespace>.<table>.
+        table: String,
+        /// Only objects last modified more than this many hours ago are
+        /// eligible — the grace window is THE guard for files written by
+        /// commits (ours or a foreign writer's) still in flight. A fixed
+        /// 15-minute clock-skew allowance is added on top of it. Values
+        /// under 1 combined with --execute are refused unless
+        /// --unsafe-grace is also passed.
+        #[arg(long, default_value_t = 72)]
+        older_than_hours: u64,
+        /// Actually delete the orphans (default: dry run, nothing deleted).
+        /// Before deleting, a tiny probe object is written under the
+        /// table's metadata/ prefix and stat'ed to verify the object-store
+        /// clock agrees with ours (aborts beyond the 15-minute allowance).
+        #[arg(long)]
+        execute: bool,
+        /// Allow --execute with --older-than-hours < 1 and drop the
+        /// 15-minute clock-skew allowance from the cutoff. ONLY for
+        /// quiescent tables (e.g. tests): concurrent writers WILL lose
+        /// in-flight files.
+        #[arg(long)]
+        unsafe_grace: bool,
+    },
 }
 
 #[tokio::main]
@@ -500,6 +533,16 @@ async fn main() -> Result<()> {
                 table,
                 keep,
             } => maintain::expire_snapshots(&catalog, &table, keep).await,
+            MaintainCmd::RemoveOrphans {
+                catalog,
+                table,
+                older_than_hours,
+                execute,
+                unsafe_grace,
+            } => {
+                maintain::remove_orphans(&catalog, &table, older_than_hours, execute, unsafe_grace)
+                    .await
+            }
         },
         Command::Sql {
             catalog,

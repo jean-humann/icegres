@@ -1962,4 +1962,103 @@ rm -rf "$KY_TAIL"
 curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_keyed?purgeRequested=true" >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
+# (y) Orphan-file GC (roadmap Phase 4, docs/sota-roadmap.md §6):
+# `icegres maintain remove-orphans` reclaims the files snapshot expiry
+# strands. Recipe: 4 one-row INSERTs make 4 small data files; TWO full-table
+# COW UPDATEs then strand them — the first rewrites all four into one file,
+# the second rewrites again AND drops the first UPDATE's DELETED manifest
+# entries (spec: DELETED entries live only in the snapshot that deleted
+# them), so after `expire-snapshots --keep 1` the four insert-era Parquet
+# files (and the expired snapshots' manifests/manifest lists) are referenced
+# by NOTHING. Live after expiry: the newest rewrite + the previous rewrite
+# (still named by a DELETED entry in the retained snapshot's manifest) = 2
+# Parquet files, plus the retained manifest list/manifests and every
+# metadata JSON in the metadata log. Proven here: dry run reports the
+# orphans and deletes NOTHING; --execute with a 0-hour grace window is
+# REFUSED (fail closed) until --unsafe-grace asserts the table is
+# quiescent; --execute --unsafe-grace deletes exactly the reported set
+# (verified via aws CLI object counts) while the table stays queryable with
+# correct rows; a rerun reports zero. Uses --older-than-hours 0 with
+# --unsafe-grace on every step (the table is quiescent, and the flag also
+# drops the 15-minute clock-skew allowance that would otherwise hide the
+# seconds-old orphans); production keeps the default 72h grace window and
+# never passes --unsafe-grace. The --execute step also exercises the
+# clock-skew probe (write/stat/delete under metadata/), which must pass
+# against the local store.
+# ---------------------------------------------------------------------------
+log "(y) orphan-file GC (maintain remove-orphans)"
+q 'drop table if exists demo.e2e_orphan' >/dev/null 2>&1 || true
+q 'create table demo.e2e_orphan (id bigint, v text)' >/dev/null
+for i in 1 2 3 4; do
+  q "insert into demo.e2e_orphan (id, v) values ($i, 'r$i')" >/dev/null
+done
+q "update demo.e2e_orphan set v = 'u1' where id >= 1" >/dev/null
+q "update demo.e2e_orphan set v = 'u2' where id >= 1" >/dev/null
+orphan_loc=$(curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_orphan" | jq -r '.metadata.location')
+[[ "$orphan_loc" == s3://lakehouse/* ]] || fail "unexpected table location for demo.e2e_orphan: $orphan_loc"
+orphan_key=${orphan_loc#s3://lakehouse/}
+count_orphan_parquet() {
+  aws --endpoint-url "$S3_ENDPOINT" s3 ls --recursive "s3://lakehouse/$orphan_key/data/" \
+    | grep -c '\.parquet$' || true
+}
+count_orphan_objects() {
+  aws --endpoint-url "$S3_ENDPOINT" s3 ls --recursive "s3://lakehouse/$orphan_key/" \
+    | grep -c . || true
+}
+"$BIN" maintain expire-snapshots demo.e2e_orphan --keep 1 >"$E2E_DIR/orphan-expire.log" 2>&1 \
+  || { cat "$E2E_DIR/orphan-expire.log" >&2; fail "expire-snapshots before GC failed"; }
+grep -q 'expired 5 snapshot' "$E2E_DIR/orphan-expire.log" \
+  || { cat "$E2E_DIR/orphan-expire.log" >&2; fail "expected 5 expired snapshots (4 inserts + 1 update)"; }
+assert_eq "stranded data files present before GC (4 inserts + 2 rewrites)" "6" "$(count_orphan_parquet)"
+orphan_obj_before=$(count_orphan_objects)
+
+# --- dry run: reports the orphans, deletes NOTHING (--unsafe-grace only
+# --- drops the skew allowance so the seconds-old orphans are visible;
+# --- dry runs never need it to be *allowed*) ---
+"$BIN" maintain remove-orphans demo.e2e_orphan --older-than-hours 0 --unsafe-grace >"$E2E_DIR/orphan-dry.log" 2>&1 \
+  || { cat "$E2E_DIR/orphan-dry.log" >&2; fail "remove-orphans dry run failed"; }
+grep -q 'DRY RUN — nothing deleted' "$E2E_DIR/orphan-dry.log" \
+  || { cat "$E2E_DIR/orphan-dry.log" >&2; fail "dry run did not announce itself"; }
+orphan_n=$(sed -n 's/^found \([0-9]\{1,\}\) orphan file(s) totaling.*/\1/p' "$E2E_DIR/orphan-dry.log")
+[[ -n "$orphan_n" && "$orphan_n" -ge 4 ]] \
+  || { cat "$E2E_DIR/orphan-dry.log" >&2; fail "dry run found [$orphan_n] orphans, expected >= 4 (the insert-era Parquet files)"; }
+orphan_dry_parquet=$(grep -c '^  s3://lakehouse/.*/data/.*\.parquet$' "$E2E_DIR/orphan-dry.log" || true)
+assert_eq "dry run names exactly the 4 insert-era Parquet files as orphans" "4" "$orphan_dry_parquet"
+assert_eq "dry run deleted NOTHING (object count unchanged)" "$orphan_obj_before" "$(count_orphan_objects)"
+assert_eq "dry run left every data file in place" "6" "$(count_orphan_parquet)"
+pass "dry run reports $orphan_n orphan(s) and deletes nothing"
+
+# --- refusal (fail closed): --execute with a sub-1h grace window must be
+# --- refused WITHOUT --unsafe-grace, deleting nothing ---
+if "$BIN" maintain remove-orphans demo.e2e_orphan --older-than-hours 0 --execute >"$E2E_DIR/orphan-refuse.log" 2>&1; then
+  cat "$E2E_DIR/orphan-refuse.log" >&2
+  fail "--execute with --older-than-hours 0 must be refused without --unsafe-grace"
+fi
+grep -q 'refusing --execute' "$E2E_DIR/orphan-refuse.log" \
+  || { cat "$E2E_DIR/orphan-refuse.log" >&2; fail "refusal did not name the grace-window guard"; }
+assert_eq "refused execute deleted NOTHING (object count unchanged)" \
+  "$orphan_obj_before" "$(count_orphan_objects)"
+
+# --- execute (+--unsafe-grace: quiescent table): deletes exactly the
+# --- reported set; live files + rows intact; clock-skew probe passes ---
+"$BIN" maintain remove-orphans demo.e2e_orphan --older-than-hours 0 --execute --unsafe-grace >"$E2E_DIR/orphan-exec.log" 2>&1 \
+  || { cat "$E2E_DIR/orphan-exec.log" >&2; fail "remove-orphans --execute failed"; }
+grep -q "deleted $orphan_n orphan file(s) totaling" "$E2E_DIR/orphan-exec.log" \
+  || { cat "$E2E_DIR/orphan-exec.log" >&2; fail "--execute did not delete the $orphan_n orphans the dry run found"; }
+assert_eq "execute removed exactly the orphan set from the object store" \
+  "$((orphan_obj_before - orphan_n))" "$(count_orphan_objects)"
+assert_eq "live data files survive the GC (newest rewrite + its DELETED-entry predecessor)" "2" \
+  "$(count_orphan_parquet)"
+assert_eq "table fully readable after GC (rows + last update intact)" "4|u2|u2" \
+  "$(q 'select count(*), min(v), max(v) from demo.e2e_orphan')"
+
+# --- rerun: idempotent, zero orphans left ---
+"$BIN" maintain remove-orphans demo.e2e_orphan --older-than-hours 0 --unsafe-grace >"$E2E_DIR/orphan-rerun.log" 2>&1 \
+  || { cat "$E2E_DIR/orphan-rerun.log" >&2; fail "remove-orphans rerun failed"; }
+grep -q 'found 0 orphan file(s)' "$E2E_DIR/orphan-rerun.log" \
+  || { cat "$E2E_DIR/orphan-rerun.log" >&2; fail "rerun should find zero orphans"; }
+pass "orphan GC: dry-run/execute/rerun contract holds ($orphan_n orphans reclaimed)"
+q 'drop table demo.e2e_orphan' >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
 log "all assertions passed ($PASS_COUNT)"

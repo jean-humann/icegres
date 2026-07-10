@@ -69,13 +69,32 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
 - **No compaction command yet.** The pinned iceberg-rust 0.9.1 `Transaction`
   API has no rewrite/replace-files action, so small-file compaction would
   require correctness-critical manifest surgery on the custom copy-on-write
-  path plus cross-engine (Trino/Spark) verification. Until then, drop-and-reseed
-  is the documented canonicalization path.
-- **Snapshot expiry is metadata-only.** `icegres maintain expire-snapshots`
-  drops snapshots from table metadata but leaves their data/manifest files in
-  object storage; reclaiming those bytes needs a separate orphan-file GC (run
-  Spark/Trino `remove_orphan_files`, or an object-store lifecycle policy scoped
-  to the table prefix).
+  path plus cross-engine (Trino/Spark) verification; it stays gated behind the
+  dependency-matrix bump (which moves as a unit, see below). Until then,
+  drop-and-reseed is the documented canonicalization path, and buffered/tail
+  mode already fixes the *source* of small files — cadence commits write one
+  well-sized file per flush window instead of one per INSERT.
+- **Snapshot expiry is metadata-only; pair it with `remove-orphans`.**
+  `icegres maintain expire-snapshots` drops snapshots from table metadata but
+  leaves their data/manifest files in object storage. The shipped counterpart,
+  `icegres maintain remove-orphans <table> [--older-than-hours N] [--execute]`,
+  reclaims those bytes: it lists the table's S3 prefix and deletes what no
+  retained snapshot/ref references — dry-run by default, and fail-closed
+  everywhere ambiguous (unreadable metadata/manifests abort; unknown-age or
+  unrecognized objects are never deleted; a recorded file path outside the
+  listed bucket aborts the whole run, since liveness cannot be verified
+  against a listing that cannot see it). The guard model, plainly: the
+  **grace window** (`--older-than-hours`, default 72) is THE protection for
+  files written by in-flight commits — ours or a foreign writer's — that
+  have not landed in the catalog yet; a fixed **15-minute clock-skew
+  allowance** is folded into the cutoff, and `--execute` verifies the real
+  host-vs-store skew with a tiny write/stat/delete probe object under
+  `metadata/`, aborting beyond the allowance (probe failure also aborts).
+  `--execute` with a grace window under 1 h is refused unless
+  `--unsafe-grace` is passed — that flag is for **quiescent tables only**
+  (e.g. tests); concurrent writers WILL lose in-flight files. Caveats:
+  S3-compatible stores only (the listing backend is built from the `--s3-*`
+  options), and run it per-table — there is no all-tables sweep yet.
 
 ## Timeouts
 
