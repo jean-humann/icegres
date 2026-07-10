@@ -465,6 +465,13 @@ pub async fn serve_custom(
                             Ok(()) => info!(
                                 "write buffer flushed on shutdown; no acked rows lost"
                             ),
+                            // With a durable tail the failure is not lossy:
+                            // the rows replay from disk on the next boot.
+                            Err(e) if buf.tail_enabled() => warn!(
+                                "write-buffer flush on shutdown FAILED; acked rows remain \
+                                 durable in the local tail and replay on the next boot \
+                                 with the same --tail-dir: {e:#}"
+                            ),
                             Err(e) => warn!(
                                 "write-buffer flush on shutdown FAILED; up to the last \
                                  cadence of acked rows may be lost: {e:#}"

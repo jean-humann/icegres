@@ -76,10 +76,38 @@ futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
+# Orphan-file GC (`icegres maintain remove-orphans`, src/maintain.rs) needs an
+# object-store LISTING, which the pinned iceberg-rust 0.9.1 FileIO does not
+# expose (delete/exists/read/write only). opendal 0.55.0 with services-s3 is
+# ALREADY compiled into the binary at exactly this version (dependency of
+# iceberg-storage-opendal 0.9.1, which enables services-s3 itself), so this
+# direct dep adds no new code and changes nothing in Cargo.lock beyond listing
+# it as a dependency of icegres. The S3 operator is built from the same
+# CatalogOpts S3 settings context.rs feeds to FileIO (path-style forced,
+# config-load/EC2-metadata disabled).
+opendal = { version = "=0.55.0", features = ["services-s3"] }
 # PEM parsing for --tls-cert/--tls-key. Already in the tree transitively via
 # datafusion-postgres; rustls itself is reached through pgwire's re-export of
 # tokio_rustls so no second rustls version can drift in.
 rustls-pemfile = "2"
+# Durable-tail WAL frame checksums (src/tail.rs). Already in the dependency
+# graph transitively (parquet et al.) at exactly this version, so the pin
+# matches Cargo.lock and adds no new code to the binary. Arrow IPC framing
+# for the same file comes through the existing `arrow` facade (arrow::ipc).
+crc32fast = "=1.5.0"
+# Durable-tail directory lock (src/tail.rs): flock(LOCK_EX | LOCK_NB) so two
+# icegres processes can never share one --tail-dir (double-apply / cross-
+# truncate hazard). Already in the tree transitively at exactly this version.
+libc = "=0.2.186"
+# Durable-tail Postgres backend (src/tail_pg.rs, --tail-url). Pinned EXACTLY
+# because the wire-protocol crates it builds on — postgres-protocol 0.6.12 and
+# postgres-types 0.2.14 — are ALREADY in this graph (pgwire/arrow-pg via
+# datafusion-postgres), and 0.7.18 is the version known to resolve against
+# exactly that pair on this toolchain (bench/harness pins the same trio); a
+# floating bound could drag the shared protocol crates and with them the
+# pinned pgwire matrix. Default features only ("runtime" = tokio connect);
+# no with-* type extensions — the tail schema is TEXT/BIGINT/BYTEA only.
+tokio-postgres = "=0.7.18"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

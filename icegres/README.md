@@ -37,7 +37,7 @@ compatibility, and scale-to-zero economics on lakehouse data — leave
 | SELECT (full SQL via DataFusion) | snapshot-aware metadata cache, exact freshness (no TTL) | default |
 | INSERT | Iceberg `fast_append` commit per statement | default |
 | UPDATE / DELETE | copy-on-write overwrite snapshots — only files containing matched rows are rewritten (`src/overwrite.rs`) | default |
-| Transactions | BEGIN/COMMIT/ROLLBACK; snapshot-pinned reads, read-your-own-writes, COMMIT = ONE Iceberg snapshot, first-committer-wins (40001) (`src/txn.rs`) | default |
+| Transactions | BEGIN/COMMIT/ROLLBACK; snapshot-pinned reads, read-your-own-writes, COMMIT = ONE Iceberg snapshot per table — atomic ACROSS tables via the catalog's multi-table `transactions/commit` endpoint (Lakekeeper), first-committer-wins (40001) (`src/txn.rs`) | default |
 | Primary-key enforcement | opt-in NOT NULL + uniqueness checks (23502/23505) anchored to the commit snapshot | `--enforce-pk` + table property `icegres.primary-key` |
 | Authentication | SCRAM-SHA-256 (salted hashes in memory, 28P01 on failure) — managed add-on | `--auth-file` |
 | Authorization | Lakekeeper-style ReBAC: warehouse/namespace/table grants, roles, per-statement 42501 — managed add-on | `--authz-file` |
@@ -45,6 +45,7 @@ compatibility, and scale-to-zero economics on lakehouse data — leave
 | Time travel | read-only snapshot-pinned queries | `demo."trips@<snapshot_id>"` |
 | Zero-copy branches | Neon-style branch-per-endpoint over Iceberg snapshot refs (`src/branch.rs`) | `icegres branch create/list/drop`, `serve --branch` |
 | Buffered writes (opt-in) | Moonlink-style group commit: ~1.5 ms INSERT ack, union reads, ≤N ms durability window, WARN on enable (`src/buffer.rs`) | `--write-buffer-ms N` (default 0 = synchronous) |
+| Keyed tail upserts (opt-in) | Hot-row `UPDATE`/`DELETE` by exact PK ack from the durable tail (~9.5 ms p50 vs ~71 ms sync), coalesced per key into ONE commit per flush window (`src/keyed.rs`, `src/buffer.rs`) | table properties `icegres.primary-key` + `icegres.tail-upsert=true`, with `--write-buffer-ms > 0` and a tail backend |
 | Scale-to-zero | clean exit after N idle seconds; stateless compute | `--idle-shutdown-secs` |
 | Wake-on-connect control plane | `icegresd`: pgwire-aware proxy that spawns computes on connect, routes `icegres@<branch>` dbnames to per-branch computes, supervises crashes with capped backoff, keeps a warm session pool (`--pool-size`, sub-ms connects; session pooling only — no transaction pooling, no cross-client reuse) | `icegresd serve` / `icegresd status` |
 | Health endpoint | HTTP 200 liveness | `--health-port` |
@@ -114,7 +115,10 @@ psql -h 127.0.0.1 -p 5439 -U postgres -d icegres
 | `icegres branch create <table> <name> [--at-snapshot <id>]` | Create a zero-copy branch: ONE metadata commit adding a snapshot ref at main's head (or `--at-snapshot`); no data copied. Fails if the branch exists (atomic via `assert-ref-snapshot-id = null`). |
 | `icegres branch list <table>` | List all snapshot refs (branches/tags) of a table with their head snapshot ids. |
 | `icegres branch drop <table> <name>` | Remove the ref only (`main` is refused); the branch's snapshots stay time-travel-readable until expiry. |
-| `icegres maintain expire-snapshots <table> [--keep N]` | Trim table metadata to the newest `N` snapshots (default 10) **plus every snapshot still reachable from a branch/tag ref** — a metadata-only, live-safe REST commit (anchored with `assert-table-uuid` + `assert-ref-snapshot-id main=<head>`). Data/manifest files of the expired snapshots are left for a separate orphan-file GC. Long-lived tables need this so `$snapshots` and the per-open metadata JSON stop growing unbounded. |
+| `icegres branch create-all <name>` | Whole-lakehouse branch: set the ref on EVERY table in the catalog in ONE atomic multi-table transaction (`POST /v1/{prefix}/transactions/commit`) — a consistent cross-table cut. Per-table `assert-ref-snapshot-id = null` guards make it all-or-nothing: if any table already has the branch, nothing is applied. Snapshot-less tables cannot hold a ref and are skipped with a loud warning. Requires a catalog implementing the endpoint (Lakekeeper does); errors cleanly otherwise. |
+| `icegres branch drop-all <name>` | Remove the ref from every table that has it in ONE atomic multi-table transaction (`main` refused; tables without the ref are skipped; errors if no table has it). |
+| `icegres maintain expire-snapshots <table> [--keep N]` | Trim table metadata to the newest `N` snapshots (default 10) **plus every snapshot still reachable from a branch/tag ref** — a metadata-only, live-safe REST commit (anchored with `assert-table-uuid` + `assert-ref-snapshot-id main=<head>`). Data/manifest files of the expired snapshots are left for `maintain remove-orphans` to reclaim. Long-lived tables need this so `$snapshots` and the per-open metadata JSON stop growing unbounded. |
+| `icegres maintain remove-orphans <table> [--older-than-hours N] [--execute] [--unsafe-grace]` | Orphan-file GC — the storage half of expiry: lists the table's S3 prefix, subtracts the LIVE set (every data file, manifest, and manifest list reachable from EVERY retained snapshot — all branches/tags, DELETED manifest entries included — plus the current metadata JSON, the metadata log, and statistics files), and reports the rest. **Dry-run by default** (count + bytes + up to 20 sample paths); `--execute` deletes. Only objects older than `--older-than-hours` (default 72) plus a fixed 15-minute clock-skew allowance are eligible — the grace window is THE guard for in-flight commits, ours or a foreign writer's; `--execute` also verifies real host-vs-store skew with a write/stat/delete probe under `metadata/` (abort beyond the allowance). `--execute` with a sub-1h window is refused without `--unsafe-grace` (quiescent tables only — concurrent writers WILL lose in-flight files). Fails closed: unreadable table metadata or any unreadable manifest aborts the whole run, a recorded path outside the listed bucket aborts the whole run (liveness unverifiable), unknown-age objects are never deleted, unrecognized objects under the prefix are skipped with a WARN, and a mid-run commit re-derives the live set (a UUID change aborts). |
 | `icegres sql -e '<query>'` | One-shot local execution against the catalog (debugging aid; no server involved). Honors `--enforce-pk`. |
 
 ### Configuration
@@ -141,7 +145,9 @@ environment variables:
 | `--branch` (serve) | `ICEGRES_BRANCH` | `main` | Serve a zero-copy branch: reads pin to the ref's head, all writes commit to the ref with `assert-ref-snapshot-id` (never touching other branches) |
 | `--write-buffer-ms` (serve) | `ICEGRES_WRITE_BUFFER_MS` | `0` (sync) | Opt-in buffered writes: INSERTs ack from an in-memory buffer, group-committed every N ms; unclean kill loses ≤N ms of acked writes (WARN on enable) |
 |  | `ICEGRES_WRITE_BUFFER_MAX_ROWS` | `50000` | Row threshold that forces an early flush in buffered mode |
-|  | `ICEGRES_TXN_STRICT` | off | Refuse any multi-table `COMMIT` up front with `0A000` (nothing applied), guaranteeing every COMMIT is all-or-nothing. Off = best-effort ordered per-table commits (a partial apply reports `40003`, not the retryable `40001`). |
+| `--tail-dir` (serve) | `ICEGRES_TAIL_DIR` | off | Durable local tail for buffered writes (requires `--write-buffer-ms > 0`): fsync'd per-table WAL appended BEFORE each buffered ack, replayed on boot — closes the unclean-kill loss window (node/disk loss still loses the tail) |
+| `--tail-url` (serve) | `ICEGRES_TAIL_URL` | off | Durable Postgres-backed tail for buffered writes (requires `--write-buffer-ms > 0`, mutually exclusive with `--tail-dir`): each buffered INSERT commits to a frames table in this Postgres database BEFORE its ack, replayed on boot — survives losing the compute node (durability = the tail database's fsync/replication); an unreachable tail database blocks buffered writes (statement errors, never silent loss) |
+|  | `ICEGRES_TXN_STRICT` | off | Only relevant on catalogs WITHOUT the multi-table `transactions/commit` endpoint (with it — e.g. Lakekeeper — multi-table COMMITs are always atomic and strict mode never bites): refuse a multi-table `COMMIT` up front with `0A000` (nothing applied) instead of best-effort ordered per-table commits (where a partial apply reports `40003`, not the retryable `40001`). |
 
 Logging uses `tracing` with an env filter: `RUST_LOG=debug icegres serve`.
 Every connection runs inside a correlation span (`conn` id + peer) so
@@ -406,11 +412,24 @@ select count(*) from demo."trips@4436304835314641572";  -- e.g. the seed snapsho
 `BEGIN` / `COMMIT` / `ROLLBACK` are real (`src/txn.rs`): reads inside a
 transaction are snapshot-pinned per table (snapshot isolation), writes are
 buffered in the session with read-your-own-writes overlays, and `COMMIT`
-composes everything into **one** Iceberg snapshot anchored at the pinned
-snapshot. Concurrency is first-committer-wins: if another writer committed
-to a touched table since the pin, `COMMIT` fails with SQLSTATE `40001`
-(retry the transaction). A statement error inside a transaction poisons it
-(`25P02`) and `COMMIT` then rolls back, like stock Postgres.
+composes everything into **one** Iceberg snapshot per table anchored at the
+pinned snapshot. Concurrency is first-committer-wins: if another writer
+committed to a touched table since the pin, `COMMIT` fails with SQLSTATE
+`40001` (retry the transaction). A statement error inside a transaction
+poisons it (`25P02`) and `COMMIT` then rolls back, like stock Postgres.
+
+**Multi-table COMMITs are atomic across tables** when the catalog
+implements the Iceberg REST multi-table transaction endpoint
+(`POST /v1/{prefix}/transactions/commit`) — verified against Lakekeeper,
+the assumed catalog: the whole COMMIT is ONE all-or-nothing catalog request
+carrying every table's `assert-ref-snapshot-id` pin, so every table commits
+or none does, and any conflict is a clean, retryable `40001` with nothing
+applied. Endpoint support is read from `GET /v1/config`'s capability list
+(or probed once on first use) and cached. On a catalog without the
+endpoint, multi-table COMMITs fall back to the documented ordered per-table
+path (a partial apply reports `40003` — see `docs/limitations.md`), and
+`ICEGRES_TXN_STRICT=true` refuses them up front (`0A000`, nothing applied);
+with the endpoint, strict mode is satisfied by atomicity and never refuses.
 
 ```sql
 begin;
@@ -448,6 +467,141 @@ feature — and enabling it logs a WARN. Both halves of the contract are
 locked by e2e (kill-loss vs clean-shutdown-flush), and the union-read flush
 race is covered by `buffer.rs` unit tests.
 
+**Durable tail — two backends.** Buffered mode can attach a durable tail
+that every INSERT is appended to BEFORE its ack, replayed into the buffer
+on the next boot; the two backends hold the identical exactly-once protocol
+(the `icegres.tail-seq.<tail-id>` watermark stamped into each flush commit)
+and differ only in where the tail lives — i.e. in the durability class:
+
+| Backend | Flag | The tail lives in | Survives unclean kill | Survives node/disk loss | Ack cost |
+|---|---|---|---|---|---|
+| Local WAL | `--tail-dir <dir>` | fsync'd segments on this node's disk | yes | **no** — the tail dies with the disk | one local fsync (~3.2 ms p50 measured) |
+| Postgres | `--tail-url <postgres url>` | a `frames` table (schema `icegres_tail`, auto-created) in any Postgres database — the natural target is a dedicated DB on the instance already backing Lakekeeper | yes | **yes** — durability = the tail database's own fsync/replication | one INSERT round trip + commit (~1–3 ms to a same-box database) |
+
+The flags are mutually exclusive (one server writes ONE tail), and both
+require `--write-buffer-ms > 0`. For `--tail-url`: the identity behind the
+watermark key is minted once into the schema's `meta` table (same URL =
+same logical tail across restarts), and an unreachable tail database fails
+startup / fails the INSERT statement mid-flight — backpressure, never
+silent loss, exactly like a failing tail disk. A session advisory lock
+refuses a second `serve` on the same URL/schema at boot — best-effort
+boot-time mutual exclusion, NOT the correctness guard: the lock releases
+with its session, and exactly-once is enforced by the in-commit watermark
+property + the catalog's `assert-ref-snapshot-id` CAS + the fresh metadata
+reload before every flush attempt (`buffer.rs`), so even a replacement
+server overlapping a half-dead predecessor cannot double-apply. The URL
+must be a direct connection or session-pooled (a transaction-mode pooler
+would silently void the session lock; boot verifies and refuses). TLS URLs
+are not yet supported (keep the tail database
+on localhost or a trusted segment), and fleet-SHARED tails — several
+computes overlaying one tail — are the roadmap's next increment, not this
+backend (docs/sota-roadmap.md §3).
+
+**The local backend in detail (`--tail-dir <dir>`)** closes the unclean-kill
+window without giving up the buffered ack (measured on the dev box: ~3.2 ms
+p50 / 6.3 ms p95 ack with the tail vs ~1.3 ms untailed and ~50–80 ms
+synchronous — the fsync is the price of the closed window): every buffered
+INSERT is appended
+to an fsync'd per-table WAL segment under `<dir>` BEFORE the client ack (a
+tail write failure is the statement's error — never a silent downgrade), and
+on the next boot with the same `--tail-dir` acked-but-uncommitted rows are
+replayed into the buffer and committed by the normal flusher, so SIGKILL /
+power loss of the process loses nothing. Exactly-once across crashes is
+anchored in the lake: each flush commit records the highest drained tail
+sequence as a table property namespaced by the tail's persistent identity
+(`icegres.tail-seq.<tail-id>`, minted once into `<dir>/identity`) in the same
+atomic commit, plus a best-effort local sidecar (`<dir>/<table>/watermark`),
+and boot replay drops frames at or below `max(property, sidecar)` (a crash
+between commit and tail truncation cannot double-apply; several buffered
+writers on one table keep independent cursors). **Honest scope:** durability
+is THIS node's disk — losing the node or the disk still loses the tail; this
+is a strict upgrade over in-memory buffering, not node-loss durability
+(`src/tail.rs`). Like the pending buffer it mirrors, the tail dir grows
+without bound while the catalog is unreachable (nothing truncates until a
+flush commits), and boot replay materializes the whole surviving tail in
+memory before the flusher drains it. One residual double-apply window
+remains: a crash between the commit and the sidecar write COMBINED with a
+foreign writer dropping the table property. The tail dir is single-writer
+(exclusive `flock`; a second server on the same dir is refused at boot).
+Requires `--write-buffer-ms > 0` (refused at boot otherwise); verified
+standalone by `icegres/tests/tail_durability.sh` (kill -9 with the tail =
+zero loss, without = the documented loss, plus the no-double-apply and
+post-flush-restart sequence-floor cases — each proven for BOTH backends,
+sections 2–4 local and 6–8 Postgres). The Postgres backend's unit tests
+(`src/tail_pg.rs`) run live against `ICEGRES_TEST_PG_URL` (the local
+stack's `postgresql://lakekeeper:lakekeeper@127.0.0.1:5433/icegres_test`)
+and skip cleanly when it is unset.
+
+### Hot rows: keyed tail upserts (`icegres.tail-upsert`, opt-in)
+
+Roadmap Phase 2 (docs/sota-roadmap.md §4). On an opted-in table, an
+autocommit `UPDATE ... WHERE <exact PK equality>` (literal SET values) or
+`DELETE ... WHERE <exact PK equality>` skips the synchronous copy-on-write
+commit entirely: the statement resolves the key's current row through the
+same union view a scan sees, fsyncs ONE keyed frame to the durable tail,
+and acks. The flusher coalesces every keyed op of the window per key
+(last-writer-wins) and applies them as ONE composed COW commit — N updates
+to a hot row become one file rewrite per flush window instead of N
+serialized ~55–70 ms commits with `40001` storms, and an acked keyed op is
+never exposed to a client-visible `40001` (flush conflicts with foreign
+writers retry internally; the rows stay tail-durable meanwhile).
+
+**Measured on the dev box** (`--write-buffer-ms 200 --tail-dir`, 30
+sequential UPDATEs to one committed row, psycopg2, autocommit):
+
+| Path | UPDATE ack p50 | min / p90 | Snapshots produced |
+|---|---|---|---|
+| Keyed tail (this feature) | **9.5 ms** | 8.2 / 15.0 ms | 3 (one per 200 ms window) |
+| Synchronous COW (same table shape, no property) | 71.1 ms | 59.7 / 106.7 ms | 30 (one per statement) |
+
+The ~9.5 ms is one catalog `load_table` (activation + read anchor) + one
+union-view point lookup + one tail fsync — the documented read-modify-write
+cost of the ack (`docs/limitations.md`).
+
+**Activation matrix — ALL of these, or the statement silently takes the
+unchanged fence-then-synchronous path (never an error):**
+
+| Requirement | How |
+|---|---|
+| Declared primary key | table property `icegres.primary-key = "col[,col...]"` |
+| Keyed-tail opt-in | table property `icegres.tail-upsert = "true"` |
+| Buffered writes | `--write-buffer-ms N` with `N > 0` |
+| A durable tail | `--tail-dir <dir>` or `--tail-url <postgres url>` |
+| Statement shape | exact equality on ALL PK columns with literals (AND-composed for composite keys), no other predicates, no `RETURNING`/joins/subqueries/bind parameters; UPDATE additionally: literal SET values, PK columns not assigned |
+| PK column types | Iceberg `int`/`long`/`string`/`boolean`/`date` |
+| Key cardinality | the key currently matches at most ONE row (duplicate keys fall back to the sync path) |
+
+Durability and crash recovery ride the existing tail machinery: one keyed
+statement = one fsync'd tail frame (op-discriminated payload, format v2),
+replayed in sequence order into the keyed map on boot, truncated by the
+same watermark protocol as inserts. Reads on this server merge lake + tail
+by key: committed rows (and older buffered layers) whose key was updated or
+deleted are suppressed and the newest buffered version unions in;
+time-travel (`table@snapshot`) and metadata tables stay point-in-time pure.
+**Semantics shift, stated plainly (docs/limitations.md):** within a flush
+window a keyed table trades snapshot-isolation-per-statement for per-key
+last-writer-wins **in ack (tail-sequence) order** — a plain INSERT of a
+key acked after a keyed delete/update of that key becomes its newest
+version (delete-then-reinsert in one window leaves the row present with
+the inserted values), and one acked before it loses, exactly as wall-clock
+ack order suggests. Explicit `BEGIN…COMMIT` keeps today's
+fence-flush-then-sync path (serialized per table against in-flight keyed
+statements, so a committed synchronous write can never be clobbered by a
+keyed statement's stale row image), and `--enforce-pk` composes: enforced
+INSERTs still fence, keyed updates still work (a keyed upsert is
+delete-then-insert of one key, so uniqueness is inherent). **Flight SQL is
+out of scope:** `flight-serve` is a separate process with no write buffer
+or tail — it executes DML synchronously, keyed routing never applies
+there, its counts are sync-exact, and it sees another server's in-window
+keyed ops at the commit cadence like any cross-server reader. Verified end
+to end by `icegres/tests/tail_durability.sh`
+section 9 (keyed UPDATE/DELETE ack fast, survive kill -9, commit exactly
+once; fence path proven for tables without the property) and
+`icegres/tests/e2e.sh` section (x) (20 hot-row UPDATEs = zero
+mid-window snapshots + ONE composed commit; union read sees the newest
+value mid-window; delete-then-reinsert of one key in one window leaves the
+row present with the inserted values; time travel unaffected).
+
 ### Zero-copy branches (`icegres branch`, `serve --branch`)
 
 Neon's branch-per-endpoint model on Iceberg snapshot refs: a branch is a
@@ -460,7 +614,21 @@ icegres serve --branch dev --port 5440 &    # a second endpoint on the branch
 psql -h 127.0.0.1 -p 5440 -c "insert into demo.trips values (…)"  # commits to 'dev'
 icegres branch list demo.trips              # main + dev, diverged heads
 icegres branch drop demo.trips dev          # removes the ref only
+
+icegres branch create-all staging           # whole-lakehouse branch: EVERY table,
+                                            # ONE atomic multi-table transaction
+icegres branch drop-all staging             # atomic removal everywhere it exists
 ```
+
+`create-all`/`drop-all` are whole-lakehouse operations: one atomic
+`transactions/commit` request sets (or removes) the ref on every table, and
+each table's request additionally pins `main` to the head captured when the
+table was loaded, so the branch is a **consistent-or-nothing cross-table
+cut** — it can never capture half of a concurrent (even atomic multi-table)
+commit. If any table already has the branch (create-all), a concurrent
+commit races the cut, or the endpoint is missing, nothing is applied (a
+raced create-all is safe to just retry). `icegres serve --branch <name>`
+then serves that cut as one endpoint.
 
 Reads on a `--branch` server pin to the branch head; all writes (INSERT,
 UPDATE, DELETE, transactions) commit with `assert-ref-snapshot-id` on the
@@ -468,6 +636,43 @@ branch ref, so endpoints on different branches never conflict and nothing
 can leak onto `main`. A table without the ref fails loudly — no silent
 fallback. Both branches share every file below the fork point; only new
 commits diverge.
+
+### Table maintenance (`icegres maintain`)
+
+Every commit adds a snapshot forever; long-lived tables need two periodic
+maintenance passes, both safe against a live serving endpoint:
+
+```sh
+# 1. Trim metadata: keep the newest 50 snapshots + everything a ref points at
+icegres maintain expire-snapshots demo.trips --keep 50
+
+# 2. Reclaim the bytes expiry stranded: dry-run first, then delete
+icegres maintain remove-orphans demo.trips                  # report only
+icegres maintain remove-orphans demo.trips --execute        # delete (72h grace)
+```
+
+`expire-snapshots` is metadata-only (one anchored REST commit); `remove-orphans`
+is the storage half: it lists the table's S3 prefix, subtracts everything any
+retained snapshot/ref still references (data files, manifests, manifest lists —
+including files named by DELETED manifest entries — plus the metadata-JSON log
+and statistics files), and deletes the rest. The guard model, plainly: the
+grace window (`--older-than-hours`, default 72) is THE guard for in-flight
+commits — from icegres or any foreign writer — whose files exist in storage
+but not yet in the catalog; a fixed 15-minute clock-skew allowance is folded
+into the cutoff, and `--execute` verifies the real host-vs-store skew with a
+tiny write/stat/delete probe under `metadata/` (abort beyond the allowance;
+probe failure aborts too). `--execute` with a grace window under 1 h is
+refused unless `--unsafe-grace` asserts the table is quiescent — that flag is
+for quiescent tables only (e.g. tests); concurrent writers WILL lose in-flight
+files. It fails closed on anything ambiguous: unreadable metadata or manifests
+abort the run, a recorded file path outside the listed bucket aborts the run
+(liveness cannot be verified against a listing that cannot see it),
+unknown-age objects and unrecognized files are never deleted, and a commit
+landing mid-run re-derives the live set. There is still no `compact` command
+(pinned iceberg-rust 0.9.1
+has no rewrite-files action — see `docs/limitations.md`); buffered/tail mode
+already keeps file sizes healthy by group-committing per window instead of
+per statement.
 
 ### Works with your ORM/BI tool
 
@@ -675,8 +880,8 @@ bash tests/e2e.sh   # end-to-end test (idempotent; needs psql, curl, jq, aws)
 ```
 
 The harness starts the stack (`infra/scripts/up.sh`), builds, seeds, serves,
-and asserts exact results over psql — **104 assertions** across sections
-(a)–(o): seeded row counts, filters/aggregates/joins, `INSERT` over the wire
+and asserts exact results over psql — **163 assertions** across sections
+(a)–(y): seeded row counts, filters/aggregates/joins, `INSERT` over the wire
 (verified from new connections), Parquet files on RustFS + catalog
 registration via the Lakekeeper REST API, durability across a server
 restart, auth + TLS (wrong password/unknown user rejected,

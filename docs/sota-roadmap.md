@@ -97,6 +97,11 @@ on the dev box (reference material only — **not** vendored into this repo).
 
 ### 2.2 Immediately actionable, license-clean wins (pre-Phase-1)
 
+> **STATUS: NOT shipped.** The `remote_storage`-style object-store
+> timeout/retry discipline remains an open `limitations.md` gap — no phase
+> has picked it up yet, and it is still the right next hardening round for
+> the storage path.
+
 - **Port `remote_storage`'s timeout/retry discipline** (or vendor the crate)
   behind icegres' OpenDAL storage factory — this closes the documented
   `limitations.md` gap "no object-store request timeout/retry" with
@@ -167,6 +172,21 @@ Backends, in build order:
    per-key writes (Phase 2). Quorum durability = the Postgres instance's own
    replication, delegated rather than rebuilt. No OSS analogue needed —
    plain SQL.
+
+   > **STATUS: shipped — the durability half.** `--tail-url` /
+   > `ICEGRES_TAIL_URL` (`icegres/src/tail_pg.rs`): durable-before-ack
+   > appends into a `frames` table (statement-atomic Arrow IPC payloads,
+   > same encoding and table-key namespace as the local WAL), identity +
+   > watermark sidecar in the same schema, one-writer advisory lock,
+   > boot replay/truncate/seq-floor under the unchanged watermark
+   > protocol — verified by live unit tests (`ICEGRES_TEST_PG_URL`) and
+   > `tail_durability.sh` sections 6–8 (kill -9 recovery, exactly-once
+   > across a double crash, post-flush seq floor). The tail therefore
+   > survives node loss (durability = the tail database's replication).
+   > **Not yet:** the SHARED half — fleet-wide overlays via
+   > `LISTEN/NOTIFY`, flush leases, per-key arbitration — is the explicit
+   > next increment; today the tail is single-writer/single-reader like
+   > the local backend.
 3. **`quorum` — the SafeKeeper-class backend (future).** Here Neon changes
    the math: the article's SafeKeeper **is Apache-2.0 Rust in
    `neon/safekeeper/`** — the proposer–acceptor consensus
@@ -215,6 +235,24 @@ protocol only Databricks' own engines speak. Parity, not deficit.
 
 ## 4. Phase 2 — hot rows: PK upserts on the tail
 
+> **STATUS: shipped — the single-compute half.** Tables opt in via
+> `icegres.primary-key` + `icegres.tail-upsert = "true"` (buffered mode +
+> a durable tail required). Exact-PK autocommit `UPDATE`/`DELETE` write a
+> keyed, op-discriminated frame to the tail (payload format v2) and ack in
+> ~9.5 ms p50 measured (vs ~71 ms synchronous COW); the flusher coalesces
+> per key (LWW — ack/tail-sequence order is the total order per key, so a
+> same-window plain re-INSERT after a keyed delete wins and resurrects the
+> row) and composes pending inserts + one delete-by-keys + the
+> replacement rows into ONE COW commit per window; scans merge lake + tail
+> by key (`KeySuppressExec` + layered overlay); replay rebuilds the keyed
+> map in sequence order through the same routing as the live path; the
+> fenced sync path and txn COMMITs serialize per table against in-flight
+> keyed read-modify-writes. Verified by `tail_durability.sh` §9 and
+> `e2e.sh` §(x). **Not yet:** cross-compute row locks / shared-tail arbitration
+> (single-writer tails only, like Phase 1), merge-on-read deletion vectors
+> (blocked on the dependency matrix), point-lookup short-circuit through
+> the keyed map, non-literal SET expressions.
+
 With a durable shared tail, hot-row traffic stops being a COW problem:
 
 - Tables opt in via the existing `icegres.primary-key` property (+
@@ -257,6 +295,8 @@ the BSL permits a deployer's internal use).
 
 ## 5. Phase 3 — multi-table atomicity and whole-lakehouse branches
 
+> **STATUS: shipped** — atomic multi-table COMMIT (40001-on-conflict, ordered/40003 fallback preserved for catalogs without the endpoint) and `icegres branch create-all`/`drop-all`, verified end-to-end against Lakekeeper 0.13.1 (e2e sections (j2)/(u)).
+
 The comparison doc scores Lakebase's whole-database branching and icegres'
 `40003` multi-table caveat as two separate gaps. They share one fix, and it
 is cheaper than it looks: the **Iceberg REST spec's multi-table transaction
@@ -276,8 +316,9 @@ Lakekeeper version in e2e, then adopt.)
   pins). Falls back to today's ordered-commit path on catalogs without the
   endpoint, preserving I3.
 - **Whole-lakehouse branches**: `icegres branch create-all <name>` sets the
-  ref on every table in one atomic transaction — a consistent cross-table
-  cut, which is the branch unit Lakebase brags about. `serve --branch` and
+  ref on every table in one atomic transaction, each table pinned to its
+  captured main head — a consistent-or-nothing cross-table cut, which is
+  the branch unit Lakebase brags about. `serve --branch` and
   `icegresd`'s `icegres@<branch>` routing already work per-ref and need no
   change. Tags give the same for PITR-style restore points; snapshot-expiry
   already preserves ref-reachable history.
@@ -288,6 +329,20 @@ Lakekeeper version in e2e, then adopt.)
   make history live outside the lake.)
 
 ## 6. Phase 4 — table health: compaction and orphan GC
+
+> **STATUS: shipped — orphan GC; compaction remains gated.** (c) is done:
+> `icegres maintain remove-orphans <table> [--older-than-hours N]
+> [--execute]` (maintain.rs) — object-store listing (direct opendal, pinned
+> to the version already in the lock) diffed against the live set walked
+> from every retained snapshot/ref (manifest lists, manifests incl. DELETED
+> entries, metadata-JSON log, statistics files), dry-run by default, 72 h
+> grace window for in-flight commits, fail-closed on unreadable metadata /
+> unknown ages / unrecognized objects, mid-run-commit re-derivation —
+> e2e-proven (dry-run/execute/rerun contract, object counts asserted via
+> the S3 CLI). (a) was already delivered by the tail: cadence commits fixed
+> the small-file *source*. (b) bin-pack compaction remains gated on the
+> pinned iceberg-rust matrix gaining a replace-files action — the matrix
+> moves as a unit behind a full gate run, per `limitations.md`.
 
 Independent of Lakebase parity, sustained writes need it (documented
 anti-pattern; today's answer is drop-and-reseed). Order of attack: (a) the
@@ -302,6 +357,13 @@ object-store listing against live manifests, or a documented external
 gate run, per `limitations.md`.
 
 ## 7. Phase 5 (deferred) — secondary index tier
+
+> **STATUS: deferred by design.** Not started, on purpose. The bar is
+> unchanged: build it against real scale evidence — measured point lookups
+> are 6.9 ms at current scale with no index object at all, and Phases 1–2
+> reshaped the write path any index must track. Until a workload shows
+> point-lookup latency dominated by file/row-group pruning at a scale where
+> 6.9 ms no longer holds, an index tier is complexity without a customer.
 
 The architecture study's §7.4 global index (key → file/row-group postings,
 refreshed per snapshot) now has a concrete reference: moonlink's
@@ -356,3 +418,17 @@ published half of it as Apache-2.0 code; icegres adds that organ with the
 chain of command inverted** — the tail serves the lake instead of the lake
 serving the row store. That is the whole difference between catching up to
 Lakebase and becoming it.
+
+## 10. Status ledger
+
+One row per phase; measured numbers are from the shipping commit's gate
+runs, not projections.
+
+| phase | status | capability added (commit) | measured |
+|---|---|---|---|
+| 1 — durable tail, `local` backend | **shipped** | `--tail-dir`: fsync'd per-table WAL before every buffered ack, boot replay, lake-anchored watermark — closes the unclean-kill loss window (`feat: durable local tail`) | ~3.2 ms p50 tail ack (vs ~1.3 ms untailed, ~50–80 ms synchronous); durability suite 17/17 (SIGKILL replay, exactly-once across double crash) |
+| 1b — durable tail, `postgres` backend | **shipped — durability half** | `--tail-url`: node-loss-durable tail in any Postgres, one-writer advisory lock, same watermark protocol (`feat: Postgres tail backend`). The SHARED half (fleet overlays via LISTEN/NOTIFY, flush leases) is still open — see §3 | durability suite grew 17→33 assertions, PG sections mirroring every LocalWal proof; no benched metric regressed vs the phase-3 baseline |
+| 2 — hot rows: PK upserts on the tail | **shipped — single-compute half** | `icegres.primary-key` + `icegres.tail-upsert`: exact-PK UPDATE/DELETE ack from the tail, per-key LWW coalescing into ONE commit per window, union-read key suppression (`feat: keyed PK upserts`). Cross-compute arbitration + MoR deletion vectors still open (matrix-gated) | 9.5 ms p50 keyed ack vs ~71 ms synchronous COW (7.4×); 30 hot-row updates → 3 snapshots instead of 30; durability suite 33→50 assertions |
+| 3 — multi-table atomicity + whole-lakehouse branches | **shipped** | One `CommitTransactionRequest` per multi-table COMMIT (40001 on conflict, nothing applied; ordered/40003 fallback preserved) + `branch create-all`/`drop-all` atomic cross-table cuts (`feat: atomic multi-table transactions`) | verified live against Lakekeeper 0.13.1; e2e grew to 140 assertions incl. section (j2)/(u) contracts |
+| 4 — table health: compaction + orphan GC | **partial: orphan GC shipped; compaction gated** | `maintain remove-orphans`: object-store listing vs live-set diff, dry-run default, 72 h grace, fail-closed (this tree). The small-file *source* was fixed by Phase 1–2 cadence commits; bin-pack rewrite waits on the pinned iceberg-rust matrix gaining replace-files | orphan-GC e2e contract proven (dry-run deletes nothing; `--execute` removes exactly the reported set with rows/live files intact; rerun reports 0); e2e suite grew 153→163 assertions |
+| 5 — secondary index tier | **deferred by design** | none — the §7 bar stands: build against real scale evidence, not the feature list | point lookups measured at 6.9 ms with no index object; no workload has beaten that bar yet |

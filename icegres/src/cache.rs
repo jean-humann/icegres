@@ -62,7 +62,7 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::catalog::{SchemaProvider, Session};
 use datafusion::datasource::{MemTable, TableProvider, TableType};
-use datafusion::error::Result as DFResult;
+use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::union::UnionExec;
@@ -257,6 +257,15 @@ impl CachingTableProvider {
                 return Err(e);
             }
         };
+        // S5 (buffer.rs): every scan pays this `load_table` anyway — record
+        // the keyed-activation decision so the write path's fallback never
+        // needs its own per-statement catalog call, and so a property
+        // change by ANY writer (a commit moves the metadata location) is
+        // picked up by the next scan. Cheap: short-circuits on an unchanged
+        // metadata location.
+        if let Some(buffer) = &self.write_buffer {
+            buffer.note_activation(&self.ident, fresh.metadata_location(), fresh.metadata());
+        }
         // Branch mode: the cache version and the served snapshot are the
         // branch HEAD (a commit to any other branch moves the metadata
         // location without changing what this endpoint serves; a commit to
@@ -327,20 +336,54 @@ impl TableProvider for CachingTableProvider {
         // Buffered write mode: take the overlay AFTER loading the committed
         // metadata — this ordering is what makes the union exactly-once
         // under concurrent flushes (see the protocol in buffer.rs).
-        let overlay = self
-            .write_buffer
-            .as_ref()
-            .and_then(|b| b.overlay(&self.ident, &metadata));
+        let overlay = match &self.write_buffer {
+            Some(b) => b
+                .overlay(&self.ident, &metadata)
+                .map_err(|e| DataFusionError::External(e.into()))?,
+            None => None,
+        };
         if let Some(overlay) = overlay {
             // Same union shape as the transaction hook's read view (txn.rs
             // UnionProvider): both children scanned with the same projection,
             // filters reported Inexact so DataFusion re-applies them above
             // the union, no per-child limit (union only concatenates).
-            let committed =
-                crate::scan::tune(provider.scan(state, projection, filters, None).await?);
+            //
+            // Keyed tail tables (Phase 2) add suppression: committed rows
+            // whose PK was updated/deleted in the buffer window are hidden
+            // by a KeySuppressExec above the committed child (the overlay's
+            // own batches were already filtered layer-aware in buffer.rs).
+            // When the scan's projection lacks a PK column, the committed
+            // child is scanned WIDENED (PK columns appended) so the filter
+            // can evaluate, and KeySuppressExec projects back down — the
+            // MemTable child keeps the original projection, so the union's
+            // child schemas still match.
+            let committed = match &overlay.suppress {
+                None => crate::scan::tune(provider.scan(state, projection, filters, None).await?),
+                Some(sup) => {
+                    let (scan_proj, out_proj) =
+                        widen_projection(projection, &self.schema, &sup.pk_cols)
+                            .map_err(|e| DataFusionError::External(e.into()))?;
+                    let inner = crate::scan::tune(
+                        provider
+                            .scan(state, scan_proj.as_ref(), filters, None)
+                            .await?,
+                    );
+                    Arc::new(crate::keyed::KeySuppressExec::try_new(
+                        inner,
+                        &sup.pk_cols,
+                        sup.keys.clone(),
+                        out_proj,
+                    )?) as Arc<dyn ExecutionPlan>
+                }
+            };
+            if overlay.batches.is_empty() {
+                // Pure suppression (e.g. only keyed deletes buffered):
+                // nothing to union in.
+                return Ok(committed);
+            }
             let mem = MemTable::try_new(overlay.schema, vec![overlay.batches])?;
             let buffered = mem.scan(state, projection, filters, None).await?;
-            return Ok(UnionExec::try_new(vec![committed, buffered])?);
+            return UnionExec::try_new(vec![committed, buffered]);
         }
         let plan = provider.scan(state, projection, filters, limit).await?;
         // Re-run plain table scans at higher object-store IO concurrency
@@ -378,6 +421,46 @@ impl TableProvider for CachingTableProvider {
             .insert_into(state, input, insert_op)
             .await
     }
+}
+
+/// Widen a scan projection so the committed child exposes every PK column
+/// the keyed suppression filter needs. Returns `(scan_projection,
+/// output_indices)`: the projection to scan the committed child with, and —
+/// when widening appended columns — the indices (into the WIDENED schema)
+/// KeySuppressExec must project back down to so the union's child schemas
+/// match. `projection = None` (all columns) needs no widening.
+#[allow(clippy::type_complexity)]
+fn widen_projection(
+    projection: Option<&Vec<usize>>,
+    full_schema: &ArrowSchemaRef,
+    pk_cols: &[String],
+) -> anyhow::Result<(Option<Vec<usize>>, Option<Vec<usize>>)> {
+    let Some(proj) = projection else {
+        return Ok((None, None));
+    };
+    let pk_idx: Vec<usize> = pk_cols
+        .iter()
+        .map(|c| {
+            full_schema
+                .fields()
+                .iter()
+                .position(|f| f.name().eq_ignore_ascii_case(c))
+                .ok_or_else(|| anyhow::anyhow!("PK column {c:?} missing from table schema"))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let missing: Vec<usize> = pk_idx
+        .iter()
+        .copied()
+        .filter(|i| !proj.contains(i))
+        .collect();
+    if missing.is_empty() {
+        return Ok((Some(proj.clone()), None));
+    }
+    let mut widened = proj.clone();
+    widened.extend(missing);
+    // The original columns are the widened schema's leading prefix.
+    let out: Vec<usize> = (0..proj.len()).collect();
+    Ok((Some(widened), Some(out)))
 }
 
 /// Maximum number of snapshot-pinned time-travel providers cached per base

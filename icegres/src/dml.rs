@@ -361,6 +361,23 @@ mod tests {
     }
 
     #[test]
+    fn commit_conflict_maps_to_sqlstate_40001() {
+        // The contract every conflict path relies on (single-table
+        // commit_pinned AND the atomic multi-table commit_pinned_multi):
+        // CommitConflict -> serialization_failure, retryable.
+        let err = anyhow::anyhow!(crate::overwrite::CommitConflict {
+            message: "could not serialize access due to concurrent update: test".to_string(),
+        });
+        match engine_error(&err) {
+            PgWireError::UserError(info) => {
+                assert_eq!(info.code, "40001");
+                assert!(info.message.contains("could not serialize access"));
+            }
+            other => panic!("expected UserError, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn translates_delete_with_predicate() {
         let (dml, tag) = translate(&parse("DELETE FROM demo.trips WHERE trip_id = 7"))
             .unwrap()

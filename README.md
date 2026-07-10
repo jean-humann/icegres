@@ -29,11 +29,12 @@ starts in ~0.3 s and serves interactive queries in single-digit milliseconds.
 |---|---|
 | **Postgres wire** | Simple + extended protocol, `pg_catalog`/`information_schema` emulation, SCRAM-SHA-256 auth, TLS. Verified against psql, psycopg2, pg8000, SQLAlchemy, pgjdbc, psqlODBC. |
 | **Arrow Flight SQL / ADBC** | Second first-class protocol: queries stream as Arrow IPC, catalog metadata (`get_objects`), prepared statements, DML, and bulk ingest (one Iceberg commit per stream). In-process TLS (`grpc+tls://`). |
-| **OLTP over the lake** | `INSERT`/`UPDATE`/`DELETE` as copy-on-write Iceberg snapshots; explicit `BEGIN/COMMIT/ROLLBACK` with snapshot isolation and first-committer-wins concurrency (`40001`); opt-in primary-key enforcement. |
-| **Time travel & branches** | `table@snapshot_id` reads; Neon-style zero-copy branches (`icegres branch …`, `serve --branch`) — a branch is one metadata commit, no data copied. |
-| **Buffered writes** | Opt-in Moonlink-style group commit (`--write-buffer-ms`): ~1.5 ms INSERT ack, union reads, flushed on clean shutdown (only an unclean kill loses the in-memory window). |
+| **OLTP over the lake** | `INSERT`/`UPDATE`/`DELETE` as copy-on-write Iceberg snapshots; explicit `BEGIN/COMMIT/ROLLBACK` with snapshot isolation, first-committer-wins concurrency (`40001`), and atomic multi-table COMMITs via the catalog's `transactions/commit` endpoint (Lakekeeper); opt-in primary-key enforcement. |
+| **Time travel & branches** | `table@snapshot_id` reads; Neon-style zero-copy branches (`icegres branch …`, `serve --branch`) — a branch is one metadata commit, no data copied — including whole-lakehouse branches (`branch create-all`/`drop-all`: every table, one atomic transaction, each table pinned to its captured main head — a consistent-or-nothing cross-table cut). |
+| **Buffered writes** | Opt-in Moonlink-style group commit (`--write-buffer-ms`): ~1.5 ms INSERT ack, union reads, flushed on clean shutdown; the unclean-kill window is closed by the **durable tail** — `--tail-dir` (local fsync'd WAL, ~3.2 ms ack) or `--tail-url` (Postgres backend, survives node loss). |
+| **Hot-row upserts** | Opt-in keyed tail (`icegres.tail-upsert` + `icegres.primary-key` + a durable tail): exact-PK `UPDATE`/`DELETE` ack in ~9.5 ms p50 (vs ~71 ms synchronous COW), coalesced per key into ONE commit per flush window — no more per-statement snapshots or `40001` storms on a hot row. |
 | **Scale-to-zero** | `icegresd` wakes computes on connect and idles them to zero; branch-endpoint routing; warm session pooling. |
-| **Ops surface** | Graceful drain, bounded memory pool + disk spill, connection cap + per-IP failed-auth backoff, catalog timeouts, catalog-aware `/ready`, Prometheus `/metrics` (incl. in-flight/slow-query), correlation-ID spans, snapshot expiry. |
+| **Ops surface** | Graceful drain, bounded memory pool + disk spill, connection cap + per-IP failed-auth backoff, catalog timeouts, catalog-aware `/ready`, Prometheus `/metrics` (incl. in-flight/slow-query), correlation-ID spans, snapshot expiry + fail-closed orphan-file GC (`maintain remove-orphans`, dry-run default). |
 
 ## Where it fits
 

@@ -12,6 +12,7 @@ mod compat;
 mod context;
 mod dml;
 mod flight;
+mod keyed;
 mod maintain;
 mod metrics;
 mod ops;
@@ -22,6 +23,8 @@ mod overwrite;
 mod pgauth;
 mod scan;
 mod seed;
+mod tail;
+mod tail_pg;
 mod traced;
 mod txn;
 
@@ -184,11 +187,39 @@ enum Command {
         /// locally and same-server cross-connection freshness is instant;
         /// OTHER servers/readers see the rows at the commit cadence (<= N
         /// ms after ack). TRADE-OFF: an unclean kill loses up to N ms of
-        /// acked-but-uncommitted writes — that is why the default is 0
-        /// (fully synchronous, semantics unchanged) and enabling it logs a
-        /// WARN. See icegres/src/buffer.rs for the full semantics.
+        /// acked-but-uncommitted writes (--tail-dir closes that window) —
+        /// that is why the default is 0 (fully synchronous, semantics
+        /// unchanged) and enabling it logs a WARN. See icegres/src/buffer.rs
+        /// for the full semantics.
         #[arg(long, env = "ICEGRES_WRITE_BUFFER_MS", default_value_t = 0)]
         write_buffer_ms: u64,
+
+        /// Durable local tail for buffered writes (requires
+        /// --write-buffer-ms > 0): every buffered INSERT is appended to an
+        /// fsync'd per-table WAL under this directory BEFORE its ack, and
+        /// acked-but-uncommitted rows are replayed into the buffer on the
+        /// next boot with the same directory — an unclean kill (SIGKILL,
+        /// power loss) of the process loses NOTHING. Honest scope: the tail
+        /// is THIS node's disk, so losing the node or the disk still loses
+        /// un-flushed acked rows (see icegres/src/tail.rs). Off by default.
+        #[arg(long, env = "ICEGRES_TAIL_DIR")]
+        tail_dir: Option<PathBuf>,
+
+        /// Durable Postgres-backed tail for buffered writes (requires
+        /// --write-buffer-ms > 0; mutually exclusive with --tail-dir):
+        /// every buffered INSERT is committed to a frames table in this
+        /// Postgres database (schema `icegres_tail`, auto-created) BEFORE
+        /// its ack, and acked-but-uncommitted rows are replayed into the
+        /// buffer on the next boot with the same URL. Unlike --tail-dir,
+        /// the tail SURVIVES LOSING THIS NODE: durability = the tail
+        /// database's own fsync/replication (the natural target is a
+        /// dedicated database on the instance already backing Lakekeeper).
+        /// A tail-database outage blocks buffered writes (statement
+        /// errors — backpressure, never silent loss). One server process
+        /// per tail (session advisory lock); TLS URLs are not yet
+        /// supported. See icegres/src/tail_pg.rs. Off by default.
+        #[arg(long, env = "ICEGRES_TAIL_URL", conflicts_with = "tail_dir")]
+        tail_url: Option<String>,
 
         /// Acknowledge running an UNAUTHENTICATED listener on a non-loopback
         /// interface. Without this, binding a public address (e.g. 0.0.0.0)
@@ -326,6 +357,27 @@ enum BranchCmd {
         /// Branch name to drop (`main` is refused).
         name: String,
     },
+    /// Create branch <name> on EVERY table in the catalog as ONE atomic
+    /// multi-table transaction — a consistent-or-nothing whole-lakehouse
+    /// cut: each table's request pins main to the head captured at load, so
+    /// a concurrent commit (or an already-existing branch) fails the whole
+    /// command with nothing applied; retry it. Requires a catalog
+    /// implementing transactions/commit, e.g. Lakekeeper.
+    CreateAll {
+        #[command(flatten)]
+        catalog: CatalogOpts,
+        /// Branch name to create on every table (must not exist anywhere).
+        name: String,
+    },
+    /// Drop branch <name> from every table that has it as ONE atomic
+    /// multi-table transaction (`main` is refused; tables without the ref
+    /// are skipped; errors if no table has it).
+    DropAll {
+        #[command(flatten)]
+        catalog: CatalogOpts,
+        /// Branch name to drop everywhere (`main` is refused).
+        name: String,
+    },
 }
 
 /// `icegres maintain` subcommands.
@@ -343,6 +395,39 @@ enum MaintainCmd {
         /// kept regardless of age).
         #[arg(long, default_value_t = 10)]
         keep: usize,
+    },
+    /// Orphan-file GC: list the table's storage prefix, subtract every file
+    /// still reachable from ANY retained snapshot/ref (plus metadata JSONs
+    /// and statistics files), and report — or with --execute, delete — the
+    /// rest. Dry-run by default. Unknown-age or unrecognized objects are
+    /// never deleted; an unreadable manifest — or a recorded file path
+    /// outside the listed bucket, whose liveness cannot be verified —
+    /// aborts the whole run.
+    RemoveOrphans {
+        #[command(flatten)]
+        catalog: CatalogOpts,
+        /// Target table: <table> or <namespace>.<table>.
+        table: String,
+        /// Only objects last modified more than this many hours ago are
+        /// eligible — the grace window is THE guard for files written by
+        /// commits (ours or a foreign writer's) still in flight. A fixed
+        /// 15-minute clock-skew allowance is added on top of it. Values
+        /// under 1 combined with --execute are refused unless
+        /// --unsafe-grace is also passed.
+        #[arg(long, default_value_t = 72)]
+        older_than_hours: u64,
+        /// Actually delete the orphans (default: dry run, nothing deleted).
+        /// Before deleting, a tiny probe object is written under the
+        /// table's metadata/ prefix and stat'ed to verify the object-store
+        /// clock agrees with ours (aborts beyond the 15-minute allowance).
+        #[arg(long)]
+        execute: bool,
+        /// Allow --execute with --older-than-hours < 1 and drop the
+        /// 15-minute clock-skew allowance from the cutoff. ONLY for
+        /// quiescent tables (e.g. tests): concurrent writers WILL lose
+        /// in-flight files.
+        #[arg(long)]
+        unsafe_grace: bool,
     },
 }
 
@@ -380,6 +465,8 @@ async fn main() -> Result<()> {
             branch,
             enforce_pk,
             write_buffer_ms,
+            tail_dir,
+            tail_url,
             insecure,
         } => {
             let serve_opts = ServeOpts {
@@ -392,6 +479,8 @@ async fn main() -> Result<()> {
                 branch,
                 enforce_pk,
                 write_buffer_ms,
+                tail_dir,
+                tail_url,
                 insecure,
             };
             run_serve(&catalog, &host, port, serve_opts).await
@@ -435,6 +524,8 @@ async fn main() -> Result<()> {
                 table,
                 name,
             } => branch::drop(&catalog, &table, &name).await,
+            BranchCmd::CreateAll { catalog, name } => branch::create_all(&catalog, &name).await,
+            BranchCmd::DropAll { catalog, name } => branch::drop_all(&catalog, &name).await,
         },
         Command::Maintain { cmd } => match cmd {
             MaintainCmd::ExpireSnapshots {
@@ -442,6 +533,16 @@ async fn main() -> Result<()> {
                 table,
                 keep,
             } => maintain::expire_snapshots(&catalog, &table, keep).await,
+            MaintainCmd::RemoveOrphans {
+                catalog,
+                table,
+                older_than_hours,
+                execute,
+                unsafe_grace,
+            } => {
+                maintain::remove_orphans(&catalog, &table, older_than_hours, execute, unsafe_grace)
+                    .await
+            }
         },
         Command::Sql {
             catalog,
@@ -462,6 +563,8 @@ struct ServeOpts {
     branch: String,
     enforce_pk: bool,
     write_buffer_ms: u64,
+    tail_dir: Option<PathBuf>,
+    tail_url: Option<String>,
     insecure: bool,
 }
 
@@ -529,6 +632,29 @@ fn build_authorizer(
 }
 
 async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeOpts) -> Result<()> {
+    // Fail fast BEFORE touching the catalog. --tail-dir only means something
+    // in buffered mode: with the synchronous default every INSERT already IS
+    // an Iceberg commit before its ack, so a durable tail nothing writes to
+    // would silently promise durability it never provides.
+    if serve_opts.tail_dir.is_some() && serve_opts.write_buffer_ms == 0 {
+        bail!(
+            "--tail-dir requires buffered writes (--write-buffer-ms N with N > 0): the \
+             synchronous default commits every INSERT before its ack, so the durable tail \
+             would be a no-op. Set --write-buffer-ms, or drop --tail-dir."
+        );
+    }
+    if serve_opts.tail_url.is_some() && serve_opts.write_buffer_ms == 0 {
+        bail!(
+            "--tail-url requires buffered writes (--write-buffer-ms N with N > 0): the \
+             synchronous default commits every INSERT before its ack, so the durable tail \
+             would be a no-op. Set --write-buffer-ms, or drop --tail-url."
+        );
+    }
+    // clap's conflicts_with already refuses the pair; keep a hard error for
+    // programmatic callers (one process writes ONE tail).
+    if serve_opts.tail_dir.is_some() && serve_opts.tail_url.is_some() {
+        bail!("--tail-dir and --tail-url are mutually exclusive: a server writes ONE tail");
+    }
     // Fail fast on TLS/auth misconfiguration BEFORE touching the catalog:
     // a server asked to be secure must never come up insecure.
     let tls = match (&serve_opts.tls_cert, &serve_opts.tls_key) {
@@ -606,22 +732,67 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
     );
 
     // Moonlink-style buffered write mode (--write-buffer-ms, buffer.rs).
-    // Default 0 = fully synchronous, current semantics unchanged.
+    // Default 0 = fully synchronous, current semantics unchanged. With
+    // --tail-dir, a durable local WAL (tail.rs) closes the unclean-kill
+    // loss window: fsync before every buffered ack, replay at boot.
     let write_buffer = if serve_opts.write_buffer_ms > 0 {
+        let tail_store: Option<Arc<dyn tail::TailStore>> =
+            match (&serve_opts.tail_dir, &serve_opts.tail_url) {
+                (Some(dir), None) => Some(Arc::new(tail::LocalWal::open(dir)?)),
+                // PgTail::open connects, takes the one-writer advisory
+                // lock, and ensures the schema — an unreachable/locked
+                // tail database fails startup loudly right here.
+                (None, Some(url)) => Some(Arc::new(tail_pg::PgTail::open(url)?)),
+                (None, None) => None,
+                (Some(_), Some(_)) => unreachable!("refused above"),
+            };
         let buf = Arc::new(buffer::WriteBuffer::new(
             catalog.clone(),
             engine.clone(),
             serve_opts.write_buffer_ms,
+            tail_store,
         ));
-        warn!(
-            write_buffer_ms = serve_opts.write_buffer_ms,
-            max_rows = buf.max_rows(),
-            "write buffering is ENABLED: INSERTs acknowledge BEFORE their Iceberg commit; \
-             an UNCLEAN kill loses up to {} ms of acked-but-uncommitted writes; other \
-             servers/readers see buffered rows only at the commit cadence. Reads on this \
-             server union the buffer (read-your-writes holds locally).",
-            serve_opts.write_buffer_ms
-        );
+        if let Some(dir) = &serve_opts.tail_dir {
+            warn!(
+                write_buffer_ms = serve_opts.write_buffer_ms,
+                max_rows = buf.max_rows(),
+                tail_dir = %dir.display(),
+                "write buffering is ENABLED with a durable local tail: INSERTs fsync to \
+                 the tail BEFORE their ack and un-flushed rows replay on the next boot \
+                 with the same --tail-dir, so an unclean kill of this process loses \
+                 NOTHING. Durability is THIS node's disk — losing the node or the disk \
+                 still loses acked-but-uncommitted rows. Other servers/readers see \
+                 buffered rows only at the commit cadence; reads on this server union \
+                 the buffer (read-your-writes holds locally)."
+            );
+        } else if serve_opts.tail_url.is_some() {
+            warn!(
+                write_buffer_ms = serve_opts.write_buffer_ms,
+                max_rows = buf.max_rows(),
+                "write buffering is ENABLED with a durable Postgres tail (--tail-url): \
+                 INSERTs commit to the tail database BEFORE their ack and un-flushed \
+                 rows replay on the next boot against the same tail, so an unclean kill \
+                 — or losing this NODE entirely — loses NOTHING; durability = the tail \
+                 database's own fsync/replication. A tail-database outage BLOCKS \
+                 buffered writes (statement errors — backpressure, never silent loss). \
+                 Other servers/readers see buffered rows only at the commit cadence; \
+                 reads on this server union the buffer (read-your-writes holds locally)."
+            );
+        } else {
+            warn!(
+                write_buffer_ms = serve_opts.write_buffer_ms,
+                max_rows = buf.max_rows(),
+                "write buffering is ENABLED: INSERTs acknowledge BEFORE their Iceberg commit; \
+                 an UNCLEAN kill loses up to {} ms of acked-but-uncommitted writes; other \
+                 servers/readers see buffered rows only at the commit cadence. Reads on this \
+                 server union the buffer (read-your-writes holds locally).",
+                serve_opts.write_buffer_ms
+            );
+        }
+        // Recover acked rows a previous process failed to commit: into
+        // pending BEFORE the flusher starts (and before the listener opens),
+        // so the normal cadence drains them like any other buffered rows.
+        buf.replay_tail().await?;
         buf.spawn_flusher();
         Some(buf)
     } else {
@@ -697,10 +868,12 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
 
 /// The icegres query-hook chain, in order:
 /// 1. [`buffer::BufferHook`] (only with `--write-buffer-ms > 0`) — buffered
-///    autocommit INSERT ack + ordering fences (flush before UPDATE/DELETE/
-///    BEGIN/DDL). Must run first so a fence flush happens before the fenced
-///    statement's own handler; it defers to TxnHook for any connection with
-///    an open transaction.
+///    autocommit INSERT ack, keyed tail UPDATE/DELETE ack (Phase 2: exact-PK
+///    statements on `icegres.tail-upsert` tables with a durable tail), and
+///    ordering fences (flush before non-keyed UPDATE/DELETE/BEGIN/DDL). Must
+///    run first so a fence flush happens before the fenced statement's own
+///    handler; it defers to TxnHook for any connection with an open
+///    transaction.
 /// 2. [`compat::CompatHook`] — ORM/driver pg_catalog compatibility rewrites
 ///    (SPEC A8). Must run before TxnHook: ORMs reflect inside a
 ///    driver-opened transaction, and the rewritten introspection SQL reads
@@ -739,16 +912,23 @@ fn query_hooks(
             context::DEFAULT_SCHEMA.to_string(),
         )));
     }
-    if let Some(buf) = write_buffer {
+    if let Some(buf) = &write_buffer {
         hooks.push(Arc::new(buffer::BufferHook::new(
-            buf,
+            buf.clone(),
             registry.clone(),
             enforce_pk,
         )));
     }
     hooks.push(Arc::new(compat::CompatHook));
     hooks.push(Arc::new(ops::CopyOutHook));
-    hooks.push(Arc::new(TxnHook::new(registry, engine.clone(), catalog)));
+    // The buffer handle lets COMMIT serialize against in-flight keyed
+    // read-modify-writes on keyed-activated tables (buffer.rs, fix L1).
+    hooks.push(Arc::new(TxnHook::new(
+        registry,
+        engine.clone(),
+        catalog,
+        write_buffer,
+    )));
     hooks.push(Arc::new(SetShowHook));
     hooks.push(Arc::new(dml::DmlHook::new(engine)));
     hooks.push(Arc::new(compat::InsertTagHook));

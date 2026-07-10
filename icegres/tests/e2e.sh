@@ -520,6 +520,226 @@ assert_eq "loser txn's row absent, winner's row present" "0|1" \
   "$(q "select count(*) from demo.trips where trip_id = $TX_A + 100")|$(q "select count(*) from demo.trips where trip_id = $TX_C")"
 
 # ---------------------------------------------------------------------------
+# (j2) Atomic multi-table transactions (roadmap Phase 3): a COMMIT touching
+#      N tables is ONE all-or-nothing catalog request against Lakekeeper's
+#      POST /v1/{prefix}/transactions/commit. Both tables commit together
+#      (exactly one new snapshot each), and a staged conflict is a clean
+#      40001 with NEITHER table changed — the 40003 partial-apply outcome is
+#      unreachable on this path. Whole-lakehouse branches ride the same
+#      endpoint: create-all/drop-all set/remove the ref on EVERY table —
+#      tables in NESTED namespaces included, each request pinning main to
+#      the head captured at load (consistent-or-nothing cut) — in one
+#      atomic transaction.
+# ---------------------------------------------------------------------------
+log "(j2) atomic multi-table transactions + whole-lakehouse branches"
+
+# snap_count <table>: snapshot count of demo.<table> via the REST catalog.
+snap_count() {
+  curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/$1" \
+    | jq '[.metadata.snapshots[]?] | length'
+}
+
+q 'drop table if exists demo.e2e_mt_a' >/dev/null 2>&1 || true
+q 'drop table if exists demo.e2e_mt_b' >/dev/null 2>&1 || true
+q 'create table demo.e2e_mt_a (id bigint, v double)' >/dev/null
+q 'create table demo.e2e_mt_b (id bigint, v double)' >/dev/null
+
+# j2-1: a two-table COMMIT lands atomically: both rows visible from new
+# connections, exactly ONE new snapshot per table, and the server used the
+# multi-table transaction endpoint (not N ordered per-table commits).
+mt_atomic_before=$(grep -c 'transaction committed atomically via transactions/commit' "$SERVE_LOG" || true)
+snaps_a_before=$(snap_count e2e_mt_a)
+snaps_b_before=$(snap_count e2e_mt_b)
+"${PSQL[@]}" -q 2>"$E2E_DIR/mt-commit.err" <<EOF || { cat "$E2E_DIR/mt-commit.err" >&2; fail "multi-table txn COMMIT failed"; }
+BEGIN;
+insert into demo.e2e_mt_a values (1, 1.0);
+insert into demo.e2e_mt_b values (2, 2.0);
+COMMIT;
+EOF
+assert_eq "both tables visible from new connections after ONE COMMIT" "1|1" \
+  "$(q 'select count(*) from demo.e2e_mt_a')|$(q 'select count(*) from demo.e2e_mt_b')"
+assert_eq "exactly one new snapshot per table" \
+  "$((snaps_a_before + 1))|$((snaps_b_before + 1))" \
+  "$(snap_count e2e_mt_a)|$(snap_count e2e_mt_b)"
+mt_atomic_after=$(grep -c 'transaction committed atomically via transactions/commit' "$SERVE_LOG" || true)
+assert_eq "COMMIT went through the atomic transactions/commit endpoint" \
+  "$((mt_atomic_before + 1))" "$mt_atomic_after"
+
+# j2-2: staged conflict — a second writer commits to ONE touched table while
+# the transaction is open. COMMIT fails with 40001 (serialization_failure,
+# retryable) and NEITHER table changed: no partial apply, no 40003.
+snaps_a_before=$(snap_count e2e_mt_a)
+snaps_b_before=$(snap_count e2e_mt_b)
+( echo "BEGIN;"
+  echo "insert into demo.e2e_mt_a values (10, 10.0);"
+  echo "insert into demo.e2e_mt_b values (11, 11.0);"
+  sleep 3
+  echo "COMMIT;" ) | "${PSQL[@]}" -v VERBOSITY=verbose >"$E2E_DIR/mt-conflict.out" 2>&1 &
+MT_PID=$!
+sleep 1.5
+"${PSQL[@]}" -q -c 'insert into demo.e2e_mt_b values (777, 7.0)' \
+  || fail "concurrent autocommit INSERT failed"
+wait "$MT_PID" || true
+grep -q 'could not serialize access due to concurrent update' "$E2E_DIR/mt-conflict.out" \
+  || { cat "$E2E_DIR/mt-conflict.out" >&2; fail "multi-table conflict did not report a serialization failure"; }
+grep -q '40001' "$E2E_DIR/mt-conflict.out" \
+  || { cat "$E2E_DIR/mt-conflict.out" >&2; fail "multi-table conflict sqlstate is not 40001"; }
+grep -q 'no changes were applied' "$E2E_DIR/mt-conflict.out" \
+  || { cat "$E2E_DIR/mt-conflict.out" >&2; fail "conflict error does not state that nothing was applied"; }
+pass "staged conflict -> 40001 serialization_failure (all-or-nothing, retryable)"
+assert_eq "NEITHER table has the loser txn's rows; the winner's row landed" "0|0|1" \
+  "$(q 'select count(*) from demo.e2e_mt_a where id = 10')|$(q 'select count(*) from demo.e2e_mt_b where id = 11')|$(q 'select count(*) from demo.e2e_mt_b where id = 777')"
+assert_eq "conflicted COMMIT wrote no snapshot (only the winner's on table b)" \
+  "$snaps_a_before|$((snaps_b_before + 1))" \
+  "$(snap_count e2e_mt_a)|$(snap_count e2e_mt_b)"
+
+# j2-3: whole-lakehouse branches: create-all sets the ref on EVERY table in
+# ONE atomic transaction (per-table assert-ref-snapshot-id=null guard, plus
+# a main=<captured head> anchor per table so the cut is consistent-or-
+# nothing); drop-all removes it everywhere the same way. Tables in NESTED
+# namespaces are part of "every table": list_all_tables walks the namespace
+# tree (the REST list_namespaces answers one level per call), so a table in
+# demo_nested.child must get the ref too — before that fix it was silently
+# excluded from the cut.
+ALL_BR=e2e_all
+
+# Nested-namespace fixture: demo_nested.child.nested_t with ONE honest EMPTY
+# snapshot (an Iceberg branch ref must point at a snapshot; a real
+# zero-manifest manifest list is uploaded to the table's metadata dir and
+# committed via the REST API — no SQL surface reaches nested namespaces).
+NESTED_NS_URL="demo_nested%1Fchild" # %1F = REST spec namespace level separator
+NESTED_SNAP=424242424242
+nested_table_url() { echo "$CATALOG_URI/v1/$prefix/namespaces/$NESTED_NS_URL/tables/nested_t"; }
+# crashed-run cleanup, then (re)create parent + child namespaces and table
+curl -sf -X DELETE "$(nested_table_url)?purgeRequested=true" >/dev/null 2>&1 || true
+curl -sf -X POST "$CATALOG_URI/v1/$prefix/namespaces" -H 'Content-Type: application/json' \
+  -d '{"namespace":["demo_nested"]}' >/dev/null 2>&1 || true # may already exist
+curl -sf -X POST "$CATALOG_URI/v1/$prefix/namespaces" -H 'Content-Type: application/json' \
+  -d '{"namespace":["demo_nested","child"]}' >/dev/null 2>&1 || true
+curl -sf -X POST "$CATALOG_URI/v1/$prefix/namespaces/$NESTED_NS_URL/tables" \
+  -H 'Content-Type: application/json' -d '{
+  "name": "nested_t",
+  "schema": {"type":"struct","schema-id":0,"fields":[
+    {"id":1,"name":"id","required":false,"type":"long"}]}
+}' >/dev/null || fail "could not create demo_nested.child.nested_t via the REST catalog"
+nested_loc=$(curl -sf "$(nested_table_url)" | jq -r '.metadata.location')
+[[ "$nested_loc" == s3://lakehouse/* ]] || fail "unexpected nested table location: $nested_loc"
+# A valid EMPTY manifest list is an Avro OCF with a header (magic + writer
+# schema + null codec + sync marker) and zero data blocks.
+python3 - "$E2E_DIR/nested-empty-manifest-list.avro" <<'PYEOF' \
+  || fail "could not generate the empty manifest list"
+import json, os, sys
+schema = {"type": "record", "name": "manifest_file", "fields": [
+    {"name": "manifest_path", "type": "string", "field-id": 500},
+    {"name": "manifest_length", "type": "long", "field-id": 501},
+    {"name": "partition_spec_id", "type": "int", "field-id": 502},
+    {"name": "content", "type": "int", "field-id": 517},
+    {"name": "sequence_number", "type": "long", "field-id": 515},
+    {"name": "min_sequence_number", "type": "long", "field-id": 516},
+    {"name": "added_snapshot_id", "type": "long", "field-id": 503},
+    {"name": "added_files_count", "type": "int", "field-id": 504},
+    {"name": "existing_files_count", "type": "int", "field-id": 505},
+    {"name": "deleted_files_count", "type": "int", "field-id": 506},
+    {"name": "added_rows_count", "type": "long", "field-id": 512},
+    {"name": "existing_rows_count", "type": "long", "field-id": 513},
+    {"name": "deleted_rows_count", "type": "long", "field-id": 514},
+    {"name": "partitions", "field-id": 507, "type": ["null", {
+        "type": "array", "element-id": 508, "items": {
+            "type": "record", "name": "r508", "fields": [
+                {"name": "contains_null", "type": "boolean", "field-id": 509},
+                {"name": "contains_nan", "type": ["null", "boolean"], "field-id": 518},
+                {"name": "lower_bound", "type": ["null", "bytes"], "field-id": 510},
+                {"name": "upper_bound", "type": ["null", "bytes"], "field-id": 511}]},
+    }]},
+]}
+def vlong(n):  # Avro zigzag varint
+    n = (n << 1) ^ (n >> 63)
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+meta = {"avro.schema": json.dumps(schema).encode(),
+        "avro.codec": b"null", "format-version": b"2"}
+buf = b"Obj\x01" + vlong(len(meta))
+for k, v in meta.items():
+    buf += vlong(len(k.encode())) + k.encode() + vlong(len(v)) + v
+buf += vlong(0)        # end of the header metadata map
+buf += os.urandom(16)  # sync marker; zero data blocks follow
+open(sys.argv[1], "wb").write(buf)
+PYEOF
+aws --endpoint-url "$S3_ENDPOINT" s3 cp "$E2E_DIR/nested-empty-manifest-list.avro" \
+  "$nested_loc/metadata/snap-$NESTED_SNAP-0-e2e-empty.avro" >/dev/null \
+  || fail "could not upload the empty manifest list for demo_nested.child.nested_t"
+curl -sf -X POST "$(nested_table_url)" -H 'Content-Type: application/json' -d "{
+  \"requirements\": [{\"type\":\"assert-ref-snapshot-id\",\"ref\":\"main\",\"snapshot-id\":null}],
+  \"updates\": [
+    {\"action\":\"add-snapshot\",\"snapshot\":{
+      \"snapshot-id\": $NESTED_SNAP,
+      \"sequence-number\": 1,
+      \"timestamp-ms\": $(date +%s%3N),
+      \"manifest-list\": \"$nested_loc/metadata/snap-$NESTED_SNAP-0-e2e-empty.avro\",
+      \"summary\": {\"operation\":\"append\"},
+      \"schema-id\": 0
+    }},
+    {\"action\":\"set-snapshot-ref\",\"ref-name\":\"main\",
+     \"type\":\"branch\",\"snapshot-id\": $NESTED_SNAP}
+  ]
+}" >/dev/null || fail "could not commit the empty snapshot to demo_nested.child.nested_t"
+pass "nested-namespace fixture: demo_nested.child.nested_t with one (empty) snapshot"
+# The branch ref of the nested table, read via the REST catalog (the branch
+# CLI addresses <namespace>.<table> only; nested tables are asserted here).
+nested_ref() {
+  curl -sf "$(nested_table_url)" \
+    | jq -r ".metadata.refs.\"$ALL_BR\".\"snapshot-id\" // \"absent\""
+}
+
+"$BIN" branch drop-all "$ALL_BR" >/dev/null 2>&1 || true # crashed-run cleanup
+"$BIN" branch create-all "$ALL_BR" >"$E2E_DIR/branch-create-all.log" 2>&1 \
+  || { cat "$E2E_DIR/branch-create-all.log" >&2; fail "branch create-all failed"; }
+grep -q "ONE atomic transaction" "$E2E_DIR/branch-create-all.log" \
+  || fail "create-all output unexpected: $(cat "$E2E_DIR/branch-create-all.log")"
+for t in trips cities e2e_mt_a e2e_mt_b; do
+  "$BIN" branch list "demo.$t" 2>/dev/null | grep -q "^$ALL_BR	" \
+    || fail "branch $ALL_BR missing on demo.$t after create-all"
+done
+pass "branch create-all: ref present on every table (trips, cities, e2e_mt_a, e2e_mt_b)"
+grep -q "created branch $ALL_BR on demo_nested.child.nested_t at snapshot $NESTED_SNAP" \
+  "$E2E_DIR/branch-create-all.log" \
+  || fail "create-all output does not mention the nested table: $(cat "$E2E_DIR/branch-create-all.log")"
+assert_eq "create-all reached the NESTED namespace (ref on demo_nested.child.nested_t)" \
+  "$NESTED_SNAP" "$(nested_ref)"
+if "$BIN" branch create-all "$ALL_BR" >/dev/null 2>&1; then
+  fail "duplicate create-all was ACCEPTED (per-table assert-ref-snapshot-id=null must reject it)"
+fi
+pass "duplicate create-all rejected (all-or-nothing, nothing applied)"
+"$BIN" branch drop-all "$ALL_BR" >"$E2E_DIR/branch-drop-all.log" 2>&1 \
+  || { cat "$E2E_DIR/branch-drop-all.log" >&2; fail "branch drop-all failed"; }
+for t in trips cities e2e_mt_a e2e_mt_b; do
+  if "$BIN" branch list "demo.$t" 2>/dev/null | grep -q "^$ALL_BR	"; then
+    fail "branch $ALL_BR still on demo.$t after drop-all"
+  fi
+done
+pass "branch drop-all: ref removed from every table"
+assert_eq "drop-all removed the ref from the NESTED table too" \
+  "absent" "$(nested_ref)"
+if "$BIN" branch drop-all "$ALL_BR" >/dev/null 2>&1; then
+  fail "drop-all of a nonexistent branch was ACCEPTED (must error when no table has it)"
+fi
+pass "drop-all errors when no table has the branch"
+q 'drop table demo.e2e_mt_a' >/dev/null 2>&1 || true
+q 'drop table demo.e2e_mt_b' >/dev/null 2>&1 || true
+# Nested fixture cleanup: table (with purge — the empty manifest list is a
+# real file under its location), then child + parent namespaces.
+curl -sf -X DELETE "$(nested_table_url)?purgeRequested=true" >/dev/null 2>&1 || true
+curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/$NESTED_NS_URL" >/dev/null 2>&1 || true
+curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/demo_nested" >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
 # (k) Opt-in PK enforcement (SPEC B5): --enforce-pk + icegres.primary-key
 # ---------------------------------------------------------------------------
 log "(k) PK enforcement (--enforce-pk) on :$PK_PORT"
@@ -1366,49 +1586,72 @@ pass "expire-snapshots trims to newest-N, keeps head, is idempotent"
 q 'drop table demo.e2e_expire' >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
-# (u) Strict transaction mode (SPEC B4 hardening): ICEGRES_TXN_STRICT refuses
-# a multi-table COMMIT up front rather than applying it non-atomically.
+# (u) Strict transaction mode (SPEC B4 hardening): on a catalog WITH the
+# multi-table transaction endpoint (Lakekeeper), ICEGRES_TXN_STRICT is
+# satisfied by atomicity — a multi-table COMMIT succeeds as ONE atomic
+# request. Only when the catalog LACKS the endpoint (simulated with the
+# test-only ICEGRES_TXN_DISABLE_ATOMIC knob) does strict mode refuse up
+# front (0A000, nothing applied) instead of committing per-table.
 # ---------------------------------------------------------------------------
-log "(u) strict multi-table refusal (ICEGRES_TXN_STRICT) on :$STRICT_PORT"
-stop_pidfile_generic "$E2E_DIR/serve-strict.pid"
-: >"$E2E_DIR/serve-strict.log"
-ICEGRES_TXN_STRICT=true "$BIN" serve --host "$PG_HOST" --port "$STRICT_PORT" \
-  >>"$E2E_DIR/serve-strict.log" 2>&1 &
-echo $! >"$E2E_DIR/serve-strict.pid"
-strict_ready=0
-for _ in $(seq 1 60); do
-  if psql -h "$PG_HOST" -p "$STRICT_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
-    strict_ready=1; break
-  fi
-  sleep 0.5
-done
-[[ "$strict_ready" == 1 ]] || { tail -n 20 "$E2E_DIR/serve-strict.log" >&2; fail "strict server not ready on :$STRICT_PORT"; }
+log "(u) strict transaction mode (ICEGRES_TXN_STRICT) on :$STRICT_PORT"
+strict_start() { # strict_start [EXTRA_ENV=...]
+  stop_pidfile_generic "$E2E_DIR/serve-strict.pid"
+  : >"$E2E_DIR/serve-strict.log"
+  env "$@" ICEGRES_TXN_STRICT=true "$BIN" serve --host "$PG_HOST" --port "$STRICT_PORT" \
+    >>"$E2E_DIR/serve-strict.log" 2>&1 &
+  echo $! >"$E2E_DIR/serve-strict.pid"
+  local ready=0
+  for _ in $(seq 1 60); do
+    if psql -h "$PG_HOST" -p "$STRICT_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+      ready=1; break
+    fi
+    sleep 0.5
+  done
+  [[ "$ready" == 1 ]] \
+    || { tail -n 20 "$E2E_DIR/serve-strict.log" >&2; fail "strict server not ready on :$STRICT_PORT"; }
+}
 SQ=(psql -h "$PG_HOST" -p "$STRICT_PORT" -U postgres -d icegres)
+strict_start
 "${SQ[@]}" -tA -c 'drop table if exists demo.e2e_strict_a' >/dev/null 2>&1 || true
 "${SQ[@]}" -tA -c 'drop table if exists demo.e2e_strict_b' >/dev/null 2>&1 || true
 "${SQ[@]}" -tA -c 'create table demo.e2e_strict_a (id bigint)' >/dev/null
 "${SQ[@]}" -tA -c 'create table demo.e2e_strict_b (id bigint)' >/dev/null
-# Two-table transaction: strict mode must refuse the COMMIT and apply nothing.
-strict_out=$("${SQ[@]}" -v VERBOSITY=verbose 2>&1 <<'EOF'
+# u1: strict + supported catalog: the two-table COMMIT succeeds ATOMICALLY.
+strict_out=$("${SQ[@]}" -v ON_ERROR_STOP=1 2>&1 <<'EOF'
 BEGIN;
 insert into demo.e2e_strict_a values (1);
 insert into demo.e2e_strict_b values (2);
 COMMIT;
 EOF
+) || { echo "$strict_out" >&2; fail "strict multi-table COMMIT failed on a catalog WITH transactions/commit"; }
+echo "$strict_out" | grep -q "COMMIT" || fail "strict COMMIT tag missing: $strict_out"
+grep -q 'transaction committed atomically via transactions/commit' "$E2E_DIR/serve-strict.log" \
+  || fail "strict multi-table COMMIT did not use the atomic endpoint"
+assert_eq "strict mode + Lakekeeper: multi-table COMMIT applied atomically" "1|1" \
+  "$("${SQ[@]}" -tA -c 'select (select count(*) from demo.e2e_strict_a) as a, (select count(*) from demo.e2e_strict_b) as b')"
+# u2: catalog without the endpoint (simulated): strict refuses the COMMIT
+# up front and applies nothing.
+strict_start ICEGRES_TXN_DISABLE_ATOMIC=1
+strict_out=$("${SQ[@]}" -v VERBOSITY=verbose 2>&1 <<'EOF'
+BEGIN;
+insert into demo.e2e_strict_a values (3);
+insert into demo.e2e_strict_b values (4);
+COMMIT;
+EOF
 ) || true
 echo "$strict_out" | grep -q '0A000' \
-  || fail "strict multi-table COMMIT not refused with 0A000: $strict_out"
-pass "strict mode refuses multi-table COMMIT (0A000 feature_not_supported)"
-assert_eq "strict refusal applied nothing to either table (atomic rollback)" "0|0" \
+  || fail "strict multi-table COMMIT not refused with 0A000 without the endpoint: $strict_out"
+pass "strict mode refuses multi-table COMMIT when the catalog lacks the endpoint (0A000)"
+assert_eq "strict refusal applied nothing to either table (atomic rollback)" "1|1" \
   "$("${SQ[@]}" -tA -c 'select (select count(*) from demo.e2e_strict_a) as a, (select count(*) from demo.e2e_strict_b) as b')"
-# Single-table transaction still commits normally under strict mode.
+# u3: single-table transaction still commits normally under strict mode.
 "${SQ[@]}" 2>&1 <<'EOF' >/dev/null
 BEGIN;
 insert into demo.e2e_strict_a values (9);
 insert into demo.e2e_strict_a values (10);
 COMMIT;
 EOF
-assert_eq "strict mode still commits single-table transactions" "2" \
+assert_eq "strict mode still commits single-table transactions" "3" \
   "$("${SQ[@]}" -tA -c 'select count(*) from demo.e2e_strict_a')"
 "${SQ[@]}" -tA -c 'drop table demo.e2e_strict_a' >/dev/null 2>&1 || true
 "${SQ[@]}" -tA -c 'drop table demo.e2e_strict_b' >/dev/null 2>&1 || true
@@ -1608,6 +1851,214 @@ PY
   pass "Flight in-process TLS: ADBC grpc+tls query works, plaintext client rejected"
   stop_pidfile_generic "$FTLS_PID"
 fi
+
+# ---------------------------------------------------------------------------
+# (x) Keyed tail upserts (roadmap Phase 2, docs/sota-roadmap.md §4): on a
+# table with icegres.tail-upsert=true + icegres.primary-key, an exact-PK
+# UPDATE acks from the durable tail instead of a synchronous COW commit.
+# Proven here: 20 sequential UPDATEs to ONE hot row ack fast, produce ZERO
+# intermediate snapshots, and net exactly ONE composed commit at the flush;
+# a mid-window SELECT sees the newest value through the union read; time
+# travel to the pre-update snapshot still shows the old value (never
+# overlaid). Port 5457 (5456 belongs to tail_durability.sh).
+# ---------------------------------------------------------------------------
+KY_PORT=5457
+KY_PID="$E2E_DIR/serve-keyed.pid"
+KY_LOG="$E2E_DIR/serve-keyed.log"
+KY_TAIL="$E2E_DIR/keyed-tail-wal"
+KY_MS=600000 # only fences flush: every commit below is one the test forced
+KYQ=(psql -h "$PG_HOST" -p "$KY_PORT" -U postgres -d icegres -v ON_ERROR_STOP=1 -tA)
+ky_snap_count() {
+  curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_keyed"     | jq '[.metadata.snapshots[]?] | length'
+}
+# The fence: any non-keyed DML forces a synchronous flush first (this one
+# then matches nothing and commits nothing itself).
+ky_flush() { "${KYQ[@]}" -c 'delete from demo.e2e_keyed where id < -1' >/dev/null; }
+log "(x) keyed tail upserts (Phase 2) on :$KY_PORT"
+stop_pidfile_generic "$KY_PID"
+if "${KYQ[@]}" -c 'select 1' >/dev/null 2>&1; then fail "something is already listening on :$KY_PORT"; fi
+rm -rf "$KY_TAIL"
+: >"$KY_LOG"
+curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_keyed?purgeRequested=true" >/dev/null 2>&1 || true
+curl -sf -X POST "$CATALOG_URI/v1/$prefix/namespaces/demo/tables" \
+  -H 'Content-Type: application/json' -d @- <<'JSON' >/dev/null
+{
+  "name": "e2e_keyed",
+  "schema": {
+    "type": "struct",
+    "schema-id": 0,
+    "fields": [
+      {"id": 1, "name": "id", "required": false, "type": "long"},
+      {"id": 2, "name": "val", "required": false, "type": "string"}
+    ]
+  },
+  "properties": {"icegres.primary-key": "id", "icegres.tail-upsert": "true"}
+}
+JSON
+"$BIN" serve --host "$PG_HOST" --port "$KY_PORT" --write-buffer-ms "$KY_MS" \
+  --tail-dir "$KY_TAIL" >>"$KY_LOG" 2>&1 &
+echo $! >"$KY_PID"
+ky_ready=0
+for _ in $(seq 1 60); do
+  if "${KYQ[@]}" -c 'select 1' >/dev/null 2>&1; then ky_ready=1; break; fi
+  sleep 0.5
+done
+[[ "$ky_ready" == 1 ]] || { tail -n 20 "$KY_LOG" >&2; fail "keyed server not ready on :$KY_PORT"; }
+
+# Seed one committed row, note the pre-update snapshot for time travel.
+"${KYQ[@]}" -c "insert into demo.e2e_keyed values (1, 'before')" >/dev/null
+ky_flush
+assert_eq "seed flush produced the first snapshot" "1" "$(ky_snap_count)"
+KY_SNAP1=$(curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_keyed" \
+  | jq -r '.metadata."current-snapshot-id"')
+
+# 20 sequential hot-row UPDATEs: each acks UPDATE 1 without a commit.
+ky_t0=$(date +%s%N)
+for i in $(seq 1 20); do
+  ky_tag=$(psql -h "$PG_HOST" -p "$KY_PORT" -U postgres -d icegres -c \
+    "update demo.e2e_keyed set val = 'v$i' where id = 1" | tr -d '[:space:]')
+  [[ "$ky_tag" == "UPDATE1" ]] || fail "keyed UPDATE $i answered [$ky_tag], expected UPDATE 1"
+done
+ky_ms=$(( ($(date +%s%N) - ky_t0) / 1000000 ))
+pass "20 sequential keyed UPDATEs acked (total ${ky_ms} ms ≈ $((ky_ms / 20)) ms/stmt incl. psql startup)"
+assert_eq "mid-window SELECT sees the NEWEST value (union read)" "v20" \
+  "$("${KYQ[@]}" -c 'select val from demo.e2e_keyed where id = 1')"
+assert_eq "no per-statement snapshots: still only the seed commit" "1" "$(ky_snap_count)"
+
+# One flush -> ONE coalesced commit carrying the final value.
+ky_flush
+assert_eq "one flush window = ONE snapshot for 20 updates" "2" "$(ky_snap_count)"
+assert_eq "post-flush value is the last write" "v20" \
+  "$("${KYQ[@]}" -c 'select val from demo.e2e_keyed where id = 1')"
+assert_eq "exactly one row for the key (no duplicates)" "1" \
+  "$("${KYQ[@]}" -c 'select count(*) from demo.e2e_keyed')"
+
+# (L2) Ack order is the total order for a key: a keyed DELETE followed by a
+# plain INSERT of the SAME key in the SAME window leaves the row PRESENT
+# with the inserted values — the later insert becomes the key's newest
+# version instead of being folded away by the coalesced delete.
+ky_tag=$(psql -h "$PG_HOST" -p "$KY_PORT" -U postgres -d icegres -c \
+  "delete from demo.e2e_keyed where id = 1" | tr -d '[:space:]')
+[[ "$ky_tag" == "DELETE1" ]] || fail "keyed DELETE answered [$ky_tag], expected DELETE 1"
+assert_eq "keyed DELETE hides the row mid-window (union read)" "0" \
+  "$("${KYQ[@]}" -c 'select count(*) from demo.e2e_keyed where id = 1')"
+"${KYQ[@]}" -c "insert into demo.e2e_keyed values (1, 'reborn')" >/dev/null
+assert_eq "same-window re-INSERT after the keyed DELETE is visible (union)" "reborn|1" \
+  "$("${KYQ[@]}" -c 'select val from demo.e2e_keyed where id = 1')|$("${KYQ[@]}" \
+    -c 'select count(*) from demo.e2e_keyed where id = 1')"
+assert_eq "delete-then-reinsert made no mid-window snapshots" "2" "$(ky_snap_count)"
+ky_flush
+assert_eq "flush committed the delete-then-reinsert as ONE snapshot" "3" "$(ky_snap_count)"
+assert_eq "committed row survives the same-window delete-then-reinsert, exactly once" "reborn|1" \
+  "$("${KYQ[@]}" -c 'select val from demo.e2e_keyed where id = 1')|$("${KYQ[@]}" \
+    -c 'select count(*) from demo.e2e_keyed where id = 1')"
+
+# Time travel predates the updates and never sees the buffer.
+assert_eq "time travel to the pre-update snapshot shows the OLD value" "before" \
+  "$("${KYQ[@]}" -c "select val from demo.\"e2e_keyed@$KY_SNAP1\" where id = 1")"
+
+stop_pidfile_generic "$KY_PID"
+rm -rf "$KY_TAIL"
+curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_keyed?purgeRequested=true" >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
+# (y) Orphan-file GC (roadmap Phase 4, docs/sota-roadmap.md §6):
+# `icegres maintain remove-orphans` reclaims the files snapshot expiry
+# strands. Recipe: 4 one-row INSERTs make 4 small data files; TWO full-table
+# COW UPDATEs then strand them — the first rewrites all four into one file,
+# the second rewrites again AND drops the first UPDATE's DELETED manifest
+# entries (spec: DELETED entries live only in the snapshot that deleted
+# them), so after `expire-snapshots --keep 1` the four insert-era Parquet
+# files (and the expired snapshots' manifests/manifest lists) are referenced
+# by NOTHING. Live after expiry: the newest rewrite + the previous rewrite
+# (still named by a DELETED entry in the retained snapshot's manifest) = 2
+# Parquet files, plus the retained manifest list/manifests and every
+# metadata JSON in the metadata log. Proven here: dry run reports the
+# orphans and deletes NOTHING; --execute with a 0-hour grace window is
+# REFUSED (fail closed) until --unsafe-grace asserts the table is
+# quiescent; --execute --unsafe-grace deletes exactly the reported set
+# (verified via aws CLI object counts) while the table stays queryable with
+# correct rows; a rerun reports zero. Uses --older-than-hours 0 with
+# --unsafe-grace on every step (the table is quiescent, and the flag also
+# drops the 15-minute clock-skew allowance that would otherwise hide the
+# seconds-old orphans); production keeps the default 72h grace window and
+# never passes --unsafe-grace. The --execute step also exercises the
+# clock-skew probe (write/stat/delete under metadata/), which must pass
+# against the local store.
+# ---------------------------------------------------------------------------
+log "(y) orphan-file GC (maintain remove-orphans)"
+q 'drop table if exists demo.e2e_orphan' >/dev/null 2>&1 || true
+q 'create table demo.e2e_orphan (id bigint, v text)' >/dev/null
+for i in 1 2 3 4; do
+  q "insert into demo.e2e_orphan (id, v) values ($i, 'r$i')" >/dev/null
+done
+q "update demo.e2e_orphan set v = 'u1' where id >= 1" >/dev/null
+q "update demo.e2e_orphan set v = 'u2' where id >= 1" >/dev/null
+orphan_loc=$(curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_orphan" | jq -r '.metadata.location')
+[[ "$orphan_loc" == s3://lakehouse/* ]] || fail "unexpected table location for demo.e2e_orphan: $orphan_loc"
+orphan_key=${orphan_loc#s3://lakehouse/}
+count_orphan_parquet() {
+  aws --endpoint-url "$S3_ENDPOINT" s3 ls --recursive "s3://lakehouse/$orphan_key/data/" \
+    | grep -c '\.parquet$' || true
+}
+count_orphan_objects() {
+  aws --endpoint-url "$S3_ENDPOINT" s3 ls --recursive "s3://lakehouse/$orphan_key/" \
+    | grep -c . || true
+}
+"$BIN" maintain expire-snapshots demo.e2e_orphan --keep 1 >"$E2E_DIR/orphan-expire.log" 2>&1 \
+  || { cat "$E2E_DIR/orphan-expire.log" >&2; fail "expire-snapshots before GC failed"; }
+grep -q 'expired 5 snapshot' "$E2E_DIR/orphan-expire.log" \
+  || { cat "$E2E_DIR/orphan-expire.log" >&2; fail "expected 5 expired snapshots (4 inserts + 1 update)"; }
+assert_eq "stranded data files present before GC (4 inserts + 2 rewrites)" "6" "$(count_orphan_parquet)"
+orphan_obj_before=$(count_orphan_objects)
+
+# --- dry run: reports the orphans, deletes NOTHING (--unsafe-grace only
+# --- drops the skew allowance so the seconds-old orphans are visible;
+# --- dry runs never need it to be *allowed*) ---
+"$BIN" maintain remove-orphans demo.e2e_orphan --older-than-hours 0 --unsafe-grace >"$E2E_DIR/orphan-dry.log" 2>&1 \
+  || { cat "$E2E_DIR/orphan-dry.log" >&2; fail "remove-orphans dry run failed"; }
+grep -q 'DRY RUN — nothing deleted' "$E2E_DIR/orphan-dry.log" \
+  || { cat "$E2E_DIR/orphan-dry.log" >&2; fail "dry run did not announce itself"; }
+orphan_n=$(sed -n 's/^found \([0-9]\{1,\}\) orphan file(s) totaling.*/\1/p' "$E2E_DIR/orphan-dry.log")
+[[ -n "$orphan_n" && "$orphan_n" -ge 4 ]] \
+  || { cat "$E2E_DIR/orphan-dry.log" >&2; fail "dry run found [$orphan_n] orphans, expected >= 4 (the insert-era Parquet files)"; }
+orphan_dry_parquet=$(grep -c '^  s3://lakehouse/.*/data/.*\.parquet$' "$E2E_DIR/orphan-dry.log" || true)
+assert_eq "dry run names exactly the 4 insert-era Parquet files as orphans" "4" "$orphan_dry_parquet"
+assert_eq "dry run deleted NOTHING (object count unchanged)" "$orphan_obj_before" "$(count_orphan_objects)"
+assert_eq "dry run left every data file in place" "6" "$(count_orphan_parquet)"
+pass "dry run reports $orphan_n orphan(s) and deletes nothing"
+
+# --- refusal (fail closed): --execute with a sub-1h grace window must be
+# --- refused WITHOUT --unsafe-grace, deleting nothing ---
+if "$BIN" maintain remove-orphans demo.e2e_orphan --older-than-hours 0 --execute >"$E2E_DIR/orphan-refuse.log" 2>&1; then
+  cat "$E2E_DIR/orphan-refuse.log" >&2
+  fail "--execute with --older-than-hours 0 must be refused without --unsafe-grace"
+fi
+grep -q 'refusing --execute' "$E2E_DIR/orphan-refuse.log" \
+  || { cat "$E2E_DIR/orphan-refuse.log" >&2; fail "refusal did not name the grace-window guard"; }
+assert_eq "refused execute deleted NOTHING (object count unchanged)" \
+  "$orphan_obj_before" "$(count_orphan_objects)"
+
+# --- execute (+--unsafe-grace: quiescent table): deletes exactly the
+# --- reported set; live files + rows intact; clock-skew probe passes ---
+"$BIN" maintain remove-orphans demo.e2e_orphan --older-than-hours 0 --execute --unsafe-grace >"$E2E_DIR/orphan-exec.log" 2>&1 \
+  || { cat "$E2E_DIR/orphan-exec.log" >&2; fail "remove-orphans --execute failed"; }
+grep -q "deleted $orphan_n orphan file(s) totaling" "$E2E_DIR/orphan-exec.log" \
+  || { cat "$E2E_DIR/orphan-exec.log" >&2; fail "--execute did not delete the $orphan_n orphans the dry run found"; }
+assert_eq "execute removed exactly the orphan set from the object store" \
+  "$((orphan_obj_before - orphan_n))" "$(count_orphan_objects)"
+assert_eq "live data files survive the GC (newest rewrite + its DELETED-entry predecessor)" "2" \
+  "$(count_orphan_parquet)"
+assert_eq "table fully readable after GC (rows + last update intact)" "4|u2|u2" \
+  "$(q 'select count(*), min(v), max(v) from demo.e2e_orphan')"
+
+# --- rerun: idempotent, zero orphans left ---
+"$BIN" maintain remove-orphans demo.e2e_orphan --older-than-hours 0 --unsafe-grace >"$E2E_DIR/orphan-rerun.log" 2>&1 \
+  || { cat "$E2E_DIR/orphan-rerun.log" >&2; fail "remove-orphans rerun failed"; }
+grep -q 'found 0 orphan file(s)' "$E2E_DIR/orphan-rerun.log" \
+  || { cat "$E2E_DIR/orphan-rerun.log" >&2; fail "rerun should find zero orphans"; }
+pass "orphan GC: dry-run/execute/rerun contract holds ($orphan_n orphans reclaimed)"
+q 'drop table demo.e2e_orphan' >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
 log "all assertions passed ($PASS_COUNT)"
