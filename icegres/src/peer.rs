@@ -16,11 +16,22 @@
 //! Honesty/fallback contract (scope §2): mirrors are read-side only and
 //! best-effort. On disconnect the mirror is DROPPED — reads fall back to
 //! commit-cadence freshness (rows are tail-durable on the peer; nothing is
-//! at stake but the freshness bonus) — with ONE warn per outage and the
-//! `icegres_peer_tail_age_ms` gauge tracking staleness. The
-//! single-buffering-writer-per-table deployment model is unchanged.
+//! at stake but the freshness bonus) — with ONE warn per outage (the latch
+//! resets only after a session that exchanged tail RPCs, never on a bare
+//! TCP connect) and the `icegres_peer_tail_age_ms` gauge tracking
+//! staleness. The single-buffering-writer-per-table deployment model is
+//! unchanged: a table's mirror is OWNED by the first peer to claim it —
+//! ingest/drop from any other peer is refused, and a second peer claiming
+//! the same table is refused with one WARN (it takes over automatically
+//! once the owner's mirror drops).
+//!
+//! Auth: when the peer's tail API runs with `--auth-file`, set
+//! `ICEGRES_PEER_TAIL_USER` / `ICEGRES_PEER_TAIL_PASSWORD` (one identity
+//! for all peers, v1) — the subscriber performs the standard Flight
+//! basic-auth handshake per connection and attaches the minted bearer
+//! token to every tail RPC.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -119,6 +130,18 @@ struct TableMirror {
     /// Watermark-covered retention ([`PeerMirrors::gc_grace`], threaded in
     /// at install).
     gc_grace: Duration,
+    /// Highest watermark OBSERVED in a scan's own committed metadata
+    /// (recorded by [`overlay_for`](Self::overlay_for)) — the mirror
+    /// analogue of buffer.rs's observed-coverage GC gate (F9): during a
+    /// reader-side catalog outage the stale-read default keeps serving a
+    /// frozen snapshot, and dropping items its watermark has not caught up
+    /// to would make previously-visible rows VANISH from the union.
+    observed_watermark: u64,
+    /// When a scan last consulted this mirror (F9): with no reader inside
+    /// the grace window, nothing can observe coverage — and nothing can
+    /// experience a non-monotonic read either, so GC proceeds on the
+    /// peer-reported watermark alone.
+    last_overlay_at: Option<Instant>,
 }
 
 impl TableMirror {
@@ -186,6 +209,7 @@ impl TableMirror {
             }
             "append" => self.apply_append(seq, run)?,
             "upsert" => {
+                self.require_pk("upsert")?;
                 // Wire data columns are already canonical types, so key
                 // encoding compares equal to committed-scan keys.
                 let keys = keyed::encode_batch_keys(&run, &self.pk_cols)?;
@@ -194,6 +218,7 @@ impl TableMirror {
                 }
             }
             "delete" => {
+                self.require_pk("delete")?;
                 // Delete rows carry the key in the PK columns (rest null).
                 let keys = keyed::encode_batch_keys(&run, &self.pk_cols)?;
                 for key in keys {
@@ -205,10 +230,31 @@ impl TableMirror {
         Ok(())
     }
 
+    /// F1 consumer hardening: a keyed event arriving on a mirror whose wire
+    /// header declared NO pk-cols is a PROTOCOL ERROR — with an empty key
+    /// declaration `encode_batch_keys` yields zero keys and the op would be
+    /// SILENTLY discarded (deleted rows served as live, updates lost, on a
+    /// stream that stays healthy). Erroring here ends the subscriber task,
+    /// which drops the mirror and re-snapshots with a fresh header.
+    fn require_pk(&self, op: &str) -> Result<()> {
+        anyhow::ensure!(
+            !self.pk_cols.is_empty(),
+            "protocol error: a keyed {op} event arrived but the tail header declared \
+             no pk-cols — dropping the mirror to re-snapshot (the peer must serve the \
+             table's declared primary key in icegres.tail.pk-cols)"
+        );
+        Ok(())
+    }
+
     /// Route-on-append (the mirror-side `route_appends`): rows whose key has
-    /// an OLDER keyed entry supersede it as an upsert at this seq; the rest
-    /// stay appends. Ordering-robust: an append older than the key's entry
-    /// stays an append and is suppressed at read time by the newer entry.
+    /// an OLDER, still-LIVE keyed entry supersede it as an upsert at this
+    /// seq; the rest stay appends. Ordering-robust: an append older than the
+    /// key's entry stays an append and is suppressed at read time by the
+    /// newer entry. Watermark-covered entries never route (F10): the source
+    /// drained them from its live map at the flush that stamped the
+    /// watermark, so ITS `route_appends` appended the row plainly — routing
+    /// against the retained-for-grace copy would fabricate an upsert that
+    /// suppresses a committed row the source serves.
     fn apply_append(&mut self, seq: u64, run: RecordBatch) -> Result<()> {
         if self.pk_cols.is_empty() || self.keyed.is_empty() {
             let keys = if self.pk_cols.is_empty() {
@@ -226,7 +272,11 @@ impl TableMirror {
         let keys = keyed::encode_batch_keys(&run, &self.pk_cols)?;
         let routed: Vec<bool> = keys
             .iter()
-            .map(|k| self.keyed.get(k).is_some_and(|e| e.seq < seq))
+            .map(|k| {
+                self.keyed
+                    .get(k)
+                    .is_some_and(|e| e.seq < seq && e.seq > self.watermark)
+            })
             .collect();
         for (row, key) in keys.iter().enumerate().filter(|&(r, _)| routed[r]) {
             self.upsert_key(key.clone(), seq, Some(run.slice(row, 1)));
@@ -261,18 +311,44 @@ impl TableMirror {
         }
     }
 
+    /// Whether an OBSERVED peer watermark separates `older` from `newer`
+    /// (some mark `w` with `older <= w < newer`): the two seqs then belong
+    /// to different flush windows on the source, so its live map could NOT
+    /// have routed one against the other. Marks are pruned only together
+    /// with the items they cover (see [`gc`](Self::gc)), so a needed mark
+    /// is present whenever the question can still arise.
+    fn separated_by_watermark(&self, older: u64, newer: u64) -> bool {
+        self.covered_marks
+            .iter()
+            .any(|(_, w)| older <= *w && *w < newer)
+    }
+
     /// Drop items covered by a watermark observed at least `gc_grace` ago
     /// (a bounded-stale reader may still need younger coverage;
     /// [`effective_mirror_gc`] sizes the grace to the freshness bound).
+    /// While a reader is actively scanning this mirror, coverage must
+    /// additionally have been OBSERVED in the reader's own scan metadata
+    /// (F9, [`observed_watermark`](Self::observed_watermark)): the
+    /// stale-read-on-catalog-error default can freeze scan metadata for
+    /// arbitrarily long, and age-only GC would make rows that were being
+    /// served from the mirror vanish mid-outage (non-monotonic reads) —
+    /// the exact hazard buffer.rs's FLUSHED_GC observed-rule closes for
+    /// the local overlay.
     fn gc(&mut self) {
         let now = Instant::now();
-        let threshold = self
+        let aged = self
             .covered_marks
             .iter()
             .filter(|(at, _)| now.duration_since(*at) >= self.gc_grace)
             .map(|(_, w)| *w)
             .max();
-        let Some(threshold) = threshold else { return };
+        let Some(mut threshold) = aged else { return };
+        let reader_active = self
+            .last_overlay_at
+            .is_some_and(|at| now.duration_since(at) < self.gc_grace);
+        if reader_active {
+            threshold = threshold.min(self.observed_watermark);
+        }
         self.appends.retain(|a| a.seq > threshold);
         self.keyed.retain(|_, e| e.seq > threshold);
         self.covered_marks
@@ -281,7 +357,13 @@ impl TableMirror {
 
     /// The overlay this mirror contributes to a scan whose committed
     /// metadata is `metadata` — the exactly-once rule from the module docs.
-    fn overlay_for(&self, ident: &TableIdent, metadata: &TableMetadata) -> Result<Option<Overlay>> {
+    /// Also records the scan observation (F9): the metadata's own watermark
+    /// is what unblocks watermark-covered GC while readers are active.
+    fn overlay_for(
+        &mut self,
+        ident: &TableIdent,
+        metadata: &TableMetadata,
+    ) -> Result<Option<Overlay>> {
         let w = parse_watermark_property(
             ident,
             metadata
@@ -289,6 +371,10 @@ impl TableMirror {
                 .get(&self.property_key)
                 .map(String::as_str),
         );
+        self.last_overlay_at = Some(Instant::now());
+        if let Some(w) = w {
+            self.observed_watermark = self.observed_watermark.max(w);
+        }
         self.overlay_at(w)
     }
 
@@ -297,6 +383,21 @@ impl TableMirror {
     /// this peer — nothing committed, include everything).
     fn overlay_at(&self, w: Option<u64>) -> Result<Option<Overlay>> {
         let newer = |seq: u64| w.is_none_or(|w| seq > w);
+        // Newest mirrored append seq per key (F7): the read-time half of
+        // route-on-append for OUT-OF-ORDER arrival — an upsert/delete that
+        // arrives after a same-key append with a higher seq must not serve
+        // its (older) row next to the append's.
+        let mut append_newest: HashMap<&[u8], u64> = HashMap::new();
+        if !self.keyed.is_empty() {
+            for append in &self.appends {
+                if let Some(keys) = &append.keys {
+                    for k in keys {
+                        let e = append_newest.entry(k.as_slice()).or_insert(append.seq);
+                        *e = (*e).max(append.seq);
+                    }
+                }
+            }
+        }
         let mut batches: Vec<RecordBatch> = Vec::new();
         for append in &self.appends {
             if !newer(append.seq) {
@@ -331,7 +432,20 @@ impl TableMirror {
             }
             suppress_keys.insert(key.clone());
             if let Some(row) = &entry.row {
-                batches.push(row.clone());
+                // F7 (newest seq per key wins, arrival-order independent):
+                // skip the row when a NEWER same-key append is mirrored and
+                // no observed watermark separates the two — the source's
+                // route-on-append superseded this op at ingest, so serving
+                // both would duplicate the key. A watermark BETWEEN them
+                // means separate flush windows (this op committed first;
+                // the append is a genuine later row): both serve, matching
+                // the source (declaration != enforcement).
+                let superseded = append_newest.get(key.as_slice()).is_some_and(|&aseq| {
+                    aseq > entry.seq && !self.separated_by_watermark(entry.seq, aseq)
+                });
+                if !superseded {
+                    batches.push(row.clone());
+                }
             }
         }
         if batches.is_empty() && suppress_keys.is_empty() {
@@ -370,6 +484,11 @@ pub struct PeerMirrors {
     peers: StdMutex<HashMap<String, PeerHealth>>,
     /// Watermark-covered mirror retention ([`effective_mirror_gc`]).
     gc_grace: Duration,
+    /// `(table, refused peer)` pairs already WARNed about (F3: one WARN per
+    /// contested claim, not one per 2 s discovery pass). Entries clear when
+    /// the table's mirror drops (the refused peer then takes over) or the
+    /// refused peer's claim later succeeds. Leaf lock.
+    contested: StdMutex<HashSet<(TableIdent, String)>>,
 }
 
 impl Default for PeerMirrors {
@@ -390,6 +509,7 @@ impl PeerMirrors {
             tables: StdMutex::new(HashMap::new()),
             peers: StdMutex::new(HashMap::new()),
             gc_grace,
+            contested: StdMutex::new(HashSet::new()),
         }
     }
 
@@ -460,7 +580,14 @@ impl PeerMirrors {
         false
     }
 
-    /// Install (replace) a table mirror from a fresh TailSnapshot header.
+    /// Install a table mirror from a fresh TailSnapshot header. F3 (one
+    /// buffering writer per table): the FIRST peer to claim a table owns
+    /// its mirror; a claim by any OTHER peer is REFUSED (`false`, one WARN
+    /// per contested pair) — never replaced, so the owner's live stream
+    /// cannot be interleaved with a second seq space or cross-killed. The
+    /// refused peer's discovery loop keeps re-trying cheaply and takes
+    /// over as soon as the owner's mirror drops. A same-peer re-install
+    /// (reconnect re-snapshot) replaces as before.
     fn install(
         &self,
         ident: TableIdent,
@@ -468,21 +595,18 @@ impl PeerMirrors {
         property_key: String,
         schema: ArrowSchemaRef,
         pk_cols: Vec<String>,
-    ) {
+    ) -> bool {
         let mut tables = self.tables.lock().expect("peer mirror lock poisoned");
         if let Some(existing) = tables.get(&ident) {
             if existing.peer != peer {
-                warn!(
-                    table = %ident,
-                    old_peer = %existing.peer,
-                    new_peer = %peer,
-                    "two peers serve a tail for the same table — replacing the mirror; \
-                     the deployment model is ONE buffering writer per table"
-                );
+                let owner = existing.peer.clone();
+                drop(tables);
+                self.note_contested(&ident, peer, &owner);
+                return false;
             }
         }
         tables.insert(
-            ident,
+            ident.clone(),
             TableMirror {
                 property_key,
                 schema,
@@ -493,32 +617,88 @@ impl PeerMirrors {
                 covered_marks: Vec::new(),
                 peer: peer.to_string(),
                 gc_grace: self.gc_grace,
+                observed_watermark: 0,
+                last_overlay_at: None,
             },
         );
         drop(tables);
+        // A successful claim clears any earlier refusal latch for this
+        // pair (a NEW contest later warns again).
+        self.contested
+            .lock()
+            .expect("peer contested lock poisoned")
+            .remove(&(ident, peer.to_string()));
         self.touch(peer);
+        true
     }
 
-    /// Ingest one wire batch into a table's mirror.
-    fn ingest(&self, ident: &TableIdent, batch: &RecordBatch) -> Result<()> {
-        let peer = {
+    /// The owner check + one-shot WARN behind a refused claim (F3). `true`
+    /// = the table is currently owned by ANOTHER peer, do not proceed.
+    fn claim_refused(&self, ident: &TableIdent, peer: &str) -> bool {
+        let owner = {
+            let tables = self.tables.lock().expect("peer mirror lock poisoned");
+            match tables.get(ident) {
+                Some(m) if m.peer != peer => m.peer.clone(),
+                _ => return false,
+            }
+        };
+        self.note_contested(ident, peer, &owner);
+        true
+    }
+
+    /// WARN once per contested `(table, refused peer)` pair (F3).
+    fn note_contested(&self, ident: &TableIdent, peer: &str, owner: &str) {
+        let mut contested = self.contested.lock().expect("peer contested lock poisoned");
+        if contested.insert((ident.clone(), peer.to_string())) {
+            warn!(
+                table = %ident,
+                owner = %owner,
+                refused_peer = %peer,
+                "two peers serve a tail for the same table — keeping the FIRST claim \
+                 and refusing this one (the deployment model is ONE buffering writer \
+                 per table); the refused subscriber takes over if the owner's mirror \
+                 drops"
+            );
+        }
+    }
+
+    /// Ingest one wire batch into a table's mirror. Scoped to the OWNING
+    /// peer (F3): a batch from any other peer's subscriber errors — ending
+    /// that stale subscriber task — instead of interleaving a foreign seq
+    /// space into the owner's mirror.
+    fn ingest(&self, peer: &str, ident: &TableIdent, batch: &RecordBatch) -> Result<()> {
+        {
             let mut tables = self.tables.lock().expect("peer mirror lock poisoned");
             let mirror = tables
                 .get_mut(ident)
                 .ok_or_else(|| anyhow!("no mirror installed for {ident}"))?;
+            anyhow::ensure!(
+                mirror.peer == peer,
+                "mirror for {ident} is owned by peer {} (this subscriber's peer {peer} \
+                 was refused; one buffering writer per table)",
+                mirror.peer
+            );
             mirror.ingest(batch)?;
-            mirror.peer.clone()
-        };
-        self.touch(&peer);
+        }
+        self.touch(peer);
         Ok(())
     }
 
-    /// Drop a table's mirror (disconnect → fall back to commit cadence).
-    fn drop_table(&self, ident: &TableIdent) {
-        self.tables
-            .lock()
-            .expect("peer mirror lock poisoned")
-            .remove(ident);
+    /// Drop a table's mirror (disconnect → fall back to commit cadence) —
+    /// only when `peer` OWNS it (F3): a refused/stale subscriber's teardown
+    /// must not kill the owner's healthy mirror.
+    fn drop_table(&self, ident: &TableIdent, peer: &str) {
+        let mut tables = self.tables.lock().expect("peer mirror lock poisoned");
+        if tables.get(ident).is_some_and(|m| m.peer == peer) {
+            tables.remove(ident);
+            drop(tables);
+            // The table is unowned: clear its refusal latches so the next
+            // contest (if any) warns afresh.
+            self.contested
+                .lock()
+                .expect("peer contested lock poisoned")
+                .retain(|(t, _)| t != ident);
+        }
     }
 
     /// The peer overlay for one scan (cache.rs): `None` when nothing is
@@ -530,17 +710,19 @@ impl PeerMirrors {
     }
 
     /// [`overlay`](Self::overlay)'s gate + dispatch, with the per-mirror
-    /// build injectable so the age gate is unit-testable.
+    /// build injectable so the age gate is unit-testable. `&mut` mirror:
+    /// [`TableMirror::overlay_for`] records the scan observation (F9).
     fn overlay_with(
         &self,
         ident: &TableIdent,
-        build: impl FnOnce(&TableMirror) -> Result<Option<Overlay>>,
+        build: impl FnOnce(&mut TableMirror) -> Result<Option<Overlay>>,
     ) -> Result<Option<Overlay>> {
-        let tables = self.tables.lock().expect("peer mirror lock poisoned");
-        let Some(mirror) = tables.get(ident) else {
+        let mut tables = self.tables.lock().expect("peer mirror lock poisoned");
+        let Some(mirror) = tables.get_mut(ident) else {
             return Ok(None);
         };
-        if !self.peer_serving(&mirror.peer) {
+        let peer = mirror.peer.clone();
+        if !self.peer_serving(&peer) {
             return Ok(None);
         }
         build(mirror)
@@ -554,8 +736,9 @@ impl PeerMirrors {
 use arrow_flight::decode::{DecodedPayload, FlightDataDecoder};
 use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_client::FlightServiceClient;
-use arrow_flight::Ticket;
+use arrow_flight::{HandshakeRequest, Ticket};
 use futures::StreamExt;
+use tonic::metadata::{Ascii, MetadataValue};
 use tonic::transport::Channel;
 
 /// Spawn the peer subscriber machinery: one task per peer address, each
@@ -581,42 +764,149 @@ pub fn spawn_peer_tails(peers: Vec<String>, mirrors: Arc<PeerMirrors>) {
     });
 }
 
+/// Reconnect/WARN policy for one peer subscriber (F8): the warn latch and
+/// backoff reset only after a session that actually EXCHANGED tail RPCs (a
+/// successful handshake + first `Tables` response), never on a bare TCP/h2
+/// connect. A persistently failing post-connect peer (auth misconfig,
+/// `--peer-tail` aimed at a non-buffering Flight port, authz denial)
+/// therefore backs off to [`BACKOFF_MAX`] with ONE warn per outage instead
+/// of a ~500 ms WARN + reconnect storm against a production endpoint.
+struct ReconnectPolicy {
+    backoff: Duration,
+    warned: bool,
+}
+
+impl ReconnectPolicy {
+    fn new() -> Self {
+        Self {
+            backoff: BACKOFF_MIN,
+            warned: false,
+        }
+    }
+
+    /// Register one failed session. `established` = the session got at
+    /// least one successful tail RPC response before failing (a NEW
+    /// outage: latch and backoff reset). Returns `(warn_now, sleep_for)`.
+    fn on_failure(&mut self, established: bool) -> (bool, Duration) {
+        if established {
+            self.warned = false;
+            self.backoff = BACKOFF_MIN;
+        }
+        let warn_now = !self.warned;
+        self.warned = true;
+        let sleep_for = self.backoff;
+        self.backoff = (self.backoff * 2).min(BACKOFF_MAX);
+        (warn_now, sleep_for)
+    }
+}
+
 /// Connect-discover-subscribe loop for one peer, forever, with backoff.
-/// WARNs once per outage (the connect flag resets it), then logs at debug.
+/// WARNs once per outage (see [`ReconnectPolicy`]), then logs at debug.
 async fn peer_loop(peer: String, mirrors: Arc<PeerMirrors>) {
-    let mut backoff = BACKOFF_MIN;
-    let mut warned = false;
+    let mut policy = ReconnectPolicy::new();
     loop {
-        let mut connected = false;
-        let err = run_peer(&peer, &mirrors, &mut connected)
+        let mut established = false;
+        let err = run_peer(&peer, &mirrors, &mut established)
             .await
             .expect_err("run_peer only returns on error");
-        if connected {
-            // We had a live session: this is a NEW outage.
-            warned = false;
-            backoff = BACKOFF_MIN;
-        }
-        if !warned {
+        let (warn_now, sleep_for) = policy.on_failure(established);
+        if warn_now {
             warn!(
                 peer = %peer,
                 "peer tail unavailable — reads fall back to commit-cadence \
                  freshness until it returns (rows are tail-durable on the \
                  peer; only the freshness bonus is lost): {err:#}"
             );
-            warned = true;
         } else {
             tracing::debug!(peer = %peer, "peer tail still unavailable: {err:#}");
         }
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(BACKOFF_MAX);
+        tokio::time::sleep(sleep_for).await;
     }
 }
 
-/// One connected session against a peer: poll its table list and keep one
-/// subscriber task per table alive. Returns Err on any connection-level
-/// failure (the caller backs off and reconnects); sets `connected` once a
-/// session was actually established.
-async fn run_peer(peer: &str, mirrors: &Arc<PeerMirrors>, connected: &mut bool) -> Result<()> {
+/// One session's connection state: the channel plus the bearer token from
+/// the Flight basic-auth handshake (F2; `None` = no credentials configured
+/// — an open tail API). Cloned into every per-table subscriber task.
+#[derive(Clone)]
+struct TailSession {
+    channel: Channel,
+    bearer: Option<MetadataValue<Ascii>>,
+}
+
+impl TailSession {
+    /// A DoGet request for `ticket`, carrying the bearer token when the
+    /// session is authenticated.
+    fn do_get_request(&self, ticket: Ticket) -> tonic::Request<Ticket> {
+        let mut request = tonic::Request::new(ticket);
+        if let Some(bearer) = &self.bearer {
+            request
+                .metadata_mut()
+                .insert("authorization", bearer.clone());
+        }
+        request
+    }
+}
+
+/// Subscriber credentials for authed peer tail APIs (F2):
+/// `ICEGRES_PEER_TAIL_USER` / `ICEGRES_PEER_TAIL_PASSWORD` — ONE identity
+/// for every configured peer (v1; documented in the README flag table and
+/// docs/open-tail-protocol.md). `None` = connect without credentials.
+fn peer_tail_credentials() -> Option<(String, String)> {
+    let user = std::env::var("ICEGRES_PEER_TAIL_USER").ok()?;
+    if user.is_empty() {
+        return None;
+    }
+    let password = std::env::var("ICEGRES_PEER_TAIL_PASSWORD").unwrap_or_default();
+    Some((user, password))
+}
+
+/// Perform the standard Flight basic-auth handshake (the same flow the
+/// server documents for every consumer: `authorization: Basic
+/// base64(user:password)` → per-boot `Bearer` token) and return the
+/// `authorization` header value every subsequent tail RPC must carry.
+async fn tail_handshake(
+    channel: &Channel,
+    user: &str,
+    password: &str,
+) -> Result<MetadataValue<Ascii>> {
+    use base64::Engine as _;
+    let mut client = tail_client(channel);
+    let mut request = tonic::Request::new(futures::stream::iter([HandshakeRequest::default()]));
+    let basic = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"));
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Basic {basic}")
+            .parse()
+            .map_err(|e| anyhow!("peer tail credentials are not header-safe: {e}"))?,
+    );
+    let response = client
+        .handshake(request)
+        .await
+        .map_err(|e| anyhow!("peer tail handshake failed: {e}"))?;
+    // The server answers with `authorization: Bearer <token>` response
+    // metadata (and the raw token in the payload); reuse the header as-is.
+    if let Some(bearer) = response.metadata().get("authorization") {
+        return Ok(bearer.clone());
+    }
+    let mut stream = response.into_inner();
+    let payload = stream
+        .message()
+        .await
+        .map_err(|e| anyhow!("peer tail handshake stream failed: {e}"))?
+        .ok_or_else(|| anyhow!("peer tail handshake returned no token"))?;
+    let token = String::from_utf8(payload.payload.to_vec())
+        .map_err(|_| anyhow!("peer tail handshake token is not UTF-8"))?;
+    format!("Bearer {token}")
+        .parse()
+        .map_err(|e| anyhow!("peer tail handshake token is not header-safe: {e}"))
+}
+
+/// One connected session against a peer: handshake (when credentials are
+/// configured), then poll its table list and keep one subscriber task per
+/// table alive. Returns Err on any connection-level failure (the caller
+/// backs off and reconnects); sets `established` only once a tail RPC got
+/// a successful response — never on the bare transport connect (F8).
+async fn run_peer(peer: &str, mirrors: &Arc<PeerMirrors>, established: &mut bool) -> Result<()> {
     let endpoint = format!("http://{peer}");
     // Keepalives (PF2): an infinite Subscribe stream on a hung/partitioned
     // peer would otherwise sit in recv() forever — HTTP/2 PINGs (also while
@@ -632,32 +922,80 @@ async fn run_peer(peer: &str, mirrors: &Arc<PeerMirrors>, connected: &mut bool) 
         .connect()
         .await
         .with_context(|| format!("cannot connect to peer tail {peer}"))?;
-    info!(peer = %peer, "connected to peer tail API");
-    *connected = true;
+    // F2: authed tail APIs need the Flight basic-auth handshake before any
+    // tail RPC. Credentials come from the environment (one fleet identity).
+    let bearer = match peer_tail_credentials() {
+        Some((user, password)) => Some(
+            tail_handshake(&channel, &user, &password)
+                .await
+                .with_context(|| {
+                    format!(
+                        "peer tail {peer} rejected the ICEGRES_PEER_TAIL_USER/\
+                         ICEGRES_PEER_TAIL_PASSWORD handshake"
+                    )
+                })?,
+        ),
+        None => None,
+    };
+    let session = TailSession {
+        channel: channel.clone(),
+        bearer,
+    };
+    // Per-table WARN latches (F8's lesser storm): a persistently failing
+    // table mirror (protocol-version mismatch, refused claim turned error)
+    // is respawned every DISCOVERY_EVERY — warn on the FIRST failure, then
+    // debug until a successful install resets the latch.
+    let mut table_warned: HashMap<TableIdent, Arc<std::sync::atomic::AtomicBool>> = HashMap::new();
     let mut subscribers: HashMap<TableIdent, tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut announced = false;
     let result: Result<()> = async {
         loop {
-            let tables = list_tables(&channel).await?;
+            let tables = list_tables(&session).await?;
+            // First successful tail RPC response: the session is real (F8 —
+            // this, not the transport connect, resets the outage latch).
+            *established = true;
+            if !announced {
+                announced = true;
+                info!(peer = %peer, "connected to peer tail API");
+            }
             for ident in tables {
                 let stale = subscribers
                     .get(&ident)
                     .is_none_or(|handle| handle.is_finished());
                 if stale {
-                    let channel = channel.clone();
+                    let session = session.clone();
                     let mirrors = mirrors.clone();
                     let peer = peer.to_string();
                     let table = ident.clone();
+                    let warned = table_warned
+                        .entry(ident.clone())
+                        .or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(false)))
+                        .clone();
                     subscribers.insert(
                         ident,
                         tokio::spawn(async move {
-                            if let Err(e) = mirror_table(&channel, &peer, &table, &mirrors).await {
-                                mirrors.drop_table(&table);
-                                warn!(
-                                    peer = %peer,
-                                    table = %table,
-                                    "peer tail mirror dropped (fallback to commit \
-                                     cadence); will re-establish: {e:#}"
-                                );
+                            match mirror_table(&session, &peer, &table, &mirrors, &warned).await {
+                                // A refused claim (another peer owns the
+                                // table) returns Ok: nothing to warn about,
+                                // the next discovery pass re-checks.
+                                Ok(()) => {}
+                                Err(e) => {
+                                    mirrors.drop_table(&table, &peer);
+                                    if !warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                        warn!(
+                                            peer = %peer,
+                                            table = %table,
+                                            "peer tail mirror dropped (fallback to commit \
+                                             cadence); will re-establish: {e:#}"
+                                        );
+                                    } else {
+                                        tracing::debug!(
+                                            peer = %peer,
+                                            table = %table,
+                                            "peer tail mirror still failing: {e:#}"
+                                        );
+                                    }
+                                }
                             }
                         }),
                     );
@@ -668,22 +1006,22 @@ async fn run_peer(peer: &str, mirrors: &Arc<PeerMirrors>, connected: &mut bool) 
     }
     .await;
     // Connection-level failure: stop every per-table subscriber and drop
-    // their mirrors (fallback semantics).
+    // their mirrors (fallback semantics; scoped — only OUR mirrors).
     for (ident, handle) in subscribers {
         handle.abort();
-        mirrors.drop_table(&ident);
+        mirrors.drop_table(&ident, peer);
     }
     result
 }
 
 /// Fetch the peer's buffered-table list.
-async fn list_tables(channel: &Channel) -> Result<Vec<TableIdent>> {
-    let mut client = tail_client(channel);
+async fn list_tables(session: &TailSession) -> Result<Vec<TableIdent>> {
+    let mut client = tail_client(&session.channel);
     let ticket = Ticket {
         ticket: crate::tailapi::TailTicket::Tables.encode().into(),
     };
     let stream = client
-        .do_get(ticket)
+        .do_get(session.do_get_request(ticket))
         .await
         .map_err(|e| anyhow!("peer Tables call failed: {e}"))?
         .into_inner();
@@ -717,16 +1055,26 @@ fn tail_client(channel: &Channel) -> FlightServiceClient<Channel> {
         .max_encoding_message_size(64 * 1024 * 1024)
 }
 
-/// Snapshot → install → subscribe loop for one table. Returns Err on any
-/// stream failure; the caller drops the mirror (fallback) and the discovery
-/// loop re-spawns us.
+/// Snapshot → install → subscribe loop for one table. Returns Ok when the
+/// table is owned by another peer (a refused claim — quiet; the discovery
+/// loop re-checks) and Err on any stream failure; the caller drops the
+/// mirror (fallback, scoped to this peer) and the discovery loop re-spawns
+/// us. `warned` is the per-table failure latch, reset once a mirror
+/// installs successfully.
 async fn mirror_table(
-    channel: &Channel,
+    session: &TailSession,
     peer: &str,
     table: &TableIdent,
     mirrors: &Arc<PeerMirrors>,
+    warned: &std::sync::atomic::AtomicBool,
 ) -> Result<()> {
-    let mut client = tail_client(channel);
+    // F3: don't even Snapshot a table another peer owns — the claim would
+    // be refused at install anyway; this keeps the contested-retry loop to
+    // one cheap in-memory check per discovery pass.
+    if mirrors.claim_refused(table, peer) {
+        return Ok(());
+    }
+    let mut client = tail_client(&session.channel);
     // 1. Snapshot.
     let ticket = Ticket {
         ticket: crate::tailapi::TailTicket::Snapshot {
@@ -736,7 +1084,7 @@ async fn mirror_table(
         .into(),
     };
     let stream = client
-        .do_get(ticket)
+        .do_get(session.do_get_request(ticket))
         .await
         .map_err(|e| anyhow!("TailSnapshot({table}) failed: {e}"))?
         .into_inner();
@@ -756,9 +1104,13 @@ async fn mirror_table(
     }
     let (property_key, schema, pk_cols, high) =
         header.ok_or_else(|| anyhow!("TailSnapshot({table}) carried no schema header"))?;
-    mirrors.install(table.clone(), peer, property_key, schema.clone(), pk_cols);
+    if !mirrors.install(table.clone(), peer, property_key, schema.clone(), pk_cols) {
+        // Lost the claim race to another peer between the check above and
+        // the snapshot: quiet, the discovery loop re-checks.
+        return Ok(());
+    }
     for batch in &backlog {
-        mirrors.ingest(table, batch)?;
+        mirrors.ingest(peer, table, batch)?;
     }
     info!(
         peer = %peer,
@@ -767,6 +1119,8 @@ async fn mirror_table(
         items = backlog.len(),
         "peer tail mirror installed"
     );
+    // A healthy install resets the per-table failure WARN latch.
+    warned.store(false, std::sync::atomic::Ordering::Relaxed);
     // 2. Subscribe from the snapshot head; every decoded batch feeds the
     // mirror. The stream is infinite (heartbeats at 1 Hz); returning = error.
     let ticket = Ticket {
@@ -778,7 +1132,7 @@ async fn mirror_table(
         .into(),
     };
     let stream = client
-        .do_get(ticket)
+        .do_get(session.do_get_request(ticket))
         .await
         .map_err(|e| anyhow!("TailSubscribe({table}) failed: {e}"))?
         .into_inner();
@@ -787,7 +1141,7 @@ async fn mirror_table(
     while let Some(msg) = decoder.next().await {
         let msg = msg.map_err(|e| anyhow!("TailSubscribe({table}) stream failed: {e}"))?;
         if let DecodedPayload::RecordBatch(batch) = msg.payload {
-            mirrors.ingest(table, &batch)?;
+            mirrors.ingest(peer, table, &batch)?;
         }
     }
     Err(anyhow!(
@@ -928,6 +1282,8 @@ mod tests {
             covered_marks: Vec::new(),
             peer: "127.0.0.1:1".into(),
             gc_grace: MIRROR_GC,
+            observed_watermark: 0,
+            last_overlay_at: None,
         }
     }
 
@@ -1016,6 +1372,190 @@ mod tests {
         assert_eq!(overlay_ids(&ov), vec![(1, "newest".into())]);
     }
 
+    // F7: the inverted arrival order of the same-window race — the append
+    // (an INSERT the source routed as the key's NEWEST op, seq 12) arrives
+    // BEFORE the older upsert (seq 9). The mirror must still serve exactly
+    // one row per key, with the newest seq winning, and suppress the
+    // committed row — never a duplicate of key 1.
+    #[test]
+    fn out_of_order_upsert_after_newer_append_does_not_duplicate_key() {
+        let mut m = mirror(true);
+        feed(
+            &mut m,
+            12,
+            TailEventKind::Append,
+            Some(&row(1, "insert-new")),
+        );
+        feed(
+            &mut m,
+            9,
+            TailEventKind::Upsert,
+            Some(&row(1, "update-old")),
+        );
+        let ov = m.overlay_at(None).unwrap().unwrap();
+        assert_eq!(
+            overlay_ids(&ov),
+            vec![(1, "insert-new".into())],
+            "newest seq per key wins regardless of arrival order"
+        );
+        let sup = ov.suppress.expect("the keyed op still suppresses");
+        assert!(sup.keys.len() == 1);
+        // Same interleaving with a delete: append 12 then delete 9 — the
+        // reinserted row survives, the key is suppressed exactly once.
+        let mut m = mirror(true);
+        feed(
+            &mut m,
+            12,
+            TailEventKind::Append,
+            Some(&row(1, "reinserted")),
+        );
+        feed(&mut m, 9, TailEventKind::Delete, Some(&row(1, "")));
+        let ov = m.overlay_at(None).unwrap().unwrap();
+        assert_eq!(overlay_ids(&ov), vec![(1, "reinserted".into())]);
+    }
+
+    // F10: a keyed entry the source already drained (covered by an observed
+    // watermark) must NOT route a later same-key append into an upsert —
+    // the source's live map was empty, so IT appended plainly, serving the
+    // committed row AND the new append. The peer must agree for the same
+    // metadata: fresh scans (w = the covering watermark) see the append
+    // without suppressing the committed row.
+    #[test]
+    fn covered_keyed_entry_does_not_route_or_suppress_a_later_append() {
+        let mut m = mirror(true);
+        feed(&mut m, 5, TailEventKind::Upsert, Some(&row(1, "a")));
+        feed(&mut m, 5, TailEventKind::Watermark, None); // source flushed seq 5
+        feed(&mut m, 9, TailEventKind::Append, Some(&row(1, "b")));
+        // Fresh metadata (w=5): the committed row holds 'a'; the overlay
+        // must add ONLY the plain append 'b' and suppress nothing.
+        let ov = m.overlay_at(Some(5)).unwrap().unwrap();
+        assert_eq!(overlay_ids(&ov), vec![(1, "b".into())]);
+        assert!(
+            ov.suppress.is_none(),
+            "a watermark-covered keyed entry must not suppress the committed row"
+        );
+        // Stale metadata (no watermark): the covered upsert still overlays
+        // (its commit is invisible there) NEXT TO the append — exactly the
+        // source's union view (declaration != enforcement).
+        let ov = m.overlay_at(None).unwrap().unwrap();
+        assert_eq!(
+            overlay_ids(&ov),
+            vec![(1, "a".into()), (1, "b".into())],
+            "separate flush windows: both rows serve, matching the source"
+        );
+    }
+
+    // F1 consumer hardening: a keyed event on a mirror whose header carried
+    // no pk-cols is a PROTOCOL ERROR (ingest errs -> the subscriber task
+    // drops the mirror and re-snapshots) — never a silent no-op that would
+    // keep serving deleted rows as live.
+    #[test]
+    fn keyed_event_with_empty_pk_cols_is_a_protocol_error() {
+        let mut m = mirror(false); // header declared no pk-cols
+        let wire = tailapi::wire_schema(&canonical(), &ident(), "icegres.tail-seq.peer", 0, &[]);
+        for kind in [TailEventKind::Upsert, TailEventKind::Delete] {
+            let wb = tailapi::wire_batch(&wire, 7, kind, Some(&row(5, "x"))).unwrap();
+            let err = m.ingest(&wb).unwrap_err();
+            assert!(
+                err.to_string().contains("protocol error"),
+                "keyed op on an empty-pk mirror must error loudly, got: {err}"
+            );
+        }
+        // Plain appends still ingest fine on a PK-less mirror.
+        let wb = tailapi::wire_batch(&wire, 8, TailEventKind::Append, Some(&row(5, "x"))).unwrap();
+        m.ingest(&wb).unwrap();
+        assert_eq!(m.appends.len(), 1);
+    }
+
+    // F3: mirror ownership is scoped to the claiming peer — the FIRST claim
+    // wins, a second peer's install is refused, its ingest/drop are inert
+    // against the owner's mirror, and the refused peer takes over once the
+    // owner's mirror drops.
+    #[test]
+    fn mirror_ops_are_scoped_to_the_owning_peer() {
+        let mirrors = PeerMirrors::new();
+        let (peer_a, peer_b) = ("127.0.0.1:1", "127.0.0.1:2");
+        assert!(mirrors.install(
+            ident(),
+            peer_a,
+            "icegres.tail-seq.a".into(),
+            canonical(),
+            Vec::new(),
+        ));
+        let wire_a = tailapi::wire_schema(&canonical(), &ident(), "icegres.tail-seq.a", 0, &[]);
+        let wb = |seq| {
+            tailapi::wire_batch(&wire_a, seq, TailEventKind::Append, Some(&row(1, "a"))).unwrap()
+        };
+        mirrors.ingest(peer_a, &ident(), &wb(3)).unwrap();
+        // B claims the same table: refused, the owner's mirror survives.
+        assert!(
+            !mirrors.install(
+                ident(),
+                peer_b,
+                "icegres.tail-seq.b".into(),
+                canonical(),
+                Vec::new(),
+            ),
+            "the FIRST claim is kept; a second peer's claim is refused"
+        );
+        assert!(mirrors.claim_refused(&ident(), peer_b));
+        assert!(!mirrors.claim_refused(&ident(), peer_a));
+        // B's ingest errors (its subscriber ends) instead of interleaving
+        // its seq space into A's mirror.
+        assert!(mirrors.ingest(peer_b, &ident(), &wb(9)).is_err());
+        // B's teardown must not kill A's healthy mirror ...
+        mirrors.drop_table(&ident(), peer_b);
+        assert!(
+            mirrors
+                .overlay_with(&ident(), |t| t.overlay_at(None))
+                .unwrap()
+                .is_some(),
+            "the owner's mirror survives a refused peer's drop"
+        );
+        // ... while A's own drop removes it, and B can then take over.
+        mirrors.drop_table(&ident(), peer_a);
+        assert!(mirrors
+            .overlay_with(&ident(), |t| t.overlay_at(None))
+            .unwrap()
+            .is_none());
+        assert!(mirrors.install(
+            ident(),
+            peer_b,
+            "icegres.tail-seq.b".into(),
+            canonical(),
+            Vec::new(),
+        ));
+    }
+
+    // F8: the reconnect policy warns once per outage and escalates backoff;
+    // only a session that actually exchanged tail RPCs (established) resets
+    // the latch and backoff — a bare TCP connect does not.
+    #[test]
+    fn reconnect_policy_latches_until_a_session_is_established() {
+        let mut p = ReconnectPolicy::new();
+        // Persistent post-connect failure (never established): one warn,
+        // then silence, with backoff escalating to the max.
+        let (warn0, sleep0) = p.on_failure(false);
+        assert!(warn0, "first failure of an outage warns");
+        assert_eq!(sleep0, BACKOFF_MIN);
+        let mut last_sleep = sleep0;
+        for _ in 0..8 {
+            let (warn, sleep) = p.on_failure(false);
+            assert!(!warn, "the same outage never re-warns");
+            assert!(sleep >= last_sleep, "backoff never shrinks mid-outage");
+            last_sleep = sleep;
+        }
+        assert_eq!(last_sleep, BACKOFF_MAX, "backoff reaches the cap");
+        // An established session failing later = a NEW outage: warn again,
+        // backoff restarts from the minimum.
+        let (warn, sleep) = p.on_failure(true);
+        assert!(warn, "a new outage after a live session warns");
+        assert_eq!(sleep, BACKOFF_MIN);
+        // And an unestablished retry right after stays latched again.
+        let (warn, _) = p.on_failure(false);
+        assert!(!warn);
+    }
+
     // Watermark GC honors the grace period: freshly covered items stay (a
     // bounded-stale reader may still need them); items covered longer than
     // MIRROR_GC ago are dropped.
@@ -1030,6 +1570,47 @@ mod tests {
         m.covered_marks = vec![(old, 4)];
         m.gc();
         assert!(m.appends.is_empty(), "aged coverage: GC drops the items");
+    }
+
+    // F9: while a reader is actively scanning the mirror, watermark-covered
+    // GC additionally requires the coverage to have been OBSERVED in the
+    // reader's own scan metadata — a reader frozen on stale metadata (the
+    // stale-read-on-catalog-error default during an outage) must not have
+    // rows it is still being served vanish out from under it. With no
+    // active reader inside the grace window, the peer watermark alone
+    // suffices (nothing can observe, and nothing can read non-monotonically
+    // either).
+    #[test]
+    fn gc_defers_to_reader_observed_watermark_while_scans_are_active() {
+        let aged = Instant::now() - (MIRROR_GC + Duration::from_secs(1));
+        // Active reader whose scan metadata never advanced past w=0:
+        // coverage aged out, but GC must HOLD the items.
+        let mut m = mirror(false);
+        feed(&mut m, 3, TailEventKind::Append, Some(&row(1, "a")));
+        m.covered_marks = vec![(aged, 4)];
+        m.watermark = 4;
+        m.last_overlay_at = Some(Instant::now());
+        m.observed_watermark = 0;
+        m.gc();
+        assert_eq!(
+            m.appends.len(),
+            1,
+            "aged peer coverage alone must not GC while an active reader's \
+             metadata has not observed it"
+        );
+        // The reader's scans observe covering metadata (w=4): GC unblocks.
+        m.covered_marks = vec![(aged, 4)];
+        m.observed_watermark = 4;
+        m.gc();
+        assert!(m.appends.is_empty(), "observed coverage: GC proceeds");
+        // No reader within the grace window: peer coverage alone GCs.
+        let mut m = mirror(false);
+        feed(&mut m, 3, TailEventKind::Append, Some(&row(1, "a")));
+        m.covered_marks = vec![(aged, 4)];
+        m.watermark = 4;
+        m.last_overlay_at = None;
+        m.gc();
+        assert!(m.appends.is_empty(), "no active reader: GC proceeds");
     }
 
     // Heartbeats never regress the watermark.
@@ -1049,16 +1630,16 @@ mod tests {
     fn age_gate_excludes_stale_mirrors_and_resumes() {
         let mirrors = PeerMirrors::new();
         let peer = "127.0.0.1:1";
-        mirrors.install(
+        assert!(mirrors.install(
             ident(),
             peer,
             "icegres.tail-seq.peer".into(),
             canonical(),
             Vec::new(),
-        );
+        ));
         let wire = tailapi::wire_schema(&canonical(), &ident(), "icegres.tail-seq.peer", 0, &[]);
         let wb = tailapi::wire_batch(&wire, 3, TailEventKind::Append, Some(&row(1, "a"))).unwrap();
-        mirrors.ingest(&ident(), &wb).unwrap();
+        mirrors.ingest(peer, &ident(), &wb).unwrap();
         let overlay = |m: &PeerMirrors| m.overlay_with(&ident(), |t| t.overlay_at(None)).unwrap();
         assert!(overlay(&mirrors).is_some(), "fresh events: mirror serves");
         // The peer goes silent past the bound: mirror treated as absent.
@@ -1080,7 +1661,7 @@ mod tests {
         // Events resume (any applied batch/heartbeat): serving resumes and
         // the warn latch resets for the next outage.
         let wb = tailapi::wire_batch(&wire, 4, TailEventKind::Append, Some(&row(2, "b"))).unwrap();
-        mirrors.ingest(&ident(), &wb).unwrap();
+        mirrors.ingest(peer, &ident(), &wb).unwrap();
         assert!(overlay(&mirrors).is_some(), "events resumed: serves again");
         assert!(!mirrors.peers.lock().unwrap()[peer].warned_stale);
         // An unknown/never-registered peer never serves.

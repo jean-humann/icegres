@@ -20,6 +20,10 @@ stretch target).  Environment:
   ICEGRES_P1_ASSERT_MS   assert p50 <= this bound; empty/unset = report only
                          (the P1 scope target is 15, stretch 10 with
                          --freshness-ms)
+  ICEGRES_P1_ASSERT_BOUND=1   assert the P1 scope target (p50 <= 15 ms)
+                         without spelling the number out; ICEGRES_P1_ASSERT_MS
+                         wins when both are set. Default off, so foreign
+                         boxes report instead of flaking.
 
 Read-only: no writes, no cleanup needed.  Exit 0 on pass/report, 2 on a
 failed assertion or error.  Final line:
@@ -39,6 +43,14 @@ PORT = int(os.environ.get("ICEGRES_PROBE_FLIGHT_PORT", "50051"))
 WARMUP = int(os.environ.get("ICEGRES_P1_WARMUP", "3"))
 ITERS = int(os.environ.get("ICEGRES_P1_ITERS", "15"))
 ASSERT_MS = os.environ.get("ICEGRES_P1_ASSERT_MS", "").strip()
+# The P1 scope target (docs/p1-open-tail-scope.md §3): p50 <= 15 ms.
+if not ASSERT_MS and os.environ.get("ICEGRES_P1_ASSERT_BOUND", "").strip() in (
+    "1",
+    "true",
+    "on",
+    "yes",
+):
+    ASSERT_MS = "15"
 
 Q1 = "SELECT trip_id, city, distance_km, fare, ts FROM demo.trips WHERE trip_id = 137"
 

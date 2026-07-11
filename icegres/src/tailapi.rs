@@ -247,6 +247,15 @@ fn internal(e: impl std::fmt::Display) -> Status {
     Status::internal(format!("{e:#}"))
 }
 
+/// The documented status for a subscriber that lagged past the broadcast
+/// capacity: gRPC DATA_LOSS with the re-snapshot recovery hint (F14 — the
+/// wire spec's `DATA_LOSS (subscriber lagged; re-snapshot)`).
+fn lagged_status(lagged_by: u64) -> Status {
+    Status::data_loss(format!(
+        "tail subscriber lagged by {lagged_by} events; re-run TailSnapshot and re-subscribe"
+    ))
+}
+
 /// Wrap record batches into the encoded Flight stream (schema first).
 fn encode_batches(wire: SchemaRef, batches: Vec<Result<RecordBatch, FlightError>>) -> FlightStream {
     let flight = FlightDataEncoderBuilder::new()
@@ -337,20 +346,29 @@ pub(crate) fn snapshot_stream(
     Ok(encode_batches(wire, batches))
 }
 
-/// `TailSubscribe { table, from_seq }`: backfill the window's ops with
-/// `from_seq < seq <= high`, then stream durable events with `seq > high`
-/// as they ack, plus watermark events and 1 Hz liveness heartbeats.
-/// `high` is the window head at subscribe time; the event receiver is
-/// registered BEFORE the snapshot is taken, so the cursor is exact (every
-/// op is delivered exactly once by seq — see the module docs of buffer.rs
-/// for the staging-order invariant). A lagged receiver ends the stream
-/// with DATA_LOSS; the consumer re-runs TailSnapshot.
+/// `TailSubscribe { table, from_seq }`: backfill the window's durable ops
+/// with `from_seq < seq <= high`, then stream durable events with
+/// `seq > high` as they ack, plus watermark events and 1 Hz liveness
+/// heartbeats. `high` is the snapshot's durable head at subscribe time; the
+/// event receiver is registered BEFORE the snapshot is taken, so the cursor
+/// is exact (every op is delivered at most once by seq — see the module
+/// docs of buffer.rs for the staging-order invariant). A lagged receiver
+/// ends the stream with DATA_LOSS; the consumer re-runs TailSnapshot.
+/// Concurrent subscribe streams are capped at
+/// [`crate::buffer::TAIL_MAX_SUBSCRIBERS`] per server (F15) — beyond it
+/// the request is answered RESOURCE_EXHAUSTED.
 pub(crate) fn subscribe_stream(
     buffer: &Arc<WriteBuffer>,
     table: &TableIdent,
     from_seq: u64,
 ) -> Result<FlightStream, Status> {
     let watermark_property = require_tail(buffer)?;
+    let permit = buffer.try_subscribe_permit().ok_or_else(|| {
+        Status::resource_exhausted(format!(
+            "too many concurrent TailSubscribe streams (cap {}); close one and retry",
+            crate::buffer::TAIL_MAX_SUBSCRIBERS
+        ))
+    })?;
     // Register FIRST: any op staged after the snapshot below reaches the
     // receiver; anything staged before is in the snapshot (seq <= high).
     let mut events = buffer.subscribe_events();
@@ -380,6 +398,10 @@ pub(crate) fn subscribe_stream(
         .filter(|i| i.seq > from_seq)
         .collect();
     tokio::spawn(async move {
+        // The subscriber slot (F15) lives exactly as long as this fan-out
+        // task: dropped on any return below, including the ~1 s
+        // heartbeat-send reap of an abandoned consumer.
+        let _permit = permit;
         let ext = |e: anyhow::Error| FlightError::ExternalError(e.into());
         for item in backfill {
             let batch = wire_batch(&task_wire, item.seq, item.kind, Some(&item.batch));
@@ -422,15 +444,11 @@ pub(crate) fn subscribe_stream(
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        let _ = tx
-                            .send(Err(FlightError::ExternalError(
-                                anyhow!(
-                                    "tail subscriber lagged by {n} events; \
-                                     re-run TailSnapshot and re-subscribe"
-                                )
-                                .into(),
-                            )))
-                            .await;
+                        // F14: the wire contract (docs/open-tail-protocol.md)
+                        // is gRPC DATA_LOSS for a lagged subscriber — send a
+                        // real tonic Status so the encoder forwards the code
+                        // verbatim (an ExternalError would surface INTERNAL).
+                        let _ = tx.send(Err(FlightError::Tonic(Box::new(lagged_status(n))))).await;
                         return;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
@@ -564,5 +582,17 @@ mod tests {
         assert!(b.column(0).is_null(0) && b.column(1).is_null(0));
         let seqs = b.column(2).as_any().downcast_ref::<UInt64Array>().unwrap();
         assert_eq!(seqs.value(0), 11);
+    }
+
+    // F14: the lagged-subscriber error reaches the wire as gRPC DATA_LOSS —
+    // the exact code docs/open-tail-protocol.md promises — through the same
+    // FlightError::Tonic -> Status conversion the stream encoder applies
+    // (an ExternalError would be flattened to INTERNAL instead).
+    #[test]
+    fn lagged_subscriber_maps_to_data_loss_on_the_wire() {
+        let status = Status::from(FlightError::Tonic(Box::new(lagged_status(4097))));
+        assert_eq!(status.code(), tonic::Code::DataLoss);
+        assert!(status.message().contains("lagged by 4097 events"));
+        assert!(status.message().contains("re-run TailSnapshot"));
     }
 }

@@ -81,14 +81,19 @@ takeover — durability is NOT at stake, only the freshness bonus).
     engine can do LTAP's trick).
   - p1_flight_perf.py: measures Flight small-query p50 before/after
     (against the old binary if present, else documents after-only) and
-    asserts the target bound.
+    asserts the target bound when ICEGRES_P1_ASSERT_BOUND=1 /
+    ICEGRES_P1_ASSERT_MS is set (report-only by default so debug builds
+    and foreign boxes don't flake). The <=15 ms p50 target is ENFORCED on
+    the release binary by bench/bench.sh section 4e (flight_q1_ms); e2e's
+    p3e leg runs the probe report-only against the debug build.
   Use ONLY libraries already used by bench/clients (adbc_driver_flightsql,
   pyarrow, psycopg2 — check what a11_adbc_probe.py imports; pip install
   into the env if absent, matching the harness's existing skip-if-missing
   conventions).
 - Bench: extend bench.sh's ungated extras with flight_q1_ms (small query
-  via Flight) so the improvement is a tracked metric; record
-  before/after in the PR.
+  via Flight, default mode) AND flight_q1_fresh_ms (the same recipe
+  against `flight-serve --freshness-ms 25`) so both cited numbers are
+  tracked metrics; record before/after in the PR.
 
 ## Constraints
 Invariants I1-I4. Zero new Rust dependencies unless already lock-present

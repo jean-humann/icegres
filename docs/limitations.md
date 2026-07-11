@@ -315,17 +315,28 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
   snapshot has not caught up to, or rows would transiently vanish from the
   union. Watermark-covered mirror items are therefore retained for
   max(30 s, 4×S) — computed at startup, with a WARN stating the retention
-  chosen; the cost is memory, never correctness.
+  chosen — and, while scans are actively consulting the mirror,
+  additionally until a scan's OWN metadata has observed the covering
+  watermark (the stale-read-on-catalog-error default can freeze scan
+  metadata for the length of a reader-side catalog outage, unbounded by S);
+  the cost is memory, never correctness.
 - **Single buffering writer per table, unchanged.** Peer overlays are
   read-side only; there is no cross-compute write coordination. Two servers
   buffering writes to the same table remains an unsupported deployment
   (the tail one-writer locks fence it), and a reader mirroring two peers
-  that both claim a table WARNs and keeps the latest.
+  that both claim a table WARNs once and keeps the FIRST claim — the
+  second peer's ingest/drop are refused so it can neither interleave its
+  seq space into the owner's mirror nor kill it, and it takes over
+  automatically when the owner's mirror drops.
 - **The tail API is read-only and plaintext (v1).** The listener rejects
   every Flight write (a write executed there would bypass the pgwire
-  ordering fences); auth rides `--auth-file` basic-auth, but there is no
-  TLS on this port yet — run it on a trusted network. SQL SELECTs on it
-  are served (union reads), which is a feature, not an accident.
+  ordering fences); auth rides `--auth-file` basic-auth — the `--peer-tail`
+  subscriber authenticates with `ICEGRES_PEER_TAIL_USER` /
+  `ICEGRES_PEER_TAIL_PASSWORD` (one identity for all peers) — but there is
+  no TLS on this port yet: run it on a trusted network. Concurrent
+  TailSubscribe streams are capped at 64 per server (RESOURCE_EXHAUSTED
+  beyond). SQL SELECTs on it are served (union reads), which is a
+  feature, not an accident.
 - **Peer mirror visibility is best-effort, not a bound.** Discovery polls
   the peer every ~2 s and events ride a broadcast channel; a lagged/slow
   consumer is disconnected (DATA_LOSS) and must re-snapshot. Expect

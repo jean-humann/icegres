@@ -301,8 +301,11 @@ enum Command {
         /// silent past the serving bound, its mirror drops out of reads and
         /// they fall back to commit-cadence freshness (WARN once; per-peer
         /// gauge icegres_peer_tail_age_ms). Read-side only — the
-        /// single-buffering-writer-per-table model is unchanged. Off by
-        /// default.
+        /// single-buffering-writer-per-table model is unchanged. Peers
+        /// secured with --auth-file need ICEGRES_PEER_TAIL_USER /
+        /// ICEGRES_PEER_TAIL_PASSWORD (one identity for every peer): the
+        /// subscriber runs the Flight basic-auth handshake per connection.
+        /// Off by default.
         #[arg(long, env = "ICEGRES_PEER_TAILS", value_delimiter = ',')]
         peer_tail: Vec<String>,
 

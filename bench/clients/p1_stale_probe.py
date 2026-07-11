@@ -19,11 +19,23 @@ Steps (raw pyarrow.flight so the GetFlightInfo/DoGet pair is controlled):
      Assert count == 1 (FRESH), the PF1 fix.
   3. sanity: a fresh GetFlightInfo -> DoGet pair also counts 1.
 
+Freshness mode: against a `--freshness-ms N` server the pre-write ticket
+check first waits (fresh mint→DoGet polls, bounded) until the write's
+metadata version has been observed by the server's freshness cache —
+bounded staleness is that mode's CONTRACT, and only after the version
+moved does "the pre-write ticket re-plans on the version mismatch" become
+the thing under test (a broken server that blindly pins would still
+answer 0 from the pre-commit file list).  In default mode the polls
+succeed on their first try, preserving the original INSERT-then-DoGet
+shape.
+
 Environment:
   ICEGRES_PROBE_FLIGHT_HOST / ICEGRES_PROBE_FLIGHT_PORT  (127.0.0.1:50051)
   ICEGRES_PROBE_PG_HOST / ICEGRES_PROBE_PG_PORT          (127.0.0.1:5432)
   ICEGRES_PROBE_TABLE                                    (demo.e2e_p1)
   ICEGRES_PROBE_TRIP_ID                                  (980600)
+  ICEGRES_PROBE_SETTLE_S    max seconds to wait for a fresh ticket to
+                            observe each write (default 10)
 
 Owns trip_id = ICEGRES_PROBE_TRIP_ID (default 980600, inside the probes'
 reserved >= 980000 range) and deletes it on exit.  Exit 0 on pass, 2 on
@@ -32,6 +44,7 @@ failure.  Final line:  P1STALE RESULT: pass=<n> fail=<n> status=<PASS|FAIL>
 
 import os
 import sys
+import time
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -42,6 +55,7 @@ PG_HOST = os.environ.get("ICEGRES_PROBE_PG_HOST", "127.0.0.1")
 PG_PORT = int(os.environ.get("ICEGRES_PROBE_PG_PORT", "5432"))
 TABLE = os.environ.get("ICEGRES_PROBE_TABLE", "demo.e2e_p1")
 TRIP_ID = int(os.environ.get("ICEGRES_PROBE_TRIP_ID", "980600"))
+SETTLE_S = float(os.environ.get("ICEGRES_PROBE_SETTLE_S", "10"))
 
 PASS = 0
 FAIL = 0
@@ -109,27 +123,44 @@ def main():
         with pg.cursor() as cur:
             cur.execute(stmt)
 
+    def settle(expected: int) -> int:
+        """Fresh mint->DoGet polls until `expected` is observed (bounded).
+
+        Default mode observes a commit on the first try; freshness mode
+        needs up to ~freshness-ms + one refresh round trip — that lag is
+        the mode's documented contract, not the staleness bug under test.
+        Returns the last observed count.
+        """
+        deadline = time.monotonic() + SETTLE_S
+        got = count_via(mint_ticket())
+        while got != expected and time.monotonic() < deadline:
+            time.sleep(0.05)
+            got = count_via(mint_ticket())
+        return got
+
     try:
         pg_exec(f"delete from {TABLE} where trip_id = {TRIP_ID}")
 
-        # 1. Baseline: the sentinel row does not exist yet.
-        check(count_via(mint_ticket()) == 0, "baseline -- sentinel row absent (count=0)")
+        # 1. Baseline: the sentinel row does not exist yet (settled, so a
+        #    freshness-mode server has observed the cleanup delete).
+        check(settle(0) == 0, "baseline -- sentinel row absent (count=0)")
 
         # 2. The PF1 repro: ticket minted BEFORE the write must be FRESH at
-        #    DoGet (a stale pinned plan would still answer 0).
+        #    DoGet (a stale pinned plan would still answer 0). Fresh
+        #    tickets settle on the write FIRST, so the server's current
+        #    table version provably moved past the pre-write ticket's
+        #    pinned one — the version-mismatch re-plan is what's exercised.
         pre_write_ticket = mint_ticket()
         pg_exec(
             f"insert into {TABLE} (trip_id, city, distance_km, fare, ts) values "
             f"({TRIP_ID}, 'stale-probe', 1.0, 2.0, TIMESTAMP '2026-07-11 00:00:02')"
         )
+        check(settle(1) == 1, "fresh ticket observes the row (count=1)")
         got = count_via(pre_write_ticket)
         check(
             got == 1,
             f"pre-write ticket serves FRESH results at DoGet (count={got}, want 1)",
         )
-
-        # 3. Sanity: a fresh GetFlightInfo -> DoGet pair agrees.
-        check(count_via(mint_ticket()) == 1, "fresh ticket also counts the row")
     finally:
         try:
             pg_exec(f"delete from {TABLE} where trip_id = {TRIP_ID}")

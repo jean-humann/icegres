@@ -31,8 +31,14 @@ which makes the protocol identical across `--tail-dir`, `--tail-url`, and
   exactly as fresh as committed state.
 * Auth: the standard Flight basic-auth handshake when `--auth-file` is
   set (`authorization: Basic ...` → per-boot `Bearer` token); `--authz-file`
-  gates Snapshot/Subscribe as `ReadData` on the table. v1 is plaintext —
+  gates Snapshot/Subscribe as `ReadData` on the table. The `--peer-tail`
+  subscriber authenticates with the same handshake: set
+  `ICEGRES_PEER_TAIL_USER` / `ICEGRES_PEER_TAIL_PASSWORD` on the reader
+  (one identity for every configured peer, v1). v1 is plaintext —
   run it on a trusted network.
+* Concurrent `Subscribe` streams are capped at 64 per server; beyond that
+  the request is answered `RESOURCE_EXHAUSTED` (each stream pins a task,
+  a broadcast receiver, and queue/window memory).
 
 ## Fallback contract (honesty)
 
@@ -78,6 +84,7 @@ def any_ticket(type_url: bytes, value: bytes) -> bytes:
 Errors: `NOT_FOUND` (table has no window yet — nothing was ever buffered
 for it this boot), `FAILED_PRECONDITION` (endpoint not buffering / no
 durable tail), `DATA_LOSS` (subscriber lagged; re-snapshot),
+`RESOURCE_EXHAUSTED` (the per-server Subscribe cap, 64, is reached),
 `PERMISSION_DENIED` (authz).
 
 ## Responses: one Arrow stream
@@ -103,8 +110,8 @@ Schema-level metadata (the header):
 | `icegres.tail.version` | protocol version, `"1"` |
 | `icegres.tail.table` | `namespace.table` |
 | `icegres.tail.watermark-property` | the FULL `icegres.tail-seq.<tail-id>` property key this server's flushes stamp — what the consumer looks up in ITS scan metadata |
-| `icegres.tail.high` | highest tail sequence in the window at snapshot/subscribe time (the `from_seq` resume cursor) |
-| `icegres.tail.pk-cols` | comma-joined declared PK columns (empty = no keyed ops possible → no suppression) |
+| `icegres.tail.high` | highest DURABLE tail sequence served at snapshot/subscribe time (the `from_seq` resume cursor; ops with in-flight durability waits sit above it and arrive as later events or with the next flush) |
+| `icegres.tail.pk-cols` | comma-joined DECLARED PK columns (the table's `icegres.primary-key`) — the key encoding for every keyed op on the stream. Empty ⇒ the table declares no primary key; a keyed (`upsert`/`delete`) event on an empty-pk-cols stream is a PROTOCOL ERROR — consumers MUST drop the mirror and re-snapshot, never silently ignore it |
 
 Row semantics by `__icegres_op`:
 
@@ -122,11 +129,17 @@ Row semantics by `__icegres_op`:
 A `Snapshot` stream ends when the window has been sent (possibly zero
 batches). A `Subscribe` stream never ends voluntarily: it backfills every
 window op with `from_seq < seq <= high`, then streams ops with
-`seq > high` as they become durable (an op is NEVER sent before its
-durability wait succeeded), interleaved with watermark events. Sequences
-are per-table, strictly increasing, and never reused; events may arrive
+`seq > high` as they become durable, interleaved with watermark events.
+An op is NEVER sent — by Snapshot, the Subscribe backfill, or the live
+stream — before its durability wait succeeded: a statement that errors on
+its durability wait leaves nothing on any consumer. Sequences are
+per-table, strictly increasing, and never reused; events may arrive
 slightly out of order across concurrent statements — consumers must key on
-`seq`, not arrival order.
+`seq`, not arrival order. (Rare bounded gap: when durability completes out
+of order across concurrent statements, an op below the served `high` may
+be delivered by neither the backfill nor the live stream — it is covered
+by the next flush's watermark instead, i.e. it loses only the freshness
+bonus.)
 
 ## The exactly-once merge rule (the whole point)
 
@@ -166,13 +179,18 @@ ops SHOULD be ignored with a warning.
 ## Consumers
 
 * **Peer icegres computes** (`--peer-tail host:port[,...]`, env
-  `ICEGRES_PEER_TAILS`): maintain per-table mirrors via
-  Tables→Snapshot→Subscribe with reconnect/backoff; scans union the mirror
-  through the same `KeySuppressExec`/union machinery as the local overlay.
-  Mirror staleness is the per-peer `icegres_peer_tail_age_ms{peer=…}`
-  gauge (worst case: `icegres_peer_tail_age_max_ms`); a disconnect drops
-  the mirror (fallback, one WARN per outage). Two consumer-side bounds a
-  reimplementation should copy:
+  `ICEGRES_PEER_TAILS`; credentials for authed peers via
+  `ICEGRES_PEER_TAIL_USER` / `ICEGRES_PEER_TAIL_PASSWORD`): maintain
+  per-table mirrors via Tables→Snapshot→Subscribe with reconnect/backoff;
+  scans union the mirror through the same `KeySuppressExec`/union
+  machinery as the local overlay. Mirror staleness is the per-peer
+  `icegres_peer_tail_age_ms{peer=…}` gauge (worst case:
+  `icegres_peer_tail_age_max_ms`); a disconnect drops the mirror
+  (fallback, one WARN per outage — the latch resets only after a session
+  that exchanged tail RPCs, never on a bare TCP connect). A table claimed
+  by TWO peers keeps the FIRST claim: the second is refused (one WARN)
+  and takes over automatically when the owner's mirror drops. Two
+  consumer-side bounds a reimplementation should copy:
   * **Serving age bound.** The subscriber channel runs HTTP/2 + TCP
     keepalives, and a mirror whose peer delivered no event (the 1 Hz
     heartbeat counts) for over 5 s is treated as ABSENT — a hung-but-
@@ -185,7 +203,14 @@ ops SHOULD be ignored with a warning.
     (icegres: `--freshness-ms S`), the grace period must comfortably
     exceed S — icegres enforces max(30 s, 4×S), computed at startup —
     otherwise a row can be absent from BOTH the stale committed snapshot
-    and the already-GC'd mirror, silently vanishing from the union.
+    and the already-GC'd mirror, silently vanishing from the union. The
+    grace alone is NOT sufficient when the consumer can serve committed
+    metadata of UNBOUNDED staleness (icegres's stale-read-on-catalog-error
+    default during a reader-side catalog outage): while scans are actively
+    consulting the mirror, icegres additionally holds covered items until
+    a scan's OWN metadata has observed the covering watermark — otherwise
+    rows being served from the mirror would vanish mid-outage
+    (non-monotonic reads).
 * **External engines**: `bench/clients/p1_tail_reader.py` demonstrates the
   full merged-fresh read in ~100 lines of pyarrow — committed state via
   ADBC/pgwire, tail via one DoGet, merge per the rule above — and asserts
