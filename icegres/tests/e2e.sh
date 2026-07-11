@@ -1862,7 +1862,7 @@ fi
 # intermediate snapshots, and net exactly ONE composed commit at the flush;
 # a mid-window SELECT sees the newest value through the union read; time
 # travel to the pre-update snapshot still shows the old value (never
-# overlaid). Port 5457 (5456 belongs to tail_durability.sh).
+# overlaid). Port 5457 (5456 and 5458 belong to tail_durability.sh).
 # ---------------------------------------------------------------------------
 KY_PORT=5457
 KY_PID="$E2E_DIR/serve-keyed.pid"
@@ -2080,7 +2080,7 @@ q 'drop table demo.e2e_orphan' >/dev/null 2>&1 || true
 #       - default mode (--freshness-ms 0) is untouched — every assertion in
 #         sections (a)..(y) above ran against default-mode servers.
 # ---------------------------------------------------------------------------
-FR_PORT=5458
+FR_PORT=5459 # 5458 belongs to tail_durability.sh (fencing second server)
 FR_HEALTH=8092
 FR_MS=25
 FR_PID="$E2E_DIR/serve-fresh.pid"

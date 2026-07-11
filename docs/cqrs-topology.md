@@ -137,7 +137,7 @@ makes this operable from ONE public port:
 | synchronous INSERT (durable Iceberg commit) | ~50–60 ms (56.1 ms; p95 72 ms) pre-increment; **~46 ms** after the write-latency increment (redundant metadata fetch killed + independent uploads overlapped; timing-mode probe, this tree) | same + write-latency probe |
 | batch INSERT, 100 rows | ~99 ms (≈1 ms/row) pre-increment; **~40 ms** timing-mode probe, this tree | same |
 | buffered INSERT ack (`--write-buffer-ms 100`) | ~1.3–1.5 ms | same + R6.4 acceptance |
-| durable tail ack (`--tail-dir` / `--tail-url` / `--tail-quorum`) | ~1.5–2.5 / ~2.2 / ~2.5 ms; local WAL group fsync under concurrency: 8 writers p50 ~6 ms (was ~9 ms serialized), p95 ~11 ms (was ~24 ms) | write-latency probe, this tree; `durable_ack_*_ms` in bench |
+| durable tail ack (`--tail-dir` / `--tail-url` / `--tail-quorum`) | 3.6 / 2.7 / 4.1 ms (`durable_ack_*_ms` in bench); statement-level probe ~2.4–2.5 / 2.2 / 2.5 ms (`ICEGRES_QUERY_TIMING`); local WAL group fsync under concurrency: 8 writers p50 ~6.1 ms (was ~9–10 ms serialized) | `durable_ack_*_ms` in bench + write-latency probe, this tree |
 | keyed UPDATE ack (`icegres.tail-upsert`, hot row) | **~5.2 ms** with `--freshness-ms 25` (~7.0 ms exact-freshness; was ~9.5 ms pre-increment) | write-latency probe, this tree |
 | freshness, buffered mode (same server, new conn) | ~8–10 ms (p95 bimodal ~80 ms) | same |
 | freshness, synchronous mode (any reader) | ~60–73 ms | same |
@@ -159,7 +159,7 @@ makes this operable from ONE public port:
 | Bulk load / backfill | Tier 2, multi-row INSERT batches (or direct Iceberg writers) | ~1 ms/row amortized at batch 100; engines can write via the catalog directly |
 | BI, ad-hoc analytics, scheduled reports | Tier 3 branch/replica endpoints via icegresd | isolation from serving path, zero-copy stable views, scale-to-zero when idle |
 | Reproducible reporting / audits | Tier 3 + time travel / tags | any retained snapshot queryable read-only |
-| Sub-10 ms durable single-statement writes | Tier 2 + `--write-buffer-ms` + a durable tail (`--tail-dir`/`--tail-url`/`--tail-quorum`) | ~1.5–2.5 ms tail-durable INSERT ack, ~5.2 ms keyed UPDATE with `--freshness-ms`; durability class = the chosen tail (see the ladder in the READMEs); explicit transactions stay sync by design |
+| Sub-10 ms durable single-statement writes | Tier 2 + `--write-buffer-ms` + a durable tail (`--tail-dir`/`--tail-url`/`--tail-quorum`) | ~3.6 ms tail-durable INSERT ack (bench; ~2.4–2.5 ms statement-level probe), ~5.2 ms keyed UPDATE with `--freshness-ms`; durability class = the chosen tail (see the ladder in the READMEs); explicit transactions stay sync by design |
 | Hot counters, queues, `FOR UPDATE` row locking, sub-ms SLOs, multi-statement transactions at sub-10 ms | **Tier 1 external Postgres** → stream to Iceberg | copy-on-write + optimistic concurrency is the wrong engine for lock choreography, and a tail-staged COMMIT would break `40001` (refused — docs/limitations.md) |
 | Spark/Trino/Python batch jobs | direct Iceberg REST + S3 (no icegres at all) | the single copy is open; don't proxy bulk scans through pgwire |
 

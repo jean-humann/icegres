@@ -49,7 +49,7 @@
 # icegres_test, and its own icekeeper data dirs under .e2e. Uses port 5456
 # for the main server, 5458 for the fencing second server, and 5471-5473 for
 # the icekeeperd acceptors (left free: 5452 belongs to bench/parity.sh D7,
-# 5455 to e2e.sh THR_PORT, 5457 to e2e.sh KY_PORT).
+# 5455 to e2e.sh THR_PORT, 5457 to e2e.sh KY_PORT, 5459 to e2e.sh FR_PORT).
 # Standalone by design — NOT wired into e2e.sh (keep the gate stable).
 
 set -euo pipefail
