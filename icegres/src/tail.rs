@@ -42,11 +42,36 @@
 //! * **Fail loudly.** A tail append error is the INSERT's statement error
 //!   (no silent downgrade to non-durable); an unreadable tail at boot
 //!   aborts startup rather than silently dropping acked rows.
-//! * **Tail fsync runs under the buffer lock.** One statement's durable
-//!   append serializes with every other buffered INSERT and with the
-//!   same-server union-read overlay, so a slow tail disk stalls other
-//!   tables' buffered inserts AND union reads for that fsync's window.
-//!   Per-table locking is the known follow-up.
+//! * **Group fsync (staged appends).** [`TailStore::append_staged`] splits
+//!   an append into (a) frame write + sequence assignment, done under the
+//!   tables lock, and (b) the durability WAIT, done outside every lock.
+//!   Waiters on one segment share `sync_data` calls: while a sync runs,
+//!   later statements write their frames and queue; the first waiter after
+//!   it completes leads ONE sync covering everything written meanwhile —
+//!   natural batching, no timer. **Fsync-before-ack holds for every
+//!   statement of a coalesced batch**: the leader snapshots the written
+//!   boundary BEFORE calling `sync_data` and only advances the synced
+//!   boundary to that snapshot, so a waiter returns Ok only when a
+//!   completed sync provably covers its frame's end offset; frames written
+//!   during a sync wait for the next round. On a sync FAILURE every waiter
+//!   past the durable boundary errors, the segment is sealed at that
+//!   boundary (rolled back, or clamped by a poison marker), and the failed
+//!   frames' sequences are **BURNED — never reused**: the caller may have
+//!   already exposed them to the flush watermark (buffer.rs stages before
+//!   waiting), and reusing one would hand an already-stamped sequence to a
+//!   NEW acked statement whose frame the next crash-replay would silently
+//!   drop as covered. The resulting sequence hole is benign (nothing in it
+//!   was ever acked); the poison marker's resume hint teaches replay to
+//!   accept it. Buffer-side consequence, stated honestly: rows of a
+//!   statement that fails at the WAIT stage are already routed into the
+//!   buffer window and may still be committed by a flush — a failed-fsync
+//!   statement's error is AMBIGUOUS (rows may land), where the classic
+//!   write-stage failure remains exact (nothing routed, nothing durable).
+//! * **Tail fsync runs after the buffer lock is dropped** (buffer.rs):
+//!   one statement's durable wait no longer stalls other buffered INSERTs
+//!   or union reads — concurrent statements on one table coalesce into
+//!   shared fsyncs, concurrent statements on different tables sync their
+//!   segments independently.
 //! * **flock is advisory — and unreliable on NFS.** The one-writer guard
 //!   only binds processes on a filesystem with sound flock semantics; put
 //!   the tail dir on a LOCAL filesystem, never NFS.
@@ -78,22 +103,24 @@
 //!
 //! # Failed appends never poison the segment
 //!
-//! The whole frame is built in memory first; on ANY write/fsync error the
-//! segment is rolled back (`set_len`) to the last known-good frame boundary
-//! so later acked frames never sit behind garbage, and the un-consumed
-//! sequence number is safely reused. If the rollback itself fails (disk
-//! truly failing), the segment is POISONED: sealed at the last known-good
-//! offset and never written again — the next append opens a fresh segment.
-//! Residual window, honestly: a poisoned segment whose truncation failed
-//! keeps its trailing garbage on disk, and a later crash-replay stops at
-//! that garbage (discarding any later segments) — the price of a disk that
-//! rejects both the write and its undo. When a segment is poisoned, a
-//! best-effort `<segment>.poisoned` marker records the last good byte
-//! length (ASCII u64) so a later replay CLAMPS the scan there: bytes the
-//! failing disk wrote past the boundary — possibly a whole crc-valid
-//! "ghost" frame whose un-consumed sequence was later reused — never
-//! replay. Residual window, honestly: if the marker write fails too, a
-//! later crash-replay stops at the trailing garbage instead.
+//! The whole frame is built in memory first; on a WRITE error the segment
+//! is rolled back (`set_len`) to the last fully-written frame boundary so
+//! later frames never sit behind garbage, and the un-consumed sequence
+//! number is safely reused (the failed frame was never staged into any
+//! watermark). If the rollback itself fails (disk truly failing), the
+//! segment is POISONED: the whole un-synced tail is failed (any
+//! staged-but-unsynced statements error with it), the segment is sealed at
+//! its DURABLE boundary, and the un-synced sequences are burned (see the
+//! group-fsync bullet above) — the next append opens a fresh segment. A
+//! best-effort `<segment>.poisoned` marker records the durable byte length
+//! plus the resume sequence (`"<len> <resume_seq>"`, ASCII) so a later
+//! replay CLAMPS the scan at the durable boundary — bytes the failing disk
+//! wrote past it, possibly whole crc-valid "ghost" frames of statements
+//! that were reported failed, never replay — and accepts the burned gap in
+//! front of the next segment. Residual window, honestly: if the marker
+//! write fails too, a later crash-replay stops at the trailing garbage and
+//! may discard later segments as gapped — the price of a disk that rejects
+//! the write, its undo, AND the marker.
 //!
 //! # Torn-write tolerance
 //!
@@ -112,7 +139,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex as StdMutex;
+use std::sync::{Arc, Condvar, Mutex as StdMutex};
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use arrow::array::RecordBatch;
@@ -250,6 +277,53 @@ pub struct ReplayedTable {
     pub sidecar_watermark: Option<u64>,
 }
 
+/// A tail append whose frame is written (and sequence number assigned) but
+/// whose durability may still be pending. Produced by
+/// [`TailStore::append_staged`]; the caller MUST call
+/// [`wait_durable`](Self::wait_durable) before acknowledging the statement —
+/// the fsync-before-ack contract is exactly as strong as with
+/// [`TailStore::append`], only the WAIT is separated from the write so the
+/// caller can drop its own locks first (buffer.rs releases the buffer lock,
+/// letting concurrent statements' fsyncs coalesce — the group-commit win).
+pub struct StagedAppend {
+    seq: u64,
+    /// `None` = already durable (backends without a staged fast path).
+    waiter: Option<Box<dyn FnOnce() -> Result<()> + Send>>,
+}
+
+impl StagedAppend {
+    /// An append that is already durable (the default-backend shape).
+    pub fn durable(seq: u64) -> Self {
+        Self { seq, waiter: None }
+    }
+
+    /// A staged append with an explicit durability waiter (backend
+    /// overrides and test doubles).
+    pub fn with_waiter(seq: u64, waiter: Box<dyn FnOnce() -> Result<()> + Send>) -> Self {
+        Self {
+            seq,
+            waiter: Some(waiter),
+        }
+    }
+
+    /// The frame's sequence number (assigned; final if
+    /// [`wait_durable`](Self::wait_durable) succeeds).
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// Block until the frame is durable (joining/leading the backend's
+    /// group sync where one exists). Must be called before the statement is
+    /// acknowledged. An error means the frame is NOT durable and will never
+    /// replay (the backend rolls back / clamps it away).
+    pub fn wait_durable(self) -> Result<u64> {
+        if let Some(wait) = self.waiter {
+            wait()?;
+        }
+        Ok(self.seq)
+    }
+}
+
 /// A durable staging log for acked-but-uncommitted buffered rows. The
 /// buffer appends BEFORE acking, the flusher truncates AFTER the Iceberg
 /// commit lands — the tail is never a second source of truth, only the gap
@@ -262,6 +336,25 @@ pub trait TailStore: Send + Sync {
     /// survives (see the module docs). `batches` must be non-empty; its
     /// meaning depends on `kind` (see [`TailOpKind`]).
     fn append(&self, table: &TableIdent, kind: TailOpKind, batches: &[RecordBatch]) -> Result<u64>;
+
+    /// Two-phase variant of [`append`](Self::append): write the frame and
+    /// assign its sequence now, defer the durability WAIT to the returned
+    /// [`StagedAppend`]. The caller must call
+    /// [`StagedAppend::wait_durable`] before the statement ack. Default:
+    /// fully-durable `append` (correct for every backend; LocalWal
+    /// overrides it with the group-fsync fast path). Callers must uphold
+    /// one contract in exchange for the split: once this returns Ok, the
+    /// assigned sequence may become visible to the flush watermark, so a
+    /// backend override must NEVER reuse the sequence of a staged frame
+    /// whose wait later fails (see LocalWal's burned-sequence rule).
+    fn append_staged(
+        &self,
+        table: &TableIdent,
+        kind: TailOpKind,
+        batches: &[RecordBatch],
+    ) -> Result<StagedAppend> {
+        Ok(StagedAppend::durable(self.append(table, kind, batches)?))
+    }
 
     /// Segment-management hint called at flush start: seal the active
     /// segment so a later [`truncate`](TailStore::truncate) can delete it
@@ -358,15 +451,72 @@ pub fn effective_watermark(
     }
 }
 
+/// Group-fsync coordination for ONE active segment (see the module docs'
+/// "Group fsync" section). Shared (`Arc`) between the appenders staging
+/// frames under the tables lock and the waiters syncing OUTSIDE it.
+struct SegSync {
+    m: StdMutex<SegSyncState>,
+    cv: Condvar,
+    /// Test-only hook run by a sync leader right before `sync_data` (with
+    /// NO lock held) — lets a test park a leader mid-sync to exercise the
+    /// cleanup-vs-in-flight-sync interleaving (F1). `None` in production.
+    #[cfg(test)]
+    test_sync_hook: StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+struct SegSyncState {
+    /// Bytes of fully-written frames (advanced under the tables lock).
+    written_len: u64,
+    /// Sequence of the last fully-written frame (`base` when none).
+    written_seq: u64,
+    /// Bytes covered by a completed, successful `sync_data`.
+    synced_len: u64,
+    /// Sequence of the last frame at or below `synced_len`. Initialized to
+    /// the sequence BEFORE the segment's first frame, so "no durable frame
+    /// in this segment yet" still yields the correct resume point.
+    synced_seq: u64,
+    /// A leader is currently running `sync_data` (outside all locks).
+    syncing: bool,
+    /// Sticky failure: once a sync (or an unrecoverable write) fails, every
+    /// waiter whose frame end lies beyond `synced_len` fails — their
+    /// sequences are BURNED (never reused; see the module docs).
+    failed: Option<String>,
+    /// The failure cleanup (seal at the durable boundary) already ran.
+    cleaned: bool,
+}
+
+impl SegSync {
+    fn new(base_seq: u64) -> Self {
+        Self {
+            m: StdMutex::new(SegSyncState {
+                written_len: 0,
+                written_seq: base_seq,
+                synced_len: 0,
+                synced_seq: base_seq,
+                syncing: false,
+                failed: None,
+                cleaned: false,
+            }),
+            cv: Condvar::new(),
+            #[cfg(test)]
+            test_sync_hook: StdMutex::new(None),
+        }
+    }
+}
+
 /// The segment currently receiving appends for one table.
 struct ActiveSegment {
     path: PathBuf,
-    file: File,
+    /// Shared with staged waiters, whose group fsync runs outside the
+    /// tables lock (and must survive rotation/truncation of the segment).
+    file: Arc<File>,
     /// Highest sequence written to this segment (0 = no frames yet).
     max_seq: u64,
     /// Byte length of the last known-good frame boundary — the rollback
     /// target when an append fails partway (see the module docs).
     good_len: u64,
+    /// Group-fsync state for this segment's staged frames.
+    sync: Arc<SegSync>,
 }
 
 /// A sealed (rotated, recovered, or poisoned) segment awaiting truncation
@@ -429,7 +579,10 @@ pub struct LocalWal {
     /// Exclusive `flock` on `<dir>/.lock`, held (the fd lives in the
     /// struct) for the process lifetime — one writer per tail dir.
     _lock: File,
-    tables: StdMutex<HashMap<TableIdent, TableWal>>,
+    /// `Arc` so staged-append waiters (which outlive the `append_staged`
+    /// call and run without the lock) can reach the bookkeeping for the
+    /// group-fsync failure cleanup.
+    tables: Arc<StdMutex<HashMap<TableIdent, TableWal>>>,
 }
 
 impl LocalWal {
@@ -458,13 +611,239 @@ impl LocalWal {
             root: root.to_path_buf(),
             prop_key: format!("{TAIL_SEQ_PROPERTY_PREFIX}{identity}"),
             _lock: lock,
-            tables: StdMutex::new(HashMap::new()),
+            tables: Arc::new(StdMutex::new(HashMap::new())),
         })
+    }
+}
+
+/// Wait until the group fsync of `sync`/`file` covers `my_end` bytes,
+/// leading the sync when no leader is in flight (the group-commit core:
+/// whoever arrives while a sync runs waits, and the FIRST waiter after it
+/// completes leads ONE `sync_data` covering everything written meanwhile).
+/// Runs with NO lock but `sync.m` held intermittently — never the tables
+/// lock (lock order: tables → m; the failure cleanup below re-acquires
+/// tables only after releasing m).
+fn wait_group_sync(sync: &SegSync, file: &File, my_end: u64) -> std::result::Result<(), String> {
+    let mut st = sync.m.lock().expect("segment sync lock poisoned");
+    loop {
+        // F1: the FAILED check comes first. Once a failure lands, the
+        // cleanup erases everything past the boundary it snapshots — a
+        // boundary that looks satisfied here may be about to be (or already
+        // was) truncated away, so it must never mask the failure and let an
+        // erased frame ACK. The cost is honest over-reporting: a waiter
+        // whose frame IS below the durable boundary errors too (its frame
+        // survives and replays — the standard ambiguous-error direction).
+        if let Some(err) = &st.failed {
+            return Err(err.clone());
+        }
+        if st.synced_len >= my_end {
+            return Ok(());
+        }
+        if !st.syncing {
+            st.syncing = true;
+            let (target_len, target_seq) = (st.written_len, st.written_seq);
+            drop(st);
+            #[cfg(test)]
+            {
+                let hook = sync
+                    .test_sync_hook
+                    .lock()
+                    .expect("test sync hook lock poisoned")
+                    .clone();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
+            let res = file.sync_data();
+            st = sync.m.lock().expect("segment sync lock poisoned");
+            st.syncing = false;
+            match res {
+                Ok(()) => {
+                    // F1: re-check failed/cleaned BEFORE advancing. A
+                    // failure that landed while this sync ran (another
+                    // statement's poisoned write) triggers the cleanup,
+                    // which truncates the segment at the durable boundary
+                    // it snapshots — advancing `synced_len` past frames the
+                    // cleanup erases (or is about to erase; it waits for
+                    // `!syncing` and then snapshots) would let those frames
+                    // satisfy a waiter's boundary check and ACK erased
+                    // bytes. Leave the boundary at the cleanup's seal point;
+                    // loop re-entry returns the failure to this waiter too.
+                    if st.failed.is_none() && !st.cleaned {
+                        // Only bytes written BEFORE the sync started are
+                        // proven durable — hence the snapshot above, never
+                        // the live written_len.
+                        st.synced_len = st.synced_len.max(target_len);
+                        st.synced_seq = st.synced_seq.max(target_seq);
+                    }
+                    sync.cv.notify_all();
+                }
+                Err(e) => {
+                    st.failed = Some(format!("fsync failed: {e}"));
+                    sync.cv.notify_all();
+                    // Loop re-entry returns the error to THIS waiter too;
+                    // the caller performs the cleanup.
+                }
+            }
+            continue;
+        }
+        st = sync.cv.wait(st).expect("segment sync lock poisoned");
+    }
+}
+
+/// Failure cleanup after a group-fsync error (or a poisoned write): seal
+/// the segment at its DURABLE boundary and burn the un-synced sequences.
+/// Runs under the tables lock (callers without it pass through
+/// [`cleanup_failed_segment`]). Idempotent via the `cleaned` flag; a
+/// no-longer-active segment (rotated after a full sync, or deleted by a
+/// covering truncate) needs no cleanup — rotation syncs before sealing and
+/// a covering truncate means the rows are already in the lake.
+///
+/// The one rule that keeps replay exact (module docs, "Group fsync"):
+/// `next_seq` is NEVER rewound. The failed frames' sequences may already be
+/// visible to the flush watermark (the caller staged them before waiting),
+/// so reusing one could hand an already-stamped sequence to a NEW acked
+/// statement, whose frame the next crash-replay would then silently drop
+/// as covered. Burning the sequences leaves a benign hole instead; the
+/// poison marker's resume hint (see [`poison_marker_path`]) teaches replay
+/// that the hole is expected.
+fn cleanup_failed_segment_locked(entry: &mut TableWal, sync: &Arc<SegSync>, why: &str) {
+    let (synced_len, synced_seq) = {
+        let mut st = sync.m.lock().expect("segment sync lock poisoned");
+        if st.cleaned {
+            return;
+        }
+        // Invariant for the leader's Ok-arm re-check: `failed` is always
+        // set before (and whenever) `cleaned` is. Every caller sets it
+        // already; this is belt-and-braces.
+        if st.failed.is_none() {
+            st.failed = Some(why.to_string());
+        }
+        // F1: NEVER snapshot the durable boundary while a leader is mid-
+        // `sync_data` (it runs with no lock held). Its completing Ok would
+        // otherwise advance `synced_len` past the boundary snapshotted
+        // here, and the truncation below would erase frames whose waiters
+        // then ACK — silent loss at the next crash-replay. Wait the
+        // in-flight sync out (bounded: one sync_data; the leader needs only
+        // `m` to finish, never the tables lock we may hold — the documented
+        // lock order). With `failed` set above, a completing leader no
+        // longer advances the boundary, so the snapshot below is final.
+        while st.syncing {
+            st = sync.cv.wait(st).expect("segment sync lock poisoned");
+        }
+        if st.cleaned {
+            return; // another cleanup won the race while we waited
+        }
+        st.cleaned = true;
+        (st.synced_len, st.synced_seq)
+    };
+    let is_active = entry
+        .active
+        .as_ref()
+        .is_some_and(|a| Arc::ptr_eq(&a.sync, sync));
+    if !is_active {
+        // Rotation syncs before sealing and a covering truncate implies the
+        // rows are committed — nothing on disk needs sealing or clamping.
+        return;
+    }
+    let active = entry.active.take().expect("just checked");
+    tracing::warn!(
+        segment = %active.path.display(),
+        synced_len,
+        synced_seq,
+        next_seq = entry.next_seq,
+        "tail segment group fsync FAILED ({why}); sealing it at the durable \
+         boundary — the un-synced statements error, their sequences are burned \
+         (never reused), and new appends go to a fresh segment"
+    );
+    // Erase the non-durable tail of the file; if the disk refuses even the
+    // truncation, a poison marker clamps replay to the durable boundary AND
+    // records where numbering resumes (the burned-hole hint).
+    if roll_back_segment(&active.file, synced_len).is_err() {
+        let marker = poison_marker_path(&active.path);
+        if let Err(me) = fs::write(&marker, format!("{synced_len} {}", entry.next_seq)) {
+            tracing::warn!(
+                marker = %marker.display(),
+                "cannot write tail poison marker (best-effort; a crash before a \
+                 covering flush may then stop replay at the trailing garbage and \
+                 drop LATER acked segments as gapped): {me}"
+            );
+        }
+    }
+    if synced_len > 0 {
+        entry.sealed.push(SealedSegment {
+            path: active.path,
+            max_seq: synced_seq,
+        });
+    } else if fs::remove_file(&active.path).is_ok() {
+        let _ = fs::remove_file(poison_marker_path(&active.path));
+    }
+    // entry.next_seq deliberately NOT touched: the un-synced sequences are
+    // burned (see the doc comment above).
+}
+
+/// [`cleanup_failed_segment_locked`] for callers that do not hold the
+/// tables lock (the staged waiter's failure path).
+fn cleanup_failed_segment(
+    tables: &StdMutex<HashMap<TableIdent, TableWal>>,
+    ident: &TableIdent,
+    sync: &Arc<SegSync>,
+    why: &str,
+) {
+    let mut tables = tables.lock().expect("tail lock poisoned");
+    if let Some(entry) = tables.get_mut(ident) {
+        cleanup_failed_segment_locked(entry, sync, why);
+    }
+}
+
+/// Make every written frame of the active segment durable (rotation's
+/// sync-before-seal step): join an in-flight group sync or lead one. MUST
+/// be called with the tables lock held — safe because an in-flight leader
+/// needs only `sync.m` to finish (never the tables lock while `m` is
+/// held). On failure, performs the cleanup inline (we hold the lock) and
+/// reports the error.
+fn ensure_active_synced(entry: &mut TableWal) -> Result<()> {
+    let Some(active) = &entry.active else {
+        return Ok(());
+    };
+    if active.max_seq == 0 {
+        return Ok(()); // no frames, nothing to sync
+    }
+    let sync = active.sync.clone();
+    let file = active.file.clone();
+    let written = sync
+        .m
+        .lock()
+        .expect("segment sync lock poisoned")
+        .written_len;
+    match wait_group_sync(&sync, &file, written) {
+        Ok(()) => Ok(()),
+        Err(why) => {
+            cleanup_failed_segment_locked(entry, &sync, &why);
+            Err(anyhow!("tail segment sync before rotation failed: {why}"))
+        }
     }
 }
 
 impl TailStore for LocalWal {
     fn append(&self, table: &TableIdent, kind: TailOpKind, batches: &[RecordBatch]) -> Result<u64> {
+        self.append_staged(table, kind, batches)?.wait_durable()
+    }
+
+    /// The group-fsync fast path (module docs, "Group fsync"): under the
+    /// tables lock the frame is written and its sequence consumed; the
+    /// returned waiter joins/leads ONE `sync_data` shared with every other
+    /// statement staged onto the same segment meanwhile. Fsync-before-ack
+    /// holds for EVERY statement of a coalesced batch: a waiter only
+    /// returns Ok once a completed `sync_data` provably covers its frame's
+    /// end offset (the leader snapshots `written_len` BEFORE syncing, so
+    /// bytes written during the sync wait for the next round).
+    fn append_staged(
+        &self,
+        table: &TableIdent,
+        kind: TailOpKind,
+        batches: &[RecordBatch],
+    ) -> Result<StagedAppend> {
         let mut tables = self.tables.lock().expect("tail lock poisoned");
         let entry = table_entry(&self.root, &mut tables, table)?;
         if entry.active.is_none() {
@@ -481,28 +860,38 @@ impl TailStore for LocalWal {
             entry.next_segment += 1;
             entry.active = Some(ActiveSegment {
                 path,
-                file,
+                file: Arc::new(file),
                 max_seq: 0,
                 good_len: 0,
+                sync: Arc::new(SegSync::new(entry.next_seq.saturating_sub(1))),
             });
         }
         let seq = entry.next_seq;
+        // ICEGRES_QUERY_TIMING tail-ack budget: frame encode vs. the durable
+        // write + group-fsync wait. One cached bool load when unset
+        // (timing.rs). The fsync Instant spans staging AND the wait so the
+        // stage keeps meaning "everything the durability costs".
+        let timing = crate::timing::enabled();
         // The whole frame is built in memory FIRST so a failure can only
         // ever leave partial bytes of one contiguous write — which the
         // rollback below erases.
+        let t = timing.then(std::time::Instant::now);
         let frame = encode_frame(seq, kind, batches)?;
+        if let Some(t) = t {
+            crate::timing::record("tail_encode", t.elapsed());
+        }
+        let fsync_started = timing.then(std::time::Instant::now);
         let (write_res, good_len, path) = {
             let active = entry.active.as_mut().expect("just ensured active");
-            let res = active
-                .file
-                .write_all(&frame)
-                .and_then(|()| active.file.sync_data());
+            let res = active.file.write_all(&frame);
             (res, active.good_len, active.path.clone())
         };
         if let Err(e) = write_res {
             // Roll back to the last known-good frame boundary so later
-            // acked frames never sit behind garbage; retry through a fresh
+            // frames never sit behind garbage; retry through a fresh
             // handle before giving up (the original handle may be wedged).
+            // Earlier STAGED frames below good_len stay pending their group
+            // sync — only this frame's partial bytes are erased.
             let rolled_back = {
                 let active = entry.active.as_mut().expect("just ensured active");
                 roll_back_segment(&active.file, good_len).or_else(|_| {
@@ -514,50 +903,76 @@ impl TailStore for LocalWal {
             };
             if let Err(rb) = rolled_back {
                 // POISONED: the disk refused both the write and its undo.
-                // Seal at the last known-good offset and never touch this
-                // file again — the next append opens a fresh segment.
-                tracing::warn!(
-                    segment = %path.display(),
-                    good_len,
-                    "tail segment is POISONED (append failed AND rollback failed: {rb}); \
-                     sealing it at the last good frame — new appends go to a fresh \
-                     segment. A .poisoned marker records the boundary so replay \
-                     clamps there"
-                );
-                // Best-effort marker: record the last good byte length so a
-                // later replay clamps the scan there. The failing disk may
-                // have persisted ANY prefix of the frame — even the whole
-                // thing, a crc-valid "ghost" whose sequence is about to be
-                // reused — and without the clamp it would replay.
-                let marker = poison_marker_path(&path);
-                if let Err(me) = fs::write(&marker, good_len.to_string()) {
-                    tracing::warn!(
-                        marker = %marker.display(),
-                        "cannot write tail poison marker (best-effort; a crash \
-                         before a covering flush may then stop replay at the \
-                         trailing garbage): {me}"
-                    );
+                // The whole un-synced tail of the segment is failed (any
+                // staged-but-unsynced statements error with it — the disk
+                // is refusing writes AND truncations), the segment is
+                // sealed at its DURABLE boundary, and their sequences are
+                // burned. THIS frame's sequence was never consumed and is
+                // safely reused (nothing staged it into any watermark).
+                let sync = entry
+                    .active
+                    .as_ref()
+                    .expect("just ensured active")
+                    .sync
+                    .clone();
+                let why = format!("append failed AND rollback failed: {rb}");
+                {
+                    let mut st = sync.m.lock().expect("segment sync lock poisoned");
+                    if st.failed.is_none() {
+                        st.failed = Some(why.clone());
+                    }
                 }
-                seal_active(entry);
+                sync.cv.notify_all();
+                cleanup_failed_segment_locked(entry, &sync, &why);
             }
             // Either way the sequence number was NOT consumed (it is only
-            // consumed after a durable append), so reusing it is safe: no
-            // durable frame carries it.
+            // consumed after a written frame), so reusing it is safe: no
+            // frame — durable or staged — carries it.
             return Err(anyhow!(e).context(format!("tail append to {} failed", path.display())));
         }
-        // Only now is the frame durable: consume the sequence number.
-        {
+        // The frame is fully written: consume the sequence and publish the
+        // new write boundary to the segment's sync group.
+        let (file, sync, my_end) = {
             let active = entry.active.as_mut().expect("just ensured active");
             active.good_len += frame.len() as u64;
             active.max_seq = seq;
-        }
+            let mut st = active.sync.m.lock().expect("segment sync lock poisoned");
+            st.written_len = active.good_len;
+            st.written_seq = seq;
+            (active.file.clone(), active.sync.clone(), active.good_len)
+        };
         entry.next_seq += 1;
-        Ok(seq)
+        drop(tables);
+        let tables_arc = self.tables.clone();
+        let ident = table.clone();
+        Ok(StagedAppend::with_waiter(
+            seq,
+            Box::new(move || {
+                let res = wait_group_sync(&sync, &file, my_end);
+                if let Some(t) = fsync_started {
+                    crate::timing::record("tail_fsync", t.elapsed());
+                }
+                match res {
+                    Ok(()) => Ok(()),
+                    Err(why) => {
+                        cleanup_failed_segment(&tables_arc, &ident, &sync, &why);
+                        Err(anyhow!(
+                            "tail append to {} failed (group fsync): {why}",
+                            path.display()
+                        ))
+                    }
+                }
+            }),
+        ))
     }
 
     fn rotate(&self, table: &TableIdent) -> Result<()> {
         let mut tables = self.tables.lock().expect("tail lock poisoned");
         if let Some(entry) = tables.get_mut(table) {
+            // Sealed segments must be FULLY durable (the failure-cleanup
+            // and replay logic rely on it): join/lead the group sync for
+            // any staged-but-unsynced frames first.
+            ensure_active_synced(entry)?;
             seal_active(entry);
         }
         Ok(())
@@ -998,24 +1413,43 @@ struct SegmentScan {
     max_seq: Option<u64>,
     /// The segment ended in an invalid frame (now truncated away).
     hit_bad_frame: bool,
+    /// A poison marker's resume hint: the sequence the NEXT segment starts
+    /// at. Group-fsync failures BURN the un-synced sequences (they are
+    /// never reused — see the module docs), so the gap between this
+    /// segment's last durable frame and the next segment is expected, not
+    /// a hole of lost acked writes.
+    resume_hint: Option<u64>,
 }
 
 /// Path of a segment's poison marker (`<segment>.poisoned`) — written
-/// best-effort when an append fails AND its rollback fails; holds the last
-/// good byte length (ASCII u64) so replay clamps the scan there.
+/// best-effort when the disk refuses both a write/fsync and its rollback
+/// truncation. Holds the last DURABLE byte length (ASCII u64) so replay
+/// clamps the scan there, optionally followed by the resume sequence
+/// (`"<len> <resume_seq>"`) so replay accepts the burned-sequence gap in
+/// front of the next segment (see [`SegmentScan::resume_hint`]). The
+/// one-number legacy form still parses (no hint).
 fn poison_marker_path(segment: &Path) -> PathBuf {
     let mut name = segment.as_os_str().to_os_string();
     name.push(".poisoned");
     PathBuf::from(name)
 }
 
-/// Read a poison marker's recorded good byte length. Garbage is a WARN +
-/// `None` — the marker is best-effort defense, never a replay failure.
-fn read_poison_marker(path: &Path) -> Option<u64> {
+struct PoisonMarker {
+    clamp: u64,
+    resume_seq: Option<u64>,
+}
+
+/// Read a poison marker. Garbage is a WARN + `None` — the marker is
+/// best-effort defense, never a replay failure.
+fn read_poison_marker(path: &Path) -> Option<PoisonMarker> {
     let s = fs::read_to_string(path).ok()?;
-    match s.trim().parse::<u64>() {
-        Ok(v) => Some(v),
-        Err(_) => {
+    let mut parts = s.split_whitespace();
+    match parts.next().map(str::parse::<u64>) {
+        Some(Ok(clamp)) => Some(PoisonMarker {
+            clamp,
+            resume_seq: parts.next().and_then(|v| v.parse::<u64>().ok()),
+        }),
+        _ => {
             tracing::warn!(
                 marker = %path.display(),
                 content = s.trim(),
@@ -1039,14 +1473,17 @@ fn scan_segment(path: &Path) -> Result<SegmentScan> {
         fs::read(path).with_context(|| format!("cannot read tail segment {}", path.display()))?;
     let marker = poison_marker_path(path);
     let mut clamp: Option<String> = None;
-    if let Some(good) = read_poison_marker(&marker) {
-        if (data.len() as u64) > good {
+    let mut resume_hint: Option<u64> = None;
+    if let Some(pm) = read_poison_marker(&marker) {
+        resume_hint = pm.resume_seq;
+        if (data.len() as u64) > pm.clamp {
             clamp = Some(format!(
-                "poison marker clamps the scan to {good} bytes ({} bytes of \
+                "poison marker clamps the scan to {} bytes ({} bytes of \
                  post-poisoning garbage past it)",
-                data.len() as u64 - good
+                pm.clamp,
+                data.len() as u64 - pm.clamp
             ));
-            data.truncate(good as usize);
+            data.truncate(pm.clamp as usize);
         }
     }
     let mut frames: Vec<(u64, TailOp)> = Vec::new();
@@ -1122,6 +1559,7 @@ fn scan_segment(path: &Path) -> Result<SegmentScan> {
         max_seq: frames.last().map(|(seq, _)| *seq),
         hit_bad_frame,
         frames,
+        resume_hint,
     })
 }
 
@@ -1157,6 +1595,10 @@ fn scan_table(dir: &Path) -> Result<TableScan> {
     // Segment whose scan ended in a bad frame; later segments must prove
     // sequence continuity to be kept while this is set.
     let mut bad_frame_at: Option<PathBuf> = None;
+    // A poison marker's resume hint: where numbering resumes after burned
+    // (never-reused) sequences — the expected first seq of the NEXT
+    // segment when set (see [`SegmentScan::resume_hint`]).
+    let mut resume_hint: Option<u64> = None;
     for path in &seg_paths {
         if let Some(id) = path
             .file_stem()
@@ -1175,11 +1617,12 @@ fn scan_table(dir: &Path) -> Result<TableScan> {
             }
             if scan.hit_bad_frame {
                 bad_frame_at = Some(path.clone());
+                resume_hint = scan.resume_hint;
             }
             continue;
         };
         if let Some(bad) = &bad_frame_at {
-            let expected = frames.last().map(|(seq, _)| seq + 1);
+            let expected = resume_hint.or_else(|| frames.last().map(|(seq, _)| seq + 1));
             let first = scan.frames.first().map(|(seq, _)| *seq);
             if expected.is_none() || first != expected {
                 tracing::warn!(
@@ -1197,9 +1640,12 @@ fn scan_table(dir: &Path) -> Result<TableScan> {
                 }
                 continue;
             }
-            // Contiguous: the bad frame's sequence was reused by this
-            // segment (the poisoned-append shape) — no hole, keep going.
+            // Contiguous (or exactly at the marker's resume hint): the gap
+            // in front of this segment is the expected shape of a failed
+            // append — a reused never-written sequence, or burned
+            // never-acked ones. No acked row is missing; keep going.
             bad_frame_at = None;
+            resume_hint = None;
         }
         sealed.push(SealedSegment {
             path: path.clone(),
@@ -1208,6 +1654,7 @@ fn scan_table(dir: &Path) -> Result<TableScan> {
         frames.extend(scan.frames);
         if scan.hit_bad_frame {
             bad_frame_at = Some(path.clone());
+            resume_hint = scan.resume_hint;
         }
     }
     let next_seq = frames.last().map(|(seq, _)| seq + 1).unwrap_or(1);
@@ -1832,6 +2279,228 @@ mod tests {
             vec![1, 2, 3]
         );
         assert_eq!(seg_files(&root).len(), 2, "the gapped segment is deleted");
+    }
+
+    // GROUP FSYNC: concurrent staged appends all ack durably, coalesce onto
+    // one segment, and replay in exact sequence order — the
+    // fsync-before-ack + ordering invariants under real thread concurrency.
+    #[test]
+    fn concurrent_staged_appends_all_durable_in_seq_order() {
+        let root = temp_root("group-fsync");
+        let wal = Arc::new(LocalWal::open(&root).unwrap());
+        let threads: Vec<_> = (0..8i64)
+            .map(|v| {
+                let wal = wal.clone();
+                std::thread::spawn(move || {
+                    let staged = wal
+                        .append_staged(&ident(), TailOpKind::Append, &[batch(&[v])])
+                        .unwrap();
+                    let seq = staged.seq();
+                    // fsync-before-ack: wait_durable must succeed before the
+                    // caller may ack.
+                    assert_eq!(staged.wait_durable().unwrap(), seq);
+                    (seq, v)
+                })
+            })
+            .collect();
+        let mut acked: Vec<(u64, i64)> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        acked.sort();
+        let seqs: Vec<u64> = acked.iter().map(|(s, _)| *s).collect();
+        assert_eq!(seqs, (1..=8).collect::<Vec<u64>>(), "dense, no burns");
+        drop(wal);
+        let wal2 = LocalWal::open(&root).unwrap();
+        let frames = replay_frames(&wal2);
+        assert_eq!(frames.len(), 8);
+        for (i, (t, seq, batches)) in frames.iter().enumerate() {
+            assert_eq!(t, &ident());
+            assert_eq!(*seq, i as u64 + 1, "replay in sequence order");
+            // The value each acked statement wrote is exactly what its seq
+            // carries on disk.
+            let want = acked.iter().find(|(s, _)| s == seq).unwrap().1;
+            assert_eq!(ids(&batches[0]), vec![want]);
+        }
+    }
+
+    // GROUP FSYNC: rotate() makes staged-but-unwaited frames durable BEFORE
+    // sealing (sealed segments are always fully durable — the invariant the
+    // failure cleanup and replay rely on); the deferred wait then returns
+    // immediately and the frame replays.
+    #[test]
+    fn rotate_syncs_staged_frames_before_sealing() {
+        let root = temp_root("rotate-staged");
+        let wal = LocalWal::open(&root).unwrap();
+        let staged = wal
+            .append_staged(&ident(), TailOpKind::Append, &[batch(&[1])])
+            .unwrap();
+        wal.rotate(&ident()).unwrap();
+        assert_eq!(staged.wait_durable().unwrap(), 1);
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[2])])
+            .unwrap();
+        assert_eq!(seg_files(&root).len(), 2, "rotation sealed the segment");
+        drop(wal);
+        let wal2 = LocalWal::open(&root).unwrap();
+        let frames = replay_frames(&wal2);
+        assert_eq!(frames.iter().map(|f| f.1).collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    // F1 (ordering flip): once a failure lands, a waiter must get the
+    // error EVEN IF its boundary check would be satisfied — the failure
+    // cleanup truncates to the boundary it snapshots, so a satisfied
+    // boundary must never mask a failure that erased (or is erasing) bytes.
+    #[test]
+    fn failed_flag_beats_satisfied_boundary() {
+        let root = temp_root("failed-first");
+        let file = File::create(root.join("f.seg")).unwrap();
+        let sync = SegSync::new(0);
+        {
+            let mut st = sync.m.lock().unwrap();
+            st.written_len = 100;
+            st.written_seq = 3;
+            st.synced_len = 100;
+            st.synced_seq = 3;
+            st.failed = Some("injected failure".into());
+        }
+        let err = wait_group_sync(&sync, &file, 50).unwrap_err();
+        assert!(err.contains("injected failure"), "got: {err}");
+    }
+
+    // F1 (the fsync-before-ack race, both ends): a poison-path cleanup
+    // racing an IN-FLIGHT group fsync must wait for the sync to complete
+    // before snapshotting the durable boundary, and the leader's Ok arm
+    // must not advance the boundary once the failure landed — pre-fix, the
+    // cleanup snapshotted mid-sync, truncated the segment (erasing the
+    // in-flight frame), and the leader's completing sync then advanced
+    // `synced_len` past the erased frame, ACKING it (silent loss at the
+    // next crash-replay). The test parks a leader mid-sync via the
+    // test-only hook and injects the failure + cleanup concurrently.
+    #[test]
+    fn cleanup_waits_for_inflight_sync_and_erased_frame_never_acks() {
+        let root = temp_root("f1-race");
+        let wal = Arc::new(LocalWal::open(&root).unwrap());
+        // Frame 1: fully durable — the boundary the cleanup must seal at.
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[1])])
+            .unwrap();
+        let sync = {
+            let tables = wal.tables.lock().unwrap();
+            tables
+                .get(&ident())
+                .unwrap()
+                .active
+                .as_ref()
+                .unwrap()
+                .sync
+                .clone()
+        };
+        // Park the next sync leader until released.
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        // Mutex wrappers: mpsc endpoints are Send but not Sync, and the
+        // hook is a shared `dyn Fn + Sync`.
+        let parked_tx = StdMutex::new(parked_tx);
+        let release_rx = StdMutex::new(release_rx);
+        *sync.test_sync_hook.lock().unwrap() = Some(Arc::new(move || {
+            let _ = parked_tx.lock().unwrap().send(());
+            let _ = release_rx.lock().unwrap().recv();
+        }));
+        // Statement 2: stages its frame and leads the group sync (parks).
+        let wal_writer = wal.clone();
+        let waiter = std::thread::spawn(move || {
+            let staged = wal_writer
+                .append_staged(&ident(), TailOpKind::Append, &[batch(&[2])])
+                .unwrap();
+            staged.wait_durable()
+        });
+        parked_rx.recv().expect("leader parked in the sync hook");
+        // Later syncs (post-cleanup appends) run unhooked.
+        *sync.test_sync_hook.lock().unwrap() = None;
+        // Another statement's poison arm, mid-flight: failure lands + the
+        // cleanup runs while the leader is STILL inside sync_data.
+        {
+            let mut st = sync.m.lock().unwrap();
+            st.failed = Some("injected poison while a sync is in flight".into());
+        }
+        sync.cv.notify_all();
+        let cleaned_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleanup = {
+            let wal = wal.clone();
+            let sync = sync.clone();
+            let cleaned_up = cleaned_up.clone();
+            std::thread::spawn(move || {
+                cleanup_failed_segment(&wal.tables, &ident(), &sync, "injected poison");
+                cleaned_up.store(true, Ordering::SeqCst);
+            })
+        };
+        // The cleanup MUST block while the leader is mid-sync: no boundary
+        // snapshot, no truncation of bytes the sync may prove durable.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            !cleaned_up.load(Ordering::SeqCst),
+            "cleanup must wait out the in-flight sync before snapshotting"
+        );
+        // Release the leader: its sync_data physically succeeds, but the
+        // failure landed — the boundary must NOT advance and the statement
+        // must ERROR (never ack a frame the cleanup erases).
+        release_tx.send(()).unwrap();
+        let res = waiter.join().unwrap();
+        assert!(res.is_err(), "the erased frame must never ack");
+        cleanup.join().unwrap();
+        assert!(cleaned_up.load(Ordering::SeqCst));
+        // Seq 2 is burned; the next append opens a fresh segment at seq 3.
+        assert_eq!(
+            wal.append(&ident(), TailOpKind::Append, &[batch(&[3])])
+                .unwrap(),
+            3
+        );
+        drop(wal);
+        // Crash-replay ground truth: exactly the ACKED frames (1 and 3) —
+        // the failed statement is erased AND errored, never both persisted
+        // and errored silently, and never erased yet acked.
+        let wal2 = LocalWal::open(&root).unwrap();
+        let frames = replay_frames(&wal2);
+        assert_eq!(frames.iter().map(|f| f.1).collect::<Vec<_>>(), vec![1, 3]);
+        assert_eq!(ids(&frames[0].2[0]), vec![1]);
+        assert_eq!(ids(&frames[1].2[0]), vec![3]);
+    }
+
+    // GROUP FSYNC failure shape: a poison marker with a RESUME HINT
+    // (`"<len> <resume_seq>"`) — the on-disk trace of burned (never-reused,
+    // never-acked) sequences — clamps the scan AND lets the next segment
+    // survive the gap, so acked frames past a failed batch are never
+    // deleted as "behind a hole".
+    #[test]
+    fn poison_marker_resume_hint_bridges_burned_gap() {
+        let root = temp_root("burn-hint");
+        let wal = LocalWal::open(&root).unwrap();
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[1])])
+            .unwrap();
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[2])])
+            .unwrap();
+        wal.rotate(&ident()).unwrap();
+        // Seqs 3-4 burned by a failed group fsync (never durable, never
+        // acked); numbering resumed at 5 in a fresh segment.
+        wal.ensure_seq_floor(&ident(), 5).unwrap();
+        wal.append(&ident(), TailOpKind::Append, &[batch(&[5])])
+            .unwrap();
+        drop(wal);
+        let segs = seg_files(&root);
+        assert_eq!(segs.len(), 2);
+        // The failed batch's trace on segment 1: garbage past the durable
+        // boundary plus the marker recording (durable_len, resume_seq).
+        let good_len = fs::metadata(&segs[0]).unwrap().len();
+        let mut f = OpenOptions::new().append(true).open(&segs[0]).unwrap();
+        f.write_all(&[0xde, 0xad, 0xbe, 0xef, 0x42]).unwrap();
+        drop(f);
+        fs::write(poison_marker_path(&segs[0]), format!("{good_len} 5")).unwrap();
+        let wal2 = LocalWal::open(&root).unwrap();
+        let frames = replay_frames(&wal2);
+        assert_eq!(
+            frames.iter().map(|f| f.1).collect::<Vec<_>>(),
+            vec![1, 2, 5],
+            "the hinted gap is accepted; the acked later segment survives"
+        );
+        assert_eq!(seg_files(&root).len(), 2, "nothing deleted");
+        // Contrast: without the hint the same shape would treat 3-4 as a
+        // real hole (gapped_segment_behind_bad_frame_is_deleted below).
     }
 
     // PHASE 2: the op discriminator round-trips through the file framing

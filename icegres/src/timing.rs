@@ -28,6 +28,43 @@
 //! the default handler byte-identical. Known divergence when ENABLED (a
 //! diagnostic mode): rows are buffered rather than streamed, and the
 //! per-session `statement_timeout` is not applied to intercepted `SELECT`s.
+//!
+//! # Write-path stages (same env var, same zero-cost contract)
+//!
+//! The WRITE hot paths emit stage records through [`record`] too — every
+//! call site gates its `Instant::now()` on [`enabled`], so an unset env var
+//! costs one cached bool load per statement:
+//!
+//! * sync commit (overwrite.rs `prepare_commit` / `post_commit` and the
+//!   autocommit retry loops): `insert_plan` (txn.rs, shaping INSERT rows
+//!   through DataFusion), `file_scan` (reading existing live data files),
+//!   `dml_apply` (folding UPDATE/DELETE ops over rows), `parquet_encode`
+//!   (data-writer writes), `data_file_put` (writer close = Parquet flush +
+//!   object-store PUT(s)), `manifest_put`, `manifest_list_put`,
+//!   `prepare_total`, `catalog_post` (the REST commit POST), and one
+//!   `commit_attempt`/`commit_retry` per optimistic-concurrency attempt.
+//!   Because the stock fast_append INSERT runs fused inside
+//!   iceberg-datafusion's execution plan, timing mode routes PLAIN
+//!   autocommit INSERTs through the engine path so these stages are
+//!   observable (txn.rs `autocommit_insert` docs) — an equivalent append
+//!   snapshot, posted via the same REST commit.
+//! * tail ack (tail.rs / tail_pg.rs / tail_quorum.rs + buffer.rs):
+//!   `tail_encode` (Arrow-IPC frame/payload encode), then per backend
+//!   `tail_fsync` (local WAL frame write + group-fsync wait — the whole
+//!   durability cost of the statement, shared syncs included) /
+//!   `tail_pg_commit` (tail-database INSERT+commit round trip) /
+//!   `tail_quorum_ack` (proposer round trip to a 2-of-3 AppendResp
+//!   quorum); `buffer_route` (in-memory window bookkeeping),
+//!   `buffer_append` (whole statement append: align, staged tail append,
+//!   bookkeeping, and the durability wait — which since the group-fsync
+//!   change runs AFTER the buffer lock drops), `buffer_ack_total` (whole
+//!   buffered-INSERT ack incl. planning).
+//! * keyed tail writes (buffer.rs `try_keyed_dml`): `keyed_gate`
+//!   (activation resolution: freshness-cached metadata when
+//!   `--freshness-ms` is on and fresh — ~0 — otherwise one catalog load),
+//!   `keyed_rmw_read` (current-row resolution: keyed-map hit or union-view
+//!   read), `keyed_apply` (folding the statement over the row),
+//!   `keyed_write` (durable tail append + map insert), `keyed_total`.
 
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};

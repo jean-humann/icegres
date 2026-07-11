@@ -283,6 +283,27 @@ impl CachingTableProvider {
         crate::freshness::table_key(&self.ident)
     }
 
+    /// The cached table metadata (+ its metadata location, when known) —
+    /// `Some` ONLY when serving it without a catalog round trip is sound
+    /// under the freshness contract: freshness mode is on and the cache is
+    /// currently fresh (a local write/DDL invalidates synchronously; a
+    /// foreign writer's change lands within the configured bound). `None`
+    /// in default mode, so callers keep their exact per-statement catalog
+    /// load byte-identical. Used by the keyed-DML activation gate
+    /// (buffer.rs): the gate's per-statement `load_table` rides the same
+    /// bounded-staleness cache reads already ride.
+    pub(crate) fn fresh_metadata(
+        &self,
+    ) -> Option<(Option<String>, iceberg::spec::TableMetadataRef)> {
+        let f = self.freshness.as_ref()?;
+        if !f.is_fresh() {
+            return None;
+        }
+        let guard = crate::freshness::recover("cache lock", self.cached.read());
+        let cached = guard.as_ref()?;
+        Some((cached.version.0.clone(), cached.metadata.clone()))
+    }
+
     /// The metadata version a cached physical plan over this table may be
     /// reused at (plancache.rs). `Some(version)` ONLY when a plan-cache hit
     /// is sound without any catalog round trip: freshness mode is on, the

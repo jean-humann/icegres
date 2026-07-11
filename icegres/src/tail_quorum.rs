@@ -109,6 +109,11 @@ enum Job {
     PeerFlushes {
         resp: std_mpsc::Sender<Result<Vec<u64>>>,
     },
+    /// Test-only: an append-shaped job whose spawned responder PANICS
+    /// before replying (drops `resp` unsent) — exercises the
+    /// closed-channel => poison wiring in `append_roundtrip`.
+    #[cfg(test)]
+    InjectAppendPanic { resp: std_mpsc::Sender<Result<()>> },
 }
 
 /// What the worker reports back once the election + recovery are done.
@@ -129,6 +134,16 @@ pub struct QuorumTail {
     /// (and a poisoned tail never appends again, so an ambiguous timed-out
     /// number is never reused either).
     next_seq: StdMutex<HashMap<TableIdent, u64>>,
+    /// QuorumTail-level poison (distinct from the proposer's own): set
+    /// when an append's responder DIES without reporting an outcome (the
+    /// spawned worker task panicked, or the worker runtime tore down
+    /// mid-append). The record may or may not have entered the replicated
+    /// log; since the failed append did not consume its sequence, letting
+    /// a later append reuse `(table, seq)` against a log that may hold the
+    /// record would double-apply on replay — so every later append fails
+    /// instead (same no-reuse rule as the proposer's timeout poison;
+    /// restart the server to recover the ambiguous record exactly-once).
+    poisoned: StdMutex<Option<String>>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -178,6 +193,7 @@ impl QuorumTail {
             prop_key: format!("{TAIL_SEQ_PROPERTY_PREFIX}{}", init.tail_id),
             job_tx: Some(job_tx),
             next_seq: StdMutex::new(next_seq),
+            poisoned: StdMutex::new(None),
             worker: Some(worker),
         })
     }
@@ -197,9 +213,73 @@ impl QuorumTail {
             .map_err(|_| anyhow!("tail-quorum worker dropped a request; restart the server"))?
     }
 
+    /// Round-trip an append-shaped job, with the poison rule an append's
+    /// AMBIGUITY demands (unlike [`call`](Self::call)): a send failure
+    /// means the job never reached the worker (the record certainly did
+    /// not enter the log — plain retryable error), but a responder that
+    /// DIES without replying (the spawned task panicked inside
+    /// `Quorum::append`, or the worker runtime tore down mid-flight) is
+    /// ambiguous — the record MAY be in the replicated log — so the tail
+    /// poisons itself before erroring: the un-consumed `(table, seq)` must
+    /// never be reused against a log that may hold it (double-apply on
+    /// replay). Restart recovers the ambiguous record exactly-once via the
+    /// election, exactly like the proposer's timeout poison.
+    fn append_roundtrip(
+        &self,
+        table: &TableIdent,
+        seq: u64,
+        build: impl FnOnce(std_mpsc::Sender<Result<()>>) -> Job,
+    ) -> Result<()> {
+        let (resp_tx, resp_rx) = std_mpsc::channel();
+        self.job_tx
+            .as_ref()
+            .expect("job_tx lives until drop")
+            .send(build(resp_tx))
+            .map_err(|_| anyhow!("tail-quorum worker is gone; restart the server"))?;
+        match resp_rx.recv() {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                let why = format!(
+                    "the tail-quorum append for {table} (seq {seq}) died without \
+                     reporting an outcome (worker task panicked or the worker shut \
+                     down mid-append); the record may already be in the replicated \
+                     log, so its sequence can never be reused"
+                );
+                let mut poisoned = self.poisoned.lock().expect("tail-quorum poison lock");
+                if poisoned.is_none() {
+                    *poisoned = Some(why.clone());
+                }
+                drop(poisoned);
+                Err(anyhow!(
+                    "quorum tail is POISONED ({why}); restart the server — the \
+                     election recovers the ambiguous record exactly once"
+                ))
+            }
+        }
+    }
+
+    /// The sticky QuorumTail-level poison check (see the `poisoned` field).
+    fn check_poisoned(&self) -> Result<()> {
+        let poisoned = self.poisoned.lock().expect("tail-quorum poison lock");
+        match poisoned.as_ref() {
+            Some(why) => Err(anyhow!(
+                "quorum tail is POISONED ({why}); restart the server"
+            )),
+            None => Ok(()),
+        }
+    }
+
     #[cfg(test)]
     fn peer_flushes(&self) -> Result<Vec<u64>> {
         self.call(|resp| Job::PeerFlushes { resp })
+    }
+
+    /// Test-only: drive an append-shaped job whose spawned responder
+    /// PANICS before replying — the injectable stand-in for a panic inside
+    /// `Quorum::append` (see [`append_roundtrip`](Self::append_roundtrip)).
+    #[cfg(test)]
+    fn inject_append_panic(&self, table: &TableIdent, seq: u64) -> Result<()> {
+        self.append_roundtrip(table, seq, |resp| Job::InjectAppendPanic { resp })
     }
 }
 
@@ -216,20 +296,33 @@ impl Drop for QuorumTail {
 
 impl TailStore for QuorumTail {
     fn append(&self, table: &TableIdent, kind: TailOpKind, batches: &[RecordBatch]) -> Result<u64> {
+        self.check_poisoned()?;
         let key = table_dir_name(table)?;
+        // ICEGRES_QUERY_TIMING tail-ack budget: payload encode vs. the
+        // proposer round trip to a 2-of-3 AppendResp quorum. Cached bool
+        // when unset.
+        let timing = crate::timing::enabled();
         // Encode BEFORE consuming anything: an unencodable statement fails
         // with no seq minted and no round trip made.
+        let t = timing.then(std::time::Instant::now);
         let payload = encode_op_payload(kind, batches)?;
+        if let Some(t) = t {
+            crate::timing::record("tail_encode", t.elapsed());
+        }
         let mut map = self.next_seq.lock().expect("tail-quorum seq lock poisoned");
         let entry = map.entry(table.clone()).or_insert(1);
         let seq = *entry;
-        self.call(|resp| Job::Append {
+        let t = timing.then(std::time::Instant::now);
+        self.append_roundtrip(table, seq, |resp| Job::Append {
             key,
             seq,
             payload,
             resp,
         })
         .with_context(|| format!("quorum-tail append for {table} (seq {seq}) failed"))?;
+        if let Some(t) = t {
+            crate::timing::record("tail_quorum_ack", t.elapsed());
+        }
         // Only now is the record quorum-durable: consume the sequence.
         *entry += 1;
         Ok(seq)
@@ -343,6 +436,18 @@ fn worker_main(
                 return;
             }
         };
+        // `Arc` so Append jobs can be SPAWNED off the job loop: an
+        // append's quorum round trip must not head-of-line-block the next
+        // job (the flusher's truncate/watermark jobs behind a statement's
+        // append). HONEST SCOPE: this is NOT append pipelining — appends
+        // themselves still serialize upstream (QuorumTail::append holds
+        // the seq-map lock across the reply, and the default
+        // `append_staged` runs the whole round trip under the buffer
+        // lock), so at most ONE statement append is ever in flight.
+        // `Quorum::append` would tolerate more (records enter the shared
+        // LogBuf under its lock, commit waiters are broadcast-driven), but
+        // the per-table sequencing above it does not, yet.
+        let quorum = std::sync::Arc::new(quorum);
         let mut seeds: HashMap<String, u64> = HashMap::new();
         // Highest watermark appended per table (never regress the sidecar,
         // mirroring LocalWal's skip).
@@ -372,7 +477,7 @@ fn worker_main(
 }
 
 async fn run_job(
-    quorum: &Quorum,
+    quorum: &std::sync::Arc<Quorum>,
     replay_records: &mut Option<Vec<Record>>,
     wm_max: &mut HashMap<String, u64>,
     job: Job,
@@ -384,8 +489,21 @@ async fn run_job(
             payload,
             resp,
         } => {
-            let r = quorum.append(RECORD_FRAME, &key, seq, &payload).await;
-            let _ = resp.send(r);
+            // Spawned so truncate/watermark jobs behind it are not
+            // head-of-line blocked — NOT append pipelining (see the
+            // worker_main comment: QuorumTail::append holds the seq-map
+            // lock across the reply, so at most one append job is in
+            // flight; the LSN is assigned inside `Quorum::append` under
+            // the log lock). If this task dies WITHOUT replying (a panic
+            // inside `Quorum::append`), `resp` drops unsent and the caller
+            // observes the closed channel and POISONS the tail — the
+            // record may already be in the log and its un-consumed
+            // sequence must never be reused (QuorumTail::append_roundtrip).
+            let quorum = quorum.clone();
+            tokio::spawn(async move {
+                let r = quorum.append(RECORD_FRAME, &key, seq, &payload).await;
+                let _ = resp.send(r);
+            });
         }
         Job::Replay { resp } => {
             let _ = resp.send(Ok(replay_records.take().unwrap_or_default()));
@@ -432,6 +550,15 @@ async fn run_job(
         #[cfg(test)]
         Job::PeerFlushes { resp } => {
             let _ = resp.send(Ok(quorum.peer_flushes()));
+        }
+        #[cfg(test)]
+        Job::InjectAppendPanic { resp } => {
+            tokio::spawn(async move {
+                // `resp` is moved in and dropped UNSENT when the panic
+                // unwinds — the caller sees the closed channel.
+                let _hold = resp;
+                panic!("injected append panic (test)");
+            });
         }
     }
 }
@@ -1047,5 +1174,50 @@ mod tests {
         drop(tail);
         drop(a1);
         drop(a2);
+    }
+
+    // F4: an append whose spawned worker task DIES without reporting an
+    // outcome (a panic inside Quorum::append) is AMBIGUOUS — the record
+    // may already be in the replicated log — so the tail must POISON
+    // itself instead of returning a plain error: the failed append never
+    // consumed its sequence, and a later append reusing (table, seq)
+    // against a log that may hold the record would double-apply on replay.
+    #[test]
+    fn append_task_death_without_outcome_poisons_the_tail() {
+        let (_acceptors, addrs) = spawn_cluster("panic-poison");
+        let tail = QuorumTail::open_with_config(cfg(&addrs, 5000)).unwrap();
+        assert_eq!(
+            tail.append(&ident(), TailOpKind::Append, &[batch(&[1])])
+                .unwrap(),
+            1
+        );
+        // Seq 2 would be next; its injected append dies without an outcome.
+        let err = tail.inject_append_panic(&ident(), 2).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("POISONED"),
+            "a dead-responder append must poison, got: {err:#}"
+        );
+        // The poison is sticky: no later append runs (so the ambiguous
+        // sequence is never reused), and the worker is still alive (the
+        // panic was confined to the spawned task) — the check fires before
+        // any round trip.
+        let err = tail
+            .append(&ident(), TailOpKind::Append, &[batch(&[2])])
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("POISONED"), "got: {err:#}");
+        drop(tail);
+        // A restart (new election) recovers exactly the acked records.
+        let tail = QuorumTail::open_with_config(cfg(&addrs, 5000)).unwrap();
+        let replayed = tail.replay().unwrap();
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(
+            replayed[0]
+                .frames
+                .iter()
+                .map(|(s, _)| *s)
+                .collect::<Vec<_>>(),
+            vec![1],
+            "exactly the acked record survives the poisoned session"
+        );
     }
 }

@@ -442,10 +442,10 @@ runs, not projections.
 
 | phase | status | capability added (commit) | measured |
 |---|---|---|---|
-| 1 — durable tail, `local` backend | **shipped** | `--tail-dir`: fsync'd per-table WAL before every buffered ack, boot replay, lake-anchored watermark — closes the unclean-kill loss window (`feat: durable local tail`) | ~3.2 ms p50 tail ack (vs ~1.3 ms untailed, ~50–80 ms synchronous); durability suite 17/17 (SIGKILL replay, exactly-once across double crash) |
+| 1 — durable tail, `local` backend | **shipped** | `--tail-dir`: fsync'd per-table WAL before every buffered ack, boot replay, lake-anchored watermark — closes the unclean-kill loss window (`feat: durable local tail`); group fsync added by the write-latency increment (§11) | ~1.5–2.5 ms p50 tail ack (vs ~1.4 ms untailed, ~46 ms synchronous); concurrent writers coalesce (8 writers p50 ~6 ms vs ~9 ms serialized); durability suite (SIGKILL replay, exactly-once across double crash) green incl. the group-fsync change |
 | 1b — durable tail, `postgres` backend | **shipped — durability half** | `--tail-url`: node-loss-durable tail in any Postgres, one-writer advisory lock, same watermark protocol (`feat: Postgres tail backend`). The SHARED half (fleet overlays via LISTEN/NOTIFY, flush leases) is still open — see §3 | durability suite grew 17→33 assertions, PG sections mirroring every LocalWal proof; no benched metric regressed vs the phase-3 baseline |
 | 1c — durable tail, `quorum` backend | **shipped** | `--tail-quorum` + `icekeeperd`: consensus-class tail — 2-of-3 acceptor fsyncs before every buffered ack, election/recovery on boot, term fencing instead of lock files, same watermark protocol (SafeKeeper fork with attribution; see §3) | 31 consensus unit tests + 6 in-process integration tests (one-down/two-down/catch-up/replay/fencing) green in ~1 s; durability suite grew 50→~70 assertions (section 10: compute kill, acceptor kill, exactly-once, seq floor, fencing) |
-| 2 — hot rows: PK upserts on the tail | **shipped — single-compute half** | `icegres.primary-key` + `icegres.tail-upsert`: exact-PK UPDATE/DELETE ack from the tail, per-key LWW coalescing into ONE commit per window, union-read key suppression (`feat: keyed PK upserts`). Cross-compute arbitration + MoR deletion vectors still open (matrix-gated) | 9.5 ms p50 keyed ack vs ~71 ms synchronous COW (7.4×); 30 hot-row updates → 3 snapshots instead of 30; durability suite 33→50 assertions |
+| 2 — hot rows: PK upserts on the tail | **shipped — single-compute half** | `icegres.primary-key` + `icegres.tail-upsert`: exact-PK UPDATE/DELETE ack from the tail, per-key LWW coalescing into ONE commit per window, union-read key suppression (`feat: keyed PK upserts`). Cross-compute arbitration + MoR deletion vectors still open (matrix-gated) | 5.2 ms p50 keyed ack with `--freshness-ms 25`, 7.0 ms exact-freshness (was 9.5 ms pre-§11) vs ~46 ms synchronous COW; hot-row updates → ONE snapshot per flush window; durability suite 33→50 assertions |
 | 3 — multi-table atomicity + whole-lakehouse branches | **shipped** | One `CommitTransactionRequest` per multi-table COMMIT (40001 on conflict, nothing applied; ordered/40003 fallback preserved) + `branch create-all`/`drop-all` atomic cross-table cuts (`feat: atomic multi-table transactions`) | verified live against Lakekeeper 0.13.1; e2e grew to 140 assertions incl. section (j2)/(u) contracts |
 | 4 — table health: compaction + orphan GC | **partial: orphan GC shipped; compaction gated** | `maintain remove-orphans`: object-store listing vs live-set diff, dry-run default, 72 h grace, fail-closed (this tree). The small-file *source* was fixed by Phase 1–2 cadence commits; bin-pack rewrite waits on the pinned iceberg-rust matrix gaining replace-files | orphan-GC e2e contract proven (dry-run deletes nothing; `--execute` removes exactly the reported set with rows/live files intact; rerun reports 0); e2e suite grew 153→163 assertions |
 | 5 — secondary index tier | **deferred by design** | none — the §7 bar stands: build against real scale evidence, not the feature list | point lookups measured at 6.9 ms with no index object; no workload has beaten that bar yet |
@@ -460,9 +460,43 @@ runs, not projections.
   4.3 ms p95** at `--freshness-ms 25`; repeated statements ~2.8 ms;
   default (0) byte-identical exact freshness. e2e §(z); the per-stage
   timing instrumentation (`ICEGRES_QUERY_TIMING=1`) ships with it.
-- **Sub-10 ms durable writes — QUEUED.** Full scope in
-  `write-latency-scope.md`: write-path instrumentation, tail-ack
-  group-fsync + quorum pipelining + bench ladder legs, keyed RMW fast
-  path (< 7 ms via the read machinery), sync-path parallel uploads
-  (~30–40 ms honest target — sub-10 sync commits are physically
-  impossible on object storage; the tail IS the sub-10 write path).
+- **Sub-10 ms durable writes — SHIPPED (this tree).** Full scope in
+  `write-latency-scope.md`; sub-10 sync commits are physically impossible
+  on object storage — the tail IS the sub-10 write path, now measured and
+  first-class. Measured p50s (local Lakekeeper 0.13.1 + RustFS + PG16):
+  - **Write instrumentation**: `ICEGRES_QUERY_TIMING=1` now covers the
+    write hot paths (sync commit stages, per-backend tail-ack stages,
+    keyed RMW stages; timing.rs module docs) — zero cost when unset.
+  - **Tail acks**: `--tail-dir` **~1.5–2.5 ms** single-writer (never worse
+    than pre-change: alternating A/B 1.73/1.52/1.74 → 1.55/1.50/1.63 ms),
+    and the new LOCAL-WAL GROUP FSYNC coalesces concurrent statements:
+    4 writers p50 4.0 → **3.5 ms** (p95 9–15 → 5.6–8.6), 8 writers p50
+    8.8 → **6.1–6.6 ms** (p95 21–27 → 10.5–12). `--tail-url` **~2.2 ms**,
+    `--tail-quorum` **~2.5 ms** — honest scope: quorum append PIPELINING
+    was NOT achieved (the scope item stays open) — appends still
+    serialize on the per-server sequence lock (and the buffer lock, via
+    the default `append_staged`); what shipped is only the removal of the
+    worker loop's head-of-line blocking, so truncate/watermark jobs no
+    longer queue behind an in-flight append (plus poison-on-dead-append
+    so a worker-task panic can never lead to sequence reuse).
+    `bench/bench.sh` gained the ungated `durable_ack_{dir,pg,quorum}_ms`
+    ladder legs (own icekeeperd trio lifecycle).
+  - **Keyed RMW fast path**: keyed UPDATE **5.2 ms p50 / 7.8 ms p95** with
+    `--freshness-ms 25` (target < 7 ms met; hard gate < 10 ms met) — the
+    activation gate rides the freshness cache (2.4 ms → ~0), a hot key
+    resolves from the keyed map with no engine read; **7.0 ms** under
+    exact freshness (was 9.5 ms pre-increment; gate now 2.4 ms after the
+    redundant-load removal).
+  - **Sync path**: single INSERT **51.8 → 46.0 ms** client p50 in the
+    timing-mode engine-path probe (`commit_attempt` 47.0 → 37.5 ms:
+    redundant per-statement double `load_table` killed, append-only
+    manifest-list read overlapped with data staging); batch-100
+    **47.7 → 40.3 ms**; COW UPDATE holds/improves (the m0 manifest PUT
+    now overlaps the data-file close — spec-safe: the manifest list is
+    written strictly after every manifest, the catalog POST strictly
+    after the list). HTTP connection reuse VERIFIED, not assumed: server
+    fd count constant (11 sockets) across 15 sequential commits — reqwest
+    pools for the engine, REST catalog, and S3 paths; nothing to enable.
+  - **Refused trade** (docs/limitations.md): explicit transactions REMAIN
+    synchronous — a tail-staged COMMIT would ack before conflict
+    detection and break `40001`.

@@ -283,14 +283,22 @@ impl Drop for PgTail {
 impl TailStore for PgTail {
     fn append(&self, table: &TableIdent, kind: TailOpKind, batches: &[RecordBatch]) -> Result<u64> {
         let key = table_dir_name(table)?;
+        // ICEGRES_QUERY_TIMING tail-ack budget: payload encode vs. the
+        // durable INSERT+commit round trip. Cached bool when unset.
+        let timing = crate::timing::enabled();
         // Encode BEFORE consuming anything: an unencodable statement fails
         // with no seq minted and no round trip made.
+        let t = timing.then(std::time::Instant::now);
         let payload = encode_op_payload(kind, batches)?;
+        if let Some(t) = t {
+            crate::timing::record("tail_encode", t.elapsed());
+        }
         let mut map = self.next_seq.lock().expect("tail-pg seq lock poisoned");
         let entry = map.entry(table.clone()).or_insert(1);
         let seq = *entry;
         let seq_i64 = i64::try_from(seq)
             .map_err(|_| anyhow!("tail sequence {seq} for {table} overflows BIGINT"))?;
+        let t = timing.then(std::time::Instant::now);
         self.call(|resp| Job::Append {
             key,
             seq: seq_i64,
@@ -298,6 +306,9 @@ impl TailStore for PgTail {
             resp,
         })
         .with_context(|| format!("tail-pg append for {table} (seq {seq}) failed"))?;
+        if let Some(t) = t {
+            crate::timing::record("tail_pg_commit", t.elapsed());
+        }
         // Only now is the frame durable: consume the sequence number (a
         // failed INSERT left no row, so reusing its number is safe).
         *entry += 1;

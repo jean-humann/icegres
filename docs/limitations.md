@@ -43,6 +43,23 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
   extended protocol normally.
 - **DDL and non-DML statements inside a transaction are rejected** (`0A000`),
   never half-applied.
+- **Explicit transactions REMAIN synchronous — the tail-staged COMMIT was
+  evaluated and REFUSED.** Buffered/tail mode never applies to
+  `BEGIN … COMMIT`: `BEGIN` is an ordering fence (the buffer flushes first)
+  and `COMMIT` is a synchronous Iceberg commit (~50 ms+), even when every
+  autocommit INSERT on the same server acks from the tail in ~2 ms. The
+  tempting optimization — ack the COMMIT after fsyncing the transaction's
+  ops to the durable tail and post the catalog commit asynchronously —
+  would acknowledge BEFORE the catalog's `assert-ref-snapshot-id` check
+  runs, i.e. before conflict detection. A losing transaction could then no
+  longer answer its COMMIT with `40001` (the client is gone, told
+  "committed"); the only remaining options are silently dropping the
+  transaction (lost acked writes) or silently re-applying it against data
+  it never read (row counts and read-your-writes become lies). That breaks
+  the first-committer-wins contract above, so the trade is refused, not
+  deferred. Use autocommit statements (buffered INSERT, keyed
+  UPDATE/DELETE) when you need tail-latency acks; use transactions when
+  you need multi-statement atomicity with honest conflict reporting.
 
 ## Ingestion and cursors
 
@@ -132,11 +149,20 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
   materializes the whole surviving tail in memory before the flusher drains
   it; and one residual double-apply window remains (a crash between the
   commit and the sidecar write combined with a foreign writer dropping the
-  watermark property). Two more operational notes: the tail fsync runs under
-  the buffer lock, so a slow tail disk stalls other tables' buffered INSERTs
-  *and* same-server union reads for that fsync's window (per-table locking is
-  the known follow-up); and the single-writer guard is an advisory `flock`,
-  which is unreliable on NFS — put the tail dir on a local filesystem.
+  watermark property). Two more operational notes: the tail fsync is
+  GROUP-COMMITTED outside the buffer lock (frames are staged under the
+  lock, concurrent statements share one `sync_data`; measured: 8 concurrent
+  writers p50 ~6 ms vs ~9 ms when it serialized) — a statement that fails
+  at the fsync-WAIT stage (a dying disk) errors to the client AND its
+  routed rows are removed from the buffer window (exact failure; during
+  the brief staging window the rows were transiently visible to
+  same-server union reads, acceptable for buffered mode), UNLESS a flush
+  snapshot claimed the rows first — that narrow window keeps the old
+  disclosed ambiguity (the error may still commit) and the server WARNs
+  loudly with the burned sequence; the frame itself never replays and its
+  sequence is never reused, so replay stays exactly-once either way — and
+  the single-writer guard is an advisory `flock`, which is unreliable on
+  NFS — put the tail dir on a local filesystem.
   Default is off (no tail, behavior above unchanged);
   requires `--write-buffer-ms > 0` or startup fails.
 - **`--tail-url` (Postgres tail) buys node-loss durability, with its own honest
@@ -209,10 +235,17 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
   have a real ack cost — both stated plainly.** On a table with
   `icegres.primary-key` + `icegres.tail-upsert=true` under buffered mode
   with a tail, exact-PK `UPDATE`/`DELETE` acks are a read-modify-write:
-  one catalog `load_table` + one union-view point lookup + one tail fsync
-  (~9.5 ms p50 measured vs ~71 ms synchronous — better, but not the ~1.5 ms
-  of a buffered INSERT; the lookup is the price of returning honest row
-  counts and a full replacement row). Routing is **exact-PK-equality
+  activation gate + current-row resolution + row fold + one tail fsync
+  (~7.0 ms p50 measured, ~5.2 ms with `--freshness-ms 25` — the gate then
+  serves the freshness-cached metadata and a hot key resolves from the
+  keyed map with no engine read — vs ~46 ms synchronous; better, but not
+  the ~1.5 ms of a buffered INSERT: the read-modify-write is the price of
+  returning honest row counts and a full replacement row). With
+  `--freshness-ms N`, the activation gate and the `icegres.primary-key`
+  declaration resolve from metadata up to ~N ms stale, so a FOREIGN writer
+  flipping `icegres.primary-key`/`icegres.tail-upsert` inside that window
+  can have a keyed write address rows under the old declaration (DDL
+  through THIS server invalidates the caches synchronously). Routing is **exact-PK-equality
   only**: every PK column bound once by `=` with a literal (AND-composed
   for composite keys), literal SET values, no other predicates, no
   `RETURNING`/joins/subqueries/binds, PK columns never assigned; PK types

@@ -134,9 +134,11 @@ makes this operable from ONE public port:
 |---|---|---|
 | API read latency (point/filtered/agg/join) | 6.9 / 6.8 / 7.2 / 9.9 ms | `baseline.json` (= `bench-20260706T033809Z`) |
 | read throughput, 8 conns, 4 cores | ~382 qps direct / ~359 via icegresd | same |
-| synchronous INSERT (durable Iceberg commit) | ~50–60 ms (56.1 ms; p95 72 ms) | same |
-| batch INSERT, 100 rows | ~99 ms (≈1 ms/row) | same |
+| synchronous INSERT (durable Iceberg commit) | ~50–60 ms (56.1 ms; p95 72 ms) pre-increment; **~46 ms** after the write-latency increment (redundant metadata fetch killed + independent uploads overlapped; timing-mode probe, this tree) | same + write-latency probe |
+| batch INSERT, 100 rows | ~99 ms (≈1 ms/row) pre-increment; **~40 ms** timing-mode probe, this tree | same |
 | buffered INSERT ack (`--write-buffer-ms 100`) | ~1.3–1.5 ms | same + R6.4 acceptance |
+| durable tail ack (`--tail-dir` / `--tail-url` / `--tail-quorum`) | ~1.5–2.5 / ~2.2 / ~2.5 ms; local WAL group fsync under concurrency: 8 writers p50 ~6 ms (was ~9 ms serialized), p95 ~11 ms (was ~24 ms) | write-latency probe, this tree; `durable_ack_*_ms` in bench |
+| keyed UPDATE ack (`icegres.tail-upsert`, hot row) | **~5.2 ms** with `--freshness-ms 25` (~7.0 ms exact-freshness; was ~9.5 ms pre-increment) | write-latency probe, this tree |
 | freshness, buffered mode (same server, new conn) | ~8–10 ms (p95 bimodal ~80 ms) | same |
 | freshness, synchronous mode (any reader) | ~60–73 ms | same |
 | API read latency with `--freshness-ms 25` (point, distinct literals / repeated point / repeated filtered agg) | 4.4 / 3.6 / 2.8 ms | `ICEGRES_QUERY_TIMING` 30-query probe, this tree |
@@ -157,7 +159,8 @@ makes this operable from ONE public port:
 | Bulk load / backfill | Tier 2, multi-row INSERT batches (or direct Iceberg writers) | ~1 ms/row amortized at batch 100; engines can write via the catalog directly |
 | BI, ad-hoc analytics, scheduled reports | Tier 3 branch/replica endpoints via icegresd | isolation from serving path, zero-copy stable views, scale-to-zero when idle |
 | Reproducible reporting / audits | Tier 3 + time travel / tags | any retained snapshot queryable read-only |
-| Hot counters, queues, `FOR UPDATE` row locking, sub-10 ms durable writes | **Tier 1 external Postgres** → stream to Iceberg | copy-on-write + optimistic concurrency is the wrong engine for hot-row mutation |
+| Sub-10 ms durable single-statement writes | Tier 2 + `--write-buffer-ms` + a durable tail (`--tail-dir`/`--tail-url`/`--tail-quorum`) | ~1.5–2.5 ms tail-durable INSERT ack, ~5.2 ms keyed UPDATE with `--freshness-ms`; durability class = the chosen tail (see the ladder in the READMEs); explicit transactions stay sync by design |
+| Hot counters, queues, `FOR UPDATE` row locking, sub-ms SLOs, multi-statement transactions at sub-10 ms | **Tier 1 external Postgres** → stream to Iceberg | copy-on-write + optimistic concurrency is the wrong engine for lock choreography, and a tail-staged COMMIT would break `40001` (refused — docs/limitations.md) |
 | Spark/Trino/Python batch jobs | direct Iceberg REST + S3 (no icegres at all) | the single copy is open; don't proxy bulk scans through pgwire |
 
 ## Anti-patterns (honest list)
@@ -171,7 +174,8 @@ makes this operable from ONE public port:
   concurrency. **Opt-in mitigation (roadmap Phase 2, shipped):** for
   upsert-shaped traffic, keyed tail upserts (`icegres.tail-upsert` +
   `icegres.primary-key` + `--write-buffer-ms` + a durable tail) ack
-  exact-PK UPDATE/DELETE from the tail in ~9.5 ms p50 and coalesce per
+  exact-PK UPDATE/DELETE from the tail in ~5.2 ms p50 with
+  `--freshness-ms 25` (~7.0 ms without) and coalesce per
   key into ONE commit per flush window — no per-statement snapshots, no
   client-visible 40001 for acked keyed ops (see `icegres/README.md`
   "Hot rows" and docs/limitations.md for the LWW semantics trade).
