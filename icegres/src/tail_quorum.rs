@@ -38,9 +38,15 @@
 //!   same logical tail = same cursor). The sidecar's role is played by
 //!   Watermark RECORDS in the replicated log: `record_watermark` appends
 //!   one (quorum-durable), and replay reports the highest per table.
-//! * **The tail append runs under the buffer lock** (like the other
-//!   backends): one statement's quorum round trip serializes with other
-//!   buffered INSERTs — budget one LAN RTT + one fsync per statement.
+//! * **The quorum round trip runs OUTSIDE the buffer lock** (staged
+//!   appends, like the local WAL's group fsync): under the buffer lock a
+//!   statement only allocates its sequence and SUBMITS the record to the
+//!   proposer ([`QuorumTail::append_staged`]); the durability wait — the
+//!   LAN RTT + the slower of two acceptor fsyncs — happens after the lock
+//!   drops, so concurrent statements pipeline their round trips instead of
+//!   serializing behind one another (and buffered reads are never stalled
+//!   behind an in-flight append). Budget one LAN RTT + one fsync of
+//!   LATENCY per statement; concurrent statements overlap it.
 //! * **Trusted network only.** No TLS/authentication between proposer and
 //!   acceptors yet; keep them on a private segment (docs/limitations.md).
 //!
@@ -67,7 +73,7 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc as std_mpsc;
-use std::sync::Mutex as StdMutex;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::thread::JoinHandle;
 
 use anyhow::{anyhow, bail, Context as _, Result};
@@ -78,7 +84,7 @@ use crate::quorum::proposer::{Quorum, QuorumConfig};
 use crate::quorum::proto::{Record, RECORD_FRAME, RECORD_WATERMARK};
 use crate::tail::{
     decode_op_payload, encode_op_payload, parse_table_dir_name, table_dir_name, ReplayedTable,
-    TailOp, TailOpKind, TailStore, TAIL_SEQ_PROPERTY_PREFIX,
+    StagedAppend, TailOp, TailOpKind, TailStore, TAIL_SEQ_PROPERTY_PREFIX,
 };
 
 /// One request to the worker thread; every variant carries its own reply
@@ -111,7 +117,7 @@ enum Job {
     },
     /// Test-only: an append-shaped job whose spawned responder PANICS
     /// before replying (drops `resp` unsent) — exercises the
-    /// closed-channel => poison wiring in `append_roundtrip`.
+    /// closed-channel => poison wiring in `wait_append_outcome`.
     #[cfg(test)]
     InjectAppendPanic { resp: std_mpsc::Sender<Result<()>> },
 }
@@ -129,21 +135,26 @@ pub struct QuorumTail {
     prop_key: String,
     /// `None` only during drop (taken so the worker loop can end).
     job_tx: Option<tokio::sync::mpsc::UnboundedSender<Job>>,
-    /// Next sequence per table, seeded at open, bumped only AFTER a
-    /// quorum-durable append — a failed append never consumes its number
-    /// (and a poisoned tail never appends again, so an ambiguous timed-out
-    /// number is never reused either).
+    /// Next sequence per table, seeded at open, bumped at SUBMIT time
+    /// (I2, [`append_staged`](TailStore::append_staged)): once the record
+    /// is handed to the worker it may enter the replicated log, so the
+    /// number is consumed immediately — concurrent staged appends see the
+    /// next one, and a failed wait BURNS its number (LocalWal's
+    /// burned-sequence rule), never reuses it. A statement that fails
+    /// before the submit (encode error, poisoned tail) consumes nothing.
     next_seq: StdMutex<HashMap<TableIdent, u64>>,
     /// QuorumTail-level poison (distinct from the proposer's own): set
     /// when an append's responder DIES without reporting an outcome (the
     /// spawned worker task panicked, or the worker runtime tore down
     /// mid-append). The record may or may not have entered the replicated
-    /// log; since the failed append did not consume its sequence, letting
-    /// a later append reuse `(table, seq)` against a log that may hold the
-    /// record would double-apply on replay — so every later append fails
-    /// instead (same no-reuse rule as the proposer's timeout poison;
-    /// restart the server to recover the ambiguous record exactly-once).
-    poisoned: StdMutex<Option<String>>,
+    /// log, so letting a later append reuse `(table, seq)` against a log
+    /// that may hold the record would double-apply on replay — every later
+    /// append fails instead (same no-reuse rule as the proposer's timeout
+    /// poison; restart the server to recover the ambiguous record
+    /// exactly-once). `Arc` because staged-append waiters (which outlive
+    /// the `append_staged` borrow) must be able to set it
+    /// ([`wait_append_outcome`]).
+    poisoned: Arc<StdMutex<Option<String>>>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -193,7 +204,7 @@ impl QuorumTail {
             prop_key: format!("{TAIL_SEQ_PROPERTY_PREFIX}{}", init.tail_id),
             job_tx: Some(job_tx),
             next_seq: StdMutex::new(next_seq),
-            poisoned: StdMutex::new(None),
+            poisoned: Arc::new(StdMutex::new(None)),
             worker: Some(worker),
         })
     }
@@ -211,51 +222,6 @@ impl QuorumTail {
         resp_rx
             .recv()
             .map_err(|_| anyhow!("tail-quorum worker dropped a request; restart the server"))?
-    }
-
-    /// Round-trip an append-shaped job, with the poison rule an append's
-    /// AMBIGUITY demands (unlike [`call`](Self::call)): a send failure
-    /// means the job never reached the worker (the record certainly did
-    /// not enter the log — plain retryable error), but a responder that
-    /// DIES without replying (the spawned task panicked inside
-    /// `Quorum::append`, or the worker runtime tore down mid-flight) is
-    /// ambiguous — the record MAY be in the replicated log — so the tail
-    /// poisons itself before erroring: the un-consumed `(table, seq)` must
-    /// never be reused against a log that may hold it (double-apply on
-    /// replay). Restart recovers the ambiguous record exactly-once via the
-    /// election, exactly like the proposer's timeout poison.
-    fn append_roundtrip(
-        &self,
-        table: &TableIdent,
-        seq: u64,
-        build: impl FnOnce(std_mpsc::Sender<Result<()>>) -> Job,
-    ) -> Result<()> {
-        let (resp_tx, resp_rx) = std_mpsc::channel();
-        self.job_tx
-            .as_ref()
-            .expect("job_tx lives until drop")
-            .send(build(resp_tx))
-            .map_err(|_| anyhow!("tail-quorum worker is gone; restart the server"))?;
-        match resp_rx.recv() {
-            Ok(outcome) => outcome,
-            Err(_) => {
-                let why = format!(
-                    "the tail-quorum append for {table} (seq {seq}) died without \
-                     reporting an outcome (worker task panicked or the worker shut \
-                     down mid-append); the record may already be in the replicated \
-                     log, so its sequence can never be reused"
-                );
-                let mut poisoned = self.poisoned.lock().expect("tail-quorum poison lock");
-                if poisoned.is_none() {
-                    *poisoned = Some(why.clone());
-                }
-                drop(poisoned);
-                Err(anyhow!(
-                    "quorum tail is POISONED ({why}); restart the server — the \
-                     election recovers the ambiguous record exactly once"
-                ))
-            }
-        }
     }
 
     /// The sticky QuorumTail-level poison check (see the `poisoned` field).
@@ -276,10 +242,56 @@ impl QuorumTail {
 
     /// Test-only: drive an append-shaped job whose spawned responder
     /// PANICS before replying — the injectable stand-in for a panic inside
-    /// `Quorum::append` (see [`append_roundtrip`](Self::append_roundtrip)).
+    /// the worker's append handling (see [`wait_append_outcome`]).
     #[cfg(test)]
     fn inject_append_panic(&self, table: &TableIdent, seq: u64) -> Result<()> {
-        self.append_roundtrip(table, seq, |resp| Job::InjectAppendPanic { resp })
+        let (resp_tx, resp_rx) = std_mpsc::channel();
+        self.job_tx
+            .as_ref()
+            .expect("job_tx lives until drop")
+            .send(Job::InjectAppendPanic { resp: resp_tx })
+            .map_err(|_| anyhow!("tail-quorum worker is gone; restart the server"))?;
+        wait_append_outcome(&self.poisoned, table, seq, resp_rx)
+    }
+}
+
+/// The durability wait of one append-shaped job, with the poison rule an
+/// append's AMBIGUITY demands: a responder that DIES without replying (the
+/// spawned worker task panicked, or the worker runtime tore down
+/// mid-flight) is ambiguous — the record MAY be in the replicated log — so
+/// the tail poisons itself before erroring: the staged `(table, seq)` must
+/// never be reused against a log that may hold it (double-apply on
+/// replay). Restart recovers the ambiguous record exactly-once via the
+/// election, exactly like the proposer's timeout poison. Shared by the
+/// staged-append waiter ([`QuorumTail::append_staged`]) and the test's
+/// panic injection, so both exercise identical machinery.
+fn wait_append_outcome(
+    poisoned: &StdMutex<Option<String>>,
+    table: &TableIdent,
+    seq: u64,
+    resp_rx: std_mpsc::Receiver<Result<()>>,
+) -> Result<()> {
+    match resp_rx.recv() {
+        Ok(outcome) => {
+            outcome.with_context(|| format!("quorum-tail append for {table} (seq {seq}) failed"))
+        }
+        Err(_) => {
+            let why = format!(
+                "the tail-quorum append for {table} (seq {seq}) died without \
+                 reporting an outcome (worker task panicked or the worker shut \
+                 down mid-append); the record may already be in the replicated \
+                 log, so its sequence can never be reused"
+            );
+            let mut poisoned = poisoned.lock().expect("tail-quorum poison lock");
+            if poisoned.is_none() {
+                *poisoned = Some(why.clone());
+            }
+            drop(poisoned);
+            Err(anyhow!(
+                "quorum tail is POISONED ({why}); restart the server — the \
+                 election recovers the ambiguous record exactly once"
+            ))
+        }
     }
 }
 
@@ -296,6 +308,31 @@ impl Drop for QuorumTail {
 
 impl TailStore for QuorumTail {
     fn append(&self, table: &TableIdent, kind: TailOpKind, batches: &[RecordBatch]) -> Result<u64> {
+        self.append_staged(table, kind, batches)?.wait_durable()
+    }
+
+    /// The pipelined fast path (I2, mirroring LocalWal's group-fsync
+    /// split): under the caller's lock (buffer.rs holds its tables mutex
+    /// here) this only allocates the sequence and SUBMITS the record to
+    /// the proposer — a non-blocking channel send; the worker enters
+    /// records into the replicated log strictly in job order, so per-table
+    /// log order == seq order == submit order (single lock holder). The
+    /// full quorum round trip happens in the returned waiter, AFTER the
+    /// caller drops its locks — concurrent statements pipeline their round
+    /// trips and buffered reads are never stalled behind one. Contract
+    /// notes: a poisoned tail fails at submit (nothing staged); once the
+    /// job is submitted the sequence is CONSUMED — the record may enter
+    /// the log, so a failed wait burns the number, never reuses it (the
+    /// same burned-sequence rule as LocalWal); the ack still only arrives
+    /// on a quorum commit covering the record, and a responder that dies
+    /// without an outcome poisons the tail exactly as before
+    /// ([`wait_append_outcome`]).
+    fn append_staged(
+        &self,
+        table: &TableIdent,
+        kind: TailOpKind,
+        batches: &[RecordBatch],
+    ) -> Result<StagedAppend> {
         self.check_poisoned()?;
         let key = table_dir_name(table)?;
         // ICEGRES_QUERY_TIMING tail-ack budget: payload encode vs. the
@@ -303,7 +340,7 @@ impl TailStore for QuorumTail {
         // when unset.
         let timing = crate::timing::enabled();
         // Encode BEFORE consuming anything: an unencodable statement fails
-        // with no seq minted and no round trip made.
+        // with no seq minted and no job submitted.
         let t = timing.then(std::time::Instant::now);
         let payload = encode_op_payload(kind, batches)?;
         if let Some(t) = t {
@@ -312,20 +349,36 @@ impl TailStore for QuorumTail {
         let mut map = self.next_seq.lock().expect("tail-quorum seq lock poisoned");
         let entry = map.entry(table.clone()).or_insert(1);
         let seq = *entry;
-        let t = timing.then(std::time::Instant::now);
-        self.append_roundtrip(table, seq, |resp| Job::Append {
-            key,
-            seq,
-            payload,
-            resp,
-        })
-        .with_context(|| format!("quorum-tail append for {table} (seq {seq}) failed"))?;
-        if let Some(t) = t {
-            crate::timing::record("tail_quorum_ack", t.elapsed());
-        }
-        // Only now is the record quorum-durable: consume the sequence.
+        // Submit UNDER the seq lock: channel order == seq order, the
+        // invariant the worker's in-order submits turn into log order.
+        let (resp_tx, resp_rx) = std_mpsc::channel();
+        self.job_tx
+            .as_ref()
+            .expect("job_tx lives until drop")
+            .send(Job::Append {
+                key,
+                seq,
+                payload,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow!("tail-quorum worker is gone; restart the server"))?;
+        // The record may enter the log from here on: the sequence is
+        // consumed NOW (a later failure burns it, never reuses it).
         *entry += 1;
-        Ok(seq)
+        drop(map);
+        let poisoned = self.poisoned.clone();
+        let table = table.clone();
+        let t = timing.then(std::time::Instant::now);
+        Ok(StagedAppend::with_waiter(
+            seq,
+            Box::new(move || {
+                wait_append_outcome(&poisoned, &table, seq, resp_rx)?;
+                if let Some(t) = t {
+                    crate::timing::record("tail_quorum_ack", t.elapsed());
+                }
+                Ok(())
+            }),
+        ))
     }
 
     fn replay(&self) -> Result<Vec<ReplayedTable>> {
@@ -436,28 +489,30 @@ fn worker_main(
                 return;
             }
         };
-        // `Arc` so Append jobs can be SPAWNED off the job loop: an
-        // append's quorum round trip must not head-of-line-block the next
-        // job (the flusher's truncate/watermark jobs behind a statement's
-        // append). HONEST SCOPE: this is NOT append pipelining — appends
-        // themselves still serialize upstream (QuorumTail::append holds
-        // the seq-map lock across the reply, and the default
-        // `append_staged` runs the whole round trip under the buffer
-        // lock), so at most ONE statement append is ever in flight.
-        // `Quorum::append` would tolerate more (records enter the shared
-        // LogBuf under its lock, commit waiters are broadcast-driven), but
-        // the per-table sequencing above it does not, yet.
-        let quorum = std::sync::Arc::new(quorum);
+        // `Arc` so the WAIT half of every append job can be SPAWNED off
+        // the job loop (I2 — append pipelining): the loop SUBMITS each
+        // record synchronously (`Quorum::submit`, LSN assigned in job
+        // order, so per-table log order == seq order == the order
+        // `QuorumTail::append_staged` allocated the sequences in) and only
+        // the quorum commit wait runs in a spawned task — several
+        // statement appends overlap their round trips, and the flusher's
+        // truncate/watermark jobs are never head-of-line blocked behind
+        // one.
+        let quorum = Arc::new(quorum);
         let mut seeds: HashMap<String, u64> = HashMap::new();
         // Highest watermark appended per table (never regress the sidecar,
-        // mirroring LocalWal's skip).
-        let mut wm_max: HashMap<String, u64> = HashMap::new();
-        for rec in &recovered {
-            let s = seeds.entry(rec.table_key.clone()).or_insert(0);
-            *s = (*s).max(rec.seq);
-            if rec.kind == RECORD_WATERMARK {
-                let w = wm_max.entry(rec.table_key.clone()).or_insert(0);
-                *w = (*w).max(rec.seq);
+        // mirroring LocalWal's skip). Shared with the spawned watermark
+        // waits, which fold their success in after the quorum ack.
+        let wm_max: Arc<StdMutex<HashMap<String, u64>>> = Arc::new(StdMutex::new(HashMap::new()));
+        {
+            let mut wm = wm_max.lock().expect("tail-quorum watermark lock");
+            for rec in &recovered {
+                let s = seeds.entry(rec.table_key.clone()).or_insert(0);
+                *s = (*s).max(rec.seq);
+                if rec.kind == RECORD_WATERMARK {
+                    let w = wm.entry(rec.table_key.clone()).or_insert(0);
+                    *w = (*w).max(rec.seq);
+                }
             }
         }
         let init = InitState {
@@ -469,17 +524,78 @@ fn worker_main(
         }
         let mut replay_records: Option<Vec<Record>> = Some(recovered);
         while let Some(job) = job_rx.recv().await {
-            run_job(&quorum, &mut replay_records, &mut wm_max, job).await;
+            run_job(&quorum, &mut replay_records, &wm_max, job).await;
         }
         // Channel closed = QuorumTail dropped: block_on returns, dropping
         // the runtime, the streaming tasks, and the connections.
     });
 }
 
+/// Append one watermark record without blocking the job loop (M2): submit
+/// synchronously, spawn the quorum wait, nudge the horizon after the
+/// commit. `wm_max` is folded at SUBMIT time, still inside the
+/// single-threaded job loop — the never-regress skip in
+/// `Job::RecordWatermark` must see every already-submitted watermark, or
+/// an older flush's lower seq racing a spawned wait could enter the log
+/// AFTER a higher one and regress the proposer's latest-watermark
+/// bookkeeping. (A submitted record is in the retained log and will
+/// commit unless the proposer poisons — in which case every later append
+/// fails anyway, so the optimistic fold is never a lie that matters.)
+/// `resp = None` for the best-effort refresh (failure is a WARN — the
+/// next flush retries); `Some` forwards the quorum-durable outcome to a
+/// blocked `record_watermark` caller. Poison rules are identical to
+/// statement appends: a submit against a poisoned/superseded proposer
+/// fails fast, a stalled wait rides the proposer's re-election/poison
+/// ladder, and no new sequence is consumed (a watermark record reuses the
+/// covered seq by design).
+fn append_watermark_off_loop(
+    quorum: &Arc<Quorum>,
+    wm_max: &Arc<StdMutex<HashMap<String, u64>>>,
+    table: String,
+    seq: u64,
+    resp: Option<std_mpsc::Sender<Result<()>>>,
+) {
+    match quorum.submit(RECORD_WATERMARK, &table, seq, &[]) {
+        Ok(end) => {
+            {
+                let mut wm = wm_max.lock().expect("tail-quorum watermark lock");
+                let w = wm.entry(table.clone()).or_insert(0);
+                *w = (*w).max(seq);
+            }
+            let quorum = quorum.clone();
+            tokio::spawn(async move {
+                let r = quorum.wait_commit(end).await;
+                match &r {
+                    Ok(()) => {
+                        let _ = quorum.nudge_horizon();
+                    }
+                    Err(e) => tracing::warn!(
+                        table_key = table,
+                        "quorum-tail watermark append failed (horizon lags; retried on \
+                         the next flush): {e:#}"
+                    ),
+                }
+                if let Some(resp) = resp {
+                    let _ = resp.send(r);
+                }
+            });
+        }
+        Err(e) => {
+            tracing::warn!(
+                table_key = table,
+                "quorum-tail watermark append refused at submit: {e:#}"
+            );
+            if let Some(resp) = resp {
+                let _ = resp.send(Err(e));
+            }
+        }
+    }
+}
+
 async fn run_job(
-    quorum: &std::sync::Arc<Quorum>,
+    quorum: &Arc<Quorum>,
     replay_records: &mut Option<Vec<Record>>,
-    wm_max: &mut HashMap<String, u64>,
+    wm_max: &Arc<StdMutex<HashMap<String, u64>>>,
     job: Job,
 ) {
     match job {
@@ -489,21 +605,29 @@ async fn run_job(
             payload,
             resp,
         } => {
-            // Spawned so truncate/watermark jobs behind it are not
-            // head-of-line blocked — NOT append pipelining (see the
-            // worker_main comment: QuorumTail::append holds the seq-map
-            // lock across the reply, so at most one append job is in
-            // flight; the LSN is assigned inside `Quorum::append` under
-            // the log lock). If this task dies WITHOUT replying (a panic
-            // inside `Quorum::append`), `resp` drops unsent and the caller
-            // observes the closed channel and POISONS the tail — the
-            // record may already be in the log and its un-consumed
-            // sequence must never be reused (QuorumTail::append_roundtrip).
-            let quorum = quorum.clone();
-            tokio::spawn(async move {
-                let r = quorum.append(RECORD_FRAME, &key, seq, &payload).await;
-                let _ = resp.send(r);
-            });
+            // I2 — the pipelining split: SUBMIT synchronously here (the
+            // LSN is assigned under the log lock in job order, so
+            // per-table log order == seq order == submit order — the
+            // invariant replay's in-sequence fold depends on), spawn only
+            // the quorum commit WAIT. Concurrent staged appends overlap
+            // their round trips and later jobs are never head-of-line
+            // blocked. If the spawned wait dies WITHOUT replying, `resp`
+            // drops unsent and the caller's waiter observes the closed
+            // channel and POISONS the tail — the record is in the log and
+            // its consumed sequence must never carry a different record
+            // (wait_append_outcome).
+            match quorum.submit(RECORD_FRAME, &key, seq, &payload) {
+                Ok(end) => {
+                    let quorum = quorum.clone();
+                    tokio::spawn(async move {
+                        let r = quorum.wait_commit(end).await;
+                        let _ = resp.send(r);
+                    });
+                }
+                Err(e) => {
+                    let _ = resp.send(Err(e));
+                }
+            }
         }
         Job::Replay { resp } => {
             let _ = resp.send(Ok(replay_records.take().unwrap_or_default()));
@@ -515,37 +639,32 @@ async fn run_job(
         } => {
             let refresh = quorum.note_covered(&key, upto_seq);
             // Coverage is recorded; the caller need not wait for the
-            // (best-effort) watermark refresh below.
+            // (best-effort) watermark refresh below — and neither does the
+            // job loop (M2): the refresh's full quorum round trip is
+            // spawned like statement appends, so statement appends queued
+            // behind this job are submitted without delay.
             let _ = resp.send(Ok(()));
             if let Some((table, seq)) = refresh {
-                match quorum.append(RECORD_WATERMARK, &table, seq, &[]).await {
-                    Ok(()) => {
-                        let w = wm_max.entry(table).or_insert(0);
-                        *w = (*w).max(seq);
-                        let _ = quorum.nudge_horizon();
-                    }
-                    Err(e) => tracing::warn!(
-                        table_key = table,
-                        "quorum-tail watermark refresh failed (horizon lags; retried on \
-                         the next flush): {e:#}"
-                    ),
-                }
+                append_watermark_off_loop(quorum, wm_max, table, seq, None);
             }
         }
         Job::RecordWatermark { key, seq, resp } => {
             // Never regress a higher watermark (an older flush retrying
             // late) — the LATEST watermark record must carry the max.
-            if wm_max.get(&key).copied().unwrap_or(0) >= seq {
+            if wm_max
+                .lock()
+                .expect("tail-quorum watermark lock")
+                .get(&key)
+                .copied()
+                .unwrap_or(0)
+                >= seq
+            {
                 let _ = resp.send(Ok(()));
                 return;
             }
-            let r = quorum.append(RECORD_WATERMARK, &key, seq, &[]).await;
-            if r.is_ok() {
-                let w = wm_max.entry(key).or_insert(0);
-                *w = (*w).max(seq);
-                let _ = quorum.nudge_horizon();
-            }
-            let _ = resp.send(r);
+            // The caller blocks on `resp` for the quorum-durable outcome,
+            // but the job LOOP must not (M2): submit here, wait spawned.
+            append_watermark_off_loop(quorum, wm_max, key, seq, Some(resp));
         }
         #[cfg(test)]
         Job::PeerFlushes { resp } => {
@@ -909,6 +1028,135 @@ mod tests {
             new.append(&ident(), TailOpKind::Append, &[batch(&[2])])
                 .unwrap(),
             2
+        );
+    }
+
+    // FIX (I2): QuorumTail stages appends without running the quorum round
+    // trip inside the staging call: several appends staged back-to-back
+    // get consecutive sequences (submit order == seq order, single lock
+    // holder), every wait acks on quorum commit (completion order
+    // irrelevant), and a reopen replays the frames in exact sequence order
+    // — the invariant the worker's synchronous in-job-order submits
+    // preserve even with several round trips in flight.
+    #[test]
+    fn staged_appends_pipeline_and_replay_in_seq_order() {
+        let (_acceptors, addrs) = spawn_cluster("staged-order");
+        {
+            let tail = QuorumTail::open_with_config(cfg(&addrs, 5000)).unwrap();
+            let staged: Vec<StagedAppend> = (1..=4i64)
+                .map(|v| {
+                    tail.append_staged(&ident(), TailOpKind::Append, &[batch(&[v])])
+                        .unwrap()
+                })
+                .collect();
+            assert_eq!(
+                staged.iter().map(|s| s.seq()).collect::<Vec<_>>(),
+                vec![1, 2, 3, 4],
+                "sequences are allocated in submit order"
+            );
+            // Wait in REVERSE order: acks are commit-driven, not
+            // submission-serialized.
+            for (i, s) in staged.into_iter().enumerate().rev() {
+                assert_eq!(s.wait_durable().unwrap(), (i + 1) as u64);
+            }
+        }
+        let tail = QuorumTail::open_with_config(cfg(&addrs, 5000)).unwrap();
+        let replayed = tail.replay().unwrap();
+        assert_eq!(replayed.len(), 1);
+        let seqs: Vec<u64> = replayed[0].frames.iter().map(|(s, _)| *s).collect();
+        assert_eq!(seqs, vec![1, 2, 3, 4], "no loss, no duplicates");
+        let rows: Vec<i64> = replayed[0]
+            .frames
+            .iter()
+            .flat_map(|(_, op)| op.batches().iter().map(ids).next().unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![1, 2, 3, 4],
+            "log order == seq order == submit order"
+        );
+    }
+
+    // FIX (I2): staging never blocks on the quorum round trip — with NO
+    // quorum alive, append_staged still returns promptly (the buffer-lock
+    // holder is never stalled behind the LAN RTT / the append timeout);
+    // the WAIT carries the failure and the poison, and a staged sequence
+    // is consumed at submit and never reused.
+    #[test]
+    fn staging_returns_without_a_quorum_and_the_wait_poisons() {
+        let (mut acceptors, addrs) = spawn_cluster("staged-noblock");
+        let tail = QuorumTail::open_with_config(cfg(&addrs, 700)).unwrap();
+        tail.append(&ident(), TailOpKind::Append, &[batch(&[1])])
+            .unwrap();
+        acceptors[1].kill();
+        acceptors[2].kill();
+        let started = Instant::now();
+        let staged = tail
+            .append_staged(&ident(), TailOpKind::Append, &[batch(&[2])])
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(600),
+            "staging must not run the quorum round trip (append_timeout is \
+             700 ms and no quorum exists), took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(staged.seq(), 2);
+        let err = staged.wait_durable().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("POISONED"),
+            "the wait carries the quorum-timeout poison, got: {err:#}"
+        );
+        // Sequence 2 is burned: a later staged append gets 3 (submit-time
+        // consumption, no reuse) and fails through the sticky poison.
+        let staged = tail
+            .append_staged(&ident(), TailOpKind::Append, &[batch(&[3])])
+            .unwrap();
+        assert_eq!(
+            staged.seq(),
+            3,
+            "a staged sequence is consumed at submit and never reused"
+        );
+        let err = staged.wait_durable().unwrap_err();
+        assert!(format!("{err:#}").contains("POISONED"), "got: {err:#}");
+    }
+
+    // FIX (H1): the recovery donor read is CHUNKED. A tiny injected chunk
+    // size (smaller than one record frame, forcing mid-record chunk
+    // boundaries) still recovers the exact acked record set — so a
+    // recovery range larger than one wire message (reachable:
+    // MAX_PEER_LAG_BYTES == MAX_MESSAGE_BYTES) can never brick reopen.
+    #[test]
+    fn recovery_donor_read_is_chunked() {
+        let (_acceptors, addrs) = spawn_cluster("chunked-recovery");
+        {
+            let tail = QuorumTail::open_with_config(cfg(&addrs, 5000)).unwrap();
+            for v in 1..=5i64 {
+                tail.append(&ident(), TailOpKind::Append, &[batch(&[v])])
+                    .unwrap();
+            }
+        }
+        let mut c = cfg(&addrs, 5000);
+        c.recovery_read_chunk = 16; // dozens of chunks, all mid-record
+        let tail = QuorumTail::open_with_config(c).unwrap();
+        let replayed = tail.replay().unwrap();
+        assert_eq!(replayed.len(), 1);
+        let seqs: Vec<u64> = replayed[0].frames.iter().map(|(s, _)| *s).collect();
+        assert_eq!(
+            seqs,
+            vec![1, 2, 3, 4, 5],
+            "chunked recovery loses/duplicates nothing"
+        );
+        let rows: Vec<i64> = replayed[0]
+            .frames
+            .iter()
+            .flat_map(|(_, op)| op.batches().iter().map(ids).next().unwrap())
+            .collect();
+        assert_eq!(rows, vec![1, 2, 3, 4, 5]);
+        // And the recovered tail still takes writes above the replay set.
+        assert_eq!(
+            tail.append(&ident(), TailOpKind::Append, &[batch(&[6])])
+                .unwrap(),
+            6
         );
     }
 

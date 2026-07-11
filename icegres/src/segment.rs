@@ -122,13 +122,19 @@ pub(crate) fn write_atomic(dir: &Path, path: &Path, bytes: &[u8], log_kind: &str
         .and_then(|n| n.to_str())
         .ok_or_else(|| anyhow!("write_atomic target {} has no file name", path.display()))?;
     let tmp = dir.join(format!(".{name}.tmp"));
-    (|| -> std::io::Result<()> {
+    let res = (|| -> std::io::Result<()> {
         let mut f = File::create(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
         fs::rename(&tmp, path)
-    })()
-    .with_context(|| format!("cannot write {} atomically", path.display()))?;
+    })();
+    if let Err(e) = res {
+        // L4: don't leave the partial tmp file behind — a later retry
+        // recreates it, but an abandoned one would sit in the data dir
+        // forever (best-effort: the original error is what matters).
+        let _ = fs::remove_file(&tmp);
+        return Err(anyhow!(e).context(format!("cannot write {} atomically", path.display())));
+    }
     sync_dir(dir, log_kind)
 }
 

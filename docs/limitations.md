@@ -313,9 +313,13 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
   honest edges of stale-serving: read-your-own-writes can regress to
   last-snapshot for a write that committed in the instant before the
   catalog became unreachable (the post-write refresh cannot complete), and
-  in buffered mode (`--write-buffer-ms > 0`) an outage longer than the 30 s
-  flushed-overlay GC window can temporarily hide rows flushed just before
-  the outage until the catalog returns. `ICEGRES_STALE_READ_ON_CATALOG_ERROR`
+  in buffered mode (`--write-buffer-ms > 0`) rows flushed just before the
+  outage stay served through the union overlay for the whole outage — a
+  flushed overlay generation is garbage-collected only once metadata
+  containing its commit has actually been observed (plus a 30 s age), so
+  committed rows never vanish from reads mid-outage; the cost is that the
+  overlay memory for those generations is retained until the catalog
+  returns. `ICEGRES_STALE_READ_ON_CATALOG_ERROR`
   controls the trade in BOTH modes: default mode fails reads during an
   outage unless it is set truthy; freshness mode serves stale unless it is
   set to `0`/`false` — the explicit fail-loud override for deployments
@@ -342,6 +346,35 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
   logs a startup `WARN`. Remote binds are guarded: binding a non-loopback
   interface with auth off requires `--insecure`. Always enable auth in
   production.
+
+## Hardening backlog
+
+Known-and-accepted sharp edges, queued rather than closed — none is a
+correctness hole under the documented deployment posture, each would harden
+an operational edge:
+
+- **Acceptor idle/read timeout + greeting-stage length cap** (`icekeeperd`):
+  a connected-but-silent client holds its connection task forever, and the
+  pre-greeting frame length is bounded only by the generic message cap —
+  acceptable under the trusted-network posture above, worth tightening.
+- **Acceptor fsync via `spawn_blocking`**: acceptor fsyncs run inline on the
+  connection task's runtime thread; a slow disk stalls that acceptor's
+  other traffic.
+- **`run_peer`/supervisor `JoinHandle` watchers**: the proposer's per-peer
+  streaming tasks and the re-election supervisor are fire-and-forget; a
+  panicked task is only noticed indirectly (stalls → re-election → poison)
+  rather than by a watcher that logs the panic itself.
+- **Per-table sequence lock for quorum appends** (pipelining refinement):
+  staged quorum appends already pipeline their round trips, but sequence
+  allocation still serializes on ONE map-wide mutex; per-table locks would
+  remove the last cross-table serialization point.
+- **Validation-only record walk**: quorum-tail replay decodes every
+  surviving record's Arrow payload eagerly; a cheap validation-only walk
+  would bound boot memory on very large recovered suffixes.
+- **Plan-cache miss-counter noise in buffered+freshness mode**: overlay-
+  bearing tables are (correctly) never cached, but each of their SELECTs
+  still counts as a plan-cache miss, skewing the hit-ratio metric on mixed
+  workloads.
 
 ## Build / dependency matrix
 

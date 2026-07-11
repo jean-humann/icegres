@@ -178,7 +178,12 @@ impl PlanCache {
         key: &PlanKey,
         resolve: impl Fn(&str) -> Option<MetadataVersion>,
     ) -> Option<(Arc<dyn ExecutionPlan>, ArrowSchemaRef)> {
-        let mut guard = self.entries.lock().expect("plan cache poisoned");
+        // M3: recover a poisoned lock instead of panicking — the cache is
+        // shared across every connection, and one panic under the lock
+        // must not turn every later SELECT into a panic. Worst case after
+        // an unwind mid-insert is a stale/missing entry, which the version
+        // validation below already treats as a miss.
+        let mut guard = crate::freshness::recover("plan cache", self.entries.lock());
         let (map, clock) = &mut *guard;
         let entry = map.get_mut(key)?;
         let valid = entry
@@ -205,7 +210,8 @@ impl PlanCache {
         schema: ArrowSchemaRef,
         tables: Vec<(String, MetadataVersion)>,
     ) {
-        let mut guard = self.entries.lock().expect("plan cache poisoned");
+        // M3: see lookup_with — recover, never panic-cascade.
+        let mut guard = crate::freshness::recover("plan cache", self.entries.lock());
         let (map, clock) = &mut *guard;
         *clock += 1;
         map.insert(
@@ -346,10 +352,20 @@ pub struct PlanCacheHook {
 
 impl PlanCacheHook {
     pub fn new() -> Self {
-        let capacity = std::env::var("ICEGRES_PLAN_CACHE_ENTRIES")
-            .ok()
-            .and_then(|raw| raw.trim().parse::<usize>().ok())
-            .unwrap_or(DEFAULT_CAPACITY);
+        // L5: an unparseable override WARNs and falls back, matching the
+        // other knobs (ICEGRES_SCAN_CONCURRENCY & co.) — never a silent
+        // default.
+        let capacity = match std::env::var("ICEGRES_PLAN_CACHE_ENTRIES") {
+            Ok(raw) => raw.trim().parse::<usize>().unwrap_or_else(|_| {
+                tracing::warn!(
+                    value = %raw,
+                    default = DEFAULT_CAPACITY,
+                    "invalid ICEGRES_PLAN_CACHE_ENTRIES; using default"
+                );
+                DEFAULT_CAPACITY
+            }),
+            Err(_) => DEFAULT_CAPACITY,
+        };
         Self {
             cache: PlanCache::new(capacity),
             parser: PostgresCompatibilityParser::new(),

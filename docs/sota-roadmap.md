@@ -473,14 +473,17 @@ runs, not projections.
     CONCURRENCY, not single-writer: the new LOCAL-WAL GROUP FSYNC
     coalesces concurrent statements, 8 writers p50 **~6.1 ms** vs
     ~9–10 ms serialized. `--tail-url` **~2.2 ms** probe (bench 2.7 ms),
-    `--tail-quorum` **~2.5 ms** probe (bench 4.1 ms) — honest scope:
-    quorum append PIPELINING
-    was NOT achieved (the scope item stays open) — appends still
-    serialize on the per-server sequence lock (and the buffer lock, via
-    the default `append_staged`); what shipped is only the removal of the
-    worker loop's head-of-line blocking, so truncate/watermark jobs no
-    longer queue behind an in-flight append (plus poison-on-dead-append
-    so a worker-task panic can never lead to sequence reuse).
+    `--tail-quorum` **~2.5 ms** probe (bench 4.1 ms) — quorum append
+    PIPELINING shipped in the PR #3 second review round: `QuorumTail`
+    implements `append_staged` (sequence allocated + record submitted
+    under the buffer lock, the quorum round trip waited OUTSIDE it), the
+    worker submits records in job order (log order == seq order) and
+    spawns only the commit waits, so concurrent statements overlap their
+    round trips and truncate/watermark jobs never queue behind an
+    in-flight append (poison-on-dead-append preserved — a worker-task
+    panic can never lead to sequence reuse). Remaining refinement, in the
+    hardening backlog: a per-table sequence lock (allocation still
+    serializes on one map-wide mutex).
     `bench/bench.sh` gained the ungated `durable_ack_{dir,pg,quorum}_ms`
     ladder legs (own icekeeperd trio lifecycle).
   - **Keyed RMW fast path**: keyed UPDATE **5.2 ms p50 / 7.8 ms p95** with

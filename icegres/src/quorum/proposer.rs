@@ -143,6 +143,13 @@ pub(crate) struct QuorumConfig {
     /// I2): a connected-but-silent acceptor is treated as unavailable
     /// instead of hanging the sequential election calls forever.
     pub call_timeout: Duration,
+    /// Bytes per donor Read chunk during open()'s recovery download (FIX
+    /// H1): one giant Read of the whole `[truncate_lsn, term_start)` range
+    /// could exceed [`MAX_MESSAGE_BYTES`] (reachable —
+    /// [`MAX_PEER_LAG_BYTES`] equals the wire cap) and would brick every
+    /// reopen. Default [`MAX_APPEND_BATCH_BYTES`]; overridden small in
+    /// tests to exercise the chunk loop.
+    pub recovery_read_chunk: u64,
 }
 
 impl QuorumConfig {
@@ -154,6 +161,7 @@ impl QuorumConfig {
             ),
             connect_timeout: Duration::from_secs(5),
             call_timeout: Duration::from_secs(5),
+            recovery_read_chunk: MAX_APPEND_BATCH_BYTES as u64,
         }
     }
 }
@@ -676,18 +684,29 @@ impl Quorum {
                  — inconsistent acceptor state"
             );
         }
-        // 5. Download the unfinished suffix from the donor. Everything in
-        // it must be treated as COMMITTED (the quorum that acked it may
-        // differ from the voting quorum). Bounded too — but generously,
-        // the range can be large.
+        // 5. Download the unfinished suffix from the donor, CHUNKED (FIX
+        // H1): a single Read of the whole range can exceed the wire cap
+        // (MAX_PEER_LAG_BYTES reaches MAX_MESSAGE_BYTES), and the resulting
+        // un-encodable ReadResp would make every reopen fail forever. The
+        // acceptor's handle_read already clamps `to_lsn` and serves
+        // arbitrary byte ranges (record boundaries are re-established by
+        // decode_records over the concatenation), so the loop is purely
+        // proposer-side. Everything downloaded must be treated as COMMITTED
+        // (the quorum that acked it may differ from the voting quorum).
+        // Each chunk's round trip is bounded.
         let read_timeout = cfg.call_timeout.max(cfg.append_timeout);
-        let rec_bytes: Vec<u8> = if term_start_lsn > truncate_lsn {
+        let chunk = cfg.recovery_read_chunk.max(1);
+        let mut rec_bytes: Vec<u8> =
+            Vec::with_capacity(term_start_lsn.saturating_sub(truncate_lsn) as usize);
+        let mut read_pos = truncate_lsn;
+        while read_pos < term_start_lsn {
+            let to_lsn = term_start_lsn.min(read_pos.saturating_add(chunk));
             let c = conns[donor].as_mut().expect("donor is connected");
             match c
                 .call_timeout(
                     &Message::Read {
-                        from_lsn: truncate_lsn,
-                        to_lsn: term_start_lsn,
+                        from_lsn: read_pos,
+                        to_lsn,
                     },
                     read_timeout,
                 )
@@ -695,16 +714,27 @@ impl Quorum {
                 .context("the donor did not return the recovery range")?
             {
                 Message::ReadResp { from_lsn, records } => {
-                    if from_lsn != truncate_lsn {
+                    if from_lsn != read_pos {
                         bail!("donor read returned the wrong range start {from_lsn}");
                     }
-                    records
+                    if records.is_empty() {
+                        bail!(
+                            "donor returned an empty chunk at {read_pos} of \
+                             [{truncate_lsn}, {term_start_lsn}) — short read"
+                        );
+                    }
+                    read_pos += records.len() as u64;
+                    if read_pos > to_lsn {
+                        bail!(
+                            "donor overran the requested chunk end {to_lsn} \
+                             (returned bytes up to {read_pos})"
+                        );
+                    }
+                    rec_bytes.extend_from_slice(&records);
                 }
                 other => bail!("unexpected read response {other:?}"),
             }
-        } else {
-            Vec::new()
-        };
+        }
         if truncate_lsn + rec_bytes.len() as u64 != term_start_lsn {
             bail!(
                 "donor returned {} bytes for [{truncate_lsn}, {term_start_lsn}) — short read",
@@ -866,10 +896,19 @@ impl Quorum {
         &self.shared.tail_id
     }
 
-    /// Append one record and wait until a quorum of acceptors has fsynced
-    /// it. On a stall it attempts ONE internal re-election; on a second
-    /// timeout the tail POISONS itself (see [`QuorumConfig`]).
-    pub async fn append(&self, kind: u8, table_key: &str, seq: u64, body: &[u8]) -> Result<()> {
+    /// Enter one record into the retained log (LSN assigned under the log
+    /// lock — callers relying on per-table seq order MUST call this in seq
+    /// order) and wake the peer streams. Returns the log position a quorum
+    /// must ack; [`wait_commit`](Self::wait_commit) completes the
+    /// durability wait (on a stall it attempts ONE internal re-election;
+    /// on a second timeout the tail POISONS itself — see [`QuorumConfig`]).
+    /// A full append is exactly `submit` + `wait_commit`, split (I2) so the
+    /// tail-quorum worker submits records synchronously in job order
+    /// (preserving per-table LSN order == seq order) and spawns only the
+    /// commit wait — concurrent staged appends pipeline their round trips.
+    /// Fails fast (record NOT in the log) when the tail is already
+    /// poisoned or the record is oversized.
+    pub fn submit(&self, kind: u8, table_key: &str, seq: u64, body: &[u8]) -> Result<u64> {
         if let Some(why) = self.shared.poisoned() {
             bail!("{why}");
         }
@@ -906,10 +945,14 @@ impl Quorum {
         for p in &self.shared.peers {
             p.notify.notify_one();
         }
-        self.wait_commit(end).await
+        Ok(end)
     }
 
-    async fn wait_commit(&self, position: u64) -> Result<()> {
+    /// Wait until the quorum commit position covers `position` — the
+    /// second half of an append (see [`submit`](Self::submit)). On a stall
+    /// it requests ONE internal re-election; on a second timeout the tail
+    /// POISONS itself.
+    pub(crate) async fn wait_commit(&self, position: u64) -> Result<()> {
         let mut rx = self.shared.commit_tx.subscribe();
         let mut deadline = tokio::time::Instant::now() + self.shared.cfg.append_timeout;
         let mut stalled_once = false;
@@ -1515,19 +1558,27 @@ async fn reelect(shared: &Shared) -> Result<u64, ReelectError> {
     });
     {
         let mut el = shared.election.lock().expect("election lock");
+        // FIX (C4/M1): expulsion is non-sticky across elections — every
+        // peer gets re-evaluated under the new term. ORDER IS LOAD-BEARING:
+        // the `failed` flags must clear INSIDE this election-lock critical
+        // section, BEFORE the new term becomes observable through
+        // `Shared::term()` (which takes the same lock). run_peer reads its
+        // term snapshot FIRST and the `failed` flag SECOND; if the new term
+        // were published before the clear, a peer could read term = T2 with
+        // stale failed = true and `park_until_term_change(> T2)` forever —
+        // no further election would ever wake it. With the clear inside the
+        // critical section, a peer either sees (T1, any flag) — and any
+        // park waits only for > T1, released by the send_replace below — or
+        // (T2, failed already cleared).
+        for p in &shared.peers {
+            p.failed.store(false, Ordering::SeqCst);
+            p.flush.store(0, Ordering::SeqCst);
+        }
         *el = Election {
             term,
             term_start_lsn: donor.flush,
             history,
         };
-        for p in &shared.peers {
-            p.flush.store(0, Ordering::SeqCst);
-        }
-    }
-    // FIX (C4): expulsion is non-sticky across elections — every peer gets
-    // re-evaluated under the new term.
-    for p in &shared.peers {
-        p.failed.store(false, Ordering::SeqCst);
     }
     shared.term_tx.send_replace(term);
     for p in &shared.peers {

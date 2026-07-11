@@ -115,12 +115,23 @@
 //! generation back to the FRONT of `pending` (order preserved) and the
 //! commit is retried from fresh metadata; `S` never enters the catalog, so
 //! no scan could have excluded those rows. Flushed generations are garbage-
-//! collected once they are older than [`FLUSHED_GC`] — by then every
-//! in-flight scan that loaded pre-`S` metadata has long since taken its
-//! overlay (the load and the overlay take are adjacent awaits in one scan
-//! call), and any NEW scan's metadata contains `S`, excluding the
-//! generation anyway. Buffer memory is therefore bounded by rows inserted
-//! in the last `FLUSHED_GC` window.
+//! collected only once BOTH hold: (a) covering metadata has been OBSERVED
+//! for the generation — a metadata load provably containing its commit
+//! reached this server (a scan's overlay exclusion, or the flusher's fresh
+//! per-attempt load; see [`FlushedGen::observed`]) — and (b) the generation
+//! is older than [`FLUSHED_GC`]. Age alone is NOT sufficient: in freshness
+//! mode a catalog outage keeps serving the last PRE-commit snapshot
+//! (stale-serve default, `ICEGRES_STALE_READ_ON_CATALOG_ERROR`), and
+//! age-only GC would make committed rows VANISH from union reads mid-outage
+//! (non-monotonic reads). Once covering metadata HAS been observed, the age
+//! condition suffices: the freshness cache never regresses to older
+//! metadata, every in-flight scan that loaded pre-`S` metadata has long
+//! since taken its overlay (the load and the overlay take are adjacent
+//! awaits in one scan call), and any NEW scan's metadata contains `S`,
+//! excluding the generation anyway. Buffer memory is therefore bounded by
+//! rows inserted in the last `FLUSHED_GC` window while the catalog is
+//! healthy, and by rows inserted since the outage began while it is not
+//! (mirroring the durable tail's own documented outage growth).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -160,8 +171,11 @@ use crate::txn::{insert_target, plan_insert_rows, TxnRegistry};
 /// Overridable via `ICEGRES_WRITE_BUFFER_MAX_ROWS`.
 const DEFAULT_MAX_ROWS: usize = 50_000;
 
-/// Retain committed `flushed(S)` generations this long before garbage
-/// collection (see the union-read correctness protocol in the module docs).
+/// Retain committed `flushed(S)` generations at least this long before
+/// garbage collection. The age is the SECONDARY condition: a generation is
+/// GC'd only once covering metadata has been observed for it AND it is
+/// older than this (see the union-read correctness protocol in the module
+/// docs and [`flushed_gen_expired`]).
 const FLUSHED_GC: Duration = Duration::from_secs(30);
 
 /// What a buffered keyed op does to its key (Phase 2, keyed tail upserts).
@@ -234,6 +248,16 @@ struct FlushedGen {
     /// upsert rows; a conflicted post merges them back stamp-aware.
     keyed: Vec<(Vec<u8>, u64, KeyedOp)>,
     committed_at: Instant,
+    /// Whether a metadata load CONTAINING this generation's commit has been
+    /// observed on this server — set when a real scan's overlay excludes
+    /// the generation ([`BufferState::overlay_with`]) or the flusher's
+    /// fresh per-attempt load proves containment
+    /// ([`BufferState::note_observed`]). GC gate: an UNOBSERVED generation
+    /// is never GC'd regardless of age — in freshness mode the stale-serve
+    /// default keeps serving pre-commit metadata through a catalog outage,
+    /// and dropping the generation would make its committed rows vanish
+    /// from union reads (non-monotonic).
+    observed: bool,
 }
 
 /// One pending append batch. `id` ties the batch to the statement that
@@ -774,13 +798,18 @@ impl BufferState {
     /// (by snapshot membership, or — for a generation parked by the
     /// already-committed guard — by the metadata's own tail watermark; see
     /// [`GenCommit`]). `None` when there is nothing to add or suppress.
+    ///
+    /// Side effect (I1): a generation `is_committed` excludes here is marked
+    /// OBSERVED — the metadata the caller just loaded provably contains its
+    /// commit, so from now on age may garbage-collect it
+    /// ([`flushed_gen_expired`]).
     fn overlay_with(
         &self,
         ident: &TableIdent,
         is_committed: impl Fn(&GenCommit) -> bool,
     ) -> Result<Option<Overlay>> {
-        let tables = self.tables.lock().expect("write-buffer lock poisoned");
-        let Some(entry) = tables.get(ident) else {
+        let mut tables = self.tables.lock().expect("write-buffer lock poisoned");
+        let Some(entry) = tables.get_mut(ident) else {
             return Ok(None);
         };
         struct Layer {
@@ -789,8 +818,9 @@ impl BufferState {
             keys: HashSet<Vec<u8>>,
         }
         let mut layers: Vec<Layer> = Vec::new();
-        for flushed_gen in &entry.flushed {
+        for flushed_gen in entry.flushed.iter_mut() {
             if is_committed(&flushed_gen.commit) {
+                flushed_gen.observed = true;
                 continue;
             }
             layers.push(Layer {
@@ -893,6 +923,23 @@ impl BufferState {
         }))
     }
 
+    /// Mark every flushed generation whose commit `is_committed` proves
+    /// contained in just-loaded REAL table metadata as OBSERVED (I1) —
+    /// without taking an overlay. The flusher calls this with the fresh
+    /// metadata of each flush attempt, so covering metadata is observed
+    /// even on write-only tables that no scan ever touches (otherwise
+    /// their generations would be retained forever).
+    fn note_observed(&self, ident: &TableIdent, is_committed: impl Fn(&GenCommit) -> bool) {
+        let mut tables = self.tables.lock().expect("write-buffer lock poisoned");
+        if let Some(entry) = tables.get_mut(ident) {
+            for flushed_gen in entry.flushed.iter_mut() {
+                if !flushed_gen.observed && is_committed(&flushed_gen.commit) {
+                    flushed_gen.observed = true;
+                }
+            }
+        }
+    }
+
     fn drop_pending_prefix(
         &self,
         ident: &TableIdent,
@@ -963,6 +1010,7 @@ impl BufferState {
                 batches,
                 keyed: keyed.to_vec(),
                 committed_at: Instant::now(),
+                observed: false,
             });
         }
     }
@@ -1892,14 +1940,18 @@ impl WriteBuffer {
         )))
     }
 
-    /// The union overlay for one table against the committed metadata a
-    /// scan just loaded: all pending rows plus committed generations that
-    /// metadata cannot see yet. `None` when there is nothing to add
-    /// (fast path — scans are unchanged when the buffer is idle).
-    pub fn overlay(&self, ident: &TableIdent, metadata: &TableMetadata) -> Result<Option<Overlay>> {
-        // L3: a watermark-tagged generation (parked by the prepare-time
-        // already-committed guard) is contained in metadata exactly when
-        // the metadata's OWN tail watermark property covers its mark.
+    /// The generation-containment test `metadata` implies: a flushed
+    /// generation is contained exactly when the metadata holds its snapshot
+    /// or — for a watermark-tagged generation parked by the prepare-time
+    /// already-committed guard (L3) — when the metadata's OWN tail
+    /// watermark property covers its mark. Shared by the scan overlay and
+    /// the flusher's observed-metadata note (I1) so both apply the
+    /// identical rule.
+    fn contained_in<'m>(
+        &self,
+        ident: &TableIdent,
+        metadata: &'m TableMetadata,
+    ) -> impl Fn(&GenCommit) -> bool + 'm {
         let scan_mark = self.tail.as_deref().and_then(|t| {
             parse_watermark_property(
                 ident,
@@ -1909,12 +1961,22 @@ impl WriteBuffer {
                     .map(String::as_str),
             )
         });
-        // A generation `S` is "committed" (and so already in the scan's data)
-        // exactly when the just-loaded metadata contains it.
-        self.state.overlay_with(ident, |commit| match commit {
+        move |commit| match commit {
             GenCommit::Snapshot(s) => metadata.snapshot_by_id(*s).is_some(),
             GenCommit::CoveredByWatermark(mark) => scan_mark.is_some_and(|w| w >= *mark),
-        })
+        }
+    }
+
+    /// The union overlay for one table against the committed metadata a
+    /// scan just loaded: all pending rows plus committed generations that
+    /// metadata cannot see yet. `None` when there is nothing to add
+    /// (fast path — scans are unchanged when the buffer is idle).
+    pub fn overlay(&self, ident: &TableIdent, metadata: &TableMetadata) -> Result<Option<Overlay>> {
+        // A generation `S` is "committed" (and so already in the scan's data)
+        // exactly when the just-loaded metadata contains it — the overlay
+        // also records the observation (I1), unblocking the generation's GC.
+        self.state
+            .overlay_with(ident, self.contained_in(ident, metadata))
     }
 
     /// Synchronously flush every table's pending rows (ordering fence /
@@ -1992,6 +2054,11 @@ impl WriteBuffer {
                 .load_table(ident)
                 .await
                 .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?;
+            // I1: this fresh load is covering metadata for every EARLIER
+            // generation it contains — record the observation so their GC
+            // unblocks even on write-only tables no scan ever overlays.
+            self.state
+                .note_observed(ident, self.contained_in(ident, table.metadata()));
             let pk = self.engine.pk_columns(&table)?;
             let rows: usize =
                 batches.iter().map(|b| b.num_rows()).sum::<usize>() + keyed_snapshot.len();
@@ -2190,13 +2257,26 @@ impl WriteBuffer {
         ))
     }
 
-    /// Drop flushed generations old enough that no scan can still need them
-    /// (module docs: the metadata-load -> overlay-take window inside one
-    /// scan is microseconds; FLUSHED_GC is 30 s).
+    /// Drop flushed generations no scan can still need: covering metadata
+    /// was OBSERVED (a scan overlay excluded them or a flush load contained
+    /// them — I1) AND they are older than [`FLUSHED_GC`] (module docs: the
+    /// metadata-load -> overlay-take window inside one scan is
+    /// microseconds; FLUSHED_GC is 30 s). An unobserved generation is
+    /// retained regardless of age — the stale-serve default may still be
+    /// serving pre-commit metadata during a catalog outage, and its rows
+    /// must not vanish from union reads.
     fn gc_flushed(&self) {
         self.state
-            .retain_flushed(|g| g.committed_at.elapsed() < FLUSHED_GC);
+            .retain_flushed(|g| !flushed_gen_expired(g, FLUSHED_GC));
     }
+}
+
+/// The GC predicate for one flushed generation (I1): expired only once
+/// covering metadata has been OBSERVED for it and it has aged past
+/// `gc_age`. Age is the secondary condition; observation is the primary
+/// (see [`FlushedGen::observed`]).
+fn flushed_gen_expired(flushed_gen: &FlushedGen, gc_age: Duration) -> bool {
+    flushed_gen.observed && flushed_gen.committed_at.elapsed() >= gc_age
 }
 
 /// Floor a table's next tail sequence from its watermark SIDECAR alone —
@@ -2636,6 +2716,68 @@ mod tests {
         );
         // Drop-everything predicate (stands in for "too old"): gone.
         st.retain_flushed(|_| false);
+        assert!(st.overlay_with(&ident(), |_| false).unwrap().is_none());
+    }
+
+    // FIX (I1): a flushed generation may only be GC'd once covering
+    // metadata was OBSERVED for it. Commit gen S, never observe post-S
+    // metadata: even arbitrarily far past FLUSHED_GC (gc_age zero stands in
+    // for "any age has elapsed") the generation is retained and the overlay
+    // still supplies its rows — the stale-serve default may be serving
+    // pre-S metadata through a catalog outage, and the committed rows must
+    // not vanish mid-outage. Observing post-S metadata (a scan overlay that
+    // excludes the generation) unblocks the GC.
+    #[test]
+    fn unobserved_flushed_gen_survives_gc_until_metadata_is_observed() {
+        let st = BufferState::default();
+        let sch = schema();
+        st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[1, 2])], None)
+            .unwrap();
+        let (_b, n, _) = snap3(&st);
+        let s: i64 = 11;
+        st.move_pending_to_flushed(&ident(), n, &[], s);
+        // Never observed: the production predicate must keep it at ANY age.
+        st.retain_flushed(|g| !flushed_gen_expired(g, Duration::ZERO));
+        let ov = st
+            .overlay_with(&ident(), |_| false)
+            .unwrap()
+            .expect("unobserved generation must still overlay");
+        assert_eq!(ids(&ov), vec![1, 2]);
+        // A scan whose metadata contains S excludes the generation AND
+        // records the observation...
+        assert!(st
+            .overlay_with(&ident(), |c| *c == GenCommit::Snapshot(s))
+            .unwrap()
+            .is_none());
+        // ...after which age alone may GC it.
+        st.retain_flushed(|g| !flushed_gen_expired(g, Duration::ZERO));
+        assert!(st.overlay_with(&ident(), |_| false).unwrap().is_none());
+    }
+
+    // FIX (I1): age stays the SECONDARY condition — an observed-but-young
+    // generation is retained (pre-S scans mid-flight may still overlay it),
+    // and note_observed (the flusher's fresh-load path) records the
+    // observation without taking an overlay.
+    #[test]
+    fn observed_generation_still_respects_the_age_condition() {
+        let st = BufferState::default();
+        let sch = schema();
+        st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[7])], None)
+            .unwrap();
+        let (_b, n, _) = snap3(&st);
+        let s: i64 = 12;
+        st.move_pending_to_flushed(&ident(), n, &[], s);
+        // The flusher's next-attempt load contains S: observed, no overlay
+        // involved.
+        st.note_observed(&ident(), |c| *c == GenCommit::Snapshot(s));
+        // Observed but YOUNG (the real 30 s threshold): retained.
+        st.retain_flushed(|g| !flushed_gen_expired(g, FLUSHED_GC));
+        assert_eq!(
+            ids(&st.overlay_with(&ident(), |_| false).unwrap().unwrap()),
+            vec![7]
+        );
+        // Observed and past the age: GC'd.
+        st.retain_flushed(|g| !flushed_gen_expired(g, Duration::ZERO));
         assert!(st.overlay_with(&ident(), |_| false).unwrap().is_none());
     }
 
@@ -3701,6 +3843,115 @@ mod tests {
         fn watermark_property(&self) -> &str {
             "icegres.tail-seq.mock-tail-id"
         }
+    }
+
+    /// A tail whose durability WAIT blocks until the test releases it —
+    /// the injectable stand-in for a slow quorum round trip (I2). The
+    /// waiter signals `entered` first, so the test can order itself after
+    /// the buffer lock has provably been dropped.
+    struct BlockingWaitTail {
+        next_seq: std::sync::atomic::AtomicU64,
+        /// Taken by the (single) staged append of the test.
+        hooks: StdMutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    }
+
+    impl TailStore for BlockingWaitTail {
+        fn append(
+            &self,
+            _table: &TableIdent,
+            _kind: TailOpKind,
+            _batches: &[RecordBatch],
+        ) -> Result<u64> {
+            unreachable!("buffered paths stage; they never call append directly")
+        }
+
+        fn append_staged(
+            &self,
+            _table: &TableIdent,
+            _kind: TailOpKind,
+            _batches: &[RecordBatch],
+        ) -> Result<StagedAppend> {
+            let seq = self
+                .next_seq
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let (entered_tx, release_rx) = self
+                .hooks
+                .lock()
+                .unwrap()
+                .take()
+                .expect("exactly one staged append in this test");
+            Ok(StagedAppend::with_waiter(
+                seq,
+                Box::new(move || {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.recv(); // block until released
+                    Ok(())
+                }),
+            ))
+        }
+
+        fn replay(&self) -> Result<Vec<crate::tail::ReplayedTable>> {
+            Ok(Vec::new())
+        }
+
+        fn truncate(&self, _table: &TableIdent, _upto_seq: u64) -> Result<()> {
+            Ok(())
+        }
+
+        fn ensure_seq_floor(&self, _table: &TableIdent, _floor: u64) -> Result<()> {
+            Ok(())
+        }
+
+        fn watermark_property(&self) -> &str {
+            "icegres.tail-seq.mock-tail-id"
+        }
+    }
+
+    // FIX (I2, buffer side of the contract): a scan's overlay take is NOT
+    // blocked while a statement's durability wait is in flight — the wait
+    // runs after the buffer lock drops (the property QuorumTail's
+    // append_staged now upholds like the other backends). If the wait held
+    // the tables mutex, the overlay_with below would deadlock (the waiter
+    // returns only after the overlay completed and released it).
+    #[test]
+    fn scan_is_not_blocked_by_an_in_flight_durability_wait() {
+        let st = Arc::new(BufferState::default());
+        let sch = schema();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let tail = Arc::new(BlockingWaitTail {
+            next_seq: Default::default(),
+            hooks: StdMutex::new(Some((entered_tx, release_rx))),
+        });
+        let writer = {
+            let st = st.clone();
+            let sch = sch.clone();
+            let tail = tail.clone();
+            std::thread::spawn(move || {
+                st.append(
+                    &ident(),
+                    Some(sch.clone()),
+                    &[batch(&sch, &[1])],
+                    Some(tail.as_ref()),
+                )
+                .unwrap();
+            })
+        };
+        // The waiter has entered: staging is done, the buffer lock dropped.
+        entered_rx.recv().expect("the durability wait started");
+        // While the append is in flight, the union read completes and the
+        // staged rows are already visible (buffered mode's documented
+        // transient visibility).
+        let ov = st
+            .overlay_with(&ident(), |_| false)
+            .unwrap()
+            .expect("staged rows visible during the in-flight wait");
+        assert_eq!(ids(&ov), vec![1]);
+        release_tx
+            .send(())
+            .expect("waiter is blocked on the release");
+        writer.join().expect("the staged append acks after release");
     }
 
     // F2: a plain INSERT whose durability wait fails is removed from
