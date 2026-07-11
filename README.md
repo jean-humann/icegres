@@ -31,8 +31,9 @@ starts in ~0.3 s and serves interactive queries in single-digit milliseconds.
 | **Arrow Flight SQL / ADBC** | Second first-class protocol: queries stream as Arrow IPC, catalog metadata (`get_objects`), prepared statements, DML, and bulk ingest (one Iceberg commit per stream). In-process TLS (`grpc+tls://`). |
 | **OLTP over the lake** | `INSERT`/`UPDATE`/`DELETE` as copy-on-write Iceberg snapshots; explicit `BEGIN/COMMIT/ROLLBACK` with snapshot isolation, first-committer-wins concurrency (`40001`), and atomic multi-table COMMITs via the catalog's `transactions/commit` endpoint (Lakekeeper); opt-in primary-key enforcement. |
 | **Time travel & branches** | `table@snapshot_id` reads; Neon-style zero-copy branches (`icegres branch …`, `serve --branch`) — a branch is one metadata commit, no data copied — including whole-lakehouse branches (`branch create-all`/`drop-all`: every table, one atomic transaction, each table pinned to its captured main head — a consistent-or-nothing cross-table cut). |
-| **Buffered writes** | Opt-in Moonlink-style group commit (`--write-buffer-ms`): ~1.5 ms INSERT ack, union reads, flushed on clean shutdown; the unclean-kill window is closed by the **durable tail** — `--tail-dir` (local fsync'd WAL, ~3.2 ms ack) or `--tail-url` (Postgres backend, survives node loss). |
-| **Hot-row upserts** | Opt-in keyed tail (`icegres.tail-upsert` + `icegres.primary-key` + a durable tail): exact-PK `UPDATE`/`DELETE` ack in ~9.5 ms p50 (vs ~71 ms synchronous COW), coalesced per key into ONE commit per flush window — no more per-statement snapshots or `40001` storms on a hot row. |
+| **Buffered writes** | Opt-in Moonlink-style group commit (`--write-buffer-ms`): ~1.5 ms INSERT ack, union reads, flushed on clean shutdown; the unclean-kill window is closed by the **durable tail** — `--tail-dir` (local fsync'd WAL with group fsync: ~3.6 ms ack, bench `durable_ack_dir_ms` (statement-level probe ~2.4–2.5 ms); concurrent writers share syncs), `--tail-url` (Postgres backend, ~2.7 ms bench, survives node loss), or `--tail-quorum` (three `icekeeperd` acceptors, ~4.1 ms bench, Neon-SafeKeeper-style consensus adapted with attribution — survives any single node with no delegated single system). See the measured write-latency ladder below. |
+| **Hot-row upserts** | Opt-in keyed tail (`icegres.tail-upsert` + `icegres.primary-key` + a durable tail): exact-PK `UPDATE`/`DELETE` ack in ~5.2 ms p50 with `--freshness-ms 25` (~7.0 ms without; vs ~47 ms synchronous COW), coalesced per key into ONE commit per flush window — no more per-statement snapshots or `40001` storms on a hot row. |
+| **Bounded-staleness reads** | Opt-in freshness refresher + plan cache (`--freshness-ms N`): scans skip the per-scan catalog check — point lookups ~7.4 → ~4.4 ms p50, repeated statements ~2.8–3.6 ms. Own writes stay read-your-own-writes exact; foreign commits visible within ~N ms + one refresh round trip (tables refresh concurrently — a slow table delays only itself, bounded by a per-table timeout); staleness gauge on `/metrics`. Default 0 = exact freshness, unchanged. |
 | **Scale-to-zero** | `icegresd` wakes computes on connect and idles them to zero; branch-endpoint routing; warm session pooling. |
 | **Ops surface** | Graceful drain, bounded memory pool + disk spill, connection cap + per-IP failed-auth backoff, catalog timeouts, catalog-aware `/ready`, Prometheus `/metrics` (incl. in-flight/slow-query), correlation-ID spans, snapshot expiry + fail-closed orphan-file GC (`maintain remove-orphans`, dry-run default). |
 
@@ -49,6 +50,27 @@ volume or a real cluster.
 **Honest fit:** sub-second point / filtered / join queries, Postgres-protocol
 and ADBC compatibility, and scale-to-zero economics on lakehouse data. Leave
 100 GB+ distributed scans to Trino/Spark.
+
+## The write-latency ladder (measured)
+
+An Iceberg commit is several object-store PUTs plus a catalog POST — it can
+never acknowledge in single-digit milliseconds on real object storage.
+Sub-10 ms durable writes therefore MEAN the tail path (the same trick as
+Lakebase's SafeKeeper ack): fsync/replicate the statement to a durable tail
+first, commit to the lake on the flush cadence. Every rung is opt-in; the
+default stays fully synchronous. p50s measured on the dev box (local
+Lakekeeper + RustFS + PG16; `bench/bench.sh` reports the tail rungs as
+`durable_ack_*_ms`):
+
+| Path | Durable-ack p50 | Durability class | Cross-server/engine visibility | Semantics trade |
+|---|---|---|---|---|
+| Synchronous `INSERT` (default) | ~46 ms (batch-100 ~40 ms) | Iceberg snapshot on object storage + catalog | global, immediately (any engine) | none — one commit per statement |
+| Buffered `INSERT` (`--write-buffer-ms N`) | ~1.4 ms | process memory ONLY | this server instantly (union read); global at the ≤ N ms flush | unclean kill loses up to N ms of acked rows |
+| + `--tail-dir` (local WAL, group fsync) | ~3.6 ms bench (statement-level probe ~2.4–2.5 ms; concurrent writers coalesce: 8 writers p50 ~6.1 ms vs ~9–10 ms serialized) | this node's disk (fsync before EVERY ack) | same as buffered | node/disk loss loses acked-but-unflushed rows |
+| + `--tail-url` (Postgres tail) | ~2.7 ms bench (probe ~2.2 ms) | the tail database (its own replication/HA) | same as buffered | tail DB on the write path |
+| + `--tail-quorum` (3× `icekeeperd`) | ~4.1 ms bench (probe ~2.5 ms) | 2-of-3 independent acceptor disks (consensus) | same as buffered | run three acceptors; 2 live required |
+| Keyed `UPDATE`/`DELETE` (`icegres.tail-upsert`) | ~5.2 ms with `--freshness-ms 25` (~7.0 ms without) | as the attached tail | union read instant; ONE coalesced commit per flush window | exact-PK statements only; per-server keyed window |
+| Explicit transaction `COMMIT` | synchronous (~50 ms+) | Iceberg snapshot | global, immediately | deliberately NOT tail-staged — see `docs/limitations.md` (a tail-staged COMMIT would ack before conflict detection and break `40001`) |
 
 ---
 

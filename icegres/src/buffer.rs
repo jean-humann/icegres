@@ -34,9 +34,20 @@
 //!   drops frames at or below `max(property, sidecar)` — exactly-once across
 //!   crashes, reconcilable from the lake alone even when a foreign writer
 //!   drops the property. Honest scope: durability is this NODE's disk, not
-//!   node-loss durability (see `tail.rs`). Tail appends and the flush
-//!   snapshot both run under the buffer lock, so per-table pending order ==
-//!   tail sequence order — the invariant the watermark depends on.
+//!   node-loss durability (see `tail.rs`). Tail appends are STAGED (frame
+//!   written, sequence assigned) and the flush snapshot taken under the
+//!   buffer lock, so per-table pending order == tail sequence order and
+//!   `tail_high` is exact for any snapshot — the invariant the watermark
+//!   depends on; the durability WAIT (fsync / round trip) runs after the
+//!   lock drops, so concurrent statements coalesce into the local WAL's
+//!   group fsync instead of serializing behind one another (tail.rs,
+//!   "Group fsync"). A statement that fails at the WAIT stage errors AND
+//!   its routed rows are removed from the window (exact failure; see
+//!   [`BufferState::unroute_failed`]) unless a flush snapshot claimed them
+//!   first — that narrow window keeps the old disclosed ambiguity and
+//!   WARNs loudly. During the staging window the rows are transiently
+//!   visible to same-server union reads (acceptable for buffered mode —
+//!   its reads are already ahead of the lake by design).
 //! * **Cross-SERVER freshness = commit cadence**: other icegres computes
 //!   (and any external Iceberg reader) see buffered rows only once the
 //!   flusher commits them — at most ~`N` ms after the ack. Only reads on
@@ -104,12 +115,23 @@
 //! generation back to the FRONT of `pending` (order preserved) and the
 //! commit is retried from fresh metadata; `S` never enters the catalog, so
 //! no scan could have excluded those rows. Flushed generations are garbage-
-//! collected once they are older than [`FLUSHED_GC`] — by then every
-//! in-flight scan that loaded pre-`S` metadata has long since taken its
-//! overlay (the load and the overlay take are adjacent awaits in one scan
-//! call), and any NEW scan's metadata contains `S`, excluding the
-//! generation anyway. Buffer memory is therefore bounded by rows inserted
-//! in the last `FLUSHED_GC` window.
+//! collected only once BOTH hold: (a) covering metadata has been OBSERVED
+//! for the generation — a metadata load provably containing its commit
+//! reached this server (a scan's overlay exclusion, or the flusher's fresh
+//! per-attempt load; see [`FlushedGen::observed`]) — and (b) the generation
+//! is older than [`FLUSHED_GC`]. Age alone is NOT sufficient: in freshness
+//! mode a catalog outage keeps serving the last PRE-commit snapshot
+//! (stale-serve default, `ICEGRES_STALE_READ_ON_CATALOG_ERROR`), and
+//! age-only GC would make committed rows VANISH from union reads mid-outage
+//! (non-monotonic reads). Once covering metadata HAS been observed, the age
+//! condition suffices: the freshness cache never regresses to older
+//! metadata, every in-flight scan that loaded pre-`S` metadata has long
+//! since taken its overlay (the load and the overlay take are adjacent
+//! awaits in one scan call), and any NEW scan's metadata contains `S`,
+//! excluding the generation anyway. Buffer memory is therefore bounded by
+//! rows inserted in the last `FLUSHED_GC` window while the catalog is
+//! healthy, and by rows inserted since the outage began while it is not
+//! (mirroring the durable tail's own documented outage growth).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -135,8 +157,9 @@ use iceberg::{Catalog, TableIdent};
 use crate::dml;
 use crate::keyed;
 use crate::overwrite::{
-    align_batch, apply_dml_to_batches, pk_columns_of, prepare_commit, quote_ident, CommitOutcome,
-    DmlKind, DmlStatement, OverwriteEngine, TableOp, MAX_COMMIT_ATTEMPTS,
+    align_batch, apply_dml_to_batches, pk_columns_of, pk_columns_of_metadata, prepare_commit,
+    quote_ident, CommitOutcome, DmlKind, DmlStatement, OverwriteEngine, TableOp,
+    MAX_COMMIT_ATTEMPTS,
 };
 use crate::tail::{
     drop_stale_frames, effective_watermark, parse_watermark_property, TailOp, TailOpKind, TailStore,
@@ -148,8 +171,11 @@ use crate::txn::{insert_target, plan_insert_rows, TxnRegistry};
 /// Overridable via `ICEGRES_WRITE_BUFFER_MAX_ROWS`.
 const DEFAULT_MAX_ROWS: usize = 50_000;
 
-/// Retain committed `flushed(S)` generations this long before garbage
-/// collection (see the union-read correctness protocol in the module docs).
+/// Retain committed `flushed(S)` generations at least this long before
+/// garbage collection. The age is the SECONDARY condition: a generation is
+/// GC'd only once covering metadata has been observed for it AND it is
+/// older than this (see the union-read correctness protocol in the module
+/// docs and [`flushed_gen_expired`]).
 const FLUSHED_GC: Duration = Duration::from_secs(30);
 
 /// What a buffered keyed op does to its key (Phase 2, keyed tail upserts).
@@ -187,6 +213,12 @@ struct KeyedState {
     /// Encoded PK -> latest op (per-key last-writer-wins within the window).
     entries: HashMap<Vec<u8>, KeyedEntry>,
     next_stamp: u64,
+    /// Stamps BELOW this were taken by a flush snapshot (every snapshot
+    /// covers the whole live map, so this is simply `next_stamp` at the
+    /// last snapshot). A claimed stamp belongs to an in-flight (or
+    /// completed) commit — a failing statement may no longer unroute it
+    /// (see [`BufferState::unroute_failed`]).
+    claimed_below: u64,
 }
 
 /// How a flushed generation's commit is recognizable in scan metadata —
@@ -216,6 +248,32 @@ struct FlushedGen {
     /// upsert rows; a conflicted post merges them back stamp-aware.
     keyed: Vec<(Vec<u8>, u64, KeyedOp)>,
     committed_at: Instant,
+    /// Whether a metadata load CONTAINING this generation's commit has been
+    /// observed on this server — set when a real scan's overlay excludes
+    /// the generation ([`BufferState::overlay_with`]) or the flusher's
+    /// fresh per-attempt load proves containment
+    /// ([`BufferState::note_observed`]). GC gate: an UNOBSERVED generation
+    /// is never GC'd regardless of age — in freshness mode the stale-serve
+    /// default keeps serving pre-commit metadata through a catalog outage,
+    /// and dropping the generation would make its committed rows vanish
+    /// from union reads (non-monotonic).
+    observed: bool,
+}
+
+/// One pending append batch. `id` ties the batch to the statement that
+/// routed it (the wait-failure unroute, [`BufferState::unroute_failed`]);
+/// `claimed` is set the moment a flush snapshot takes the batch — a
+/// claimed batch belongs to an in-flight (or completed) commit and may no
+/// longer be removed by its failing statement, only drained/moved by the
+/// flush bookkeeping. Because every snapshot claims the WHOLE pending vec
+/// and new batches append behind it, claimed batches always form a prefix
+/// — which is what keeps the flush's `drain(..n_batches)` positional
+/// accounting exact in the presence of unroutes (they only ever remove
+/// unclaimed batches, i.e. batches strictly behind any claimed prefix).
+struct PendingBatch {
+    id: u64,
+    claimed: bool,
+    batch: RecordBatch,
 }
 
 /// Per-table buffer state.
@@ -224,8 +282,10 @@ struct TableBuf {
     /// aligned to — identical to what the committed scan produces.
     schema: ArrowSchemaRef,
     /// Acked rows not yet handed to a catalog commit, in insert order.
-    pending: Vec<RecordBatch>,
+    pending: Vec<PendingBatch>,
     pending_rows: usize,
+    /// Monotonic id source for [`PendingBatch::id`].
+    next_batch_id: u64,
     /// Keyed tail ops of the current window (Phase 2); `None` until the
     /// first keyed op touches the table.
     keyed: Option<KeyedState>,
@@ -292,13 +352,28 @@ impl BufferState {
 
     /// Align `batches` to the table's canonical schema and append them to its
     /// pending buffer, creating the entry from `schema_if_first` on first
-    /// touch. With a `tail`, the aligned batches are durably appended to it
-    /// FIRST (fsync before return) — a tail error leaves `pending` untouched
-    /// and becomes the statement's error, so nothing is ever acked from
-    /// memory alone. Running the tail append under the buffer lock keeps
-    /// pending order == tail sequence order (the watermark invariant; the
-    /// fsync is the same latency the client is paying for durability anyway).
-    /// Returns `(rows_appended, pending_rows_total)`.
+    /// touch. With a `tail`, the aligned batches are STAGED onto it (frame
+    /// written, sequence assigned) under the buffer lock — a staging error
+    /// leaves `pending` untouched and becomes the statement's error — then
+    /// the durability wait ([`StagedAppend::wait_durable`], the fsync /
+    /// round trip) runs AFTER the lock is dropped, so concurrent statements
+    /// coalesce into the tail's group fsync instead of serializing behind
+    /// one another. Nothing is ever acked from memory alone: this returns
+    /// (and the caller acks) only after the wait succeeds. Staging + the
+    /// window bookkeeping run under ONE lock acquisition, which keeps
+    /// pending order == tail sequence order AND tail_high exact for any
+    /// flush snapshot (the watermark invariant). Error-path semantics: a
+    /// failure at the WAIT stage (a dying disk) errors the statement AND
+    /// removes its routed rows from the window ([`unroute_failed`]
+    /// (Self::unroute_failed)) — exact failure — UNLESS a flush snapshot
+    /// already claimed them (narrow window: the failure is then AMBIGUOUS,
+    /// the rows may still commit, and this WARNs loudly with the tail
+    /// sequence). During the staging window (between routing and the wait)
+    /// the rows are transiently visible to same-server union reads —
+    /// acceptable for buffered mode, whose reads are already ahead of the
+    /// lake. The frame itself never replays and its sequence is never
+    /// reused (tail.rs burned-sequence rule), so replay stays exact either
+    /// way. Returns `(rows_appended, pending_rows_total)`.
     fn append(
         &self,
         ident: &TableIdent,
@@ -319,6 +394,7 @@ impl BufferState {
                     schema,
                     pending: Vec::new(),
                     pending_rows: 0,
+                    next_batch_id: 1,
                     keyed: None,
                     flushed: Vec::new(),
                     tail_high: None,
@@ -326,26 +402,53 @@ impl BufferState {
             );
         }
         let entry = tables.get_mut(ident).expect("just ensured present");
+        // ICEGRES_QUERY_TIMING tail-ack budget: `buffer_append` = the whole
+        // statement append (align + staged tail append + window bookkeeping
+        // + the durability wait; the tail backend logs its own
+        // encode/durability split), `buffer_route` = the in-memory
+        // bookkeeping alone. One cached bool load when unset (timing.rs).
+        let timing = crate::timing::enabled();
+        let append_started = timing.then(std::time::Instant::now);
         let aligned: Vec<RecordBatch> = batches
             .iter()
             .map(|b| align_batch(b, &entry.schema))
             .collect::<Result<_>>()?;
-        if let Some(tail) = tail {
-            // ONE append for the whole statement (all batches in one frame,
-            // one fsync, one sequence): all-or-nothing by construction — a
-            // failure leaves NO durable frame (tail.rs rolls back partial
-            // bytes), so rows of a failed statement can never replay. The
-            // frame stays a plain Append even when rows are routed into
-            // upsert entries below: boot replay pushes Append frames back
-            // through THIS function in sequence order, so the same routing
-            // rebuilds the identical split.
-            if !aligned.is_empty() {
-                entry.tail_high = Some(tail.append(ident, TailOpKind::Append, &aligned)?);
+        let staged = match tail {
+            // ONE frame for the whole statement (all batches, one fsync,
+            // one sequence): all-or-nothing by construction — a staging
+            // failure leaves NO frame (tail.rs rolls back partial bytes),
+            // so rows of a failed statement can never replay. The frame
+            // stays a plain Append even when rows are routed into upsert
+            // entries below: boot replay pushes Append frames back through
+            // THIS function in sequence order, so the same routing rebuilds
+            // the identical split.
+            Some(tail) if !aligned.is_empty() => {
+                let staged = tail.append_staged(ident, TailOpKind::Append, &aligned)?;
+                entry.tail_high = Some(staged.seq());
+                Some(staged)
+            }
+            _ => None,
+        };
+        let rows: usize = aligned.iter().map(|b| b.num_rows()).sum();
+        let t = timing.then(std::time::Instant::now);
+        let routed = route_appends(entry, aligned)?;
+        if let Some(t) = t {
+            crate::timing::record("buffer_route", t.elapsed());
+        }
+        let pending_rows = entry.pending_rows;
+        // Durability wait OUTSIDE the buffer lock (the group-fsync win).
+        drop(tables);
+        if let Some(staged) = staged {
+            let seq = staged.seq();
+            if let Err(e) = staged.wait_durable() {
+                self.unroute_failed(ident, seq, routed);
+                return Err(e);
             }
         }
-        let rows: usize = aligned.iter().map(|b| b.num_rows()).sum();
-        route_appends(entry, aligned)?;
-        Ok((rows, entry.pending_rows))
+        if let Some(t) = append_started {
+            crate::timing::record("buffer_append", t.elapsed());
+        }
+        Ok((rows, pending_rows))
     }
 
     /// Record that tail frames up to `seq` are reflected in this buffer
@@ -381,10 +484,55 @@ impl BufferState {
     /// The current keyed op for `key`: `Some(Some(row))` = buffered upsert
     /// (row = the key's current value), `Some(None)` = buffered delete,
     /// `None` = no keyed entry (resolve through the union view instead).
+    /// Test-only view of the raw map; production reads go through
+    /// [`keyed_current`](Self::keyed_current), which adds the pk-cols
+    /// declaration check.
+    #[cfg(test)]
     fn keyed_lookup(&self, ident: &TableIdent, key: &[u8]) -> Option<Option<RecordBatch>> {
         let tables = self.tables.lock().expect("write-buffer lock poisoned");
         let entry = tables.get(ident)?;
         let keyed = entry.keyed.as_ref()?;
+        keyed.entries.get(key).map(|e| match &e.op.kind {
+            KeyedKind::Upsert(row) => Some(row.clone()),
+            KeyedKind::Delete => None,
+        })
+    }
+
+    /// The key's current version when it is PROVABLY resolvable from the
+    /// live keyed map (the keyed-map RMW shortcut, write-latency scope
+    /// item 3): `Some(Some(row))` = current row, `Some(None)` = currently
+    /// deleted, `None` = not resolvable here — read through the union view.
+    ///
+    /// Only the LIVE map qualifies, and that is load-bearing: a map entry
+    /// is strictly newer than any pending append of its key (the routing
+    /// invariant, [`route_appends`]), and every serialized sync write on a
+    /// keyed table drains the map FIRST (`try_serialized_sync_dml` fences
+    /// via flush under L1 before committing), so a live entry can never be
+    /// staler than a local sync commit. A keyed op retained in a FLUSHED
+    /// generation has neither property — a sync write may have committed a
+    /// newer value for the key after the generation's commit while it is
+    /// still window-retained, and a re-inserted key may sit in `pending` or
+    /// a newer generation's batches (a duplicate only the engine read is
+    /// honest about) — so window-retained generations were deliberately
+    /// NOT made a fast-path source; their keys resolve through the union
+    /// view, which composes all of this correctly.
+    ///
+    /// A `pk_cols` mismatch with the buffered keyed state declines: the
+    /// map's keys were encoded under a different declaration and equal
+    /// bytes would not prove an equal logical key (the caller's
+    /// keyed_write later fails loudly on the change, exactly as before).
+    fn keyed_current(
+        &self,
+        ident: &TableIdent,
+        key: &[u8],
+        pk_cols: &[String],
+    ) -> Option<Option<RecordBatch>> {
+        let tables = self.tables.lock().expect("write-buffer lock poisoned");
+        let entry = tables.get(ident)?;
+        let keyed = entry.keyed.as_ref()?;
+        if keyed.pk_cols != pk_cols {
+            return None;
+        }
         keyed.entries.get(key).map(|e| match &e.op.kind {
             KeyedKind::Upsert(row) => Some(row.clone()),
             KeyedKind::Delete => None,
@@ -416,6 +564,7 @@ impl BufferState {
                     schema,
                     pending: Vec::new(),
                     pending_rows: 0,
+                    next_batch_id: 1,
                     keyed: None,
                     flushed: Vec::new(),
                     tail_high: None,
@@ -428,6 +577,7 @@ impl BufferState {
                 pk_cols: pk_cols.to_vec(),
                 entries: HashMap::new(),
                 next_stamp: 1,
+                claimed_below: 1,
             });
         }
         // S3: a pk_cols mismatch is only fatal while keys encoded under the
@@ -438,36 +588,175 @@ impl BufferState {
         // of failing keyed ops until restart.
         let old_keys_buffered = entry.keyed.as_ref().is_some_and(|k| !k.entries.is_empty())
             || entry.flushed.iter().any(|g| !g.keyed.is_empty());
-        let keyed = entry.keyed.as_mut().expect("just ensured present");
-        if keyed.pk_cols != pk_cols {
-            if old_keys_buffered {
-                // The primary-key property changed while keyed ops were
-                // pending: the buffered keys would no longer address the
-                // same rows.
-                bail_pk_changed(ident, &keyed.pk_cols, pk_cols)?;
+        {
+            let keyed = entry.keyed.as_mut().expect("just ensured present");
+            if keyed.pk_cols != pk_cols {
+                if old_keys_buffered {
+                    // The primary-key property changed while keyed ops were
+                    // pending: the buffered keys would no longer address the
+                    // same rows.
+                    bail_pk_changed(ident, &keyed.pk_cols, pk_cols)?;
+                }
+                keyed.pk_cols = pk_cols.to_vec();
             }
-            keyed.pk_cols = pk_cols.to_vec();
         }
-        if let Some(tail) = tail {
-            let (kind, frame): (TailOpKind, &RecordBatch) = match &op.kind {
-                KeyedKind::Upsert(row) => (TailOpKind::Upsert, row),
-                KeyedKind::Delete => (TailOpKind::Delete, &op.key_row),
-            };
-            entry.tail_high = Some(tail.append(ident, kind, std::slice::from_ref(frame))?);
-        }
+        // ICEGRES_QUERY_TIMING: the keyed ack's durable half — tail append
+        // (backend logs its own encode/durability split) + map insert.
+        let write_started = crate::timing::enabled().then(std::time::Instant::now);
+        // Staged like BufferState::append: frame written + seq assigned +
+        // map insert under THIS lock acquisition (keyed seq order == map
+        // order — the watermark invariant), the durability wait after the
+        // lock drops. Same error-path semantics as append: a WAIT-stage
+        // failure errors the statement AND unroutes its map entry
+        // (restoring whatever earlier acked entry it displaced) — exact
+        // failure — unless a flush snapshot already claimed the entry
+        // (narrow window: disclosed ambiguity, WARNed loudly). The frame
+        // never replays and its sequence is never reused either way.
+        let staged = match tail {
+            Some(tail) => {
+                let (kind, frame): (TailOpKind, &RecordBatch) = match &op.kind {
+                    KeyedKind::Upsert(row) => (TailOpKind::Upsert, row),
+                    KeyedKind::Delete => (TailOpKind::Delete, &op.key_row),
+                };
+                let staged = tail.append_staged(ident, kind, std::slice::from_ref(frame))?;
+                entry.tail_high = Some(staged.seq());
+                Some(staged)
+            }
+            None => None,
+        };
+        let keyed = entry.keyed.as_mut().expect("just ensured present");
         let stamp = keyed.next_stamp;
         keyed.next_stamp += 1;
-        keyed.entries.insert(key, KeyedEntry { stamp, op });
-        Ok((keyed.entries.len(), entry.pending_rows))
+        let displaced = keyed.entries.insert(key.clone(), KeyedEntry { stamp, op });
+        let routed = RoutedStmt {
+            batch_ids: Vec::new(),
+            keyed: vec![(key, stamp, displaced)],
+        };
+        let counts = (keyed.entries.len(), entry.pending_rows);
+        drop(tables);
+        if let Some(staged) = staged {
+            let seq = staged.seq();
+            if let Err(e) = staged.wait_durable() {
+                self.unroute_failed(ident, seq, routed);
+                return Err(e);
+            }
+        }
+        if let Some(t) = write_started {
+            crate::timing::record("keyed_write", t.elapsed());
+        }
+        Ok(counts)
+    }
+
+    /// The wait-failure unroute: a statement whose tail durability wait
+    /// failed has already errored to its client — its routed rows must not
+    /// silently commit. Under the buffer lock, remove EXACTLY what the
+    /// statement routed (its pending batches; its keyed entries, restoring
+    /// whatever earlier acked entry each displaced), making the failure
+    /// exact — UNLESS a flush snapshot already claimed any of it (the
+    /// narrow staging-to-failure window): then nothing is touched (partial
+    /// removal would make the outcome worse than the disclosed ambiguity)
+    /// and this WARNs loudly with the burned tail sequence. A key
+    /// overwritten by a NEWER statement is left alone either way — the
+    /// newer op supersedes the failed value regardless. Known bounded
+    /// residual: if TWO statements fail their waits on the same key in one
+    /// window, the later one's restore can resurrect the earlier one's
+    /// failed entry (both clients errored; only reachable while the tail
+    /// is already dying).
+    fn unroute_failed(&self, ident: &TableIdent, seq: u64, routed: RoutedStmt) {
+        let mut tables = self.tables.lock().expect("write-buffer lock poisoned");
+        let Some(entry) = tables.get_mut(ident) else {
+            return;
+        };
+        // Claim check first, all-or-nothing. A snapshot claims the WHOLE
+        // window at once, so a statement's routed state is either fully
+        // unclaimed or fully claimed — mixed states only arise vs. batches
+        // of OTHER statements, never within one.
+        let ids: HashSet<u64> = routed.batch_ids.iter().copied().collect();
+        let mut present_unclaimed = 0usize;
+        for pb in &entry.pending {
+            if ids.contains(&pb.id) && !pb.claimed {
+                present_unclaimed += 1;
+            }
+        }
+        let batches_claimed = present_unclaimed != ids.len();
+        let keyed_claimed = routed.keyed.iter().any(|(key, stamp, _)| {
+            match entry.keyed.as_ref() {
+                // Missing state with routed keyed ops = drained wholesale.
+                None => true,
+                // Claimed when a snapshot took our stamp, or the key
+                // vanished from the live map entirely (only a snapshot
+                // drain removes keys — an overwrite keeps the key present
+                // under a newer stamp, which is NOT ambiguous: the failed
+                // value was displaced and can no longer flush).
+                Some(state) => *stamp < state.claimed_below || !state.entries.contains_key(key),
+            }
+        });
+        if batches_claimed || keyed_claimed {
+            tracing::warn!(
+                table = %ident,
+                tail_seq = seq,
+                "a statement's tail durability wait FAILED after a flush \
+                 snapshot claimed its rows — AMBIGUOUS failure: the client \
+                 saw an error but the rows may still commit with the \
+                 in-flight flush (the tail frame itself never replays and \
+                 sequence {seq} is burned, so replay stays exactly-once)"
+            );
+            return;
+        }
+        // Exact removal: pending batches out, keyed entries removed or
+        // rolled back to what they displaced.
+        if !ids.is_empty() {
+            let mut removed_rows = 0usize;
+            entry.pending.retain(|pb| {
+                if ids.contains(&pb.id) {
+                    removed_rows += pb.batch.num_rows();
+                    false
+                } else {
+                    true
+                }
+            });
+            entry.pending_rows -= removed_rows;
+        }
+        for (key, stamp, displaced) in routed.keyed {
+            let Some(state) = entry.keyed.as_mut() else {
+                unreachable!("checked above: keyed state present");
+            };
+            match state.entries.get(&key) {
+                Some(e) if e.stamp == stamp => {
+                    match displaced {
+                        Some(prev) => {
+                            state.entries.insert(key, prev);
+                        }
+                        None => {
+                            state.entries.remove(&key);
+                        }
+                    };
+                }
+                // A newer statement overwrote the key: the failed value
+                // can no longer flush on its own — leave the newer op.
+                _ => {}
+            }
+        }
+        tracing::warn!(
+            table = %ident,
+            tail_seq = seq,
+            "a statement's tail durability wait FAILED; its routed rows were \
+             removed from the buffer window (exact failure — nothing of the \
+             statement will commit; sequence {seq} is burned, never reused)"
+        );
     }
 
     /// Snapshot the current pending prefix AND keyed map WITHOUT removing
     /// anything (rows stay readable through the union while the commit is
     /// in flight; new writes land behind/over the snapshot). The tail mark
     /// is taken under the same lock, so it is exact for this snapshot.
+    /// Everything snapshotted is marked CLAIMED (batches and keyed stamps):
+    /// from here on it belongs to the flush bookkeeping and a failing
+    /// statement may no longer unroute it (see [`unroute_failed`]
+    /// (Self::unroute_failed)).
     fn snapshot_pending(&self, ident: &TableIdent) -> PendingSnapshot {
-        let tables = self.tables.lock().expect("write-buffer lock poisoned");
-        match tables.get(ident) {
+        let mut tables = self.tables.lock().expect("write-buffer lock poisoned");
+        match tables.get_mut(ident) {
             Some(entry) => {
                 let mut keyed: Vec<(Vec<u8>, u64, KeyedOp)> = match &entry.keyed {
                     Some(k) => k
@@ -478,8 +767,14 @@ impl BufferState {
                     None => Vec::new(),
                 };
                 keyed.sort_by_key(|(_, stamp, _)| *stamp);
+                for pb in entry.pending.iter_mut() {
+                    pb.claimed = true;
+                }
+                if let Some(state) = entry.keyed.as_mut() {
+                    state.claimed_below = state.next_stamp;
+                }
                 PendingSnapshot {
-                    batches: entry.pending.clone(),
+                    batches: entry.pending.iter().map(|pb| pb.batch.clone()).collect(),
                     n_batches: entry.pending.len(),
                     keyed,
                     tail_mark: entry.tail_high,
@@ -503,13 +798,18 @@ impl BufferState {
     /// (by snapshot membership, or — for a generation parked by the
     /// already-committed guard — by the metadata's own tail watermark; see
     /// [`GenCommit`]). `None` when there is nothing to add or suppress.
+    ///
+    /// Side effect (I1): a generation `is_committed` excludes here is marked
+    /// OBSERVED — the metadata the caller just loaded provably contains its
+    /// commit, so from now on age may garbage-collect it
+    /// ([`flushed_gen_expired`]).
     fn overlay_with(
         &self,
         ident: &TableIdent,
         is_committed: impl Fn(&GenCommit) -> bool,
     ) -> Result<Option<Overlay>> {
-        let tables = self.tables.lock().expect("write-buffer lock poisoned");
-        let Some(entry) = tables.get(ident) else {
+        let mut tables = self.tables.lock().expect("write-buffer lock poisoned");
+        let Some(entry) = tables.get_mut(ident) else {
             return Ok(None);
         };
         struct Layer {
@@ -518,8 +818,9 @@ impl BufferState {
             keys: HashSet<Vec<u8>>,
         }
         let mut layers: Vec<Layer> = Vec::new();
-        for flushed_gen in &entry.flushed {
+        for flushed_gen in entry.flushed.iter_mut() {
             if is_committed(&flushed_gen.commit) {
+                flushed_gen.observed = true;
                 continue;
             }
             layers.push(Layer {
@@ -540,7 +841,7 @@ impl BufferState {
             });
         }
         layers.push(Layer {
-            appends: entry.pending.clone(),
+            appends: entry.pending.iter().map(|pb| pb.batch.clone()).collect(),
             upserts: entry
                 .keyed
                 .iter()
@@ -622,6 +923,23 @@ impl BufferState {
         }))
     }
 
+    /// Mark every flushed generation whose commit `is_committed` proves
+    /// contained in just-loaded REAL table metadata as OBSERVED (I1) —
+    /// without taking an overlay. The flusher calls this with the fresh
+    /// metadata of each flush attempt, so covering metadata is observed
+    /// even on write-only tables that no scan ever touches (otherwise
+    /// their generations would be retained forever).
+    fn note_observed(&self, ident: &TableIdent, is_committed: impl Fn(&GenCommit) -> bool) {
+        let mut tables = self.tables.lock().expect("write-buffer lock poisoned");
+        if let Some(entry) = tables.get_mut(ident) {
+            for flushed_gen in entry.flushed.iter_mut() {
+                if !flushed_gen.observed && is_committed(&flushed_gen.commit) {
+                    flushed_gen.observed = true;
+                }
+            }
+        }
+    }
+
     fn drop_pending_prefix(
         &self,
         ident: &TableIdent,
@@ -630,7 +948,11 @@ impl BufferState {
     ) {
         let mut tables = self.tables.lock().expect("write-buffer lock poisoned");
         if let Some(entry) = tables.get_mut(ident) {
-            let dropped: Vec<RecordBatch> = entry.pending.drain(..n_batches).collect();
+            let dropped: Vec<RecordBatch> = entry
+                .pending
+                .drain(..n_batches)
+                .map(|pb| pb.batch)
+                .collect();
             entry.pending_rows -= dropped.iter().map(|b| b.num_rows()).sum::<usize>();
             drain_keyed_snapshot(entry, keyed);
         }
@@ -676,7 +998,11 @@ impl BufferState {
     ) {
         let mut tables = self.tables.lock().expect("write-buffer lock poisoned");
         if let Some(entry) = tables.get_mut(ident) {
-            let batches: Vec<RecordBatch> = entry.pending.drain(..n_batches).collect();
+            let batches: Vec<RecordBatch> = entry
+                .pending
+                .drain(..n_batches)
+                .map(|pb| pb.batch)
+                .collect();
             entry.pending_rows -= batches.iter().map(|b| b.num_rows()).sum::<usize>();
             drain_keyed_snapshot(entry, keyed);
             entry.flushed.push(FlushedGen {
@@ -684,6 +1010,7 @@ impl BufferState {
                 batches,
                 keyed: keyed.to_vec(),
                 committed_at: Instant::now(),
+                observed: false,
             });
         }
     }
@@ -705,7 +1032,21 @@ impl BufferState {
                 .map(|b| b.num_rows())
                 .sum::<usize>();
             // These were the OLDEST rows: restore insert order at the front.
-            let mut restored = flushed_gen.batches;
+            // They stay CLAIMED (they belonged to acked statements a flush
+            // took; the next snapshot re-claims everything anyway).
+            let mut restored: Vec<PendingBatch> = flushed_gen
+                .batches
+                .into_iter()
+                .map(|batch| {
+                    let id = entry.next_batch_id;
+                    entry.next_batch_id += 1;
+                    PendingBatch {
+                        id,
+                        claimed: true,
+                        batch,
+                    }
+                })
+                .collect();
             restored.append(&mut entry.pending);
             entry.pending = restored;
             // Keyed merge-back, last-writer-wins: a key updated AFTER the
@@ -733,6 +1074,29 @@ impl BufferState {
     }
 }
 
+/// What one statement routed into the buffer window — the undo record for
+/// the wait-failure path ([`BufferState::unroute_failed`]): the pending
+/// batch ids it pushed, and the keyed entries it created as
+/// `(key, its stamp, the entry it displaced)`.
+#[derive(Default)]
+struct RoutedStmt {
+    batch_ids: Vec<u64>,
+    keyed: Vec<(Vec<u8>, u64, Option<KeyedEntry>)>,
+}
+
+/// Push one aligned batch into `pending`, tagged for unroute.
+fn push_pending(entry: &mut TableBuf, routed: &mut RoutedStmt, batch: RecordBatch) {
+    let id = entry.next_batch_id;
+    entry.next_batch_id += 1;
+    routed.batch_ids.push(id);
+    entry.pending_rows += batch.num_rows();
+    entry.pending.push(PendingBatch {
+        id,
+        claimed: false,
+        batch,
+    });
+}
+
 /// Route one statement's aligned append batches into the table buffer
 /// (L2 — tail sequence order is the total order for keyed keys): a row
 /// whose PK currently has a keyed-map entry supersedes it as a NEWER
@@ -742,30 +1106,31 @@ impl BufferState {
 /// buffered keyed ops take the plain-append fast path and pay nothing.
 /// Live inserts and boot replay both land here (via
 /// [`BufferState::append`]), so replay rebuilds the identical routing by
-/// construction.
-fn route_appends(entry: &mut TableBuf, aligned: Vec<RecordBatch>) -> Result<()> {
+/// construction. Returns the statement's undo record ([`RoutedStmt`]).
+fn route_appends(entry: &mut TableBuf, aligned: Vec<RecordBatch>) -> Result<RoutedStmt> {
+    let mut routed = RoutedStmt::default();
     if entry.keyed.as_ref().is_none_or(|k| k.entries.is_empty()) {
-        entry.pending_rows += aligned.iter().map(|b| b.num_rows()).sum::<usize>();
-        entry.pending.extend(aligned);
-        return Ok(());
+        for batch in aligned {
+            push_pending(entry, &mut routed, batch);
+        }
+        return Ok(routed);
     }
-    let keyed = entry.keyed.as_mut().expect("checked above");
     for batch in aligned {
         if batch.num_rows() == 0 {
             continue;
         }
+        let keyed = entry.keyed.as_mut().expect("checked above");
         let keys = keyed::encode_batch_keys(&batch, &keyed.pk_cols)?;
         let hit: Vec<bool> = keys.iter().map(|k| keyed.entries.contains_key(k)).collect();
         if hit.iter().all(|h| !h) {
-            entry.pending_rows += batch.num_rows();
-            entry.pending.push(batch);
+            push_pending(entry, &mut routed, batch);
             continue;
         }
         let key_rows = keyed::project_key_rows(&batch, &keyed.pk_cols)?;
         for (row, key) in keys.iter().enumerate().filter(|&(r, _)| hit[r]) {
             let stamp = keyed.next_stamp;
             keyed.next_stamp += 1;
-            keyed.entries.insert(
+            let displaced = keyed.entries.insert(
                 key.clone(),
                 KeyedEntry {
                     stamp,
@@ -775,6 +1140,7 @@ fn route_appends(entry: &mut TableBuf, aligned: Vec<RecordBatch>) -> Result<()> 
                     },
                 },
             );
+            routed.keyed.push((key.clone(), stamp, displaced));
         }
         if hit.iter().all(|h| *h) {
             continue;
@@ -793,10 +1159,9 @@ fn route_appends(entry: &mut TableBuf, aligned: Vec<RecordBatch>) -> Result<()> 
                 .unwrap_or(false),
             "a pending append must never carry a keyed-map key"
         );
-        entry.pending_rows += filtered.num_rows();
-        entry.pending.push(filtered);
+        push_pending(entry, &mut routed, filtered);
     }
-    Ok(())
+    Ok(routed)
 }
 
 /// Remove exactly the snapshotted keyed entries from the live map: an entry
@@ -1071,17 +1436,19 @@ impl WriteBuffer {
                     "tail replay: dropped frames already covered by the committed \
                      watermark (crash landed between commit and truncate)"
                 );
-                // Best-effort disk cleanup of the covered frames.
-                if let Some(w) = watermark {
-                    if let Err(e) = tail.truncate(&ident, w) {
-                        tracing::warn!(
-                            table = %ident,
-                            upto_seq = w,
-                            "tail truncate of stale frames failed (harmless; the \
-                             watermark keeps replay exact): {e:#}"
-                        );
-                    }
-                }
+                // Best-effort disk cleanup of the covered frames — through
+                // the SAME watermark-record-then-truncate discipline as the
+                // flush path (FIX C1a). The boot path used to truncate from
+                // the LAKE property alone: with no watermark record ever
+                // written (the crash landed between the property stamp and
+                // record_watermark), the truncate deleted the table's ONLY
+                // records, the next restart replayed nothing for it, the
+                // sequence floor never applied, and freshly acked rows were
+                // silently dropped as already-committed. record_watermark
+                // BEFORE truncate retains the table's trace; a failed
+                // watermark record skips the truncate (bounded leak, zero
+                // loss — same rule as the flush path).
+                tail_truncate_covered(Some(tail.as_ref()), &ident, watermark);
             }
             let Some((max_seq, _)) = survivors.last() else {
                 continue;
@@ -1297,25 +1664,41 @@ impl WriteBuffer {
         if self.cached_activation(&cand.ident) == Some(false) {
             return Ok(None);
         }
-        // Activation gate against the live table (also loads the metadata
-        // the union read below anchors to).
-        let table = match self.catalog.load_table(&cand.ident).await {
-            Ok(t) => t,
-            // Unknown table etc.: let the normal path produce the error.
-            Err(_) => return Ok(None),
-        };
-        self.note_activation(&cand.ident, table.metadata_location(), table.metadata());
-        if !keyed::property_is_true(
-            table
-                .metadata()
-                .properties()
-                .get(keyed::TAIL_UPSERT_PROPERTY),
-        ) {
+        // ICEGRES_QUERY_TIMING keyed-ack budget (cached bool when unset):
+        // `keyed_gate` = the activation catalog load, `keyed_rmw_read` = the
+        // current-row resolution, `keyed_apply` = folding the statement over
+        // it, `keyed_write` (keyed_write fn) = durable tail append + map
+        // insert, `keyed_total` = the whole eligible statement.
+        let timing = crate::timing::enabled();
+        let keyed_started = timing.then(std::time::Instant::now);
+        // Activation gate. With `--freshness-ms` on and the table's cache
+        // fresh, the gate serves the freshness-cached metadata with NO
+        // catalog round trip — the same bounded-staleness contract every
+        // read already rides (local writes/DDL invalidate synchronously,
+        // foreign property flips land within the bound). Otherwise (default
+        // mode, or a stale cache) one `load_table`, exactly as before.
+        let (metadata_location, metadata) =
+            match crate::freshness::provider(&crate::freshness::table_key(&cand.ident))
+                .and_then(|p| p.fresh_metadata())
+            {
+                Some((location, metadata)) => (location, metadata),
+                None => match self.catalog.load_table(&cand.ident).await {
+                    Ok(t) => (t.metadata_location().map(str::to_string), t.metadata_ref()),
+                    // Unknown table etc.: let the normal path produce the
+                    // error.
+                    Err(_) => return Ok(None),
+                },
+            };
+        if let Some(t) = keyed_started {
+            crate::timing::record("keyed_gate", t.elapsed());
+        }
+        self.note_activation(&cand.ident, metadata_location.as_deref(), &metadata);
+        if !keyed::property_is_true(metadata.properties().get(keyed::TAIL_UPSERT_PROPERTY)) {
             return Ok(None);
         }
         // The table opted in: a broken PK declaration is now a loud error,
         // not a silent fallback.
-        let Some(pk_cols) = pk_columns_of(&table)? else {
+        let Some(pk_cols) = pk_columns_of_metadata(&metadata, &cand.ident.to_string())? else {
             return Ok(None);
         };
         // WHERE must bind EVERY PK column exactly once and nothing else
@@ -1342,7 +1725,7 @@ impl WriteBuffer {
             return Ok(None);
         }
         let schema = Arc::new(
-            schema_to_arrow_schema(table.metadata().current_schema())
+            schema_to_arrow_schema(metadata.current_schema())
                 .map_err(|e| anyhow!("schema conversion failed for {}: {e}", cand.ident))?,
         );
         let pk_idx = keyed::pk_indices(&schema, &pk_cols)?;
@@ -1386,33 +1769,37 @@ impl WriteBuffer {
         // (fast path, no IO); otherwise read through the same union view a
         // scan sees (committed + pending + unseen flushed generations, with
         // keyed suppression applied by the scan path itself).
-        let current: Vec<RecordBatch> = match self.state.keyed_lookup(&cand.ident, &key) {
-            Some(Some(row)) => vec![row],
-            Some(None) => Vec::new(), // deleted earlier in this window
-            None => {
-                let from = match &cand.dml.alias {
-                    Some(alias) => format!(
-                        "{}.{} AS {}",
-                        quote_ident(&cand.dml.namespace),
-                        quote_ident(&cand.dml.table),
-                        quote_ident(alias)
-                    ),
-                    None => format!(
-                        "{}.{}",
-                        quote_ident(&cand.dml.namespace),
-                        quote_ident(&cand.dml.table)
-                    ),
-                };
-                let sql = format!("SELECT * FROM {from} WHERE ({predicate}) LIMIT 2");
-                let df = ctx
-                    .sql(&sql)
-                    .await
-                    .map_err(|e| anyhow!("keyed lookup for {} failed to plan: {e}", cand.ident))?;
-                df.collect()
-                    .await
-                    .map_err(|e| anyhow!("keyed lookup for {} failed: {e}", cand.ident))?
-            }
-        };
+        let rmw_started = timing.then(std::time::Instant::now);
+        let current: Vec<RecordBatch> =
+            match self.state.keyed_current(&cand.ident, &key, &pk_cols) {
+                Some(Some(row)) => vec![row],
+                Some(None) => Vec::new(), // deleted earlier in this window
+                None => {
+                    let from = match &cand.dml.alias {
+                        Some(alias) => format!(
+                            "{}.{} AS {}",
+                            quote_ident(&cand.dml.namespace),
+                            quote_ident(&cand.dml.table),
+                            quote_ident(alias)
+                        ),
+                        None => format!(
+                            "{}.{}",
+                            quote_ident(&cand.dml.namespace),
+                            quote_ident(&cand.dml.table)
+                        ),
+                    };
+                    let sql = format!("SELECT * FROM {from} WHERE ({predicate}) LIMIT 2");
+                    let df = ctx.sql(&sql).await.map_err(|e| {
+                        anyhow!("keyed lookup for {} failed to plan: {e}", cand.ident)
+                    })?;
+                    df.collect()
+                        .await
+                        .map_err(|e| anyhow!("keyed lookup for {} failed: {e}", cand.ident))?
+                }
+            };
+        if let Some(t) = rmw_started {
+            crate::timing::record("keyed_rmw_read", t.elapsed());
+        }
         let current_rows: usize = current.iter().map(|b| b.num_rows()).sum();
         if current_rows == 0 {
             // Missing key: 0 rows affected, nothing stored (same answer the
@@ -1424,6 +1811,7 @@ impl WriteBuffer {
             // synchronous path is honest about multi-row effects.
             return Ok(None);
         }
+        let apply_started = timing.then(std::time::Instant::now);
         let nonempty: Vec<RecordBatch> = current.into_iter().filter(|b| b.num_rows() > 0).collect();
         let current_row = align_batch(
             &arrow::compute::concat_batches(&nonempty[0].schema(), &nonempty)
@@ -1472,6 +1860,9 @@ impl WriteBuffer {
                 KeyedKind::Upsert(replacement)
             }
         };
+        if let Some(t) = apply_started {
+            crate::timing::record("keyed_apply", t.elapsed());
+        }
         // Durable tail append + map insert, under the buffer lock (ordering
         // vs. inserts) — the statement's ack rides on this succeeding.
         let (keyed_total, pending_rows) = self.state.keyed_write(
@@ -1487,6 +1878,9 @@ impl WriteBuffer {
         )?;
         if keyed_total + pending_rows >= self.max_rows {
             self.kick.notify_one();
+        }
+        if let Some(t) = keyed_started {
+            crate::timing::record("keyed_total", t.elapsed());
         }
         Ok(Some(Response::Execution(Tag::new(cand.tag).with_rows(1))))
     }
@@ -1546,14 +1940,18 @@ impl WriteBuffer {
         )))
     }
 
-    /// The union overlay for one table against the committed metadata a
-    /// scan just loaded: all pending rows plus committed generations that
-    /// metadata cannot see yet. `None` when there is nothing to add
-    /// (fast path — scans are unchanged when the buffer is idle).
-    pub fn overlay(&self, ident: &TableIdent, metadata: &TableMetadata) -> Result<Option<Overlay>> {
-        // L3: a watermark-tagged generation (parked by the prepare-time
-        // already-committed guard) is contained in metadata exactly when
-        // the metadata's OWN tail watermark property covers its mark.
+    /// The generation-containment test `metadata` implies: a flushed
+    /// generation is contained exactly when the metadata holds its snapshot
+    /// or — for a watermark-tagged generation parked by the prepare-time
+    /// already-committed guard (L3) — when the metadata's OWN tail
+    /// watermark property covers its mark. Shared by the scan overlay and
+    /// the flusher's observed-metadata note (I1) so both apply the
+    /// identical rule.
+    fn contained_in<'m>(
+        &self,
+        ident: &TableIdent,
+        metadata: &'m TableMetadata,
+    ) -> impl Fn(&GenCommit) -> bool + 'm {
         let scan_mark = self.tail.as_deref().and_then(|t| {
             parse_watermark_property(
                 ident,
@@ -1563,12 +1961,22 @@ impl WriteBuffer {
                     .map(String::as_str),
             )
         });
-        // A generation `S` is "committed" (and so already in the scan's data)
-        // exactly when the just-loaded metadata contains it.
-        self.state.overlay_with(ident, |commit| match commit {
+        move |commit| match commit {
             GenCommit::Snapshot(s) => metadata.snapshot_by_id(*s).is_some(),
             GenCommit::CoveredByWatermark(mark) => scan_mark.is_some_and(|w| w >= *mark),
-        })
+        }
+    }
+
+    /// The union overlay for one table against the committed metadata a
+    /// scan just loaded: all pending rows plus committed generations that
+    /// metadata cannot see yet. `None` when there is nothing to add
+    /// (fast path — scans are unchanged when the buffer is idle).
+    pub fn overlay(&self, ident: &TableIdent, metadata: &TableMetadata) -> Result<Option<Overlay>> {
+        // A generation `S` is "committed" (and so already in the scan's data)
+        // exactly when the just-loaded metadata contains it — the overlay
+        // also records the observation (I1), unblocking the generation's GC.
+        self.state
+            .overlay_with(ident, self.contained_in(ident, metadata))
     }
 
     /// Synchronously flush every table's pending rows (ordering fence /
@@ -1646,6 +2054,11 @@ impl WriteBuffer {
                 .load_table(ident)
                 .await
                 .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?;
+            // I1: this fresh load is covering metadata for every EARLIER
+            // generation it contains — record the observation so their GC
+            // unblocks even on write-only tables no scan ever overlays.
+            self.state
+                .note_observed(ident, self.contained_in(ident, table.metadata()));
             let pk = self.engine.pk_columns(&table)?;
             let rows: usize =
                 batches.iter().map(|b| b.num_rows()).sum::<usize>() + keyed_snapshot.len();
@@ -1844,13 +2257,26 @@ impl WriteBuffer {
         ))
     }
 
-    /// Drop flushed generations old enough that no scan can still need them
-    /// (module docs: the metadata-load -> overlay-take window inside one
-    /// scan is microseconds; FLUSHED_GC is 30 s).
+    /// Drop flushed generations no scan can still need: covering metadata
+    /// was OBSERVED (a scan overlay excluded them or a flush load contained
+    /// them — I1) AND they are older than [`FLUSHED_GC`] (module docs: the
+    /// metadata-load -> overlay-take window inside one scan is
+    /// microseconds; FLUSHED_GC is 30 s). An unobserved generation is
+    /// retained regardless of age — the stale-serve default may still be
+    /// serving pre-commit metadata during a catalog outage, and its rows
+    /// must not vanish from union reads.
     fn gc_flushed(&self) {
         self.state
-            .retain_flushed(|g| g.committed_at.elapsed() < FLUSHED_GC);
+            .retain_flushed(|g| !flushed_gen_expired(g, FLUSHED_GC));
     }
+}
+
+/// The GC predicate for one flushed generation (I1): expired only once
+/// covering metadata has been OBSERVED for it and it has aged past
+/// `gc_age`. Age is the secondary condition; observation is the primary
+/// (see [`FlushedGen::observed`]).
+fn flushed_gen_expired(flushed_gen: &FlushedGen, gc_age: Duration) -> bool {
+    flushed_gen.observed && flushed_gen.committed_at.elapsed() >= gc_age
 }
 
 /// Floor a table's next tail sequence from its watermark SIDECAR alone —
@@ -1961,15 +2387,27 @@ impl BufferHook {
         shared: &SessionContext,
         params: Option<&ParamValues>,
     ) -> Result<Response> {
+        // ICEGRES_QUERY_TIMING tail-ack budget: `insert_plan` = shaping the
+        // rows through DataFusion, `buffer_ack_total` = the whole buffered
+        // ack (plan + durable tail append + bookkeeping). Cached bool when
+        // unset (timing.rs).
+        let timing = crate::timing::enabled();
+        let ack_started = timing.then(std::time::Instant::now);
         // Target must be a real Iceberg table (planning through the shared
         // context also validates this — insert_target is the cheap check).
         let ident = insert_target(stmt)?;
         let (plan_ident, batches) = plan_insert_rows(shared, stmt, params).await?;
+        if let Some(t) = ack_started {
+            crate::timing::record("insert_plan", t.elapsed());
+        }
         anyhow::ensure!(
             plan_ident == ident,
             "INSERT target resolution mismatch: {plan_ident} vs {ident}"
         );
         let rows = self.buffer.buffer_insert(&ident, batches).await?;
+        if let Some(t) = ack_started {
+            crate::timing::record("buffer_ack_total", t.elapsed());
+        }
         Ok(Response::Execution(
             Tag::new("INSERT").with_oid(0).with_rows(rows),
         ))
@@ -2281,6 +2719,68 @@ mod tests {
         assert!(st.overlay_with(&ident(), |_| false).unwrap().is_none());
     }
 
+    // FIX (I1): a flushed generation may only be GC'd once covering
+    // metadata was OBSERVED for it. Commit gen S, never observe post-S
+    // metadata: even arbitrarily far past FLUSHED_GC (gc_age zero stands in
+    // for "any age has elapsed") the generation is retained and the overlay
+    // still supplies its rows — the stale-serve default may be serving
+    // pre-S metadata through a catalog outage, and the committed rows must
+    // not vanish mid-outage. Observing post-S metadata (a scan overlay that
+    // excludes the generation) unblocks the GC.
+    #[test]
+    fn unobserved_flushed_gen_survives_gc_until_metadata_is_observed() {
+        let st = BufferState::default();
+        let sch = schema();
+        st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[1, 2])], None)
+            .unwrap();
+        let (_b, n, _) = snap3(&st);
+        let s: i64 = 11;
+        st.move_pending_to_flushed(&ident(), n, &[], s);
+        // Never observed: the production predicate must keep it at ANY age.
+        st.retain_flushed(|g| !flushed_gen_expired(g, Duration::ZERO));
+        let ov = st
+            .overlay_with(&ident(), |_| false)
+            .unwrap()
+            .expect("unobserved generation must still overlay");
+        assert_eq!(ids(&ov), vec![1, 2]);
+        // A scan whose metadata contains S excludes the generation AND
+        // records the observation...
+        assert!(st
+            .overlay_with(&ident(), |c| *c == GenCommit::Snapshot(s))
+            .unwrap()
+            .is_none());
+        // ...after which age alone may GC it.
+        st.retain_flushed(|g| !flushed_gen_expired(g, Duration::ZERO));
+        assert!(st.overlay_with(&ident(), |_| false).unwrap().is_none());
+    }
+
+    // FIX (I1): age stays the SECONDARY condition — an observed-but-young
+    // generation is retained (pre-S scans mid-flight may still overlay it),
+    // and note_observed (the flusher's fresh-load path) records the
+    // observation without taking an overlay.
+    #[test]
+    fn observed_generation_still_respects_the_age_condition() {
+        let st = BufferState::default();
+        let sch = schema();
+        st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[7])], None)
+            .unwrap();
+        let (_b, n, _) = snap3(&st);
+        let s: i64 = 12;
+        st.move_pending_to_flushed(&ident(), n, &[], s);
+        // The flusher's next-attempt load contains S: observed, no overlay
+        // involved.
+        st.note_observed(&ident(), |c| *c == GenCommit::Snapshot(s));
+        // Observed but YOUNG (the real 30 s threshold): retained.
+        st.retain_flushed(|g| !flushed_gen_expired(g, FLUSHED_GC));
+        assert_eq!(
+            ids(&st.overlay_with(&ident(), |_| false).unwrap().unwrap()),
+            vec![7]
+        );
+        // Observed and past the age: GC'd.
+        st.retain_flushed(|g| !flushed_gen_expired(g, Duration::ZERO));
+        assert!(st.overlay_with(&ident(), |_| false).unwrap().is_none());
+    }
+
     // pending_idents reports only tables with pending rows; moving to flushed
     // clears a table from the flush work list.
     #[test]
@@ -2313,6 +2813,8 @@ mod tests {
         kinds: StdMutex<Vec<TailOpKind>>,
         truncates: StdMutex<Vec<(TableIdent, u64)>>,
         watermarks: StdMutex<Vec<(TableIdent, u64)>>,
+        /// Interleaved watermark/truncate call log (order assertions).
+        calls: StdMutex<Vec<String>>,
     }
 
     impl TailStore for MockTail {
@@ -2344,6 +2846,10 @@ mod tests {
         }
 
         fn truncate(&self, table: &TableIdent, upto_seq: u64) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("truncate:{upto_seq}"));
             self.truncates
                 .lock()
                 .unwrap()
@@ -2372,9 +2878,25 @@ mod tests {
             {
                 return Err(anyhow!("mock tail: watermark store on fire"));
             }
+            self.calls.lock().unwrap().push(format!("watermark:{seq}"));
             self.watermarks.lock().unwrap().push((table.clone(), seq));
             Ok(())
         }
+    }
+
+    // FIX (C1a): the covered-frame cleanup records the watermark BEFORE the
+    // truncate — the ORDER is the contract, not just both calls happening.
+    // The boot replay path now runs through this same helper, so a
+    // boot-time truncate can never delete a table's only frames without a
+    // watermark record retaining its trace (and with it the seq floor).
+    #[test]
+    fn covered_cleanup_records_watermark_before_truncate() {
+        let tail = MockTail::default();
+        tail_truncate_covered(Some(&tail), &ident(), Some(3));
+        assert_eq!(
+            *tail.calls.lock().unwrap(),
+            vec!["watermark:3".to_string(), "truncate:3".to_string()]
+        );
     }
 
     // Insert path: each STATEMENT is durably appended as one frame (all its
@@ -3201,5 +3723,428 @@ mod tests {
         // survives (committed 111, keyed map drained).
         assert_eq!(*committed.lock().unwrap(), 111);
         assert!(st.keyed_lookup(&ident(), &key_of(1)).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // F2 — wait-failure unroute: an errored statement's rows must not
+    // silently commit. Staging succeeds, the durability WAIT fails; the
+    // statement's routed state must be removed exactly — unless a flush
+    // snapshot claimed it first (then the disclosed ambiguity stands).
+    // -----------------------------------------------------------------------
+
+    use crate::tail::StagedAppend;
+
+    /// A tail whose staging succeeds but whose durability WAIT fails —
+    /// the F2 shape (a dying disk detected at the group fsync).
+    #[derive(Default)]
+    struct FailWaitTail {
+        next_seq: std::sync::atomic::AtomicU64,
+    }
+
+    impl TailStore for FailWaitTail {
+        fn append(
+            &self,
+            _table: &TableIdent,
+            _kind: TailOpKind,
+            _batches: &[RecordBatch],
+        ) -> Result<u64> {
+            unreachable!("buffered paths stage; they never call append directly")
+        }
+
+        fn append_staged(
+            &self,
+            _table: &TableIdent,
+            _kind: TailOpKind,
+            _batches: &[RecordBatch],
+        ) -> Result<StagedAppend> {
+            let seq = self
+                .next_seq
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            Ok(StagedAppend::with_waiter(
+                seq,
+                Box::new(|| Err(anyhow!("mock tail: fsync wait failed"))),
+            ))
+        }
+
+        fn replay(&self) -> Result<Vec<crate::tail::ReplayedTable>> {
+            Ok(Vec::new())
+        }
+
+        fn truncate(&self, _table: &TableIdent, _upto_seq: u64) -> Result<()> {
+            Ok(())
+        }
+
+        fn ensure_seq_floor(&self, _table: &TableIdent, _floor: u64) -> Result<()> {
+            Ok(())
+        }
+
+        fn watermark_property(&self) -> &str {
+            "icegres.tail-seq.mock-tail-id"
+        }
+    }
+
+    /// A tail whose WAIT stage first lets a flush CLAIM + drain the window
+    /// (snapshot + move to flushed, exactly what flush_table does between
+    /// prepare and post) and then fails — the narrow window where the
+    /// unroute must stand down and keep the disclosed ambiguity.
+    struct ClaimingTail {
+        st: Arc<BufferState>,
+        next_seq: std::sync::atomic::AtomicU64,
+    }
+
+    impl TailStore for ClaimingTail {
+        fn append(
+            &self,
+            _table: &TableIdent,
+            _kind: TailOpKind,
+            _batches: &[RecordBatch],
+        ) -> Result<u64> {
+            unreachable!("buffered paths stage; they never call append directly")
+        }
+
+        fn append_staged(
+            &self,
+            table: &TableIdent,
+            _kind: TailOpKind,
+            _batches: &[RecordBatch],
+        ) -> Result<StagedAppend> {
+            let seq = self
+                .next_seq
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let st = self.st.clone();
+            let ident = table.clone();
+            Ok(StagedAppend::with_waiter(
+                seq,
+                Box::new(move || {
+                    // The waiter runs AFTER the buffer lock drops — the
+                    // exact interleaving where a flush can claim the rows
+                    // before the wait resolves.
+                    let snap = st.snapshot_pending(&ident);
+                    st.move_pending_to_flushed(&ident, snap.n_batches, &snap.keyed, 42);
+                    Err(anyhow!("mock tail: died after a flush claimed the rows"))
+                }),
+            ))
+        }
+
+        fn replay(&self) -> Result<Vec<crate::tail::ReplayedTable>> {
+            Ok(Vec::new())
+        }
+
+        fn truncate(&self, _table: &TableIdent, _upto_seq: u64) -> Result<()> {
+            Ok(())
+        }
+
+        fn ensure_seq_floor(&self, _table: &TableIdent, _floor: u64) -> Result<()> {
+            Ok(())
+        }
+
+        fn watermark_property(&self) -> &str {
+            "icegres.tail-seq.mock-tail-id"
+        }
+    }
+
+    /// A tail whose durability WAIT blocks until the test releases it —
+    /// the injectable stand-in for a slow quorum round trip (I2). The
+    /// waiter signals `entered` first, so the test can order itself after
+    /// the buffer lock has provably been dropped.
+    struct BlockingWaitTail {
+        next_seq: std::sync::atomic::AtomicU64,
+        /// Taken by the (single) staged append of the test.
+        hooks: StdMutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    }
+
+    impl TailStore for BlockingWaitTail {
+        fn append(
+            &self,
+            _table: &TableIdent,
+            _kind: TailOpKind,
+            _batches: &[RecordBatch],
+        ) -> Result<u64> {
+            unreachable!("buffered paths stage; they never call append directly")
+        }
+
+        fn append_staged(
+            &self,
+            _table: &TableIdent,
+            _kind: TailOpKind,
+            _batches: &[RecordBatch],
+        ) -> Result<StagedAppend> {
+            let seq = self
+                .next_seq
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let (entered_tx, release_rx) = self
+                .hooks
+                .lock()
+                .unwrap()
+                .take()
+                .expect("exactly one staged append in this test");
+            Ok(StagedAppend::with_waiter(
+                seq,
+                Box::new(move || {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.recv(); // block until released
+                    Ok(())
+                }),
+            ))
+        }
+
+        fn replay(&self) -> Result<Vec<crate::tail::ReplayedTable>> {
+            Ok(Vec::new())
+        }
+
+        fn truncate(&self, _table: &TableIdent, _upto_seq: u64) -> Result<()> {
+            Ok(())
+        }
+
+        fn ensure_seq_floor(&self, _table: &TableIdent, _floor: u64) -> Result<()> {
+            Ok(())
+        }
+
+        fn watermark_property(&self) -> &str {
+            "icegres.tail-seq.mock-tail-id"
+        }
+    }
+
+    // FIX (I2, buffer side of the contract): a scan's overlay take is NOT
+    // blocked while a statement's durability wait is in flight — the wait
+    // runs after the buffer lock drops (the property QuorumTail's
+    // append_staged now upholds like the other backends). If the wait held
+    // the tables mutex, the overlay_with below would deadlock (the waiter
+    // returns only after the overlay completed and released it).
+    #[test]
+    fn scan_is_not_blocked_by_an_in_flight_durability_wait() {
+        let st = Arc::new(BufferState::default());
+        let sch = schema();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let tail = Arc::new(BlockingWaitTail {
+            next_seq: Default::default(),
+            hooks: StdMutex::new(Some((entered_tx, release_rx))),
+        });
+        let writer = {
+            let st = st.clone();
+            let sch = sch.clone();
+            let tail = tail.clone();
+            std::thread::spawn(move || {
+                st.append(
+                    &ident(),
+                    Some(sch.clone()),
+                    &[batch(&sch, &[1])],
+                    Some(tail.as_ref()),
+                )
+                .unwrap();
+            })
+        };
+        // The waiter has entered: staging is done, the buffer lock dropped.
+        entered_rx.recv().expect("the durability wait started");
+        // While the append is in flight, the union read completes and the
+        // staged rows are already visible (buffered mode's documented
+        // transient visibility).
+        let ov = st
+            .overlay_with(&ident(), |_| false)
+            .unwrap()
+            .expect("staged rows visible during the in-flight wait");
+        assert_eq!(ids(&ov), vec![1]);
+        release_tx
+            .send(())
+            .expect("waiter is blocked on the release");
+        writer.join().expect("the staged append acks after release");
+    }
+
+    // F2: a plain INSERT whose durability wait fails is removed from
+    // `pending` exactly — earlier acked rows stay, the failed rows are gone
+    // from the overlay, the snapshot, and the row accounting.
+    #[test]
+    fn wait_failure_unroutes_pending_rows_exactly() {
+        let st = BufferState::default();
+        let sch = schema();
+        // An earlier acked statement (survives).
+        st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[1])], None)
+            .unwrap();
+        let tail = FailWaitTail::default();
+        let err = st
+            .append(&ident(), None, &[batch(&sch, &[2, 3])], Some(&tail))
+            .unwrap_err();
+        assert!(err.to_string().contains("fsync wait failed"));
+        // Exactly the acked row remains.
+        let ov = st
+            .overlay_with(&ident(), |_| false)
+            .unwrap()
+            .expect("acked row still pending");
+        assert_eq!(ids(&ov), vec![1]);
+        let (_batches, n, _mark) = snap3(&st);
+        assert_eq!(n, 1, "the failed statement's batch is gone");
+        // pending_rows accounting shrank with it: only rows 1 and 4 count.
+        let (_, total) = st
+            .append(&ident(), None, &[batch(&sch, &[4])], None)
+            .unwrap();
+        assert_eq!(total, 2);
+    }
+
+    // F2: a keyed op whose durability wait fails is removed from the live
+    // map, RESTORING the earlier acked entry it displaced (that entry must
+    // still flush); a failed op on a fresh key leaves no entry at all —
+    // and keyed_current never serves the failed value.
+    #[test]
+    fn wait_failure_unroutes_keyed_entry_and_restores_displaced() {
+        let st = BufferState::default();
+        write_upsert(&st, 1, "v10", None); // acked, must survive
+        let tail = FailWaitTail::default();
+        let err = st
+            .keyed_write(
+                &ident(),
+                Some(kschema()),
+                &pk(),
+                key_of(1),
+                KeyedOp {
+                    key_row: key_row(1),
+                    kind: KeyedKind::Upsert(krow(1, "v20")),
+                },
+                Some(&tail),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("fsync wait failed"));
+        assert_eq!(
+            upserted_val(&st, 1),
+            "v10",
+            "displaced acked entry restored"
+        );
+        let cur = st
+            .keyed_current(&ident(), &key_of(1), &pk())
+            .expect("entry present")
+            .expect("upsert");
+        assert_eq!(
+            cur.column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "v10",
+            "keyed_current must not serve the failed value"
+        );
+        // Fresh key: the failed op leaves no trace.
+        let err = st
+            .keyed_write(
+                &ident(),
+                None,
+                &pk(),
+                key_of(2),
+                KeyedOp {
+                    key_row: key_row(2),
+                    kind: KeyedKind::Delete,
+                },
+                Some(&tail),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("fsync wait failed"));
+        assert!(st.keyed_lookup(&ident(), &key_of(2)).is_none());
+        assert!(st.keyed_current(&ident(), &key_of(2), &pk()).is_none());
+    }
+
+    // F2: an INSERT that route_appends split (one row into an upsert entry
+    // displacing an acked keyed op, one row into pending) unroutes BOTH
+    // halves on wait failure — the acked keyed op is restored, the pending
+    // half is gone.
+    #[test]
+    fn wait_failure_unroutes_routed_insert_upserts() {
+        let st = BufferState::default();
+        write_upsert(&st, 1, "old", None); // acked, must survive
+        let tail = FailWaitTail::default();
+        let err = st
+            .append(
+                &ident(),
+                Some(kschema()),
+                &[kbatch(&[(1, "new"), (2, "plain")])],
+                Some(&tail),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("fsync wait failed"));
+        assert_eq!(
+            upserted_val(&st, 1),
+            "old",
+            "displaced acked entry restored"
+        );
+        let ov = st
+            .overlay_with(&ident(), |_| false)
+            .unwrap()
+            .expect("the acked upsert still overlays");
+        assert_eq!(vals(&ov), vec![(1, "old".to_string())]);
+    }
+
+    // F2 narrow window: when a flush snapshot claimed (and drained) the
+    // rows BEFORE the wait failed, the unroute stands down — the rows stay
+    // in their flushed generation (they may genuinely commit; removing
+    // them would corrupt the flush accounting), union reads still serve
+    // them, and the generation excludes itself once metadata contains it.
+    #[test]
+    fn wait_failure_after_flush_claim_keeps_disclosed_ambiguity() {
+        let st = Arc::new(BufferState::default());
+        let sch = schema();
+        let tail = ClaimingTail {
+            st: st.clone(),
+            next_seq: Default::default(),
+        };
+        let err = st
+            .append(
+                &ident(),
+                Some(sch.clone()),
+                &[batch(&sch, &[1, 2])],
+                Some(&tail),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("died after a flush claimed"));
+        // Drained into flushed(42), NOT removed.
+        let (_batches, n, _mark) = snap3(&st);
+        assert_eq!(n, 0, "pending was drained by the claiming flush");
+        let ov = st
+            .overlay_with(&ident(), |_| false)
+            .unwrap()
+            .expect("rows still readable through the flushed generation");
+        assert_eq!(ids(&ov), vec![1, 2]);
+        assert!(
+            st.overlay_with(&ident(), |c| *c == GenCommit::Snapshot(42))
+                .unwrap()
+                .is_none(),
+            "once committed metadata contains the snapshot, the rows drop out"
+        );
+    }
+
+    // F2 narrow window, keyed shape: a keyed entry claimed + drained by a
+    // flush before the wait failure stays with its generation (disclosed
+    // ambiguity) — never resurrected into the live map, never removed from
+    // the generation.
+    #[test]
+    fn keyed_wait_failure_after_claim_keeps_disclosed_ambiguity() {
+        let st = Arc::new(BufferState::default());
+        let tail = ClaimingTail {
+            st: st.clone(),
+            next_seq: Default::default(),
+        };
+        let err = st
+            .keyed_write(
+                &ident(),
+                Some(kschema()),
+                &pk(),
+                key_of(1),
+                KeyedOp {
+                    key_row: key_row(1),
+                    kind: KeyedKind::Upsert(krow(1, "v1")),
+                },
+                Some(&tail),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("died after a flush claimed"));
+        assert!(
+            st.keyed_lookup(&ident(), &key_of(1)).is_none(),
+            "the live map entry was drained into the generation"
+        );
+        let ov = st
+            .overlay_with(&ident(), |_| false)
+            .unwrap()
+            .expect("the generation still overlays the op");
+        assert_eq!(vals(&ov), vec![(1, "v1".to_string())]);
     }
 }

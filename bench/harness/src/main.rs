@@ -69,6 +69,12 @@ struct Args {
     /// pool (bench.sh section 4d runs this against its own icegresd; the
     /// gated direct-serve metrics are untouched).
     proxy: bool,
+    /// Tail-ack subset (`--tail-ack <label>`, label in {dir, pg, quorum}):
+    /// measure ONLY durable_ack_<label>_ms — the single-row INSERT ack
+    /// latency against a server running --write-buffer-ms with the labeled
+    /// durable tail backend (bench.sh section 4f owns the server + backend
+    /// lifecycles; the gated default-mode metrics are untouched).
+    tail_ack: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -79,6 +85,7 @@ fn parse_args() -> Args {
     let mut cold_port = 5442u16;
     let mut buffered = false;
     let mut proxy = false;
+    let mut tail_ack = None;
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < argv.len() {
@@ -100,11 +107,12 @@ fn parse_args() -> Args {
                 proxy = true;
                 i -= 1; // flag takes no value
             }
+            "--tail-ack" => tail_ack = Some(need(i).to_string()),
             other => panic!("unknown argument: {other}"),
         }
         i += 2;
     }
-    if server_bin.is_empty() && !buffered && !proxy {
+    if server_bin.is_empty() && !buffered && !proxy && tail_ack.is_none() {
         panic!("--server-bin is required (release icegres binary path)");
     }
     Args {
@@ -115,6 +123,7 @@ fn parse_args() -> Args {
         cold_port,
         buffered,
         proxy,
+        tail_ack,
     }
 }
 
@@ -566,6 +575,41 @@ async fn run_proxy(args: &Args) {
     println!("{}", serde_json::to_string_pretty(&out).unwrap());
 }
 
+/// Tail-ack subset (ADDITIONAL, ungated; bench.sh section 4f): the
+/// durable-ack p50 of a single-row INSERT on a buffered server whose ack
+/// rides the labeled durable tail backend (fsync / tail-database commit /
+/// 2-of-3 quorum ack before the client sees the tag). Distinct id range
+/// (>= 4_000_000) so the shared scratch table cannot collide with the
+/// default-mode or buffered-mode write metrics.
+async fn run_tail_ack(args: &Args, label: &str) {
+    let mut metrics = Map::new();
+    let writer = connect(&args.host, args.port)
+        .await
+        .expect("writer connect");
+    let max_id = max_trip_id(&writer).await;
+    let next_id = std::cmp::max(max_id + 1, 4_000_000);
+    let (samples, _next_id) = measure_insert_single(&writer, next_id).await;
+    let s = summarize(samples);
+    let name = format!("durable_ack_{label}_ms");
+    eprint_metric(&name, &s);
+    metrics.insert(name, s);
+
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let out = json!({
+        "schema": "icegres-bench-tail-ack-v1",
+        "unix_ts": ts,
+        "host": args.host,
+        "port": args.port,
+        "warmup_discarded": WARMUP,
+        "iterations": ITERS,
+        "metrics": Value::Object(metrics),
+    });
+    println!("{}", serde_json::to_string_pretty(&out).unwrap());
+}
+
 #[tokio::main]
 async fn main() {
     let args = parse_args();
@@ -575,6 +619,10 @@ async fn main() {
     }
     if args.proxy {
         run_proxy(&args).await;
+        return;
+    }
+    if let Some(label) = args.tail_ack.clone() {
+        run_tail_ack(&args, &label).await;
         return;
     }
     let mut metrics = Map::new();

@@ -45,7 +45,8 @@ compatibility, and scale-to-zero economics on lakehouse data — leave
 | Time travel | read-only snapshot-pinned queries | `demo."trips@<snapshot_id>"` |
 | Zero-copy branches | Neon-style branch-per-endpoint over Iceberg snapshot refs (`src/branch.rs`) | `icegres branch create/list/drop`, `serve --branch` |
 | Buffered writes (opt-in) | Moonlink-style group commit: ~1.5 ms INSERT ack, union reads, ≤N ms durability window, WARN on enable (`src/buffer.rs`) | `--write-buffer-ms N` (default 0 = synchronous) |
-| Keyed tail upserts (opt-in) | Hot-row `UPDATE`/`DELETE` by exact PK ack from the durable tail (~9.5 ms p50 vs ~71 ms sync), coalesced per key into ONE commit per flush window (`src/keyed.rs`, `src/buffer.rs`) | table properties `icegres.primary-key` + `icegres.tail-upsert=true`, with `--write-buffer-ms > 0` and a tail backend |
+| Keyed tail upserts (opt-in) | Hot-row `UPDATE`/`DELETE` by exact PK ack from the durable tail (~5.2 ms p50 with `--freshness-ms 25`, ~7.0 ms without, vs ~47.5 ms synchronous COW UPDATE), coalesced per key into ONE commit per flush window (`src/keyed.rs`, `src/buffer.rs`) | table properties `icegres.primary-key` + `icegres.tail-upsert=true`, with `--write-buffer-ms > 0` and a tail backend |
+| Bounded-staleness reads (opt-in) | Freshness refresher + plan cache: scans skip the per-scan catalog check (point lookup ~7.4 → ~4.4 ms p50, repeated statements ~3.6/~2.8 ms via the physical-plan cache); own writes stay read-your-own-writes exact, foreign commits visible within ~N ms + one refresh round trip — tables refresh concurrently, so a slow table delays only itself (per-table timeout min(4·N, 2 s)); WARN on enable, staleness gauge on `/metrics` (`src/freshness.rs`, `src/plancache.rs`) | `--freshness-ms N` (default 0 = exact freshness) |
 | Scale-to-zero | clean exit after N idle seconds; stateless compute | `--idle-shutdown-secs` |
 | Wake-on-connect control plane | `icegresd`: pgwire-aware proxy that spawns computes on connect, routes `icegres@<branch>` dbnames to per-branch computes, supervises crashes with capped backoff, keeps a warm session pool (`--pool-size`, sub-ms connects; session pooling only — no transaction pooling, no cross-client reuse) | `icegresd serve` / `icegresd status` |
 | Health endpoint | HTTP 200 liveness | `--health-port` |
@@ -143,10 +144,13 @@ environment variables:
 | `--auth-file` (serve) | `ICEGRES_AUTH_FILE` | off | Require SCRAM-SHA-256 auth against a `user:password` credentials file |
 | `--enforce-pk` (serve, sql) | `ICEGRES_ENFORCE_PK` | off | Enforce `icegres.primary-key` table properties: NOT NULL (23502) + uniqueness (23505) checks on INSERT and PK-assigning UPDATE, anchored to the commit snapshot |
 | `--branch` (serve) | `ICEGRES_BRANCH` | `main` | Serve a zero-copy branch: reads pin to the ref's head, all writes commit to the ref with `assert-ref-snapshot-id` (never touching other branches) |
+| `--freshness-ms` (serve) | `ICEGRES_FRESHNESS_MS` | `0` (exact) | Opt-in bounded-staleness reads: scans serve the cached snapshot with no per-scan catalog check; ONE background task polls the catalog every N ms (up to 8 tables refreshed concurrently) and swaps changed snapshots. Own writes stay read-your-own-writes exact (synchronous invalidation); foreign commits visible within ~N ms + one refresh round trip — a slow table delays only itself (retry-free per-table refresh timeout min(4·N, 2 s); the next pass retries), never other tables (WARN on enable). Also enables the physical-plan cache. During a catalog outage reads keep serving the last refreshed snapshot (`ICEGRES_STALE_READ_ON_CATALOG_ERROR=0` fails loudly instead); worst-case age = `icegres_freshness_age_ms` on `/metrics`, sampled at refresher pass start (healthy ≈ N) |
+|  | `ICEGRES_PLAN_CACHE_ENTRIES` | `256` | LRU capacity of the physical-plan cache (active only with `--freshness-ms > 0`; `0` disables it) |
 | `--write-buffer-ms` (serve) | `ICEGRES_WRITE_BUFFER_MS` | `0` (sync) | Opt-in buffered writes: INSERTs ack from an in-memory buffer, group-committed every N ms; unclean kill loses ≤N ms of acked writes (WARN on enable) |
 |  | `ICEGRES_WRITE_BUFFER_MAX_ROWS` | `50000` | Row threshold that forces an early flush in buffered mode |
 | `--tail-dir` (serve) | `ICEGRES_TAIL_DIR` | off | Durable local tail for buffered writes (requires `--write-buffer-ms > 0`): fsync'd per-table WAL appended BEFORE each buffered ack, replayed on boot — closes the unclean-kill loss window (node/disk loss still loses the tail) |
 | `--tail-url` (serve) | `ICEGRES_TAIL_URL` | off | Durable Postgres-backed tail for buffered writes (requires `--write-buffer-ms > 0`, mutually exclusive with `--tail-dir`): each buffered INSERT commits to a frames table in this Postgres database BEFORE its ack, replayed on boot — survives losing the compute node (durability = the tail database's fsync/replication); an unreachable tail database blocks buffered writes (statement errors, never silent loss) |
+| `--tail-quorum` (serve) | `ICEGRES_TAIL_QUORUM` | off | Quorum-replicated durable tail for buffered writes (requires `--write-buffer-ms > 0`, mutually exclusive with `--tail-dir`/`--tail-url`): exactly three `host:port` addresses of `icekeeperd` acceptors; each buffered INSERT is fsynced by 2 of 3 acceptors BEFORE its ack (Neon SafeKeeper's consensus, adapted — see NOTICE) — survives losing ANY single node incl. this one; fewer than 2 live acceptors blocks buffered writes; a competing server fences this one ("superseded by a newer server") |
 |  | `ICEGRES_TXN_STRICT` | off | Only relevant on catalogs WITHOUT the multi-table `transactions/commit` endpoint (with it — e.g. Lakekeeper — multi-table COMMITs are always atomic and strict mode never bites): refuse a multi-table `COMMIT` up front with `0A000` (nothing applied) instead of best-effort ordered per-table commits (where a partial apply reports `40003`, not the retryable `40001`). |
 
 Logging uses `tracing` with an env filter: `RUST_LOG=debug icegres serve`.
@@ -449,6 +453,58 @@ buffered rows. Off by default because enforcement reads the key columns of
 every live data file per write; it is racy-free per commit but adds a
 read-before-write cost.
 
+### Bounded-staleness reads (`--freshness-ms N`, opt-in)
+
+By default every scan performs one catalog `load_table` round trip (~2–3 ms
+against local Lakekeeper) purely to detect snapshot changes — exact
+freshness, and the single largest line item of the ~7 ms read path (measured
+with `ICEGRES_QUERY_TIMING=1`). With `N > 0` that trade is made explicit and
+bounded instead:
+
+- ONE background task per server polls the catalog for every mounted table
+  each `N` ms — tables refresh concurrently (up to 8 in flight), each with a
+  retry-free per-table timeout of min(4·`N`, 2 s) (the next pass is the
+  retry), so a slow or stalled table delays only itself — and swaps the
+  cached provider on metadata change; scans serve the cached snapshot with
+  **no catalog round trip**. The refresher runs under a supervisor that
+  respawns it (budgeted, loudly) if it ever dies.
+- **Read-your-own-writes stays exact.** Every local write path — sync DML,
+  PK-enforced INSERT, transaction COMMIT, buffer flush, plain INSERT —
+  synchronously invalidates the touched table, so the next read on this
+  server loads fresh metadata and observes the write immediately (locked by
+  a live unit test and e2e §(z)). Buffered/keyed rows are additionally
+  readable pre-commit through the per-scan buffer overlay, unchanged.
+- **Foreign writers** (other servers, Spark, anything committing through
+  the catalog) become visible within ~`N` ms plus one refresh round trip —
+  bounded staleness, per table: a slow table delays only itself (up to its
+  per-table refresh timeout), never other tables' visibility. Time travel
+  and branch-pinned reads are unaffected (snapshot-addressed reads are
+  immutable). Enabling the mode logs a WARN stating this bound.
+- **Catalog outage honesty:** reads keep serving the last refreshed
+  snapshot (set `ICEGRES_STALE_READ_ON_CATALOG_ERROR=0` to fail loudly
+  instead); the refresher WARNs (rate-limited) and exports the worst-case
+  staleness age as the `icegres_freshness_age_ms` gauge on `/metrics` —
+  sampled at each refresher pass START, so a healthy gauge reads ≈ `N` and
+  it keeps growing through an outage (or if the refresher itself dies; its
+  supervisor's watchdog keeps bumping it).
+- **Physical-plan cache** (`src/plancache.rs`): with the freshness mode on,
+  repeated *identical* simple-protocol SELECTs reuse their physical plan
+  (LRU, `ICEGRES_PLAN_CACHE_ENTRIES`, default 256), keyed on statement text
+  + search path + time zone and validated against each referenced table's
+  metadata version — a snapshot change, local write, or DDL makes the entry
+  miss and re-plan. Overlay-bearing (buffered) tables, time-travel/metadata
+  tables, and non-immutable expressions (`now()`, `random()`, …) are never
+  cached.
+
+**Measured on the dev box** (release build, local stack, 30-query p50 per
+leg, `ICEGRES_QUERY_TIMING=1`): point lookups with distinct literals drop
+from ~7.4 ms to **~4.4 ms** (the per-scan freshness check disappears from
+physical planning: 3.46 → 0.49 ms); repeated identical statements
+additionally skip planning entirely via the plan cache — repeated point
+lookup **~3.6 ms**, repeated filtered aggregate 6.9 → **~2.8 ms**. Default
+mode (`--freshness-ms 0`) is byte-identical to the historical exact-freshness
+path.
+
 ### Buffered writes (`--write-buffer-ms N`, opt-in)
 
 Moonlink-style group commit. With `N > 0`, INSERTs acknowledge after
@@ -467,18 +523,38 @@ feature — and enabling it logs a WARN. Both halves of the contract are
 locked by e2e (kill-loss vs clean-shutdown-flush), and the union-read flush
 race is covered by `buffer.rs` unit tests.
 
-**Durable tail — two backends.** Buffered mode can attach a durable tail
+**Durable tail — three backends.** Buffered mode can attach a durable tail
 that every INSERT is appended to BEFORE its ack, replayed into the buffer
-on the next boot; the two backends hold the identical exactly-once protocol
-(the `icegres.tail-seq.<tail-id>` watermark stamped into each flush commit)
-and differ only in where the tail lives — i.e. in the durability class:
+on the next boot; the three backends hold the identical exactly-once
+protocol (the `icegres.tail-seq.<tail-id>` watermark stamped into each
+flush commit) and differ only in where the tail lives — i.e. in the
+durability class:
 
 | Backend | Flag | The tail lives in | Survives unclean kill | Survives node/disk loss | Ack cost |
 |---|---|---|---|---|---|
-| Local WAL | `--tail-dir <dir>` | fsync'd segments on this node's disk | yes | **no** — the tail dies with the disk | one local fsync (~3.2 ms p50 measured) |
-| Postgres | `--tail-url <postgres url>` | a `frames` table (schema `icegres_tail`, auto-created) in any Postgres database — the natural target is a dedicated DB on the instance already backing Lakekeeper | yes | **yes** — durability = the tail database's own fsync/replication | one INSERT round trip + commit (~1–3 ms to a same-box database) |
+| Local WAL | `--tail-dir <dir>` | fsync'd segments on this node's disk | yes | **no** — the tail dies with the disk | one local fsync, group-committed under concurrency (3.6 ms p50 single-writer, bench `durable_ack_dir_ms`; ~2.4–2.5 ms statement-level probe) |
+| Postgres | `--tail-url <postgres url>` | a `frames` table (schema `icegres_tail`, auto-created) in any Postgres database — the natural target is a dedicated DB on the instance already backing Lakekeeper | yes | **yes** — durability = the tail database's own fsync/replication (a delegated single system) | one INSERT round trip + commit (2.7 ms p50 to a same-box database, bench `durable_ack_pg_ms`; 2.2 ms statement-level probe) |
+| Quorum (consensus) | `--tail-quorum h:p,h:p,h:p` | a replicated record log fsynced by three `icekeeperd` acceptor daemons (Neon SafeKeeper's proposer–acceptor consensus, adapted — see NOTICE and `src/quorum/`) | yes | **yes — any single node**, acceptor or compute, with no delegated single system: an ack means 2 of 3 independent disks hold the record | one LAN round trip + the slower of 2 acceptor fsyncs (4.1 ms p50 on localhost, bench `durable_ack_quorum_ms`; 2.5 ms statement-level probe) |
 
-The flags are mutually exclusive (one server writes ONE tail), and both
+**The write-latency ladder, measured end to end** (dev box, local
+Lakekeeper 0.13.1 + RustFS + PG16; single-row INSERT ack p50 unless noted;
+`bench/bench.sh` reports the tail rungs as `durable_ack_{dir,pg,quorum}_ms`).
+Physics framing: an Iceberg commit is several object-store PUTs + a catalog
+POST and can never ack in single-digit milliseconds on real object storage —
+sub-10 ms durable writes MEAN the tail path; the sync path's honest floor
+is a few tens of milliseconds:
+
+| Path | Durable-ack p50 | Durability class | Cross-server/engine visibility | Semantics trade |
+|---|---|---|---|---|
+| Synchronous `INSERT` (default) | ~46 ms (batch-100 ~40 ms — batching is nearly free) | Iceberg snapshot (object storage + catalog) | global, immediately | none |
+| Buffered `INSERT` | ~1.4 ms | process memory ONLY | this server instantly; global at the flush (≤ N ms) | unclean kill loses ≤ N ms of acked rows |
+| + `--tail-dir` | ~3.6 ms bench (statement-level probe ~2.4–2.5 ms); concurrent writers share fsyncs (8 writers: p50 ~6.1 ms vs ~9–10 ms serialized) | this node's disk, fsync before EVERY ack | as buffered | node/disk loss |
+| + `--tail-url` | ~2.7 ms bench (probe ~2.2 ms) | tail database (its replication) | as buffered | tail DB on the write path |
+| + `--tail-quorum` | ~4.1 ms bench (probe ~2.5 ms) | 2-of-3 acceptor disks (consensus) | as buffered | three acceptors, 2 live required |
+| Keyed `UPDATE`/`DELETE` (`icegres.tail-upsert`) | ~5.2 ms with `--freshness-ms 25`, ~7.0 ms without | as the attached tail | union read instant; ONE coalesced commit per window | exact-PK shapes; per-key last-writer-wins window |
+| Explicit transaction `COMMIT` | synchronous (~50 ms+) | Iceberg snapshot | global, immediately | stays sync BY DESIGN — a tail-staged COMMIT would ack before conflict detection and break `40001` (docs/limitations.md) |
+
+The flags are mutually exclusive (one server writes ONE tail), and all
 require `--write-buffer-ms > 0`. For `--tail-url`: the identity behind the
 watermark key is minted once into the schema's `meta` table (same URL =
 same logical tail across restarts), and an unreachable tail database fails
@@ -497,11 +573,43 @@ on localhost or a trusted segment), and fleet-SHARED tails — several
 computes overlaying one tail — are the roadmap's next increment, not this
 backend (docs/sota-roadmap.md §3).
 
+**The quorum backend in detail (`--tail-quorum h:p,h:p,h:p` + `icekeeperd`).**
+Consensus-class durability with no delegated single system: run exactly
+three acceptor daemons (`icekeeperd serve --port P --data-dir D`, the third
+binary in this crate) on independent nodes/disks, and every buffered
+INSERT's record is fsynced by 2 of the 3 BEFORE the client ack. The
+protocol is Neon SafeKeeper's proposer–acceptor algorithm adapted for the
+generic tail log (terms, persist-before-respond voting, term-history
+reconciliation, divergence truncation, the Raft commit rule — `src/quorum/`,
+attribution in NOTICE); the record framing is the same crc-framed segment
+machinery the local tail proved (`src/segment.rs`). Boot = an election:
+the server adopts the quorum's tail identity, wins a vote from 2 of 3,
+recovers the unfinished committed suffix from the most advanced acceptor,
+reconciles every acceptor's log to it, and replays the recovered rows into
+the buffer — so acked-but-uncommitted rows survive `kill -9` of the
+compute, loss of the compute NODE, or loss of any ONE acceptor. Two live
+acceptors = writes proceed; one live = statement errors and the tail
+poisons itself until restart (backpressure, never silent loss — and a
+timed-out record that may still commit later is never re-numbered).
+**Fencing replaces lock files:** a second icegres opening the same quorum
+wins a higher-term election, the first server's next INSERT fails with
+"superseded by a newer server (term X)", and the second recovers its
+unflushed acked rows — split-brain is structurally impossible, not
+advisory-locked away. Honest scope (docs/limitations.md): static 3-node
+membership (a replacement acceptor joins empty only via a fresh election),
+no TLS/auth between proposer and acceptors (trusted network segment only),
+proposer-driven catch-up only (no acceptor gossip), and the acceptors'
+log truncation (horizon) lags flushes by design — bounded, and the latest
+per-table watermark record is always retained as the replay sidecar.
+
 **The local backend in detail (`--tail-dir <dir>`)** closes the unclean-kill
-window without giving up the buffered ack (measured on the dev box: ~3.2 ms
-p50 / 6.3 ms p95 ack with the tail vs ~1.3 ms untailed and ~50–80 ms
-synchronous — the fsync is the price of the closed window): every buffered
-INSERT is appended
+window without giving up the buffered ack (measured on the dev box: 3.6 ms
+p50 ack with the tail (bench `durable_ack_dir_ms`; ~2.4–2.5 ms statement-level
+probe) vs ~1.4 ms untailed and ~46 ms synchronous — the
+fsync is the price of the closed window, and concurrent statements share it:
+frames are staged under the lock, the fsync runs group-committed outside it,
+so 8 concurrent writers see p50 ~6.1 ms instead of ~9–10 ms serialized): every
+buffered INSERT is appended
 to an fsync'd per-table WAL segment under `<dir>` BEFORE the client ack (a
 tail write failure is the statement's error — never a silent downgrade), and
 on the next boot with the same `--tail-dir` acked-but-uncommitted rows are
@@ -526,8 +634,11 @@ foreign writer dropping the table property. The tail dir is single-writer
 Requires `--write-buffer-ms > 0` (refused at boot otherwise); verified
 standalone by `icegres/tests/tail_durability.sh` (kill -9 with the tail =
 zero loss, without = the documented loss, plus the no-double-apply and
-post-flush-restart sequence-floor cases — each proven for BOTH backends,
-sections 2–4 local and 6–8 Postgres). The Postgres backend's unit tests
+post-flush-restart sequence-floor cases — proven for ALL THREE backends:
+sections 2–4 local, 6–8 Postgres, 10 quorum incl. acceptor-kill and
+fencing; the quorum consensus core is additionally covered by in-process
+integration tests in `src/tail_quorum.rs` — 3 real acceptors on ephemeral
+ports, no shell needed). The Postgres backend's unit tests
 (`src/tail_pg.rs`) run live against `ICEGRES_TEST_PG_URL` (the local
 stack's `postgresql://lakekeeper:lakekeeper@127.0.0.1:5433/icegres_test`)
 and skip cleanly when it is unset.
@@ -546,17 +657,22 @@ serialized ~55–70 ms commits with `40001` storms, and an acked keyed op is
 never exposed to a client-visible `40001` (flush conflicts with foreign
 writers retry internally; the rows stay tail-durable meanwhile).
 
-**Measured on the dev box** (`--write-buffer-ms 200 --tail-dir`, 30
-sequential UPDATEs to one committed row, psycopg2, autocommit):
+**Measured on the dev box** (`--write-buffer-ms 250 --tail-dir`, 50
+sequential UPDATEs to one hot committed row, psql, autocommit):
 
-| Path | UPDATE ack p50 | min / p90 | Snapshots produced |
+| Path | UPDATE ack p50 | p95 | Snapshots produced |
 |---|---|---|---|
-| Keyed tail (this feature) | **9.5 ms** | 8.2 / 15.0 ms | 3 (one per 200 ms window) |
-| Synchronous COW (same table shape, no property) | 71.1 ms | 59.7 / 106.7 ms | 30 (one per statement) |
+| Keyed tail + `--freshness-ms 25` | **5.2 ms** | 7.8 ms | one per flush window |
+| Keyed tail (exact freshness) | **7.0 ms** | 10.4 ms | one per flush window |
+| Synchronous COW UPDATE (same table shape, no property) | ~47.5 ms | ~59 ms | one per statement |
 
-The ~9.5 ms is one catalog `load_table` (activation + read anchor) + one
-union-view point lookup + one tail fsync — the documented read-modify-write
-cost of the ack (`docs/limitations.md`).
+The keyed ack budget (per-stage `ICEGRES_QUERY_TIMING` p50s): activation
+gate ~2.4 ms as one catalog `load_table` under exact freshness, ~0 when
+`--freshness-ms` serves it from the freshness cache; current-row resolution
+~0 on a keyed-map hit (a hot key already in the window) or one union-view
+read otherwise (which itself rides the freshness/plan caches when enabled);
+DataFusion row fold ~2.3 ms; tail fsync ~1 ms — the documented
+read-modify-write cost of the ack (`docs/limitations.md`).
 
 **Activation matrix — ALL of these, or the statement silently takes the
 unchanged fence-then-synchronous path (never an error):**

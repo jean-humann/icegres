@@ -1,0 +1,19 @@
+icegres
+Copyright (c) the icegres contributors.
+Licensed under the Apache License, Version 2.0.
+
+This product includes software adapted from third-party projects:
+
+* Neon (https://github.com/neondatabase/neon), Apache License 2.0,
+  Copyright (c) Neon, Inc.
+  The quorum tail backend's consensus core — the acceptor state machine
+  (voting, term history, divergence-point computation and truncation, the
+  persist-before-respond discipline) and the proposer's election / donor
+  selection / recovery / quorum-commit rules — is adapted from Neon's
+  safekeeper (safekeeper/src/safekeeper.rs, safekeeper/src/control_file.rs)
+  and its WAL proposer (pgxn/neon/walproposer.c), substantially modified
+  for icegres's generic tail log (Postgres WAL framing replaced by
+  icegres's crc-framed record log; no tenants/timelines/membership
+  generations). The adapted files carry per-file attribution headers:
+  icegres/src/quorum/proto.rs, icegres/src/quorum/acceptor.rs,
+  icegres/src/quorum/proposer.rs.

@@ -43,6 +43,23 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
   extended protocol normally.
 - **DDL and non-DML statements inside a transaction are rejected** (`0A000`),
   never half-applied.
+- **Explicit transactions REMAIN synchronous — the tail-staged COMMIT was
+  evaluated and REFUSED.** Buffered/tail mode never applies to
+  `BEGIN … COMMIT`: `BEGIN` is an ordering fence (the buffer flushes first)
+  and `COMMIT` is a synchronous Iceberg commit (~50 ms+), even when every
+  autocommit INSERT on the same server acks from the tail in ~2 ms. The
+  tempting optimization — ack the COMMIT after fsyncing the transaction's
+  ops to the durable tail and post the catalog commit asynchronously —
+  would acknowledge BEFORE the catalog's `assert-ref-snapshot-id` check
+  runs, i.e. before conflict detection. A losing transaction could then no
+  longer answer its COMMIT with `40001` (the client is gone, told
+  "committed"); the only remaining options are silently dropping the
+  transaction (lost acked writes) or silently re-applying it against data
+  it never read (row counts and read-your-writes become lies). That breaks
+  the first-committer-wins contract above, so the trade is refused, not
+  deferred. Use autocommit statements (buffered INSERT, keyed
+  UPDATE/DELETE) when you need tail-latency acks; use transactions when
+  you need multi-statement atomicity with honest conflict reporting.
 
 ## Ingestion and cursors
 
@@ -132,11 +149,20 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
   materializes the whole surviving tail in memory before the flusher drains
   it; and one residual double-apply window remains (a crash between the
   commit and the sidecar write combined with a foreign writer dropping the
-  watermark property). Two more operational notes: the tail fsync runs under
-  the buffer lock, so a slow tail disk stalls other tables' buffered INSERTs
-  *and* same-server union reads for that fsync's window (per-table locking is
-  the known follow-up); and the single-writer guard is an advisory `flock`,
-  which is unreliable on NFS — put the tail dir on a local filesystem.
+  watermark property). Two more operational notes: the tail fsync is
+  GROUP-COMMITTED outside the buffer lock (frames are staged under the
+  lock, concurrent statements share one `sync_data`; measured: 8 concurrent
+  writers p50 ~6 ms vs ~9 ms when it serialized) — a statement that fails
+  at the fsync-WAIT stage (a dying disk) errors to the client AND its
+  routed rows are removed from the buffer window (exact failure; during
+  the brief staging window the rows were transiently visible to
+  same-server union reads, acceptable for buffered mode), UNLESS a flush
+  snapshot claimed the rows first — that narrow window keeps the old
+  disclosed ambiguity (the error may still commit) and the server WARNs
+  loudly with the burned sequence; the frame itself never replays and its
+  sequence is never reused, so replay stays exactly-once either way — and
+  the single-writer guard is an advisory `flock`, which is unreliable on
+  NFS — put the tail dir on a local filesystem.
   Default is off (no tail, behavior above unchanged);
   requires `--write-buffer-ms > 0` or startup fails.
 - **`--tail-url` (Postgres tail) buys node-loss durability, with its own honest
@@ -177,15 +203,49 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
   LISTEN/NOTIFY, flush leases) are the roadmap's explicit next increment
   (docs/sota-roadmap.md §3), not this backend. Mutually exclusive with
   `--tail-dir`; requires `--write-buffer-ms > 0` or startup fails.
+- **`--tail-quorum` (consensus tail) removes the delegated single system —
+  its honest bounds are operational.** Three `icekeeperd` acceptors, ack =
+  2-of-3 fsyncs (Neon SafeKeeper's protocol, adapted — NOTICE): acked rows
+  survive losing ANY single node, including the compute. Bounds, stated
+  plainly. **Trusted network only**: there is no TLS and no authentication
+  between the proposer and the acceptors — anyone who can reach an
+  acceptor's port can read/replace the log; bind them to a private segment
+  (they default to 127.0.0.1). **Static membership**: exactly three
+  acceptors, no add/remove/replace protocol; a replacement acceptor with an
+  empty data dir joins only at the next election (server restart), and one
+  that missed an election and lagged below the proposer's retained log is
+  dropped from catch-up until the next election. **Fewer than two live
+  acceptors blocks buffered writes** — the statement errors and the tail
+  POISONS itself until restart (deliberate: a quorum-timeout record may
+  still become durable later, and re-numbering past it could double-apply;
+  the restart's election replays it exactly once — the classic ambiguous-
+  commit shape). **Horizon lag**: acceptors truncate their logs lazily (the
+  horizon piggybacks on later appends), so acceptor disk usage and boot
+  replay may briefly include already-covered frames — replay stays exact
+  via the watermark records + the in-commit property; the latest watermark
+  record per table is always retained (it IS the replay sidecar), and a
+  dormant table's blocking watermark is refreshed automatically once it
+  falls ~1 MiB behind the head. Each buffered ack pays one LAN round trip +
+  the slower of two acceptor fsyncs, under the buffer lock like the other
+  backends. Proposer-driven catch-up only (no acceptor-to-acceptor gossip),
+  no acceptor S3 offload. Mutually exclusive with `--tail-dir`/`--tail-url`;
+  requires `--write-buffer-ms > 0` or startup fails.
 
 - **Keyed tail upserts (`icegres.tail-upsert`, opt-in) shift semantics and
   have a real ack cost — both stated plainly.** On a table with
   `icegres.primary-key` + `icegres.tail-upsert=true` under buffered mode
   with a tail, exact-PK `UPDATE`/`DELETE` acks are a read-modify-write:
-  one catalog `load_table` + one union-view point lookup + one tail fsync
-  (~9.5 ms p50 measured vs ~71 ms synchronous — better, but not the ~1.5 ms
-  of a buffered INSERT; the lookup is the price of returning honest row
-  counts and a full replacement row). Routing is **exact-PK-equality
+  activation gate + current-row resolution + row fold + one tail fsync
+  (~7.0 ms p50 measured, ~5.2 ms with `--freshness-ms 25` — the gate then
+  serves the freshness-cached metadata and a hot key resolves from the
+  keyed map with no engine read — vs ~46 ms synchronous; better, but not
+  the ~1.5 ms of a buffered INSERT: the read-modify-write is the price of
+  returning honest row counts and a full replacement row). With
+  `--freshness-ms N`, the activation gate and the `icegres.primary-key`
+  declaration resolve from metadata up to ~N ms stale, so a FOREIGN writer
+  flipping `icegres.primary-key`/`icegres.tail-upsert` inside that window
+  can have a keyed write address rows under the old declaration (DDL
+  through THIS server invalidates the caches synchronously). Routing is **exact-PK-equality
   only**: every PK column bound once by `=` with a literal (AND-composed
   for composite keys), literal SET values, no other predicates, no
   `RETURNING`/joins/subqueries/binds, PK columns never assigned; PK types
@@ -220,6 +280,60 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
   sync-exact, and it sees another server's in-window keyed ops only at
   the commit cadence (the existing cross-server freshness rule).
 
+## Bounded-staleness reads (opt-in, `--freshness-ms`)
+
+- **`--freshness-ms N` with `N > 0` trades exact freshness for read latency,
+  boundedly.** Default (`0`) keeps today's contract byte-identical: every
+  scan performs one catalog `load_table` (~2–3 ms locally) and observes the
+  catalog's current snapshot with no staleness window. With `N > 0`, scans
+  serve the cached snapshot with no catalog round trip and ONE background
+  task per server re-polls every mounted table each `N` ms, refreshing
+  tables concurrently (up to 8 in flight) with a retry-free per-table
+  timeout of min(4·`N`, 2 s) — the next pass is the retry — so a slow or
+  stalled table delays only its OWN visibility, never other tables'. What
+  stays EXACT: this server's own writes (every local commit path — sync
+  DML, PK-enforced INSERT, transaction COMMIT, buffer flush, plain INSERT —
+  synchronously invalidates the table, so the next local read loads fresh
+  metadata), time travel (`table@snapshot`), and branch-pinned reads
+  (snapshot-addressed, immutable). What becomes BOUNDED: commits by OTHER
+  writers (other icegres servers, Spark, any catalog committer) are visible
+  within ~`N` ms plus one refresh round trip (up to that table's refresh
+  timeout when the catalog is slow for it). Enabling the mode logs a WARN
+  stating the bound.
+- **Catalog outage under freshness mode serves stale by default, visibly —
+  with an explicit fail-loud opt-out.** The refresher keeps serving the
+  last refreshed snapshot (reads do not start failing), WARNs rate-limited,
+  and exports the worst-case staleness age as the
+  `icegres_freshness_age_ms` gauge on `/metrics` — alert on it. The gauge
+  is sampled at each refresher pass START (the age a read could have
+  observed just before that pass refreshed), so a healthy value reads
+  ≈ `N` ms and it grows monotonically through an outage; the refresher runs
+  under a supervisor whose watchdog keeps the gauge growing even if the
+  refresher task itself dies (and respawns it, budgeted per minute). Two
+  honest edges of stale-serving: read-your-own-writes can regress to
+  last-snapshot for a write that committed in the instant before the
+  catalog became unreachable (the post-write refresh cannot complete), and
+  in buffered mode (`--write-buffer-ms > 0`) rows flushed just before the
+  outage stay served through the union overlay for the whole outage — a
+  flushed overlay generation is garbage-collected only once metadata
+  containing its commit has actually been observed (plus a 30 s age), so
+  committed rows never vanish from reads mid-outage; the cost is that the
+  overlay memory for those generations is retained until the catalog
+  returns. `ICEGRES_STALE_READ_ON_CATALOG_ERROR`
+  controls the trade in BOTH modes: default mode fails reads during an
+  outage unless it is set truthy; freshness mode serves stale unless it is
+  set to `0`/`false` — the explicit fail-loud override for deployments
+  where erroring beats silently regressing read-your-own-writes.
+- **The physical-plan cache only hits under `--freshness-ms > 0`, and only
+  for repeated *identical* statements.** A hit must be sound without a
+  catalog check, so it requires the freshness contract; and Iceberg plans
+  bake in plan-time file pruning, so a plan for `id = 5` is not reusable
+  for `id = 6` — statements that vary literals re-plan every time (the
+  extended protocol's prepared statements already reuse their logical plan
+  upstream). Overlay-bearing (buffered) tables, time-travel/metadata
+  tables, and non-immutable expressions (`now()`, `random()`, …) are never
+  cached.
+
 ## Transport / security
 
 - **Arrow Flight SQL TLS is in-process** (`flight-serve --tls-cert/--tls-key`),
@@ -232,6 +346,35 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
   logs a startup `WARN`. Remote binds are guarded: binding a non-loopback
   interface with auth off requires `--insecure`. Always enable auth in
   production.
+
+## Hardening backlog
+
+Known-and-accepted sharp edges, queued rather than closed — none is a
+correctness hole under the documented deployment posture, each would harden
+an operational edge:
+
+- **Acceptor idle/read timeout + greeting-stage length cap** (`icekeeperd`):
+  a connected-but-silent client holds its connection task forever, and the
+  pre-greeting frame length is bounded only by the generic message cap —
+  acceptable under the trusted-network posture above, worth tightening.
+- **Acceptor fsync via `spawn_blocking`**: acceptor fsyncs run inline on the
+  connection task's runtime thread; a slow disk stalls that acceptor's
+  other traffic.
+- **`run_peer`/supervisor `JoinHandle` watchers**: the proposer's per-peer
+  streaming tasks and the re-election supervisor are fire-and-forget; a
+  panicked task is only noticed indirectly (stalls → re-election → poison)
+  rather than by a watcher that logs the panic itself.
+- **Per-table sequence lock for quorum appends** (pipelining refinement):
+  staged quorum appends already pipeline their round trips, but sequence
+  allocation still serializes on ONE map-wide mutex; per-table locks would
+  remove the last cross-table serialization point.
+- **Validation-only record walk**: quorum-tail replay decodes every
+  surviving record's Arrow payload eagerly; a cheap validation-only walk
+  would bound boot memory on very large recovered suffixes.
+- **Plan-cache miss-counter noise in buffered+freshness mode**: overlay-
+  bearing tables are (correctly) never cached, but each of their SELECTs
+  still counts as a plan-cache miss, skewing the hit-ratio metric on mixed
+  workloads.
 
 ## Build / dependency matrix
 

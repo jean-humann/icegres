@@ -965,6 +965,15 @@ impl TxnHook {
     /// PK (check-then-commit, re-validated on 409 retry) or when this server
     /// serves a non-`main` branch (the stock fast_append path would commit
     /// to `main`). Otherwise answers `None` so the default handler runs.
+    ///
+    /// `ICEGRES_QUERY_TIMING=1` additionally routes PLAIN autocommit INSERTs
+    /// (no PK, `main` branch, no write buffer) through this path: the stock
+    /// fast_append commit runs fused inside iceberg-datafusion's execution
+    /// plan and cannot be timed per stage, while this path produces an
+    /// equivalent append snapshot through prepare_commit/post_commit, whose
+    /// stages ARE recorded (timing.rs module docs — same diagnostic-mode
+    /// divergence contract as the read-path TimingHook). Zero cost when
+    /// unset: [`crate::timing::enabled`] is one cached bool load.
     async fn autocommit_insert(
         &self,
         stmt: &Statement,
@@ -986,12 +995,18 @@ impl TxnHook {
             Ok(Some(_)) => {}
             // No PK declared: on main the stock fast_append path is fine;
             // on a branch every INSERT must still go through the engine.
-            Ok(None) if self.engine.is_main_branch() => return None,
+            // Diagnostic timing mode keeps the engine path so the sync
+            // commit budget is observable (see the method docs).
+            Ok(None) if self.engine.is_main_branch() && !crate::timing::enabled() => return None,
             Ok(None) => {}
             Err(e) => return Some(Err(user_err("XX000", &format!("{e:#}")))),
         }
         let result: Result<Response> = async {
+            let plan_started = crate::timing::enabled().then(std::time::Instant::now);
             let (plan_ident, batches) = plan_insert_rows(shared, stmt, params).await?;
+            if let Some(t) = plan_started {
+                crate::timing::record("insert_plan", t.elapsed());
+            }
             anyhow::ensure!(
                 plan_ident == ident,
                 "INSERT target resolution mismatch: {plan_ident} vs {ident}"
@@ -1004,7 +1019,13 @@ impl TxnHook {
                 .iter()
                 .map(|b| align_batch(b, &target))
                 .collect::<Result<_>>()?;
-            let outcome = self.engine.insert_enforced(&ident, aligned).await?;
+            // The table loaded above (for the routing decision + schema)
+            // anchors attempt 1 — killing the redundant per-statement
+            // double `load_table`; retries still reload fresh metadata.
+            let outcome = self
+                .engine
+                .insert_enforced(&ident, aligned, Some(table))
+                .await?;
             Ok(Response::Execution(
                 Tag::new("INSERT")
                     .with_oid(0)
@@ -1134,7 +1155,12 @@ impl QueryHook for TxnHook {
                         .await
                 }
                 None => {
-                    if (self.engine.enforce_pk() || !self.engine.is_main_branch())
+                    // ICEGRES_QUERY_TIMING routes plain INSERTs through the
+                    // engine too, so the write budget is observable
+                    // (autocommit_insert docs); one cached bool when unset.
+                    if (self.engine.enforce_pk()
+                        || !self.engine.is_main_branch()
+                        || crate::timing::enabled())
                         && matches!(statement, Statement::Insert(_))
                     {
                         self.autocommit_insert(statement, session_context, None)
@@ -1207,7 +1233,10 @@ impl QueryHook for TxnHook {
                     .await
                 }
                 None => {
-                    if (self.engine.enforce_pk() || !self.engine.is_main_branch())
+                    // Same timing-mode routing as handle_simple_query.
+                    if (self.engine.enforce_pk()
+                        || !self.engine.is_main_branch()
+                        || crate::timing::enabled())
                         && matches!(statement, Statement::Insert(_))
                     {
                         self.autocommit_insert(statement, session_context, Some(params))

@@ -102,7 +102,7 @@ fn session_config(target_partitions: Option<usize>) -> Result<SessionConfig> {
 /// because `setup_pg_catalog` needs `register_schema`, which
 /// `IcebergCatalogProvider` does not implement.
 pub async fn build_session_context(catalog: Arc<dyn Catalog>) -> Result<SessionContext> {
-    build_session_context_with(catalog, None, None, None).await
+    build_session_context_with(catalog, None, None, None, 0).await
 }
 
 /// Total system memory in bytes from `/proc/meminfo`, if readable.
@@ -161,12 +161,17 @@ fn build_runtime_env() -> Result<Arc<RuntimeEnv>> {
 /// scan union the committed snapshot with the buffer's overlay (buffer.rs);
 /// `None` keeps scans byte-for-byte on the default path. `branch` (serve-only,
 /// `--branch`, SPEC D6) pins every plain-table scan to the head of that
-/// Iceberg snapshot ref (see cache.rs); `None` = main.
+/// Iceberg snapshot ref (see cache.rs); `None` = main. `freshness_ms`
+/// (serve-only, `--freshness-ms`) enables bounded-staleness reads: every
+/// plain-table provider is registered with the freshness refresher registry
+/// (freshness.rs; the caller spawns the refresher itself); `0` = default
+/// exact-freshness mode, byte-identical.
 pub async fn build_session_context_with(
     catalog: Arc<dyn Catalog>,
     target_partitions: Option<usize>,
     write_buffer: Option<Arc<WriteBuffer>>,
     branch: Option<String>,
+    freshness_ms: u64,
 ) -> Result<SessionContext> {
     let ctx = SessionContext::new_with_config_rt(
         session_config(target_partitions)?,
@@ -194,6 +199,7 @@ pub async fn build_session_context_with(
                 NamespaceIdent::new(schema_name.clone()),
                 write_buffer.clone(),
                 branch.clone(),
+                freshness_ms > 0,
             )
             .await
             .with_context(|| format!("failed to build caching provider for {schema_name}"))?;

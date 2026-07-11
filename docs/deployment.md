@@ -267,6 +267,40 @@ branch-endpoint routing and warm session pooling. `icegres serve
 supervisor (icegresd, systemd socket activation, or a k8s scale-to-zero
 controller) can implement scale-from-zero.
 
+### Quorum tail topology (3 × `icekeeperd`)
+
+For consensus-class buffered-write durability (`--tail-quorum`), run three
+acceptor daemons on **independent nodes/disks** — placing two on one node
+quietly reduces the promise to that node's survival:
+
+```
+node A:  icekeeperd serve --host 10.0.0.11 --port 5471 --data-dir /var/lib/icekeeper --node-id 1
+node B:  icekeeperd serve --host 10.0.0.12 --port 5471 --data-dir /var/lib/icekeeper --node-id 2
+node C:  icekeeperd serve --host 10.0.0.13 --port 5471 --data-dir /var/lib/icekeeper --node-id 3
+
+compute: icegres serve --write-buffer-ms 200 \
+           --tail-quorum 10.0.0.11:5471,10.0.0.12:5471,10.0.0.13:5471
+```
+
+Acceptors are tiny (one fsync'd record log + a JSON control file; no
+catalog/S3 access, a few MB binary) and restart-safe: kill -9 loses nothing
+acked, and a restarted acceptor is caught up by the live server. Keep the
+acceptor ports on a **trusted private segment** — the protocol has no
+TLS/authentication yet (docs/limitations.md). A second compute pointed at
+the same quorum FENCES the first (its INSERTs fail with "superseded by a
+newer server") — that is the intended failover story: start the
+replacement, the old one loses the log, no lock files to clean up. Run the
+acceptors under a restarting supervisor (systemd `Restart=always` or a k8s
+StatefulSet with one PVC per acceptor); writes survive any single failure
+and pause (statement errors, no loss) only when two of three are down.
+
+How long an append waits for the 2-of-3 ack before giving up is tunable:
+`ICEGRES_TAIL_QUORUM_TIMEOUT_MS` (default 10000, floor 1000). A stalled
+append first attempts one internal re-election (recovering from a crashed
+competitor's term bump without a restart); a second timeout poisons the
+tail (statement errors until restart — the ambiguous record is replayed
+exactly once by the restart's election).
+
 ---
 
 ## 10. Quick reference — operational env vars
@@ -285,6 +319,9 @@ ICEGRES_CATALOG_TIMEOUT_MS, ICEGRES_CATALOG_RETRIES, ICEGRES_STALE_READ_ON_CATAL
 # Semantics
 ICEGRES_TXN_STRICT, ICEGRES_ENFORCE_PK, ICEGRES_BRANCH
 ICEGRES_WRITE_BUFFER_MS, ICEGRES_WRITE_BUFFER_MAX_ROWS
+ICEGRES_TAIL_DIR, ICEGRES_TAIL_URL, ICEGRES_TAIL_QUORUM   (durable tail backends)
+ICEGRES_TAIL_QUORUM_TIMEOUT_MS   (quorum-ack timeout; default 10000, min 1000)
+ICEKEEPER_HOST, ICEKEEPER_PORT, ICEKEEPER_DATA_DIR, ICEKEEPER_NODE_ID   (icekeeperd)
 ICEGRES_IDLE_SHUTDOWN_SECS
 # Observability
 ICEGRES_LOG_FORMAT=json, RUST_LOG

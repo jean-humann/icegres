@@ -30,6 +30,14 @@ path = "src/main.rs"
 name = "icegresd"
 path = "src/bin/icegresd.rs"
 
+# The quorum-tail acceptor daemon (roadmap §3 backend 3). Same pattern as
+# icegresd: a third bin target sharing the dependency graph but compiling
+# only its own file plus the `#[path]`-included consensus modules
+# (src/segment.rs + src/quorum/*) — none of the datafusion/iceberg stack.
+[[bin]]
+name = "icekeeperd"
+path = "src/bin/icekeeperd.rs"
+
 [dependencies]
 # Iceberg stack (all pinned to the same 0.9.1 — do not bump independently)
 iceberg = "=0.9.1"
@@ -112,6 +120,13 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 async-trait = "0.1"
+
+# Test-only: tokio's paused clock (`#[tokio::test(start_paused = true)]`) so
+# the freshness refresher supervisor's respawn window (60 s) is testable in
+# milliseconds. Dev-dependency feature unification applies to test builds
+# only — the shipped binary's tokio feature set above is unchanged.
+[dev-dependencies]
+tokio = { version = "1.52", features = ["test-util"] }
 
 # Resource hygiene: symbols stripped from the release binary (rust symbol tables
 # on the datafusion+iceberg graph are enormous). binary_size_mb and rss are

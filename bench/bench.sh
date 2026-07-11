@@ -193,9 +193,27 @@ stop_icegresd_pidfile() { # identity-checked (comm=icegresd); SIGTERM
   fi
 }
 
+stop_keeper_bench() { # stop_keeper_bench <n> — identity-checked (comm=icekeeperd)
+  local pidfile="$RUN_DIR/bench-keeper-$1.pid" pid
+  if [[ -f "$pidfile" ]]; then
+    pid=$(cat "$pidfile")
+    if kill -0 "$pid" 2>/dev/null \
+        && [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == icekeeperd ]]; then
+      kill "$pid" 2>/dev/null || true
+      for _ in $(seq 1 20); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.25
+      done
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$pidfile"
+  fi
+}
+
 cleanup() {
   stop_pidfile
   stop_icegresd_pidfile
+  for n in 1 2 3; do stop_keeper_bench "$n"; done
   drop_scratch
 }
 trap cleanup EXIT
@@ -311,6 +329,98 @@ jq -s --argjson ms "$WRITE_BUFFER_MS" \
   '.[0] * {metrics: (.[0].metrics + .[1].metrics), write_buffer_ms_buffered_run: $ms}' \
   "$OUT_JSON" "$BUF_JSON" >"$OUT_JSON.tmp" && mv "$OUT_JSON.tmp" "$OUT_JSON"
 log "merged buffered-mode metrics into $OUT_JSON"
+
+# ---------------------------------------------------------------------------
+# 4f. Durable-ack ladder (ADDITIONAL, ungated): the write-latency ladder's
+#     tail legs — single-row INSERT durable-ack p50 with --write-buffer-ms
+#     100 and each durable tail backend:
+#       durable_ack_dir_ms    — --tail-dir    (local WAL group fsync)
+#       durable_ack_pg_ms     — --tail-url    (tail-database INSERT+commit)
+#       durable_ack_quorum_ms — --tail-quorum (2-of-3 icekeeperd fsync ack)
+#     Each leg runs a fresh server against a fresh scratch table (distinct
+#     id range >= 4,000,000); the quorum leg starts/stops its OWN icekeeperd
+#     trio on 5461-5463 (5471-5473 belong to tests/tail_durability.sh).
+#     Cheap: 3 warmup + 20 measured single-row inserts per leg. The gated
+#     default-mode metrics above are unaffected.
+# ---------------------------------------------------------------------------
+TAIL_ACK_BUF_MS=100
+TAIL_ACK_DIR="$RUN_DIR/tail-ack-wal"
+TAIL_PG_URL="postgresql://lakekeeper:lakekeeper@127.0.0.1:5433/icegres_test"
+QUORUM_ADDRS_BENCH="127.0.0.1:5461,127.0.0.1:5462,127.0.0.1:5463"
+KEEPER_BIN="$ICEGRES_DIR/target/release/icekeeperd"
+
+drop_bench_pg_tail_schema() {
+  psql "$TAIL_PG_URL" -c 'DROP SCHEMA IF EXISTS icegres_tail CASCADE' >/dev/null 2>&1 || true
+}
+
+start_keeper_bench() { # start_keeper_bench <n: 1..3>
+  local n=$1 port=$((5460 + n))
+  "$KEEPER_BIN" serve --host 127.0.0.1 --port "$port" \
+    --data-dir "$RUN_DIR/bench-keeper-$n" --node-id "$n" \
+    >>"$RUN_DIR/bench-keeper-$n.log" 2>&1 &
+  echo $! >"$RUN_DIR/bench-keeper-$n.pid"
+  for _ in $(seq 1 40); do
+    if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then exec 3>&- 3<&-; return 0; fi
+    kill -0 "$(cat "$RUN_DIR/bench-keeper-$n.pid")" 2>/dev/null \
+      || { tail -n 20 "$RUN_DIR/bench-keeper-$n.log" >&2; fatal "icekeeperd $n exited during startup"; }
+    sleep 0.25
+  done
+  fatal "icekeeperd $n not accepting on :$port within 10s"
+}
+
+run_tail_ack_leg() { # run_tail_ack_leg <label> <extra serve flags...>
+  local label=$1; shift
+  log "durable-ack leg '$label' (--write-buffer-ms $TAIL_ACK_BUF_MS $*)"
+  drop_scratch
+  create_scratch || fatal "could not re-create demo.$SCRATCH_TABLE for tail leg $label"
+  local leg_log="$RUN_DIR/bench-serve-tail-$label.log"
+  : >"$leg_log"
+  "$BIN" serve --host "$PG_HOST" --port "$PG_PORT" \
+    --write-buffer-ms "$TAIL_ACK_BUF_MS" "$@" >>"$leg_log" 2>&1 &
+  local pid=$!
+  echo "$pid" >"$PID_FILE"
+  for _ in $(seq 1 60); do
+    port_answers "$PG_PORT" && break
+    kill -0 "$pid" 2>/dev/null \
+      || { tail -n 20 "$leg_log" >&2; fatal "tail-leg server ($label) exited during startup"; }
+    sleep 0.5
+  done
+  port_answers "$PG_PORT" || fatal "tail-leg server ($label) not ready on :$PG_PORT within 30s"
+  local leg_json="$RUN_DIR/bench-tail-$label.json"
+  "$HARNESS_BIN" --host "$PG_HOST" --port "$PG_PORT" --tail-ack "$label" >"$leg_json" \
+    || { tail -n 10 "$leg_log" >&2; fatal "tail-ack harness ($label) failed"; }
+  # Let the last acked rows flush (cadence + margin), then stop and merge.
+  sleep 1
+  stop_pidfile
+  jq -s '.[0] * {metrics: (.[0].metrics + .[1].metrics)}' \
+    "$OUT_JSON" "$leg_json" >"$OUT_JSON.tmp" && mv "$OUT_JSON.tmp" "$OUT_JSON"
+}
+
+log "measuring the durable-ack ladder (three tail backends)"
+rm -rf "$TAIL_ACK_DIR"
+run_tail_ack_leg dir --tail-dir "$TAIL_ACK_DIR"
+rm -rf "$TAIL_ACK_DIR"
+
+drop_bench_pg_tail_schema
+run_tail_ack_leg pg --tail-url "$TAIL_PG_URL"
+drop_bench_pg_tail_schema
+
+if [[ -x "$KEEPER_BIN" ]]; then
+  for port in 5461 5462 5463; do
+    if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+      exec 3>&- 3<&-
+      fatal "port :$port is occupied — free it first (durable-ack quorum leg)"
+    fi
+  done
+  rm -rf "$RUN_DIR"/bench-keeper-{1,2,3}
+  for n in 1 2 3; do start_keeper_bench "$n"; done
+  run_tail_ack_leg quorum --tail-quorum "$QUORUM_ADDRS_BENCH"
+  for n in 1 2 3; do stop_keeper_bench "$n"; done
+  rm -rf "$RUN_DIR"/bench-keeper-{1,2,3}
+else
+  log "icekeeperd release binary not found at $KEEPER_BIN — skipping durable_ack_quorum_ms"
+fi
+log "durable-ack ladder merged: $(jq -c '.metrics | {durable_ack_dir_ms, durable_ack_pg_ms, durable_ack_quorum_ms}' "$OUT_JSON")"
 
 # ---------------------------------------------------------------------------
 # 4c. Wake-after-idle latency through icegresd (ADDITIONAL, ungated):
@@ -598,7 +708,9 @@ fi
     ( ["connect_ms","point_lookup_ms","filtered_scan_ms","aggregate_ms","join_ms",
        "insert_single_ms","insert_batch100_ms","freshness_ms","qps_8conn",
        "cold_start_ms","binary_size_mb","rss_idle_mb","rss_peak_mb","rss_after_load_mb",
-       "insert_single_buffered_ms","freshness_buffered_ms","cold_start_via_proxy_ms",
+       "insert_single_buffered_ms","freshness_buffered_ms",
+       "durable_ack_dir_ms","durable_ack_pg_ms","durable_ack_quorum_ms",
+       "cold_start_via_proxy_ms",
        "connect_via_proxy_ms","qps_via_proxy_8conn",
        "adbc_query_point_ms","adbc_query_bigfilter_ms","adbc_bulk_ingest_100k_rows_s"][] ) as $k |
     row($k; $m[$k])

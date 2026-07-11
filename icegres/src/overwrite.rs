@@ -97,7 +97,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use arrow::array::{Array, AsArray, RecordBatch};
@@ -342,6 +342,9 @@ impl OverwriteEngine {
         let ops = [TableOp::Dml(stmt.clone())];
         let mut conflicts: Vec<String> = Vec::new();
         for attempt in 1..=MAX_COMMIT_ATTEMPTS {
+            // ICEGRES_QUERY_TIMING write budget: one line per attempt, so the
+            // retry loop's cost is visible as extra `commit_attempt` records.
+            let attempt_started = crate::timing::enabled().then(Instant::now);
             let table = self
                 .catalog
                 .load_table(&ident)
@@ -376,6 +379,9 @@ impl OverwriteEngine {
                 .await?
             {
                 CommitOutcome::Committed => {
+                    if let Some(t) = attempt_started {
+                        crate::timing::record("commit_attempt", t.elapsed());
+                    }
                     tracing::info!(
                         table = %ident,
                         rows,
@@ -390,6 +396,9 @@ impl OverwriteEngine {
                     });
                 }
                 CommitOutcome::Conflict(msg) => {
+                    if let Some(t) = attempt_started {
+                        crate::timing::record("commit_retry", t.elapsed());
+                    }
                     tracing::warn!(
                         table = %ident,
                         attempt,
@@ -411,20 +420,34 @@ impl OverwriteEngine {
     /// retry reloads fresh metadata and re-checks, so racing duplicate
     /// INSERTs cannot both land (one commits, the other sees the committed
     /// row on retry and fails with 23505).
+    ///
+    /// `preloaded`: the table the CALLER just loaded (txn.rs loads it to
+    /// resolve the PK/branch routing decision) — attempt 1 anchors to it
+    /// instead of paying a second, redundant `load_table` microseconds
+    /// later. Semantics unchanged: the commit's `assert-ref-snapshot-id`
+    /// requirement is the real guard, and every RETRY reloads fresh
+    /// metadata exactly as before.
     pub async fn insert_enforced(
         &self,
         ident: &TableIdent,
         batches: Vec<RecordBatch>,
+        preloaded: Option<Table>,
     ) -> Result<DmlOutcome> {
         let rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
         let ops = [TableOp::Append(batches)];
         let mut conflicts: Vec<String> = Vec::new();
+        let mut preloaded = preloaded;
         for attempt in 1..=MAX_COMMIT_ATTEMPTS {
-            let table = self
-                .catalog
-                .load_table(ident)
-                .await
-                .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?;
+            // Same per-attempt timing record as `execute` (write budget).
+            let attempt_started = crate::timing::enabled().then(Instant::now);
+            let table = match preloaded.take() {
+                Some(t) => t,
+                None => self
+                    .catalog
+                    .load_table(ident)
+                    .await
+                    .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?,
+            };
             let pk = self.pk_columns(&table)?;
             let prepared = prepare_commit(&table, &ops, pk.as_deref(), &self.branch, None)
                 .await
@@ -445,6 +468,9 @@ impl OverwriteEngine {
                 .await?
             {
                 CommitOutcome::Committed => {
+                    if let Some(t) = attempt_started {
+                        crate::timing::record("commit_attempt", t.elapsed());
+                    }
                     return Ok(DmlOutcome {
                         rows,
                         attempts: attempt,
@@ -452,6 +478,9 @@ impl OverwriteEngine {
                     });
                 }
                 CommitOutcome::Conflict(msg) => {
+                    if let Some(t) = attempt_started {
+                        crate::timing::record("commit_retry", t.elapsed());
+                    }
                     tracing::warn!(
                         table = %ident,
                         attempt,
@@ -1053,7 +1082,34 @@ impl OverwriteEngine {
 
     /// POST the commit to the REST catalog. 2xx = committed, 409 = conflict
     /// (caller retries), anything else = hard error.
+    ///
+    /// Every local commit attempt flows through here (sync DML, PK-enforced
+    /// INSERT, transaction COMMIT's per-table fallback, buffer flush,
+    /// branch/maintenance commits), so this is where freshness mode's
+    /// read-your-own-writes invalidation lives: after the POST completes
+    /// the table's cached snapshot is invalidated (freshness.rs) so the
+    /// next read on this server observes the commit synchronously.
+    /// Invalidation is unconditional — a transport error is AMBIGUOUS (the
+    /// commit may have landed) and even a clean 409 costs at most one extra
+    /// catalog check on the next scan. No-op in default mode.
     async fn post_commit(
+        &self,
+        namespace: &str,
+        table: &str,
+        request: &CommitTableRequest,
+    ) -> Result<CommitOutcome> {
+        // Write-budget stage (b): the Iceberg REST commit round trip. One
+        // cached-bool load when ICEGRES_QUERY_TIMING is unset.
+        let started = crate::timing::enabled().then(Instant::now);
+        let result = self.post_commit_inner(namespace, table, request).await;
+        if let Some(t) = started {
+            crate::timing::record("catalog_post", t.elapsed());
+        }
+        crate::freshness::invalidate_key(&crate::freshness::commit_key(namespace, table));
+        result
+    }
+
+    async fn post_commit_inner(
         &self,
         namespace: &str,
         table: &str,
@@ -1174,6 +1230,25 @@ impl OverwriteEngine {
     /// or the catalog CAS lost) with NOTHING applied. Skips the wire
     /// entirely when support is already known to be absent.
     async fn post_transaction(&self, requests: &[&CommitTableRequest]) -> Result<TxnCommitOutcome> {
+        let result = self.post_transaction_inner(requests).await;
+        // Freshness-mode read-your-own-writes: same unconditional
+        // invalidation as post_commit, for every table the transaction
+        // touched (skipped for capability-probe requests, which carry no
+        // identifier). No-op in default mode.
+        if !matches!(result, Ok(TxnCommitOutcome::Unsupported)) {
+            for request in requests {
+                if let Some(ident) = &request.identifier {
+                    crate::freshness::invalidate_key(&crate::freshness::table_key(ident));
+                }
+            }
+        }
+        result
+    }
+
+    async fn post_transaction_inner(
+        &self,
+        requests: &[&CommitTableRequest],
+    ) -> Result<TxnCommitOutcome> {
         if !self.probe_txn_endpoint().await? {
             return Ok(TxnCommitOutcome::Unsupported);
         }
@@ -1358,7 +1433,17 @@ impl PreparedCommit {
 
 /// Parse and validate the `icegres.primary-key` table property.
 pub fn pk_columns_of(table: &Table) -> Result<Option<Vec<String>>> {
-    let Some(raw) = table.metadata().properties().get(PK_PROPERTY) else {
+    pk_columns_of_metadata(table.metadata(), &table.identifier().to_string())
+}
+
+/// [`pk_columns_of`] over bare metadata (`what` names the table in the
+/// error) — for callers holding a freshness-cached [`TableMetadata`]
+/// instead of a loaded [`Table`] (the keyed-DML gate, buffer.rs).
+pub fn pk_columns_of_metadata(
+    metadata: &iceberg::spec::TableMetadata,
+    what: &str,
+) -> Result<Option<Vec<String>>> {
+    let Some(raw) = metadata.properties().get(PK_PROPERTY) else {
         return Ok(None);
     };
     let cols: Vec<String> = raw
@@ -1370,13 +1455,12 @@ pub fn pk_columns_of(table: &Table) -> Result<Option<Vec<String>>> {
     if cols.is_empty() {
         return Ok(None);
     }
-    let schema = table.metadata().current_schema();
+    let schema = metadata.current_schema();
     for c in &cols {
         if !schema.as_struct().fields().iter().any(|f| &f.name == c) {
             bail!(
                 "table property {PK_PROPERTY}={raw:?} names column {c:?} which does not \
-                 exist in table {}",
-                table.identifier()
+                 exist in table {what}"
             );
         }
     }
@@ -1530,6 +1614,21 @@ pub async fn prepare_commit(
 ) -> Result<Option<PreparedCommit>> {
     let metadata = table.metadata();
 
+    // ICEGRES_QUERY_TIMING write budget (timing.rs module docs): per-stage
+    // accumulators for the commit hot path. `timing` is one cached bool
+    // load; when it is false no `Instant::now()` is ever taken and every
+    // accumulator update below is skipped — zero cost when unset.
+    let timing = crate::timing::enabled();
+    let prepare_started = timing.then(Instant::now);
+    let mut t_file_scan = Duration::ZERO; // reading existing live data files
+    let mut t_dml_apply = Duration::ZERO; // folding DML ops over rows
+    let mut t_parquet_encode = Duration::ZERO; // data writer .write()
+    let stage = |acc: &mut Duration, started: Option<Instant>| {
+        if let Some(t) = started {
+            *acc += t.elapsed();
+        }
+    };
+
     // ---- Guard rails: reject unsupported table shapes loudly. ----
     if metadata.format_version() != FormatVersion::V2 {
         bail!(
@@ -1587,7 +1686,12 @@ pub async fn prepare_commit(
     // PK columns of every FINAL row (kept + rewritten + appended).
     let mut pk_rows: Vec<RecordBatch> = Vec::new();
 
-    if let Some(current_snapshot) = head {
+    // Append-only commits (`!need_file_scan`) skip this block and defer
+    // the manifest-list read: it only supplies the carried manifests, none
+    // of which an append touches, so it overlaps with staging the appended
+    // rows below (the parallel-stage join). With DML/PK enforcement the
+    // list drives the file scan and is loaded here, exactly as before.
+    if let Some(current_snapshot) = head.filter(|_| need_file_scan) {
         let manifest_list = current_snapshot
             .load_manifest_list(file_io, &table.metadata_ref())
             .await
@@ -1602,11 +1706,6 @@ pub async fn prepare_commit(
         }
 
         for manifest_file in manifest_list.entries() {
-            if !need_file_scan {
-                // Append-only commit: every existing manifest is carried.
-                carried.push(manifest_file.clone());
-                continue;
-            }
             let manifest = manifest_file.load_manifest(file_io).await.map_err(|e| {
                 anyhow!(
                     "failed to load manifest {}: {e}",
@@ -1626,13 +1725,17 @@ pub async fn prepare_commit(
                     rewrite_manifest = true;
                     continue;
                 }
+                let t = timing.then(Instant::now);
                 let batches = read_parquet_file(file_io, entry.data_file()).await?;
+                stage(&mut t_file_scan, t);
                 let rows_in: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
                 let fate = if has_dml {
                     // RecordBatch clones share Arc'd buffers — cheap; the
                     // original stays available for PK collection on Keep.
+                    let t = timing.then(Instant::now);
                     let (changed, out) =
                         fold_dml_ops(ops, 0, &columns, batches.clone(), &mut rows_by_op).await?;
+                    stage(&mut t_dml_apply, t);
                     let rows_out: u64 = out.iter().map(|b| b.num_rows() as u64).sum();
                     if !changed {
                         FileFate::Keep
@@ -1709,12 +1812,14 @@ pub async fn prepare_commit(
                                     data_writer.as_mut().expect("just set")
                                 }
                             };
+                            let t = timing.then(Instant::now);
                             for batch in batches {
                                 let aligned = align_batch(&batch, &arrow_target)?;
                                 writer.write(aligned).await.map_err(|e| {
                                     anyhow!("failed to write replacement rows: {e}")
                                 })?;
                             }
+                            stage(&mut t_parquet_encode, t);
                         }
                     }
                 }
@@ -1729,7 +1834,9 @@ pub async fn prepare_commit(
             continue;
         };
         rows_by_op[i] = batches.iter().map(|b| b.num_rows() as u64).sum();
+        let t = timing.then(Instant::now);
         let (_, out) = fold_dml_ops(ops, i + 1, &columns, batches.clone(), &mut rows_by_op).await?;
+        stage(&mut t_dml_apply, t);
         let rows_out: u64 = out.iter().map(|b| b.num_rows() as u64).sum();
         if rows_out == 0 {
             continue;
@@ -1749,12 +1856,14 @@ pub async fn prepare_commit(
                 data_writer.as_mut().expect("just set")
             }
         };
+        let t = timing.then(Instant::now);
         for batch in aligned {
             writer
                 .write(batch)
                 .await
                 .map_err(|e| anyhow!("failed to write appended rows: {e}"))?;
         }
+        stage(&mut t_parquet_encode, t);
     }
 
     if !any_file_changed && appended_rows == 0 {
@@ -1767,23 +1876,43 @@ pub async fn prepare_commit(
         check_pk(pk_cols, &pk_rows, table.identifier().name()).await?;
     }
 
-    let added_files: Vec<DataFile> = match data_writer.as_mut() {
-        Some(w) => w
-            .close()
-            .await
-            .map_err(|e| anyhow!("failed to close data file writer: {e}"))?,
-        None => Vec::new(),
-    };
-
     // ---- Snapshot production (mirrors iceberg-0.9.1 SnapshotProducer). ----
     let snapshot_id = generate_unique_snapshot_id(table);
     let next_seq = metadata.next_sequence_number();
     let meta_dir = format!("{}/metadata", metadata.location());
+    let mut t_manifest_put = Duration::ZERO; // manifest Avro build + PUT(s)
 
+    // ---- Parallel stage: three INDEPENDENT pieces of work overlap here.
+    // Spec-safety of the concurrency (the review point): a snapshot may
+    // never become catalog-visible before every artifact it references is
+    // durable. Nothing here is referenced by anything else in this join —
+    // (a) closing the data writer PUTs the NEW data files, which only the
+    // m1 manifest (written strictly AFTER this join) references; (b) the
+    // m0 manifest references only files of PREVIOUS snapshots, durable
+    // long ago; (c) the append-only path's manifest-list read is a pure
+    // GET of committed metadata. The manifest LIST that references m0/m1
+    // is written strictly after them, and the catalog POST strictly after
+    // the list — the reference chain stays sequential, only unrelated
+    // uploads overlap.
+    let close_fut = async {
+        // Closing the rolling Parquet writer flushes the encoder and
+        // performs the data-file PUT(s) to object storage.
+        let t = timing.then(Instant::now);
+        let added: Vec<DataFile> = match data_writer.as_mut() {
+            Some(w) => w
+                .close()
+                .await
+                .map_err(|e| anyhow!("failed to close data file writer: {e}"))?,
+            None => Vec::new(),
+        };
+        Ok::<_, anyhow::Error>((added, t.map(|t| t.elapsed()).unwrap_or_default()))
+    };
     // One rewritten manifest holding EXISTING (kept) + DELETED (removed)
-    // entries from every touched source manifest...
-    let mut new_manifests: Vec<ManifestFile> = carried;
-    if !existing.is_empty() || !deleted.is_empty() {
+    // entries from every touched source manifest (DML/PK commits only).
+    let m0_fut = async {
+        if existing.is_empty() && deleted.is_empty() {
+            return Ok::<_, anyhow::Error>((None, Duration::ZERO));
+        }
         let mut writer = new_manifest_writer(
             table,
             snapshot_id,
@@ -1799,13 +1928,41 @@ pub async fn prepare_commit(
                 .add_delete_file(df, seq, fseq.or(Some(seq)))
                 .map_err(|e| anyhow!("failed to add deleted file entry: {e}"))?;
         }
-        new_manifests.push(
-            writer
-                .write_manifest_file()
-                .await
-                .map_err(|e| anyhow!("failed to write rewritten manifest: {e}"))?,
-        );
-    }
+        let t = timing.then(Instant::now);
+        let mf = writer
+            .write_manifest_file()
+            .await
+            .map_err(|e| anyhow!("failed to write rewritten manifest: {e}"))?;
+        Ok((Some(mf), t.map(|t| t.elapsed()).unwrap_or_default()))
+    };
+    // The deferred append-only manifest-list read: every existing manifest
+    // is carried untouched (see the deferral comment at the scan block).
+    let carried_fut = async {
+        let Some(current_snapshot) = head.filter(|_| !need_file_scan) else {
+            return Ok::<Vec<ManifestFile>, anyhow::Error>(Vec::new());
+        };
+        let manifest_list = current_snapshot
+            .load_manifest_list(file_io, &table.metadata_ref())
+            .await
+            .map_err(|e| anyhow!("failed to load manifest list: {e}"))?;
+        for mf in manifest_list.entries() {
+            if mf.content != ManifestContentType::Data {
+                bail!(
+                    "table has delete manifests (merge-on-read); writes via icegres \
+                     support copy-on-write tables only"
+                );
+            }
+        }
+        Ok(manifest_list.entries().to_vec())
+    };
+    let (close_res, m0_res, carried_res) = futures::join!(close_fut, m0_fut, carried_fut);
+    let (added_files, t_data_file_put) = close_res?;
+    let (m0_manifest, t_m0) = m0_res?;
+    t_manifest_put += t_m0;
+    carried.extend(carried_res?);
+
+    let mut new_manifests: Vec<ManifestFile> = carried;
+    new_manifests.extend(m0_manifest);
     // ... plus one manifest of ADDED files (rewritten survivors + appends).
     let (mut added_records, mut added_bytes) = (0u64, 0u64);
     if !added_files.is_empty() {
@@ -1821,15 +1978,18 @@ pub async fn prepare_commit(
                 .add_file(df.clone(), UNASSIGNED_SEQUENCE_NUMBER)
                 .map_err(|e| anyhow!("failed to add new file entry: {e}"))?;
         }
+        let t = timing.then(Instant::now);
         new_manifests.push(
             writer
                 .write_manifest_file()
                 .await
                 .map_err(|e| anyhow!("failed to write added manifest: {e}"))?,
         );
+        stage(&mut t_manifest_put, t);
     }
 
     let manifest_list_path = format!("{meta_dir}/snap-{snapshot_id}-0-{commit_uuid}.avro");
+    let t_list = timing.then(Instant::now);
     let mut list_writer = ManifestListWriter::v2(
         file_io
             .new_output(&manifest_list_path)
@@ -1845,6 +2005,22 @@ pub async fn prepare_commit(
         .close()
         .await
         .map_err(|e| anyhow!("failed to write manifest list: {e}"))?;
+    if timing {
+        // Emit the whole prepare-side budget in one place (stages that did
+        // not run — e.g. no file scan on a pure append — report 0).
+        crate::timing::record("file_scan", t_file_scan);
+        crate::timing::record("dml_apply", t_dml_apply);
+        crate::timing::record("parquet_encode", t_parquet_encode);
+        crate::timing::record("data_file_put", t_data_file_put);
+        crate::timing::record("manifest_put", t_manifest_put);
+        crate::timing::record(
+            "manifest_list_put",
+            t_list.map(|t| t.elapsed()).unwrap_or_default(),
+        );
+        if let Some(t) = prepare_started {
+            crate::timing::record("prepare_total", t.elapsed());
+        }
+    }
 
     // Snapshot summary. added/deleted counts are file-level (Iceberg spec
     // semantics — a rewritten file counts all its records on both sides);
