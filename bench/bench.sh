@@ -613,6 +613,30 @@ point = timed_query("SELECT * FROM demo.trips WHERE trip_id = 7", 20)
 bigfilter = timed_query(
     "SELECT count(*), avg(fare) FROM demo.trips_big WHERE distance_km > 25.0", 10)
 
+# flight_q1_ms (P1): bench/compare/compare.py's exact q1 recipe so the
+# number is apples-to-apples with COMPARISON.md's flightsql leg — fresh
+# cursor per sample, execute + fetchall, 3 warmup + 15 timed, p50=median.
+def timed_q1(n=15, warmup=3):
+    import statistics as _st
+    sql = ("SELECT trip_id, city, distance_km, fare, ts "
+           "FROM demo.trips WHERE trip_id = 137")
+    times = []
+    for i in range(n + warmup):
+        c2 = conn.cursor()
+        t0 = time.perf_counter()
+        c2.execute(sql)
+        c2.fetchall()
+        dt = (time.perf_counter() - t0) * 1000
+        c2.close()
+        if i >= warmup:
+            times.append(dt)
+    xs = sorted(times)
+    return {"p50": round(_st.median(xs), 2),
+            "p95": round(xs[min(n - 1, int(round(0.95 * n)) - 1)], 2),
+            "n": n}
+
+flight_q1 = timed_q1()
+
 # Bulk ingest: 100k rows per run, 3 runs; each run appends ONE commit. The
 # per-run rows/s uses the full client-observed wall time of adbc_ingest.
 N = 100_000
@@ -638,6 +662,7 @@ snapshots = len(cur.fetchall())
 assert snapshots == 3, f"expected 3 ingest commits, saw {snapshots} snapshots"
 
 out = {
+    "flight_q1_ms": flight_q1,
     "adbc_query_point_ms": point,
     "adbc_query_bigfilter_ms": bigfilter,
     "adbc_bulk_ingest_100k_rows_s": {
@@ -712,7 +737,8 @@ fi
        "durable_ack_dir_ms","durable_ack_pg_ms","durable_ack_quorum_ms",
        "cold_start_via_proxy_ms",
        "connect_via_proxy_ms","qps_via_proxy_8conn",
-       "adbc_query_point_ms","adbc_query_bigfilter_ms","adbc_bulk_ingest_100k_rows_s"][] ) as $k |
+       "adbc_query_point_ms","adbc_query_bigfilter_ms","adbc_bulk_ingest_100k_rows_s",
+       "flight_q1_ms"][] ) as $k |
     row($k; $m[$k])
   ' "$OUT_JSON"
 } >>"$SCORECARD"

@@ -74,6 +74,7 @@ use tracing::warn;
 
 use crate::buffer::WriteBuffer;
 use crate::freshness::TableFreshness;
+use crate::peer::PeerMirrors;
 
 /// Per-attempt timeout for a catalog `load_table` from
 /// `ICEGRES_CATALOG_TIMEOUT_MS` (default 5000; `0` = no timeout).
@@ -246,6 +247,11 @@ pub struct CachingTableProvider {
     /// `None` = default mode, every scan pays the exact-freshness catalog
     /// check — byte-identical to the historical path.
     freshness: Option<Arc<TableFreshness>>,
+    /// Fleet overlays (`--peer-tail`, peer.rs): scans additionally union
+    /// each peer's mirrored tail window under the property-watermark
+    /// exactly-once rule (same union machinery as the local overlay).
+    /// `None` = default mode, scans unchanged.
+    peer_mirrors: Option<Arc<PeerMirrors>>,
 }
 
 impl std::fmt::Debug for CachingTableProvider {
@@ -257,6 +263,7 @@ impl std::fmt::Debug for CachingTableProvider {
 }
 
 impl CachingTableProvider {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         catalog: Arc<dyn Catalog>,
         ident: TableIdent,
@@ -264,6 +271,7 @@ impl CachingTableProvider {
         write_buffer: Option<Arc<WriteBuffer>>,
         branch: Option<String>,
         freshness: Option<Arc<TableFreshness>>,
+        peer_mirrors: Option<Arc<PeerMirrors>>,
     ) -> Self {
         let schema = write_delegate.schema();
         Self {
@@ -275,6 +283,7 @@ impl CachingTableProvider {
             write_buffer,
             branch,
             freshness,
+            peer_mirrors,
         }
     }
 
@@ -312,7 +321,10 @@ impl CachingTableProvider {
     /// the scope's overlay trap). `None` in default mode, so the plan cache
     /// can never bypass the exact per-scan freshness check.
     pub(crate) fn plan_cache_version(&self) -> Option<MetadataVersion> {
-        if !plan_cache_eligible(self.freshness.is_some(), self.write_buffer.is_some()) {
+        // Peer mirrors are per-scan state exactly like the local overlay
+        // (the overlay trap): a mirrored table is never plan-cacheable.
+        let overlay_source = self.write_buffer.is_some() || self.peer_mirrors.is_some();
+        if !plan_cache_eligible(self.freshness.is_some(), overlay_source) {
             return None;
         }
         let f = self.freshness.as_ref()?;
@@ -531,6 +543,23 @@ impl TableProvider for CachingTableProvider {
                 .overlay(&self.ident, &metadata)
                 .map_err(|e| DataFusionError::External(e.into()))?,
             None => None,
+        };
+        // Fleet overlays (--peer-tail): the peer mirror's contribution under
+        // the SAME exactly-once rule, evaluated against THIS scan's metadata
+        // (its icegres.tail-seq.<peer-id> property), then merged with the
+        // local overlay (concat batches, union suppression keys; a PK/schema
+        // disagreement fails loudly). On the single-buffering-writer model a
+        // table has a local overlay XOR a peer mirror, but the merge
+        // composes either way.
+        let overlay = match &self.peer_mirrors {
+            Some(mirrors) => {
+                let peer = mirrors
+                    .overlay(&self.ident, &metadata)
+                    .map_err(|e| DataFusionError::External(e.into()))?;
+                crate::peer::merge_overlays(overlay, peer)
+                    .map_err(|e| DataFusionError::External(e.into()))?
+            }
+            None => overlay,
         };
         if let Some(overlay) = overlay {
             // Same union shape as the transaction hook's read view (txn.rs
@@ -933,6 +962,10 @@ pub struct CachingSchemaProvider {
     /// provider gets a [`TableFreshness`] and is registered with the
     /// process-global refresher/invalidation registry (freshness.rs).
     freshness_enabled: bool,
+    /// Fleet overlays (`--peer-tail`); threaded into every
+    /// [`CachingTableProvider`]. Time-travel and metadata tables stay
+    /// point-in-time by design and never see peer mirrors.
+    peer_mirrors: Option<Arc<PeerMirrors>>,
 }
 
 /// Parse a `<table>@<snapshot_id>` time-travel reference. Returns the base
@@ -956,6 +989,7 @@ impl std::fmt::Debug for CachingSchemaProvider {
 impl CachingSchemaProvider {
     /// Wrap `inner`, pre-building a caching provider for every plain table
     /// currently in the namespace.
+    #[allow(clippy::too_many_arguments)]
     pub async fn try_new(
         inner: Arc<dyn SchemaProvider>,
         catalog: Arc<dyn Catalog>,
@@ -963,6 +997,7 @@ impl CachingSchemaProvider {
         write_buffer: Option<Arc<WriteBuffer>>,
         branch: Option<String>,
         freshness_enabled: bool,
+        peer_mirrors: Option<Arc<PeerMirrors>>,
     ) -> DFResult<Self> {
         let mut map = HashMap::new();
         for name in inner.table_names() {
@@ -978,6 +1013,7 @@ impl CachingSchemaProvider {
                     write_buffer.clone(),
                     branch.clone(),
                     freshness_enabled,
+                    peer_mirrors.clone(),
                 );
                 map.insert(name, provider);
             }
@@ -991,11 +1027,13 @@ impl CachingSchemaProvider {
             write_buffer,
             branch,
             freshness_enabled,
+            peer_mirrors,
         })
     }
 
     /// Build one caching table provider and, in freshness mode, register it
     /// with the global refresher/invalidation registry (freshness.rs).
+    #[allow(clippy::too_many_arguments)]
     fn build_provider(
         catalog: Arc<dyn Catalog>,
         ident: TableIdent,
@@ -1003,6 +1041,7 @@ impl CachingSchemaProvider {
         write_buffer: Option<Arc<WriteBuffer>>,
         branch: Option<String>,
         freshness_enabled: bool,
+        peer_mirrors: Option<Arc<PeerMirrors>>,
     ) -> Arc<CachingTableProvider> {
         let freshness = freshness_enabled.then(|| Arc::new(TableFreshness::new()));
         let key = freshness
@@ -1015,6 +1054,7 @@ impl CachingSchemaProvider {
             write_buffer,
             branch,
             freshness.clone(),
+            peer_mirrors,
         ));
         if let (Some(key), Some(freshness)) = (key, freshness) {
             crate::freshness::register(key, freshness, &provider);
@@ -1104,6 +1144,7 @@ impl SchemaProvider for CachingSchemaProvider {
                     self.write_buffer.clone(),
                     self.branch.clone(),
                     self.freshness_enabled,
+                    self.peer_mirrors.clone(),
                 );
                 self.cached
                     .write()

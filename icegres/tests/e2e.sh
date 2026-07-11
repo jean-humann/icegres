@@ -44,6 +44,9 @@ unset ICEGRES_AUTH_FILE ICEGRES_TLS_CERT ICEGRES_TLS_KEY
 unset ICEGRES_WRITE_BUFFER_MS ICEGRES_WRITE_BUFFER_MAX_ROWS
 # And for strict transaction mode: only section (u)'s dedicated server enables it.
 unset ICEGRES_TXN_STRICT
+# And for the P1 tail-API/peer-overlay surfaces: only section (p3)'s
+# dedicated servers enable them.
+unset ICEGRES_TAIL_API_PORT ICEGRES_PEER_TAILS ICEGRES_FRESHNESS_MS
 
 CATALOG_URI="http://127.0.0.1:8181/catalog"
 WAREHOUSE=lakehouse
@@ -181,6 +184,8 @@ cleanup() {
   stop_pidfile_generic "$E2E_DIR/flight-tls.pid"
   stop_pidfile_generic "$E2E_DIR/serve-fresh.pid"
   stop_pidfile_generic "$E2E_DIR/serve-freshbuf.pid"
+  stop_pidfile_generic "$E2E_DIR/serve-p1a.pid"
+  stop_pidfile_generic "$E2E_DIR/serve-p1b.pid"
   stop_icegresd
 }
 trap cleanup EXIT
@@ -2194,6 +2199,177 @@ stop_pidfile_generic "$FRB_PID"
 # Cleanup: remove the rows this section appended (via the default server).
 q "delete from demo.trips where trip_id in ($fr_base, $((fr_base + 1)), $((fr_base + 2)))" >/dev/null
 pass "freshness section cleanup (rows removed)"
+
+# ---------------------------------------------------------------------------
+# (p3) P1: open tail API (--tail-api-port) + fleet overlays (--peer-tail).
+#      Buffering server A exposes its tail window over Arrow Flight; reader
+#      server B mirrors it, so A's acked-but-unflushed writes are visible on
+#      B within the event bound (NOT the flush cadence). Kill A -> B falls
+#      back to commit cadence without error; rows still land via A's tail
+#      replay + flush on restart. Ports: 5464/5465 pgwire (above every
+#      existing reservation; 5461-5463 belong to bench.sh icekeeperd,
+#      5471-5473 to tail_durability.sh), 50057 tail API (50051-50053/50056
+#      belong to the flight sections). docs/open-tail-protocol.md.
+# ---------------------------------------------------------------------------
+log "(p3) open tail API + peer overlays (A buffering :5464 + B reader :5465)"
+P1A_PORT=5464
+P1B_PORT=5465
+P1_TAIL_API=50057
+P1A_MS=8000 # deliberately long: event-bound visibility must beat this by miles
+P1A_PID="$E2E_DIR/serve-p1a.pid"
+P1B_PID="$E2E_DIR/serve-p1b.pid"
+P1A_LOG="$E2E_DIR/serve-p1a.log"
+P1B_LOG="$E2E_DIR/serve-p1b.log"
+P1_TAIL_DIR="$E2E_DIR/tail-p1"
+P1AQ=(psql -h "$PG_HOST" -p "$P1A_PORT" -U postgres -d icegres -tA)
+P1BQ=(psql -h "$PG_HOST" -p "$P1B_PORT" -U postgres -d icegres -tA)
+stop_pidfile_generic "$P1A_PID"
+stop_pidfile_generic "$P1B_PID"
+if "${P1AQ[@]}" -c 'select 1' >/dev/null 2>&1; then fail "something is already listening on :$P1A_PORT"; fi
+if "${P1BQ[@]}" -c 'select 1' >/dev/null 2>&1; then fail "something is already listening on :$P1B_PORT"; fi
+rm -rf "$P1_TAIL_DIR"
+: >"$P1A_LOG"
+: >"$P1B_LOG"
+# Scratch keyed table (trips-shaped so the python probe can drive it too).
+curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_p1?purgeRequested=true" >/dev/null 2>&1 || true
+curl -sf -X POST "$CATALOG_URI/v1/$prefix/namespaces/demo/tables" \
+  -H 'Content-Type: application/json' -d @- <<'JSON' >/dev/null
+{
+  "name": "e2e_p1",
+  "schema": {
+    "type": "struct",
+    "schema-id": 0,
+    "fields": [
+      {"id": 1, "name": "trip_id", "required": false, "type": "long"},
+      {"id": 2, "name": "city", "required": false, "type": "string"},
+      {"id": 3, "name": "distance_km", "required": false, "type": "double"},
+      {"id": 4, "name": "fare", "required": false, "type": "double"},
+      {"id": 5, "name": "ts", "required": false, "type": "timestamp"}
+    ]
+  },
+  "properties": {"icegres.primary-key": "trip_id", "icegres.tail-upsert": "true"}
+}
+JSON
+"$BIN" serve --host "$PG_HOST" --port "$P1A_PORT" --write-buffer-ms "$P1A_MS" \
+  --tail-dir "$P1_TAIL_DIR" --tail-api-port "$P1_TAIL_API" >>"$P1A_LOG" 2>&1 &
+echo $! >"$P1A_PID"
+"$BIN" serve --host "$PG_HOST" --port "$P1B_PORT" \
+  --peer-tail "127.0.0.1:$P1_TAIL_API" >>"$P1B_LOG" 2>&1 &
+echo $! >"$P1B_PID"
+p1_ready=0
+for _ in $(seq 1 60); do
+  if "${P1AQ[@]}" -c 'select 1' >/dev/null 2>&1 && "${P1BQ[@]}" -c 'select 1' >/dev/null 2>&1; then
+    p1_ready=1; break
+  fi
+  sleep 0.5
+done
+[[ "$p1_ready" == 1 ]] || { tail -n 20 "$P1A_LOG" "$P1B_LOG" >&2; fail "P1 servers not ready on :$P1A_PORT/:$P1B_PORT"; }
+
+# --- p3a: INSERT on A visible on B within the event bound (<< flush cadence)
+"${P1AQ[@]}" -c "insert into demo.e2e_p1 (trip_id, city, distance_km, fare, ts)
+  values (980500, 'peer-a', 1.0, 2.0, TIMESTAMP '2026-07-11 00:00:00')" >/dev/null
+p1_t0=$(date +%s%N)
+p1_seen=0
+for _ in $(seq 1 120); do
+  if [[ "$("${P1BQ[@]}" -c 'select count(*) from demo.e2e_p1 where trip_id = 980500' 2>/dev/null)" == "1" ]]; then
+    p1_seen=1; break
+  fi
+  sleep 0.05
+done
+p1_ms=$(( ($(date +%s%N) - p1_t0) / 1000000 ))
+[[ "$p1_seen" == 1 ]] || { tail -n 20 "$P1B_LOG" >&2; fail "A's buffered INSERT never became visible on B"; }
+(( p1_ms < P1A_MS )) || fail "peer visibility took ${p1_ms}ms — not faster than the ${P1A_MS}ms flush cadence"
+pass "peer overlay: A's buffered INSERT visible on B in ${p1_ms}ms (flush cadence ${P1A_MS}ms)"
+
+# --- p3b: keyed UPDATE on A suppresses/replaces on B (no duplicate)
+"${P1AQ[@]}" -c "update demo.e2e_p1 set city = 'peer-updated' where trip_id = 980500" >/dev/null
+p1_upd=0
+for _ in $(seq 1 120); do
+  if [[ "$("${P1BQ[@]}" -c "select city from demo.e2e_p1 where trip_id = 980500" 2>/dev/null)" == "peer-updated" ]]; then
+    p1_upd=1; break
+  fi
+  sleep 0.05
+done
+[[ "$p1_upd" == 1 ]] || fail "A's keyed UPDATE never replaced the row on B"
+assert_eq "keyed UPDATE on A replaces (not duplicates) on B" "1" \
+  "$("${P1BQ[@]}" -c 'select count(*) from demo.e2e_p1 where trip_id = 980500')"
+
+# --- p3c: the python external merged-fresh reader (open protocol demo)
+if python3 -c 'import psycopg2, pyarrow.flight' 2>/dev/null; then
+  p1_probe_out=$(ICEGRES_PROBE_PG_HOST="$PG_HOST" ICEGRES_PROBE_PG_PORT="$P1A_PORT" \
+    ICEGRES_PROBE_TAIL_HOST=127.0.0.1 ICEGRES_PROBE_TAIL_PORT="$P1_TAIL_API" \
+    ICEGRES_PROBE_TABLE=demo.e2e_p1 ICEGRES_PROBE_KEYED=1 \
+    python3 "$ICEGRES_DIR/../bench/clients/p1_tail_reader.py" 2>&1) || {
+      echo "$p1_probe_out" | sed 's/^/    /'; fail "p1_tail_reader.py failed"; }
+  echo "$p1_probe_out" | sed 's/^/    /'
+  echo "$p1_probe_out" | grep -q '^P1TAIL RESULT: .*fail=0' || fail "p1_tail_reader reported failures"
+  pass "p1_tail_reader.py: external merged-fresh read == server union read"
+else
+  log "    SKIPPED: p1_tail_reader.py (pip install psycopg2-binary pyarrow)"
+fi
+
+# --- p3s: PF1 stale-ticket probe — a Flight ticket minted BEFORE a write
+#          must serve FRESH results at DoGet (the reviewer's INSERT-then-
+#          DoGet repro; a stale pinned plan would answer count=0).
+if python3 -c 'import psycopg2, pyarrow.flight' 2>/dev/null; then
+  p1_stale_out=$(ICEGRES_PROBE_FLIGHT_HOST=127.0.0.1 ICEGRES_PROBE_FLIGHT_PORT="$P1_TAIL_API" \
+    ICEGRES_PROBE_PG_HOST="$PG_HOST" ICEGRES_PROBE_PG_PORT="$P1A_PORT" \
+    ICEGRES_PROBE_TABLE=demo.e2e_p1 \
+    python3 "$ICEGRES_DIR/../bench/clients/p1_stale_probe.py" 2>&1) || {
+      echo "$p1_stale_out" | sed 's/^/    /'; fail "p1_stale_probe.py failed"; }
+  echo "$p1_stale_out" | sed 's/^/    /'
+  echo "$p1_stale_out" | grep -q '^P1STALE RESULT: .*fail=0 status=PASS' \
+    || fail "p1_stale_probe reported failures"
+  pass "p1_stale_probe.py: pre-write Flight ticket serves FRESH results at DoGet"
+else
+  log "    SKIPPED: p1_stale_probe.py (pip install psycopg2-binary pyarrow)"
+fi
+
+# --- p3d: kill A -> B falls back to commit cadence WITHOUT error; the rows
+#          still land via A's durable-tail replay + flush on restart.
+p1a_pid=$(cat "$P1A_PID")
+"${P1AQ[@]}" -c "insert into demo.e2e_p1 (trip_id, city, distance_km, fare, ts)
+  values (980501, 'pre-crash', 1.0, 2.0, TIMESTAMP '2026-07-11 00:00:01')" >/dev/null
+kill -9 "$p1a_pid" 2>/dev/null || true
+rm -f "$P1A_PID"
+sleep 1
+p1_fallback=$("${P1BQ[@]}" -c 'select count(*) from demo.e2e_p1' 2>&1) \
+  || fail "B errored after A died (fallback must be silent): $p1_fallback"
+pass "B keeps answering after A is killed (fallback to commit cadence; count=$p1_fallback)"
+# Restart A on the same tail dir: replay + flush commits the acked row, and
+# B sees it (via the commit and/or the re-established mirror).
+"$BIN" serve --host "$PG_HOST" --port "$P1A_PORT" --write-buffer-ms 1000 \
+  --tail-dir "$P1_TAIL_DIR" --tail-api-port "$P1_TAIL_API" >>"$P1A_LOG" 2>&1 &
+echo $! >"$P1A_PID"
+p1_land=0
+for _ in $(seq 1 120); do
+  if [[ "$("${P1BQ[@]}" -c 'select count(*) from demo.e2e_p1 where trip_id = 980501' 2>/dev/null)" == "1" ]]; then
+    p1_land=1; break
+  fi
+  sleep 0.5
+done
+[[ "$p1_land" == 1 ]] || { tail -n 20 "$P1A_LOG" >&2; fail "the acked pre-crash row never landed after A's restart"; }
+pass "acked pre-crash row landed after restart (tail replay + flush; B sees it)"
+
+# --- p3e: flight small-query latency probe (report-only here: e2e runs the
+#          DEBUG binary, so the release-target bound is asserted in bench).
+if python3 -c 'import adbc_driver_flightsql' 2>/dev/null; then
+  p1_perf_out=$(ICEGRES_PROBE_FLIGHT_HOST=127.0.0.1 ICEGRES_PROBE_FLIGHT_PORT="$P1_TAIL_API" \
+    python3 "$ICEGRES_DIR/../bench/clients/p1_flight_perf.py" 2>&1) || {
+      echo "$p1_perf_out" | sed 's/^/    /'; fail "p1_flight_perf.py failed"; }
+  echo "$p1_perf_out" | grep '^P1PERF RESULT' | sed 's/^/    /'
+  echo "$p1_perf_out" | grep -q '^P1PERF RESULT: .*status=\(REPORT\|PASS\)' || fail "p1_flight_perf reported failure"
+  pass "p1_flight_perf.py: flight q1 measured over the tail-api listener (debug build, report-only)"
+else
+  log "    SKIPPED: p1_flight_perf.py (pip install adbc-driver-flightsql pyarrow)"
+fi
+
+# Teardown + cleanup.
+stop_pidfile_generic "$P1A_PID"
+stop_pidfile_generic "$P1B_PID"
+rm -rf "$P1_TAIL_DIR"
+curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_p1?purgeRequested=true" >/dev/null 2>&1 || true
+pass "P1 section cleanup (servers stopped, scratch table dropped)"
 
 # ---------------------------------------------------------------------------
 log "all assertions passed ($PASS_COUNT)"

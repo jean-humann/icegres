@@ -18,6 +18,7 @@ mod maintain;
 mod metrics;
 mod ops;
 mod overwrite;
+mod peer;
 /// SCRAM authentication backend — the managed add-on (behind the `managed`
 /// feature). The open-source build carries no auth backend.
 #[cfg(feature = "managed")]
@@ -34,6 +35,9 @@ mod segment;
 mod tail;
 mod tail_pg;
 mod tail_quorum;
+/// Open tail read API (TailSnapshot/TailSubscribe over Arrow Flight) —
+/// roadmap-v2 P1; see docs/open-tail-protocol.md.
+mod tailapi;
 mod timing;
 mod traced;
 mod txn;
@@ -277,6 +281,31 @@ enum Command {
         )]
         tail_quorum: Option<String>,
 
+        /// Open tail read API (roadmap-v2 P1, docs/open-tail-protocol.md):
+        /// serve TailSnapshot/TailSubscribe over Arrow Flight on this port,
+        /// exposing the buffer's un-flushed rows (with their tail sequences
+        /// and the watermark-property exclusion rule) to peer icegres
+        /// computes (--peer-tail) and ANY external Arrow Flight client.
+        /// Read-only; requires --write-buffer-ms > 0 AND a durable tail
+        /// (--tail-dir/--tail-url/--tail-quorum). Auth rides --auth-file
+        /// (Flight basic-auth handshake). Off by default (no listener).
+        #[arg(long, env = "ICEGRES_TAIL_API_PORT")]
+        tail_api_port: Option<u16>,
+
+        /// Fleet overlays (roadmap-v2 P1): comma-separated `host:port` tail
+        /// APIs of buffering PEER computes to mirror. Scans on this server
+        /// union each peer's un-flushed rows with committed data under the
+        /// same exactly-once watermark rule the local buffer uses, so this
+        /// reader sees a peer's acked writes within the event bound instead
+        /// of the commit cadence. Best-effort: if a peer dies or goes
+        /// silent past the serving bound, its mirror drops out of reads and
+        /// they fall back to commit-cadence freshness (WARN once; per-peer
+        /// gauge icegres_peer_tail_age_ms). Read-side only — the
+        /// single-buffering-writer-per-table model is unchanged. Off by
+        /// default.
+        #[arg(long, env = "ICEGRES_PEER_TAILS", value_delimiter = ',')]
+        peer_tail: Vec<String>,
+
         /// Acknowledge running an UNAUTHENTICATED listener on a non-loopback
         /// interface. Without this, binding a public address (e.g. 0.0.0.0)
         /// while `--auth-file` is unset is refused at startup (secure by
@@ -331,6 +360,17 @@ enum Command {
         /// PEM private key (PKCS#8/RSA/SEC1) for --tls-cert.
         #[arg(long, env = "ICEGRES_FLIGHT_TLS_KEY", requires = "tls_cert")]
         tls_key: Option<String>,
+
+        /// Bounded-staleness reads on the Flight SQL endpoint — same
+        /// semantics, trade-offs, and default (0 = exact freshness,
+        /// byte-identical) as `icegres serve --freshness-ms`. With N > 0,
+        /// scans serve the cached snapshot with NO per-scan catalog round
+        /// trip and the physical-plan cache activates for repeated
+        /// statements, which is what takes the small-query Flight p50 from
+        /// ~half the historical latency (plan-once tickets alone) down to
+        /// single-digit milliseconds.
+        #[arg(long, env = "ICEGRES_FRESHNESS_MS", default_value_t = 0)]
+        freshness_ms: u64,
 
         /// Acknowledge running an UNAUTHENTICATED Flight listener on a
         /// non-loopback interface (see `icegres serve --insecure`).
@@ -525,6 +565,8 @@ async fn main() -> Result<()> {
             tail_dir,
             tail_url,
             tail_quorum,
+            tail_api_port,
+            peer_tail,
             insecure,
         } => {
             let serve_opts = ServeOpts {
@@ -541,6 +583,8 @@ async fn main() -> Result<()> {
                 tail_dir,
                 tail_url,
                 tail_quorum,
+                tail_api_port,
+                peer_tail,
                 insecure,
             };
             run_serve(&catalog, &host, port, serve_opts).await
@@ -553,6 +597,7 @@ async fn main() -> Result<()> {
             authz_file,
             tls_cert,
             tls_key,
+            freshness_ms,
             insecure,
         } => {
             // Flight authorization needs an authenticated principal: reject
@@ -568,7 +613,16 @@ async fn main() -> Result<()> {
             let authorizer = build_authorizer(&authz_file, auth_file.is_some())?;
             // clap `requires` guarantees cert and key arrive together.
             let tls = tls_cert.zip(tls_key);
-            flight::run(&catalog, &host, port, auth_file, authorizer, tls).await
+            flight::run(
+                &catalog,
+                &host,
+                port,
+                auth_file,
+                authorizer,
+                tls,
+                freshness_ms,
+            )
+            .await
         }
         Command::Seed { catalog } => seed::run(&catalog).await,
         Command::Branch { cmd } => match cmd {
@@ -627,6 +681,8 @@ struct ServeOpts {
     tail_dir: Option<PathBuf>,
     tail_url: Option<String>,
     tail_quorum: Option<String>,
+    tail_api_port: Option<u16>,
+    peer_tail: Vec<String>,
     insecure: bool,
 }
 
@@ -717,6 +773,21 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
             "--tail-quorum requires buffered writes (--write-buffer-ms N with N > 0): the \
              synchronous default commits every INSERT before its ack, so the durable tail \
              would be a no-op. Set --write-buffer-ms, or drop --tail-quorum."
+        );
+    }
+    // The open tail API serves the buffer's window WITH per-op tail
+    // sequences: it needs buffered mode AND a durable tail to exist at all.
+    if serve_opts.tail_api_port.is_some()
+        && (serve_opts.write_buffer_ms == 0
+            || (serve_opts.tail_dir.is_none()
+                && serve_opts.tail_url.is_none()
+                && serve_opts.tail_quorum.is_none()))
+    {
+        bail!(
+            "--tail-api-port requires buffered writes with a durable tail \
+             (--write-buffer-ms N > 0 plus one of --tail-dir/--tail-url/--tail-quorum): \
+             the tail API serves the buffer's un-flushed window keyed by durable tail \
+             sequences, neither of which exists otherwise."
         );
     }
     // clap's conflicts_with already refuses the pairs; keep a hard error for
@@ -928,14 +999,66 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
         );
     }
 
-    let ctx = context::build_session_context_with(
-        catalog.clone(),
-        None,
-        write_buffer.clone(),
-        branch.clone(),
-        serve_opts.freshness_ms,
-    )
-    .await?;
+    // Fleet overlays (--peer-tail, peer.rs): the mirror registry is threaded
+    // into every table provider; the subscriber tasks are spawned below.
+    let peer_mirrors: Option<Arc<peer::PeerMirrors>> = {
+        let peers: Vec<String> = serve_opts
+            .peer_tail
+            .iter()
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
+        if peers.is_empty() {
+            None
+        } else {
+            warn!(
+                peers = %peers.join(","),
+                "peer tail overlays are ENABLED (--peer-tail): scans union each peer's \
+                 un-flushed tail window with committed data (event-bound freshness for \
+                 peer writes). Best-effort: a dead or silent peer drops out of reads \
+                 (commit-cadence fallback; per-peer gauge icegres_peer_tail_age_ms, \
+                 worst-case icegres_peer_tail_age_max_ms)."
+            );
+            // With bounded-staleness reads, watermark-covered mirror items
+            // must outlive the staleness window: retention = max(30 s, 4×
+            // the freshness bound), or a stale committed snapshot could
+            // miss rows the mirror already GC'd (see peer.rs).
+            let mirror_gc = peer::effective_mirror_gc(serve_opts.freshness_ms);
+            if serve_opts.freshness_ms > 0 {
+                warn!(
+                    freshness_ms = serve_opts.freshness_ms,
+                    mirror_gc_ms = mirror_gc.as_millis() as u64,
+                    "--peer-tail with --freshness-ms: watermark-covered peer-mirror \
+                     items are retained for max(30 s, 4× the freshness bound) = {} ms, \
+                     so a bounded-stale reader never misses rows that left the mirror \
+                     before its committed snapshot caught up (memory cost only).",
+                    mirror_gc.as_millis()
+                );
+            }
+            Some(Arc::new(peer::PeerMirrors::with_gc(mirror_gc)))
+        }
+    };
+
+    let ctx = Arc::new(
+        context::build_session_context_with_peers(
+            catalog.clone(),
+            None,
+            write_buffer.clone(),
+            branch.clone(),
+            serve_opts.freshness_ms,
+            peer_mirrors.clone(),
+        )
+        .await?,
+    );
+    if let Some(mirrors) = &peer_mirrors {
+        let peers: Vec<String> = serve_opts
+            .peer_tail
+            .iter()
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
+        peer::spawn_peer_tails(peers, mirrors.clone());
+    }
 
     // Spawn the per-server refresher AFTER the context registered every
     // table with the freshness registry (tables created later register
@@ -972,6 +1095,26 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
     // Keep a handle for the graceful-shutdown flush before the buffer is moved
     // into the hook chain.
     let shutdown_buffer = write_buffer.clone();
+
+    // Open tail read API (--tail-api-port, docs/open-tail-protocol.md): a
+    // read-only Flight listener inside THIS process — the only one holding
+    // the overlay state. Bind failures abort startup here.
+    if let Some(tail_port) = serve_opts.tail_api_port {
+        let buffer = write_buffer
+            .clone()
+            .expect("validated: --tail-api-port requires buffered mode");
+        flight::spawn_tail_api(
+            ctx.clone(),
+            engine.clone(),
+            buffer,
+            host,
+            tail_port,
+            serve_opts.auth_file.clone(),
+            authorizer.clone(),
+        )
+        .await?;
+    }
+
     let hooks = query_hooks(
         engine,
         txn_registry.clone(),
@@ -989,7 +1132,7 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
     // closes (disconnect = implicit ROLLBACK; without this, abandoned
     // transaction buffers would leak).
     ops::serve_custom(
-        Arc::new(ctx),
+        ctx,
         host,
         port,
         serve_opts.idle_shutdown_secs,

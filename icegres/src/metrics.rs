@@ -8,8 +8,9 @@
 //! (keeps the pinned dependency graph unchanged); the exposition format is the
 //! Prometheus/OpenMetrics text format any scraper understands.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use async_trait::async_trait;
 use datafusion::common::ParamValues;
@@ -60,6 +61,22 @@ pub struct Metrics {
     /// Physical-plan cache misses — including statements that turned out
     /// not to be cacheable (volatile expressions, non-cacheable tables).
     pub plan_cache_misses_total: AtomicU64,
+    /// WORST-CASE milliseconds since the last applied peer-tail event,
+    /// maximized over every configured peer (gauge, peer.rs; sampled every
+    /// second while `--peer-tail` is configured) — so a healthy peer can
+    /// never mask a dead one. Grows while any peer is silent; past the
+    /// serving age bound that peer's mirrors are excluded from reads
+    /// (commit-cadence fallback). Stays 0 without `--peer-tail`. Exported
+    /// as `icegres_peer_tail_age_max_ms`; the per-peer breakdown is
+    /// [`Metrics::peer_tail_ages_ms`].
+    pub peer_tail_age_ms: AtomicU64,
+    /// Per-peer milliseconds since that peer's last applied event, keyed by
+    /// peer address (gauge with a `peer` label; replaced wholesale by the
+    /// 1 Hz sampler so no dropped peer ever lingers with a frozen value). A
+    /// peer that never delivered an event reports its age since spawn —
+    /// absence of events is reported as growing age, never as a healthy 0.
+    /// Empty (no series exported) without `--peer-tail`.
+    pub peer_tail_ages_ms: Mutex<HashMap<String, u64>>,
 }
 
 /// The process-global metrics registry.
@@ -69,6 +86,16 @@ pub fn metrics() -> &'static Metrics {
 }
 
 impl Metrics {
+    /// Replace the per-peer tail-age map (peer.rs' 1 Hz sampler) and refresh
+    /// the global worst-case gauge from it.
+    pub fn set_peer_tail_ages(&self, ages: Vec<(String, u64)>) {
+        let max = ages.iter().map(|(_, age)| *age).max().unwrap_or(0);
+        self.peer_tail_age_ms.store(max, Ordering::Relaxed);
+        let mut map = crate::freshness::recover("peer age gauge", self.peer_tail_ages_ms.lock());
+        map.clear();
+        map.extend(ages);
+    }
+
     /// Render the current values in Prometheus text exposition format.
     pub fn render_prometheus(&self) -> String {
         let q = self.queries_total.load(Ordering::Relaxed);
@@ -81,6 +108,31 @@ impl Metrics {
         let fa = self.freshness_age_ms.load(Ordering::Relaxed);
         let pch = self.plan_cache_hits_total.load(Ordering::Relaxed);
         let pcm = self.plan_cache_misses_total.load(Ordering::Relaxed);
+        let pta = self.peer_tail_age_ms.load(Ordering::Relaxed);
+        // Per-peer tail-age series (one line per configured peer, sorted for
+        // stable output; empty without --peer-tail).
+        let per_peer = {
+            let map = crate::freshness::recover("peer age gauge", self.peer_tail_ages_ms.lock());
+            let mut peers: Vec<(&String, &u64)> = map.iter().collect();
+            peers.sort();
+            if peers.is_empty() {
+                String::new()
+            } else {
+                let mut s = String::from(
+                    "# HELP icegres_peer_tail_age_ms Milliseconds since this peer's \
+                     last applied tail event (grows while the peer is silent; past \
+                     the serving bound its mirrors are excluded from reads).\n\
+                     # TYPE icegres_peer_tail_age_ms gauge\n",
+                );
+                for (peer, age) in peers {
+                    let label = peer.replace('\\', "\\\\").replace('"', "\\\"");
+                    s.push_str(&format!(
+                        "icegres_peer_tail_age_ms{{peer=\"{label}\"}} {age}\n"
+                    ));
+                }
+                s
+            }
+        };
         format!(
             "# HELP icegres_queries_total Wire statements handled.\n\
              # TYPE icegres_queries_total counter\n\
@@ -117,7 +169,14 @@ impl Metrics {
              icegres_plan_cache_hits_total {pch}\n\
              # HELP icegres_plan_cache_misses_total Physical-plan cache misses.\n\
              # TYPE icegres_plan_cache_misses_total counter\n\
-             icegres_plan_cache_misses_total {pcm}\n"
+             icegres_plan_cache_misses_total {pcm}\n\
+             # HELP icegres_peer_tail_age_max_ms Worst-case milliseconds since \
+             the last applied peer-tail event across every configured peer \
+             (0 without --peer-tail; grows while any peer is silent and its \
+             mirrors fall back to commit cadence).\n\
+             # TYPE icegres_peer_tail_age_max_ms gauge\n\
+             icegres_peer_tail_age_max_ms {pta}\n\
+             {per_peer}"
         )
     }
 }
