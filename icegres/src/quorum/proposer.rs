@@ -1079,6 +1079,7 @@ impl Quorum {
 
     /// The current term, for tests/diagnostics.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn current_term(&self) -> u64 {
         self.shared.term()
     }

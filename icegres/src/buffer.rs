@@ -194,6 +194,12 @@ pub(crate) enum KeyedKind {
 pub(crate) struct KeyedOp {
     key_row: RecordBatch,
     kind: KeyedKind,
+    /// The op's durable-tail sequence (`None` only when no tail is attached
+    /// — pure in-memory mode, where the open tail API is unavailable
+    /// anyway). Retained so TailSnapshot/TailSubscribe (tailapi.rs) can
+    /// serve the per-op seq the property-watermark exclusion rule needs;
+    /// pure bookkeeping — no tail or flush semantics read it.
+    seq: Option<u64>,
 }
 
 /// A keyed map entry: the op plus a per-table monotonic stamp. The stamp is
@@ -242,7 +248,10 @@ enum GenCommit {
 /// One committed-but-possibly-not-yet-observed flush generation.
 struct FlushedGen {
     commit: GenCommit,
-    batches: Vec<RecordBatch>,
+    /// The committed append batches WITH their per-statement tail sequences
+    /// (`None` without a tail) — seqs are retained purely for the open tail
+    /// API (tailapi.rs) / peer-overlay exclusion rule.
+    batches: Vec<(Option<u64>, RecordBatch)>,
     /// The keyed ops this generation committed (key, stamp, op) — scans
     /// whose metadata predates the commit still need their suppression and
     /// upsert rows; a conflicted post merges them back stamp-aware.
@@ -273,6 +282,9 @@ struct FlushedGen {
 struct PendingBatch {
     id: u64,
     claimed: bool,
+    /// The routing statement's tail sequence (`None` without a tail);
+    /// bookkeeping for the open tail API only — see [`KeyedOp::seq`].
+    seq: Option<u64>,
     batch: RecordBatch,
 }
 
@@ -296,6 +308,19 @@ struct TableBuf {
     /// that orders `pending`, this is exactly the max sequence of any
     /// pending-snapshot taken now — the flush commit's watermark.
     tail_high: Option<u64>,
+    /// Sequences staged onto the tail whose durability wait has NOT yet
+    /// succeeded (F4). Inserted at staging under this lock, removed by
+    /// [`BufferState::note_durable`] after the wait succeeds or by
+    /// [`BufferState::unroute_failed`]'s exact-removal path. The open tail
+    /// API ([`BufferState::tail_snapshot`]) serves ONLY ops outside this
+    /// set — a snapshot/backfill must never ship a row whose statement may
+    /// still error (union reads on THIS server self-correct via unroute;
+    /// a remote mirror has no unroute and would serve the phantom row
+    /// until the next flush of the table, or forever on an idle one). An
+    /// AMBIGUOUS wait failure (flush claimed the rows first) leaves its
+    /// seq here permanently: the op is never tail-served, and consumers
+    /// pick it up from committed data once the covering flush lands.
+    undurable: HashSet<u64>,
 }
 
 /// Keyed suppression a scan must apply to its committed data (and that the
@@ -314,6 +339,62 @@ pub struct Overlay {
     pub schema: ArrowSchemaRef,
     pub batches: Vec<RecordBatch>,
     pub suppress: Option<OverlaySuppress>,
+}
+
+/// What a tail op does, as served by the open tail read API and consumed by
+/// peer mirrors (tailapi.rs / peer.rs). `Watermark` is subscribe-only: a
+/// heartbeat carrying the highest tail sequence provably stamped into a
+/// committed `icegres.tail-seq.<id>` property.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TailEventKind {
+    Append,
+    Upsert,
+    Delete,
+    Watermark,
+}
+
+/// One un-GC'd tail op in a [`TailWindowSnapshot`]: its tail sequence, what
+/// it does, and its payload — append/upsert rows are canonical-schema
+/// batches, a delete's batch is the key's PK columns.
+#[derive(Clone, Debug)]
+pub struct TailItem {
+    pub seq: u64,
+    pub kind: TailEventKind,
+    pub batch: RecordBatch,
+}
+
+/// A consistent view of one table's tail window (ONE lock acquisition):
+/// everything a remote consumer needs to reproduce this server's union-read
+/// overlay against its own scan metadata (docs/open-tail-protocol.md).
+#[derive(Debug)]
+pub struct TailWindowSnapshot {
+    /// Canonical (field-id annotated) Arrow schema of the table.
+    pub schema: ArrowSchemaRef,
+    /// The table's DECLARED `icegres.primary-key` columns (F1) — the key
+    /// encoding for every keyed op on the stream. Empty ONLY when the
+    /// table declares no primary key (keyed ops are then impossible; a
+    /// consumer receiving one anyway must treat it as a protocol error).
+    pub pk_cols: Vec<String>,
+    /// The `TailSubscribe from_seq` resume cursor: the highest DURABLE tail
+    /// sequence served by this snapshot (= the window head when no
+    /// durability wait is in flight). Every op with seq <= high is IN
+    /// `items`, committed at-or-below the stamped watermark, or (rare:
+    /// out-of-order durability across concurrent statements) covered by
+    /// the NEXT flush's watermark — see [`BufferState::tail_snapshot`].
+    pub high: u64,
+    /// The window's ops, sorted by seq.
+    pub items: Vec<TailItem>,
+}
+
+/// One broadcast tail event (TailSubscribe). Published only AFTER the op's
+/// durability wait succeeded — rows a failed statement unroutes are never
+/// broadcast. `Watermark` events carry no batches.
+#[derive(Clone)]
+pub struct TailEvent {
+    pub ident: TableIdent,
+    pub seq: u64,
+    pub kind: TailEventKind,
+    pub batches: Vec<RecordBatch>,
 }
 
 /// A consistent snapshot of one table's pending work (append prefix +
@@ -340,6 +421,14 @@ impl PendingSnapshot {
 #[derive(Default)]
 struct BufferState {
     tables: StdMutex<HashMap<TableIdent, TableBuf>>,
+    /// The DECLARED `icegres.primary-key` columns per table, recorded from
+    /// every metadata load `note_activation` sees. The open tail API's
+    /// wire header serves THIS declaration (F1) — never `entry.keyed`
+    /// presence, which is empty after a clean-shutdown boot even though
+    /// keyed ops remain possible (a consumer keyed off an empty header
+    /// would silently drop later upserts/deletes). Leaf lock: never held
+    /// while acquiring `tables` (and vice versa is fine — `tables` first).
+    declared_pks: StdMutex<HashMap<TableIdent, Vec<String>>>,
 }
 
 impl BufferState {
@@ -373,14 +462,21 @@ impl BufferState {
     /// acceptable for buffered mode, whose reads are already ahead of the
     /// lake. The frame itself never replays and its sequence is never
     /// reused (tail.rs burned-sequence rule), so replay stays exact either
-    /// way. Returns `(rows_appended, pending_rows_total)`.
+    /// way. `replay_seq` threads the ALREADY-durable frame sequence through
+    /// boot replay (tail is `None` there) so per-batch seq bookkeeping stays
+    /// exact for the open tail API. Returns `(rows_appended,
+    /// pending_rows_total, published)` where `published` is the statement's
+    /// `(seq, aligned batches)` for the tail-event broadcast (cheap `Arc`
+    /// clones; `None` without a seq source).
+    #[allow(clippy::type_complexity)]
     fn append(
         &self,
         ident: &TableIdent,
         schema_if_first: Option<ArrowSchemaRef>,
         batches: &[RecordBatch],
         tail: Option<&dyn TailStore>,
-    ) -> Result<(usize, usize)> {
+        replay_seq: Option<u64>,
+    ) -> Result<(usize, usize, Option<(u64, Vec<RecordBatch>)>)> {
         let mut tables = self.tables.lock().expect("write-buffer lock poisoned");
         if !tables.contains_key(ident) {
             // Entries are never removed, so reaching here implies the caller
@@ -398,6 +494,7 @@ impl BufferState {
                     keyed: None,
                     flushed: Vec::new(),
                     tail_high: None,
+                    undurable: HashSet::new(),
                 },
             );
         }
@@ -425,13 +522,19 @@ impl BufferState {
             Some(tail) if !aligned.is_empty() => {
                 let staged = tail.append_staged(ident, TailOpKind::Append, &aligned)?;
                 entry.tail_high = Some(staged.seq());
+                // F4: not tail-servable until the wait succeeds.
+                entry.undurable.insert(staged.seq());
                 Some(staged)
             }
             _ => None,
         };
         let rows: usize = aligned.iter().map(|b| b.num_rows()).sum();
+        // The statement's tail sequence: staged live, or the replayed
+        // frame's own (already-durable) sequence at boot.
+        let stmt_seq = staged.as_ref().map(|s| s.seq()).or(replay_seq);
+        let published = stmt_seq.map(|seq| (seq, aligned.clone()));
         let t = timing.then(std::time::Instant::now);
-        let routed = route_appends(entry, aligned)?;
+        let routed = route_appends(entry, aligned, stmt_seq)?;
         if let Some(t) = t {
             crate::timing::record("buffer_route", t.elapsed());
         }
@@ -444,11 +547,26 @@ impl BufferState {
                 self.unroute_failed(ident, seq, routed);
                 return Err(e);
             }
+            // F4: durable — the op may now be served by tail snapshots
+            // (the post-wait broadcast below the caller stays as-is).
+            self.note_durable(ident, seq);
         }
         if let Some(t) = append_started {
             crate::timing::record("buffer_append", t.elapsed());
         }
-        Ok((rows, pending_rows))
+        Ok((rows, pending_rows, published))
+    }
+
+    /// F4: a staged statement's durability wait succeeded — its ops become
+    /// servable by the open tail API. Runs under a fresh lock acquisition
+    /// (the wait itself ran lock-free); the seq is unique per statement, so
+    /// this marks every batch/keyed entry the statement routed, wherever
+    /// the window bookkeeping moved them meanwhile.
+    fn note_durable(&self, ident: &TableIdent, seq: u64) {
+        let mut tables = self.tables.lock().expect("write-buffer lock poisoned");
+        if let Some(entry) = tables.get_mut(ident) {
+            entry.undurable.remove(&seq);
+        }
     }
 
     /// Record that tail frames up to `seq` are reflected in this buffer
@@ -542,8 +660,10 @@ impl BufferState {
     /// Record one keyed op: durable tail append FIRST (under this lock, so
     /// keyed seq order == map order — the watermark invariant), then the
     /// map insert (per-key last-writer-wins). Creates the table entry /
-    /// keyed state on first touch. Returns `(keyed_entries, pending_rows)`
-    /// for the flush-kick heuristic.
+    /// keyed state on first touch. Returns `(keyed_entries, pending_rows,
+    /// seq)` — counts feed the flush-kick heuristic, `seq` the tail-event
+    /// broadcast (staged live; boot replay pre-sets `op.seq` and passes no
+    /// tail).
     #[allow(clippy::too_many_arguments)]
     fn keyed_write(
         &self,
@@ -551,9 +671,9 @@ impl BufferState {
         schema_if_first: Option<ArrowSchemaRef>,
         pk_cols: &[String],
         key: Vec<u8>,
-        op: KeyedOp,
+        mut op: KeyedOp,
         tail: Option<&dyn TailStore>,
-    ) -> Result<(usize, usize)> {
+    ) -> Result<(usize, usize, Option<u64>)> {
         let mut tables = self.tables.lock().expect("write-buffer lock poisoned");
         if !tables.contains_key(ident) {
             let schema = schema_if_first
@@ -568,6 +688,7 @@ impl BufferState {
                     keyed: None,
                     flushed: Vec::new(),
                     tail_high: None,
+                    undurable: HashSet::new(),
                 },
             );
         }
@@ -620,10 +741,18 @@ impl BufferState {
                 };
                 let staged = tail.append_staged(ident, kind, std::slice::from_ref(frame))?;
                 entry.tail_high = Some(staged.seq());
+                // F4: not tail-servable until the wait succeeds.
+                entry.undurable.insert(staged.seq());
                 Some(staged)
             }
             None => None,
         };
+        // Seq bookkeeping for the open tail API: a staged op carries its
+        // fresh sequence; boot replay pre-sets `op.seq` before calling.
+        if let Some(staged) = &staged {
+            op.seq = Some(staged.seq());
+        }
+        let stmt_seq = op.seq;
         let keyed = entry.keyed.as_mut().expect("just ensured present");
         let stamp = keyed.next_stamp;
         keyed.next_stamp += 1;
@@ -640,11 +769,13 @@ impl BufferState {
                 self.unroute_failed(ident, seq, routed);
                 return Err(e);
             }
+            // F4: durable — servable by tail snapshots from here on.
+            self.note_durable(ident, seq);
         }
         if let Some(t) = write_started {
             crate::timing::record("keyed_write", t.elapsed());
         }
-        Ok(counts)
+        Ok((counts.0, counts.1, stmt_seq))
     }
 
     /// The wait-failure unroute: a statement whose tail durability wait
@@ -701,10 +832,16 @@ impl BufferState {
                  in-flight flush (the tail frame itself never replays and \
                  sequence {seq} is burned, so replay stays exactly-once)"
             );
+            // The seq deliberately STAYS in `undurable` (F4): the rows may
+            // commit with the in-flight flush, but the wait failed — the
+            // tail API never serves them; consumers get them from the
+            // committed data the covering flush produces.
             return;
         }
         // Exact removal: pending batches out, keyed entries removed or
-        // rolled back to what they displaced.
+        // rolled back to what they displaced — and the burned seq leaves
+        // the undurable set with them (F4: nothing of it remains).
+        entry.undurable.remove(&seq);
         if !ids.is_empty() {
             let mut removed_rows = 0usize;
             entry.pending.retain(|pb| {
@@ -824,7 +961,7 @@ impl BufferState {
                 continue;
             }
             layers.push(Layer {
-                appends: flushed_gen.batches.clone(),
+                appends: flushed_gen.batches.iter().map(|(_, b)| b.clone()).collect(),
                 upserts: flushed_gen
                     .keyed
                     .iter()
@@ -948,12 +1085,12 @@ impl BufferState {
     ) {
         let mut tables = self.tables.lock().expect("write-buffer lock poisoned");
         if let Some(entry) = tables.get_mut(ident) {
-            let dropped: Vec<RecordBatch> = entry
+            let dropped_rows: usize = entry
                 .pending
                 .drain(..n_batches)
-                .map(|pb| pb.batch)
-                .collect();
-            entry.pending_rows -= dropped.iter().map(|b| b.num_rows()).sum::<usize>();
+                .map(|pb| pb.batch.num_rows())
+                .sum();
+            entry.pending_rows -= dropped_rows;
             drain_keyed_snapshot(entry, keyed);
         }
     }
@@ -998,12 +1135,12 @@ impl BufferState {
     ) {
         let mut tables = self.tables.lock().expect("write-buffer lock poisoned");
         if let Some(entry) = tables.get_mut(ident) {
-            let batches: Vec<RecordBatch> = entry
+            let batches: Vec<(Option<u64>, RecordBatch)> = entry
                 .pending
                 .drain(..n_batches)
-                .map(|pb| pb.batch)
+                .map(|pb| (pb.seq, pb.batch))
                 .collect();
-            entry.pending_rows -= batches.iter().map(|b| b.num_rows()).sum::<usize>();
+            entry.pending_rows -= batches.iter().map(|(_, b)| b.num_rows()).sum::<usize>();
             drain_keyed_snapshot(entry, keyed);
             entry.flushed.push(FlushedGen {
                 commit,
@@ -1029,7 +1166,7 @@ impl BufferState {
             entry.pending_rows += flushed_gen
                 .batches
                 .iter()
-                .map(|b| b.num_rows())
+                .map(|(_, b)| b.num_rows())
                 .sum::<usize>();
             // These were the OLDEST rows: restore insert order at the front.
             // They stay CLAIMED (they belonged to acked statements a flush
@@ -1037,12 +1174,13 @@ impl BufferState {
             let mut restored: Vec<PendingBatch> = flushed_gen
                 .batches
                 .into_iter()
-                .map(|batch| {
+                .map(|(seq, batch)| {
                     let id = entry.next_batch_id;
                     entry.next_batch_id += 1;
                     PendingBatch {
                         id,
                         claimed: true,
+                        seq,
                         batch,
                     }
                 })
@@ -1072,6 +1210,120 @@ impl BufferState {
             entry.flushed.retain(&keep);
         }
     }
+
+    /// The open tail API's TailSnapshot source (tailapi.rs): every un-GC'd
+    /// DURABLE op of the table's window — pending appends, live keyed ops,
+    /// AND retained flushed generations (their commits stamped a
+    /// covering watermark into the SAME atomic commit, so a consumer's
+    /// property-watermark exclusion is exact whether its metadata predates
+    /// or contains those commits) — with per-op seqs, under ONE lock
+    /// acquisition. Ops whose durability wait has not succeeded are
+    /// EXCLUDED (F4: a snapshot/backfill must never ship a row whose
+    /// statement may still error) and `high` is then capped at the max
+    /// served seq, so an excluded op's later post-wait broadcast passes
+    /// the subscriber's `seq > high` filter. Errors loudly if any op lacks
+    /// a seq (only possible without a durable tail, where the caller must
+    /// not offer the API).
+    fn tail_snapshot(&self, ident: &TableIdent) -> Result<Option<TailWindowSnapshot>> {
+        let tables = self.tables.lock().expect("write-buffer lock poisoned");
+        let Some(entry) = tables.get(ident) else {
+            return Ok(None);
+        };
+        fn push(
+            items: &mut Vec<TailItem>,
+            ident: &TableIdent,
+            seq: Option<u64>,
+            kind: TailEventKind,
+            batch: &RecordBatch,
+        ) -> Result<()> {
+            let seq = seq.ok_or_else(|| {
+                anyhow!(
+                    "tail snapshot unavailable for {ident}: a buffered op carries no \
+                     tail sequence (this is a bug — the tail API requires a durable tail)"
+                )
+            })?;
+            items.push(TailItem {
+                seq,
+                kind,
+                batch: batch.clone(),
+            });
+            Ok(())
+        }
+        let mut items: Vec<TailItem> = Vec::new();
+        let keyed_item = |items: &mut Vec<TailItem>, op: &KeyedOp| match &op.kind {
+            KeyedKind::Upsert(row) => push(items, ident, op.seq, TailEventKind::Upsert, row),
+            KeyedKind::Delete => push(items, ident, op.seq, TailEventKind::Delete, &op.key_row),
+        };
+        for flushed_gen in &entry.flushed {
+            for (seq, batch) in &flushed_gen.batches {
+                push(&mut items, ident, *seq, TailEventKind::Append, batch)?;
+            }
+            for (_, _, op) in &flushed_gen.keyed {
+                keyed_item(&mut items, op)?;
+            }
+        }
+        for pb in &entry.pending {
+            push(&mut items, ident, pb.seq, TailEventKind::Append, &pb.batch)?;
+        }
+        if let Some(keyed) = &entry.keyed {
+            for e in keyed.entries.values() {
+                keyed_item(&mut items, &e.op)?;
+            }
+        }
+        items.sort_by_key(|i| i.seq);
+        // F4 (durable-only serving): exclude in-flight/failed waits and cap
+        // `high` at the max SERVED seq. A durable-but-excluded interleaving
+        // cannot arise for `high`: every served seq stays <= high, so the
+        // subscribe path never re-delivers a backfilled op, and an excluded
+        // op is either broadcast after its wait succeeds (seq > high — the
+        // marking precedes the publish) or covered by the next flush's
+        // stamped watermark. Rare residual (out-of-order durability across
+        // concurrent statements): an undurable op BELOW a durable one loses
+        // the event-bound freshness bonus and is picked up at the flush.
+        let high = if entry.undurable.is_empty() {
+            entry.tail_high.unwrap_or(0)
+        } else {
+            items.retain(|i| !entry.undurable.contains(&i.seq));
+            items.iter().map(|i| i.seq).max().unwrap_or(0)
+        };
+        // F1: the wire header's pk-cols is the table's DECLARED primary key
+        // — buffered keyed state (when present) wins because the window's
+        // keyed items were encoded under exactly that declaration, but its
+        // ABSENCE proves nothing (clean-shutdown boots replay no keyed
+        // state while keyed ops remain possible on the stream).
+        let pk_cols = entry
+            .keyed
+            .as_ref()
+            .map(|k| k.pk_cols.clone())
+            .or_else(|| {
+                self.declared_pks
+                    .lock()
+                    .expect("declared-pk lock poisoned")
+                    .get(ident)
+                    .cloned()
+            })
+            .unwrap_or_default();
+        Ok(Some(TailWindowSnapshot {
+            schema: entry.schema.clone(),
+            pk_cols,
+            high,
+            items,
+        }))
+    }
+
+    /// Record (or clear) a table's DECLARED `icegres.primary-key` columns
+    /// from fresh metadata (F1 — see [`BufferState::declared_pks`]).
+    fn note_declared_pk(&self, ident: &TableIdent, pk_cols: Option<Vec<String>>) {
+        let mut pks = self.declared_pks.lock().expect("declared-pk lock poisoned");
+        match pk_cols {
+            Some(cols) => {
+                pks.insert(ident.clone(), cols);
+            }
+            None => {
+                pks.remove(ident);
+            }
+        }
+    }
 }
 
 /// What one statement routed into the buffer window — the undo record for
@@ -1085,7 +1337,12 @@ struct RoutedStmt {
 }
 
 /// Push one aligned batch into `pending`, tagged for unroute.
-fn push_pending(entry: &mut TableBuf, routed: &mut RoutedStmt, batch: RecordBatch) {
+fn push_pending(
+    entry: &mut TableBuf,
+    routed: &mut RoutedStmt,
+    batch: RecordBatch,
+    seq: Option<u64>,
+) {
     let id = entry.next_batch_id;
     entry.next_batch_id += 1;
     routed.batch_ids.push(id);
@@ -1093,6 +1350,7 @@ fn push_pending(entry: &mut TableBuf, routed: &mut RoutedStmt, batch: RecordBatc
     entry.pending.push(PendingBatch {
         id,
         claimed: false,
+        seq,
         batch,
     });
 }
@@ -1107,11 +1365,15 @@ fn push_pending(entry: &mut TableBuf, routed: &mut RoutedStmt, batch: RecordBatc
 /// Live inserts and boot replay both land here (via
 /// [`BufferState::append`]), so replay rebuilds the identical routing by
 /// construction. Returns the statement's undo record ([`RoutedStmt`]).
-fn route_appends(entry: &mut TableBuf, aligned: Vec<RecordBatch>) -> Result<RoutedStmt> {
+fn route_appends(
+    entry: &mut TableBuf,
+    aligned: Vec<RecordBatch>,
+    seq: Option<u64>,
+) -> Result<RoutedStmt> {
     let mut routed = RoutedStmt::default();
     if entry.keyed.as_ref().is_none_or(|k| k.entries.is_empty()) {
         for batch in aligned {
-            push_pending(entry, &mut routed, batch);
+            push_pending(entry, &mut routed, batch, seq);
         }
         return Ok(routed);
     }
@@ -1123,7 +1385,7 @@ fn route_appends(entry: &mut TableBuf, aligned: Vec<RecordBatch>) -> Result<Rout
         let keys = keyed::encode_batch_keys(&batch, &keyed.pk_cols)?;
         let hit: Vec<bool> = keys.iter().map(|k| keyed.entries.contains_key(k)).collect();
         if hit.iter().all(|h| !h) {
-            push_pending(entry, &mut routed, batch);
+            push_pending(entry, &mut routed, batch, seq);
             continue;
         }
         let key_rows = keyed::project_key_rows(&batch, &keyed.pk_cols)?;
@@ -1137,6 +1399,7 @@ fn route_appends(entry: &mut TableBuf, aligned: Vec<RecordBatch>) -> Result<Rout
                     op: KeyedOp {
                         key_row: key_rows.slice(row, 1),
                         kind: KeyedKind::Upsert(batch.slice(row, 1)),
+                        seq,
                     },
                 },
             );
@@ -1159,7 +1422,7 @@ fn route_appends(entry: &mut TableBuf, aligned: Vec<RecordBatch>) -> Result<Rout
                 .unwrap_or(false),
             "a pending append must never carry a keyed-map key"
         );
-        push_pending(entry, &mut routed, filtered);
+        push_pending(entry, &mut routed, filtered, seq);
     }
     Ok(routed)
 }
@@ -1264,6 +1527,47 @@ pub struct WriteBuffer {
     activation: StdMutex<HashMap<TableIdent, ActivationEntry>>,
     /// Wakes the flusher early when `max_rows` is hit.
     kick: tokio::sync::Notify,
+    /// Tail-event broadcast for the open tail API (TailSubscribe,
+    /// tailapi.rs). Ops are published only AFTER their durability wait
+    /// succeeded; watermark heartbeats fire when a flush commit stamps the
+    /// `icegres.tail-seq.<id>` property. Zero cost with no subscribers
+    /// (one atomic receiver-count load per publish site).
+    events: tokio::sync::broadcast::Sender<TailEvent>,
+    /// Concurrent TailSubscribe budget (F15, [`TAIL_MAX_SUBSCRIBERS`]).
+    subscribers: TailSubscribers,
+}
+
+/// Broadcast capacity for tail events. A subscriber that lags past this
+/// many undelivered events receives `RecvError::Lagged`; the serving stream
+/// then ends with an error and the consumer re-runs TailSnapshot.
+const TAIL_EVENT_CAPACITY: usize = 4096;
+
+/// Cap on concurrent TailSubscribe streams per server (F15): each stream
+/// pins a task, a broadcast receiver, a bounded wire-batch queue, and the
+/// h2 send window — linear in stream count, so it must be bounded even on
+/// a trusted network. Beyond the cap the request is answered
+/// RESOURCE_EXHAUSTED (documented in docs/open-tail-protocol.md); a
+/// legitimate fleet needs one stream per (peer, table).
+pub const TAIL_MAX_SUBSCRIBERS: usize = 64;
+
+/// The concurrent-subscriber budget ([`TAIL_MAX_SUBSCRIBERS`]): a permit is
+/// held for a TailSubscribe stream's whole life (the fan-out task owns it)
+/// and returns to the budget when the stream ends — including the ~1 s
+/// heartbeat-send reap of an abandoned consumer.
+pub struct TailSubscribers(Arc<tokio::sync::Semaphore>);
+
+impl Default for TailSubscribers {
+    fn default() -> Self {
+        Self(Arc::new(tokio::sync::Semaphore::new(TAIL_MAX_SUBSCRIBERS)))
+    }
+}
+
+impl TailSubscribers {
+    /// Take one subscriber slot; `None` = the cap is reached (the caller
+    /// answers RESOURCE_EXHAUSTED).
+    pub fn try_acquire(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.0.clone().try_acquire_owned().ok()
+    }
 }
 
 impl WriteBuffer {
@@ -1289,6 +1593,73 @@ impl WriteBuffer {
             keyed_serial: KeyedSerial::default(),
             activation: StdMutex::new(HashMap::new()),
             kick: tokio::sync::Notify::new(),
+            events: tokio::sync::broadcast::channel(TAIL_EVENT_CAPACITY).0,
+            subscribers: TailSubscribers::default(),
+        }
+    }
+
+    /// One TailSubscribe stream slot (F15); `None` when
+    /// [`TAIL_MAX_SUBSCRIBERS`] streams are already live — the tail API
+    /// answers RESOURCE_EXHAUSTED. The permit lives as long as the stream.
+    pub fn try_subscribe_permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.subscribers.try_acquire()
+    }
+
+    /// Subscribe to durable tail events (the open tail API's TailSubscribe
+    /// source). See [`TailEvent`]; a lagged receiver must re-snapshot.
+    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<TailEvent> {
+        self.events.subscribe()
+    }
+
+    /// The full `icegres.tail-seq.<tail-id>` property key this server's
+    /// flushes stamp — the key a tail-API consumer looks up in ITS scan
+    /// metadata for the exclusion rule. `None` without a durable tail
+    /// (the open tail API is unavailable then).
+    pub fn tail_watermark_property(&self) -> Option<String> {
+        self.tail
+            .as_deref()
+            .map(|t| t.watermark_property().to_string())
+    }
+
+    /// Idents this buffer has ever routed (tail-API table discovery).
+    /// Entries are never removed, so this is "tables with a window now or
+    /// earlier this boot" — a superset is fine for discovery.
+    pub fn buffered_tables(&self) -> Vec<TableIdent> {
+        let tables = self
+            .state
+            .tables
+            .lock()
+            .expect("write-buffer lock poisoned");
+        tables.keys().cloned().collect()
+    }
+
+    /// TailSnapshot source (tailapi.rs): one consistent view of the table's
+    /// tail window. `None` = the table has no window (never buffered here).
+    pub fn tail_snapshot(&self, ident: &TableIdent) -> Result<Option<TailWindowSnapshot>> {
+        anyhow::ensure!(
+            self.tail.is_some(),
+            "the open tail API requires a durable tail (--tail-dir/--tail-url/--tail-quorum)"
+        );
+        self.state.tail_snapshot(ident)
+    }
+
+    /// Broadcast one tail event (no-op without subscribers).
+    fn publish(&self, event: TailEvent) {
+        if self.events.receiver_count() > 0 {
+            let _ = self.events.send(event);
+        }
+    }
+
+    /// Broadcast a watermark heartbeat after a flush commit stamped (or was
+    /// proven covered by) `mark` — lets subscribers GC their mirrors.
+    fn publish_watermark(&self, ident: &TableIdent, mark: Option<u64>) {
+        if let Some(mark) = mark {
+            self.publish(TailEvent {
+                ident: ident.clone(),
+                seq: mark,
+                kind: TailEventKind::Watermark,
+                batches: Vec::new(),
+            });
         }
     }
 
@@ -1324,6 +1695,16 @@ impl WriteBuffer {
                 metadata_location: metadata_location.map(str::to_string),
                 activated,
             },
+        );
+        drop(map);
+        // F1: record the DECLARED PK for the tail wire header (best-effort:
+        // a malformed declaration serves an empty header — the keyed write
+        // path fails it loudly on use, exactly as before).
+        self.state.note_declared_pk(
+            ident,
+            pk_columns_of_metadata(metadata, &ident.to_string())
+                .ok()
+                .flatten(),
         );
     }
 
@@ -1470,9 +1851,12 @@ impl WriteBuffer {
             for (seq, op) in survivors {
                 match op {
                     TailOp::Append(batches) => {
-                        let (rows, _) = self
+                        // The frame is already durable: no tail below, but
+                        // its real sequence threads through so per-batch seq
+                        // bookkeeping (open tail API) stays exact.
+                        let (rows, _, _) = self
                             .state
-                            .append(&ident, Some(schema.clone()), &batches, None)
+                            .append(&ident, Some(schema.clone()), &batches, None, Some(seq))
                             .with_context(|| {
                                 format!("tail replay: cannot re-buffer rows for {ident}")
                             })?;
@@ -1524,7 +1908,7 @@ impl WriteBuffer {
         ident: &TableIdent,
         schema: &ArrowSchemaRef,
         pk_cols: &[String],
-        _seq: u64,
+        seq: u64,
         op: TailOp,
     ) -> Result<usize> {
         let mut applied = 0usize;
@@ -1538,6 +1922,7 @@ impl WriteBuffer {
                         let op = KeyedOp {
                             key_row: key_rows.slice(row, 1),
                             kind: KeyedKind::Upsert(aligned.slice(row, 1)),
+                            seq: Some(seq),
                         };
                         self.state.keyed_write(
                             ident,
@@ -1561,6 +1946,7 @@ impl WriteBuffer {
                         let op = KeyedOp {
                             key_row: key_batch.slice(row, 1),
                             kind: KeyedKind::Delete,
+                            seq: Some(seq),
                         };
                         self.state.keyed_write(
                             ident,
@@ -1625,9 +2011,19 @@ impl WriteBuffer {
         // With a tail: durable append FIRST, then pending, then the ack
         // (a tail error is this statement's error — never a silent
         // downgrade to non-durable buffering).
-        let (rows, pending_total) =
+        let (rows, pending_total, published) =
             self.state
-                .append(ident, schema_if_first, &batches, self.tail.as_deref())?;
+                .append(ident, schema_if_first, &batches, self.tail.as_deref(), None)?;
+        // Open tail API: broadcast AFTER the durability wait succeeded —
+        // never rows a failed statement unroutes.
+        if let Some((seq, batches)) = published {
+            self.publish(TailEvent {
+                ident: ident.clone(),
+                seq,
+                kind: TailEventKind::Append,
+                batches,
+            });
+        }
         if pending_total >= self.max_rows {
             self.kick.notify_one();
         }
@@ -1865,7 +2261,12 @@ impl WriteBuffer {
         }
         // Durable tail append + map insert, under the buffer lock (ordering
         // vs. inserts) — the statement's ack rides on this succeeding.
-        let (keyed_total, pending_rows) = self.state.keyed_write(
+        // Payload clones for the tail-event broadcast (cheap Arc clones).
+        let (publish_kind, publish_batch) = match &kind {
+            KeyedKind::Upsert(row) => (TailEventKind::Upsert, row.clone()),
+            KeyedKind::Delete => (TailEventKind::Delete, key_batch.clone()),
+        };
+        let (keyed_total, pending_rows, seq) = self.state.keyed_write(
             &cand.ident,
             Some(schema),
             &pk_cols,
@@ -1873,9 +2274,19 @@ impl WriteBuffer {
             KeyedOp {
                 key_row: key_batch,
                 kind,
+                seq: None,
             },
             self.tail.as_deref(),
         )?;
+        // Open tail API: broadcast AFTER the durability wait succeeded.
+        if let Some(seq) = seq {
+            self.publish(TailEvent {
+                ident: cand.ident.clone(),
+                seq,
+                kind: publish_kind,
+                batches: vec![publish_batch],
+            });
+        }
         if keyed_total + pending_rows >= self.max_rows {
             self.kick.notify_one();
         }
@@ -2142,6 +2553,7 @@ impl WriteBuffer {
                             mark,
                         );
                         tail_truncate_covered(self.tail.as_deref(), ident, tail_mark);
+                        self.publish_watermark(ident, tail_mark);
                         return Ok(());
                     }
                     let stamped = prev.map_or(mark, |p| p.max(mark));
@@ -2166,6 +2578,7 @@ impl WriteBuffer {
                 self.state
                     .drop_pending_prefix(ident, n_batches, &keyed_snapshot);
                 tail_truncate_covered(self.tail.as_deref(), ident, tail_mark);
+                self.publish_watermark(ident, tail_mark);
                 return Ok(());
             };
             let snapshot_id = prepared.snapshot_id();
@@ -2178,6 +2591,7 @@ impl WriteBuffer {
                     // The commit carries the watermark, so the covered tail
                     // segments are dead weight from here on.
                     tail_truncate_covered(self.tail.as_deref(), ident, tail_mark);
+                    self.publish_watermark(ident, tail_mark);
                     tracing::debug!(
                         table = %ident,
                         rows,
@@ -2233,6 +2647,7 @@ impl WriteBuffer {
                                          re-queue, no double-apply): {e:#}"
                                     );
                                     tail_truncate_covered(self.tail.as_deref(), ident, tail_mark);
+                                    self.publish_watermark(ident, tail_mark);
                                     return Ok(());
                                 }
                             }
@@ -2594,11 +3009,12 @@ mod tests {
     fn overlay_sees_all_pending() {
         let st = BufferState::default();
         let sch = schema();
-        let (rows, total) = st
+        let (rows, total, _) = st
             .append(
                 &ident(),
                 Some(sch.clone()),
                 &[batch(&sch, &[1, 2, 3])],
+                None,
                 None,
             )
             .unwrap();
@@ -2619,8 +3035,14 @@ mod tests {
     fn flushed_generation_excluded_iff_metadata_sees_it() {
         let st = BufferState::default();
         let sch = schema();
-        st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[1, 2])], None)
-            .unwrap();
+        st.append(
+            &ident(),
+            Some(sch.clone()),
+            &[batch(&sch, &[1, 2])],
+            None,
+            None,
+        )
+        .unwrap();
         let (_batches, n, _) = snap3(&st);
         assert_eq!(n, 1); // one batch
         let s: i64 = 4242;
@@ -2650,16 +3072,22 @@ mod tests {
         let st = BufferState::default();
         let sch = schema();
         // Buffer A=[1], B=[2] -> pending [A,B].
-        st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[1])], None)
-            .unwrap();
-        st.append(&ident(), None, &[batch(&sch, &[2])], None)
+        st.append(
+            &ident(),
+            Some(sch.clone()),
+            &[batch(&sch, &[1])],
+            None,
+            None,
+        )
+        .unwrap();
+        st.append(&ident(), None, &[batch(&sch, &[2])], None, None)
             .unwrap();
         let (_b, n, _) = snap3(&st);
         assert_eq!(n, 2);
         let s: i64 = 99;
         st.move_pending_to_flushed(&ident(), n, &[], s);
         // A new insert C=[3] lands while the commit is "in flight".
-        st.append(&ident(), None, &[batch(&sch, &[3])], None)
+        st.append(&ident(), None, &[batch(&sch, &[3])], None, None)
             .unwrap();
         // Commit conflicts: restore the flushed prefix to the front.
         st.move_flushed_back_to_pending(&ident(), s);
@@ -2689,6 +3117,7 @@ mod tests {
             Some(sch.clone()),
             &[batch(&sch, &[1, 2, 3])],
             None,
+            None,
         )
         .unwrap();
         let (_b, n, _) = snap3(&st);
@@ -2703,8 +3132,14 @@ mod tests {
     fn retain_flushed_by_predicate() {
         let st = BufferState::default();
         let sch = schema();
-        st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[7])], None)
-            .unwrap();
+        st.append(
+            &ident(),
+            Some(sch.clone()),
+            &[batch(&sch, &[7])],
+            None,
+            None,
+        )
+        .unwrap();
         let (_b, n, _) = snap3(&st);
         let s: i64 = 5;
         st.move_pending_to_flushed(&ident(), n, &[], s);
@@ -2731,8 +3166,14 @@ mod tests {
     fn unobserved_flushed_gen_survives_gc_until_metadata_is_observed() {
         let st = BufferState::default();
         let sch = schema();
-        st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[1, 2])], None)
-            .unwrap();
+        st.append(
+            &ident(),
+            Some(sch.clone()),
+            &[batch(&sch, &[1, 2])],
+            None,
+            None,
+        )
+        .unwrap();
         let (_b, n, _) = snap3(&st);
         let s: i64 = 11;
         st.move_pending_to_flushed(&ident(), n, &[], s);
@@ -2762,8 +3203,14 @@ mod tests {
     fn observed_generation_still_respects_the_age_condition() {
         let st = BufferState::default();
         let sch = schema();
-        st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[7])], None)
-            .unwrap();
+        st.append(
+            &ident(),
+            Some(sch.clone()),
+            &[batch(&sch, &[7])],
+            None,
+            None,
+        )
+        .unwrap();
         let (_b, n, _) = snap3(&st);
         let s: i64 = 12;
         st.move_pending_to_flushed(&ident(), n, &[], s);
@@ -2788,8 +3235,14 @@ mod tests {
         let st = BufferState::default();
         let sch = schema();
         assert!(st.pending_idents().is_empty());
-        st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[1])], None)
-            .unwrap();
+        st.append(
+            &ident(),
+            Some(sch.clone()),
+            &[batch(&sch, &[1])],
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(st.pending_idents(), vec![ident()]);
         let (_b, n, _) = snap3(&st);
         st.move_pending_to_flushed(&ident(), n, &[], 1);
@@ -2913,9 +3366,10 @@ mod tests {
             Some(sch.clone()),
             &[batch(&sch, &[1, 2]), batch(&sch, &[3])],
             Some(&tail),
+            None,
         )
         .unwrap();
-        st.append(&ident(), None, &[batch(&sch, &[4])], Some(&tail))
+        st.append(&ident(), None, &[batch(&sch, &[4])], Some(&tail), None)
             .unwrap();
         assert_eq!(
             *tail.appends.lock().unwrap(),
@@ -2940,6 +3394,7 @@ mod tests {
                 Some(sch.clone()),
                 &[batch(&sch, &[1])],
                 Some(&tail),
+                None,
             )
             .unwrap_err();
         assert!(err.to_string().contains("disk on fire"));
@@ -2963,9 +3418,10 @@ mod tests {
             Some(sch.clone()),
             &[batch(&sch, &[1])],
             Some(&tail),
+            None,
         )
         .unwrap();
-        st.append(&ident(), None, &[batch(&sch, &[2])], Some(&tail))
+        st.append(&ident(), None, &[batch(&sch, &[2])], Some(&tail), None)
             .unwrap();
         let (_batches, n, mark) = snap3(&st);
         assert_eq!((n, mark), (2, Some(2)));
@@ -3014,8 +3470,14 @@ mod tests {
     fn replayed_rows_carry_their_recovered_sequences() {
         let st = BufferState::default();
         let sch = schema();
-        st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[5])], None)
-            .unwrap();
+        st.append(
+            &ident(),
+            Some(sch.clone()),
+            &[batch(&sch, &[5])],
+            None,
+            None,
+        )
+        .unwrap();
         st.note_tail_high(&ident(), 41);
         let (_batches, n, mark) = snap3(&st);
         assert_eq!((n, mark), (1, Some(41)));
@@ -3067,11 +3529,12 @@ mod tests {
     fn row_accounting_survives_roundtrip() {
         let st = BufferState::default();
         let sch = schema();
-        let (_r, total0) = st
+        let (_r, total0, _) = st
             .append(
                 &ident(),
                 Some(sch.clone()),
                 &[batch(&sch, &[1, 2, 3])],
+                None,
                 None,
             )
             .unwrap();
@@ -3079,8 +3542,8 @@ mod tests {
         let (_b, n, _) = snap3(&st);
         st.move_pending_to_flushed(&ident(), n, &[], 1);
         // Appending after the move must not corrupt the count.
-        let (_r2, total1) = st
-            .append(&ident(), None, &[batch(&sch, &[4])], None)
+        let (_r2, total1, _) = st
+            .append(&ident(), None, &[batch(&sch, &[4])], None, None)
             .unwrap();
         assert_eq!(total1, 1); // only the new row is pending
         st.move_flushed_back_to_pending(&ident(), 1);
@@ -3153,6 +3616,7 @@ mod tests {
             KeyedOp {
                 key_row: key_row(id),
                 kind: KeyedKind::Upsert(krow(id, val)),
+                seq: None,
             },
             tail,
         )
@@ -3168,6 +3632,7 @@ mod tests {
             KeyedOp {
                 key_row: key_row(id),
                 kind: KeyedKind::Delete,
+                seq: None,
             },
             tail,
         )
@@ -3239,6 +3704,7 @@ mod tests {
             &ident(),
             Some(kschema()),
             &[kbatch(&[(1, "x"), (2, "y")])],
+            None,
             None,
         )
         .unwrap();
@@ -3326,6 +3792,7 @@ mod tests {
             Some(kschema()),
             &[kbatch(&[(1, "x")])],
             Some(&tail),
+            None,
         )
         .unwrap();
         write_upsert(&st, 2, "u", Some(&tail));
@@ -3349,6 +3816,7 @@ mod tests {
                 KeyedOp {
                     key_row: key_row(9),
                     kind: KeyedKind::Delete,
+                    seq: None,
                 },
                 Some(&tail),
             )
@@ -3388,6 +3856,7 @@ mod tests {
             KeyedOp {
                 key_row,
                 kind: KeyedKind::Upsert(row),
+                seq: None,
             },
             None,
         )
@@ -3446,6 +3915,7 @@ mod tests {
             Some(kschema()),
             &[kbatch(&[(1, "back"), (2, "new")])],
             Some(&tail),
+            None,
         )
         .unwrap();
         // The statement's tail frame is a plain Append — replay routes it
@@ -3474,8 +3944,14 @@ mod tests {
     #[test]
     fn insert_then_keyed_delete_removes_row() {
         let st = BufferState::default();
-        st.append(&ident(), Some(kschema()), &[kbatch(&[(1, "x")])], None)
-            .unwrap();
+        st.append(
+            &ident(),
+            Some(kschema()),
+            &[kbatch(&[(1, "x")])],
+            None,
+            None,
+        )
+        .unwrap();
         write_delete(&st, 1, None);
         let ov = st
             .overlay_with(&ident(), |_| false)
@@ -3498,6 +3974,7 @@ mod tests {
                 &ident(),
                 Some(kschema()),
                 &[kbatch(&[(1, "back"), (2, "plain")])],
+                None,
                 None,
             )
             .unwrap();
@@ -3542,6 +4019,7 @@ mod tests {
                 KeyedOp {
                     key_row: key_row(9),
                     kind: KeyedKind::Delete,
+                    seq: None,
                 },
                 None,
             )
@@ -3560,6 +4038,7 @@ mod tests {
                 KeyedOp {
                     key_row: key_row(9),
                     kind: KeyedKind::Delete,
+                    seq: None,
                 },
                 None,
             )
@@ -3582,6 +4061,7 @@ mod tests {
             KeyedOp {
                 key_row: key_row_new,
                 kind: KeyedKind::Upsert(row),
+                seq: None,
             },
             None,
         )
@@ -3605,8 +4085,14 @@ mod tests {
     fn covered_generation_excluded_exactly_by_watermark() {
         let st = BufferState::default();
         let sch = schema();
-        st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[1, 2])], None)
-            .unwrap();
+        st.append(
+            &ident(),
+            Some(sch.clone()),
+            &[batch(&sch, &[1, 2])],
+            None,
+            None,
+        )
+        .unwrap();
         let (_b, n, _) = snap3(&st);
         st.move_pending_to_flushed_covered(&ident(), n, &[], 7);
         assert!(!st.has_pending());
@@ -3934,6 +4420,7 @@ mod tests {
                     Some(sch.clone()),
                     &[batch(&sch, &[1])],
                     Some(tail.as_ref()),
+                    None,
                 )
                 .unwrap();
             })
@@ -3962,11 +4449,17 @@ mod tests {
         let st = BufferState::default();
         let sch = schema();
         // An earlier acked statement (survives).
-        st.append(&ident(), Some(sch.clone()), &[batch(&sch, &[1])], None)
-            .unwrap();
+        st.append(
+            &ident(),
+            Some(sch.clone()),
+            &[batch(&sch, &[1])],
+            None,
+            None,
+        )
+        .unwrap();
         let tail = FailWaitTail::default();
         let err = st
-            .append(&ident(), None, &[batch(&sch, &[2, 3])], Some(&tail))
+            .append(&ident(), None, &[batch(&sch, &[2, 3])], Some(&tail), None)
             .unwrap_err();
         assert!(err.to_string().contains("fsync wait failed"));
         // Exactly the acked row remains.
@@ -3978,8 +4471,8 @@ mod tests {
         let (_batches, n, _mark) = snap3(&st);
         assert_eq!(n, 1, "the failed statement's batch is gone");
         // pending_rows accounting shrank with it: only rows 1 and 4 count.
-        let (_, total) = st
-            .append(&ident(), None, &[batch(&sch, &[4])], None)
+        let (_, total, _) = st
+            .append(&ident(), None, &[batch(&sch, &[4])], None, None)
             .unwrap();
         assert_eq!(total, 2);
     }
@@ -4002,6 +4495,7 @@ mod tests {
                 KeyedOp {
                     key_row: key_row(1),
                     kind: KeyedKind::Upsert(krow(1, "v20")),
+                    seq: None,
                 },
                 Some(&tail),
             )
@@ -4035,6 +4529,7 @@ mod tests {
                 KeyedOp {
                     key_row: key_row(2),
                     kind: KeyedKind::Delete,
+                    seq: None,
                 },
                 Some(&tail),
             )
@@ -4059,6 +4554,7 @@ mod tests {
                 Some(kschema()),
                 &[kbatch(&[(1, "new"), (2, "plain")])],
                 Some(&tail),
+                None,
             )
             .unwrap_err();
         assert!(err.to_string().contains("fsync wait failed"));
@@ -4093,6 +4589,7 @@ mod tests {
                 Some(sch.clone()),
                 &[batch(&sch, &[1, 2])],
                 Some(&tail),
+                None,
             )
             .unwrap_err();
         assert!(err.to_string().contains("died after a flush claimed"));
@@ -4132,6 +4629,7 @@ mod tests {
                 KeyedOp {
                     key_row: key_row(1),
                     kind: KeyedKind::Upsert(krow(1, "v1")),
+                    seq: None,
                 },
                 Some(&tail),
             )
@@ -4146,5 +4644,291 @@ mod tests {
             .unwrap()
             .expect("the generation still overlays the op");
         assert_eq!(vals(&ov), vec![(1, "v1".to_string())]);
+    }
+
+    // ------------------------------------------------------------------
+    // Open tail API (P1): per-op seq retention + tail_snapshot.
+    // ------------------------------------------------------------------
+
+    // Every window op — pending appends, live keyed ops, AND retained
+    // flushed generations — appears in the snapshot with its exact tail
+    // sequence, sorted, and `high` is the window head.
+    #[test]
+    fn tail_snapshot_carries_seqs_across_pending_flushed_and_keyed() {
+        let st = BufferState::default();
+        let tail = MockTail::default();
+        // seq 1: append of two rows; seq 2: keyed upsert; seq 3: append.
+        st.append(
+            &ident(),
+            Some(kschema()),
+            &[kbatch(&[(1, "a"), (2, "b")])],
+            Some(&tail),
+            None,
+        )
+        .unwrap();
+        write_upsert(&st, 5, "u5", Some(&tail));
+        st.append(&ident(), None, &[kbatch(&[(3, "c")])], Some(&tail), None)
+            .unwrap();
+        // Move the whole window into a flushed generation (uncommitted from
+        // the scan's point of view) and add one more pending append (seq 4)
+        // plus one live keyed delete (seq 5).
+        let snap = st.snapshot_pending(&ident());
+        st.move_pending_to_flushed(&ident(), snap.n_batches, &snap.keyed, 42);
+        st.append(&ident(), None, &[kbatch(&[(4, "d")])], Some(&tail), None)
+            .unwrap();
+        write_delete(&st, 2, Some(&tail));
+
+        let ts = st.tail_snapshot(&ident()).unwrap().expect("window present");
+        assert_eq!(ts.high, 5, "high = the newest staged seq");
+        assert_eq!(ts.pk_cols, pk());
+        let got: Vec<(u64, TailEventKind, usize)> = ts
+            .items
+            .iter()
+            .map(|i| (i.seq, i.kind, i.batch.num_rows()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (1, TailEventKind::Append, 2),
+                (2, TailEventKind::Upsert, 1),
+                (3, TailEventKind::Append, 1),
+                (4, TailEventKind::Append, 1),
+                (5, TailEventKind::Delete, 1),
+            ]
+        );
+    }
+
+    // A snapshot's `high` covers every item (the TailSubscribe cursor
+    // contract): nothing in the window carries a seq above `high`.
+    #[test]
+    fn tail_snapshot_high_covers_every_item() {
+        let st = BufferState::default();
+        let tail = MockTail::default();
+        for i in 0..5 {
+            st.append(
+                &ident(),
+                (i == 0).then(kschema),
+                &[kbatch(&[(i as i64, "x")])],
+                Some(&tail),
+                None,
+            )
+            .unwrap();
+        }
+        let ts = st.tail_snapshot(&ident()).unwrap().unwrap();
+        assert!(ts.items.iter().all(|i| i.seq <= ts.high));
+        assert_eq!(ts.items.len(), 5);
+    }
+
+    // Replay threads REAL frame seqs (no tail attached), so a snapshot after
+    // boot replay still serves exact per-op sequences.
+    #[test]
+    fn replayed_rows_keep_their_frame_seqs() {
+        let st = BufferState::default();
+        st.append(
+            &ident(),
+            Some(kschema()),
+            &[kbatch(&[(1, "a")])],
+            None,
+            Some(17),
+        )
+        .unwrap();
+        st.note_tail_high(&ident(), 17);
+        let ts = st.tail_snapshot(&ident()).unwrap().unwrap();
+        assert_eq!(ts.items[0].seq, 17);
+        assert_eq!(ts.high, 17);
+    }
+
+    // Without any seq source (pure in-memory buffering) the snapshot fails
+    // loudly instead of serving rows the exclusion rule cannot place.
+    #[test]
+    fn tail_snapshot_refuses_seqless_rows() {
+        let st = BufferState::default();
+        st.append(
+            &ident(),
+            Some(kschema()),
+            &[kbatch(&[(1, "a")])],
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(st
+            .tail_snapshot(&ident())
+            .unwrap_err()
+            .to_string()
+            .contains("no tail sequence"));
+    }
+
+    // F1: the wire header's pk-cols is the table's DECLARED primary key —
+    // present even when no keyed op landed this boot (the clean-shutdown
+    // replay shape where `entry.keyed` is None), so a consumer never
+    // installs an empty-pk mirror that would silently drop later
+    // upserts/deletes. Buffered keyed state (whose keys were encoded under
+    // its own declaration) still wins when present.
+    #[test]
+    fn tail_snapshot_serves_the_declared_pk_without_keyed_state() {
+        let st = BufferState::default();
+        let tail = MockTail::default();
+        st.append(
+            &ident(),
+            Some(kschema()),
+            &[kbatch(&[(1, "a")])],
+            Some(&tail),
+            None,
+        )
+        .unwrap();
+        // No declaration recorded (a truly PK-less table): empty header.
+        let ts = st.tail_snapshot(&ident()).unwrap().unwrap();
+        assert!(ts.pk_cols.is_empty());
+        // Declared PK recorded from metadata (note_activation's path): the
+        // header carries it although `entry.keyed` is still None.
+        st.note_declared_pk(&ident(), Some(pk()));
+        let ts = st.tail_snapshot(&ident()).unwrap().unwrap();
+        assert_eq!(ts.pk_cols, pk(), "declared PK served with no keyed state");
+        // Live keyed state agrees (and would win on any divergence).
+        write_upsert(&st, 2, "u", Some(&tail));
+        let ts = st.tail_snapshot(&ident()).unwrap().unwrap();
+        assert_eq!(ts.pk_cols, pk());
+        // A dropped declaration clears the cached entry.
+        st.note_declared_pk(&ident(), None);
+        assert!(st.declared_pks.lock().unwrap().get(&ident()).is_none());
+    }
+
+    // F4: a staged statement is INVISIBLE to tail snapshots while its
+    // durability wait is in flight — `high` stays below its seq so the
+    // post-wait broadcast still reaches a subscriber — and becomes
+    // servable the moment the wait succeeds.
+    #[test]
+    fn tail_snapshot_hides_in_flight_waits_until_durable() {
+        let st = Arc::new(BufferState::default());
+        let sch = schema();
+        // Seq 1: already durable (boot-replay shape).
+        st.append(
+            &ident(),
+            Some(sch.clone()),
+            &[batch(&sch, &[1])],
+            None,
+            Some(1),
+        )
+        .unwrap();
+        st.note_tail_high(&ident(), 1);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let tail = Arc::new(BlockingWaitTail {
+            next_seq: std::sync::atomic::AtomicU64::new(1), // hands out seq 2
+            hooks: StdMutex::new(Some((entered_tx, release_rx))),
+        });
+        let writer = {
+            let st = st.clone();
+            let sch = sch.clone();
+            let tail = tail.clone();
+            std::thread::spawn(move || {
+                st.append(
+                    &ident(),
+                    None,
+                    &[batch(&sch, &[2])],
+                    Some(tail.as_ref()),
+                    None,
+                )
+                .unwrap();
+            })
+        };
+        entered_rx.recv().expect("the durability wait started");
+        // Mid-wait: the union view serves the staged row (same-server
+        // transient visibility), but the tail API must NOT.
+        let ts = st.tail_snapshot(&ident()).unwrap().unwrap();
+        let seqs: Vec<u64> = ts.items.iter().map(|i| i.seq).collect();
+        assert_eq!(seqs, vec![1], "in-flight wait: seq 2 is not served");
+        assert_eq!(ts.high, 1, "high stays below the in-flight seq");
+        release_tx.send(()).expect("waiter blocked on release");
+        writer.join().expect("append acks after release");
+        // Durable: served, and high advances to the window head.
+        let ts = st.tail_snapshot(&ident()).unwrap().unwrap();
+        let seqs: Vec<u64> = ts.items.iter().map(|i| i.seq).collect();
+        assert_eq!(seqs, vec![1, 2]);
+        assert_eq!(ts.high, 2);
+    }
+
+    // F4: a FAILED durability wait is never served by the tail API — the
+    // exact-unroute path removes the rows and the burned seq entirely
+    // (append and keyed shapes).
+    #[test]
+    fn tail_snapshot_never_serves_a_failed_wait() {
+        let st = BufferState::default();
+        let tail = FailWaitTail::default();
+        st.append(
+            &ident(),
+            Some(kschema()),
+            &[kbatch(&[(1, "a")])],
+            Some(&tail),
+            None,
+        )
+        .unwrap_err();
+        let ts = st.tail_snapshot(&ident()).unwrap().unwrap();
+        assert!(ts.items.is_empty(), "the failed append is not served");
+        st.keyed_write(
+            &ident(),
+            None,
+            &pk(),
+            key_of(2),
+            KeyedOp {
+                key_row: key_row(2),
+                kind: KeyedKind::Upsert(krow(2, "x")),
+                seq: None,
+            },
+            Some(&tail),
+        )
+        .unwrap_err();
+        let ts = st.tail_snapshot(&ident()).unwrap().unwrap();
+        assert!(ts.items.is_empty(), "the failed keyed op is not served");
+    }
+
+    // F4 narrow window: a wait failure AFTER a flush claimed the rows keeps
+    // them in the window (disclosed ambiguity — they may commit), but the
+    // tail API still never serves them: consumers pick them up from the
+    // committed data once the covering flush lands.
+    #[test]
+    fn tail_snapshot_excludes_ambiguous_claimed_failures() {
+        let st = Arc::new(BufferState::default());
+        let sch = schema();
+        let tail = ClaimingTail {
+            st: st.clone(),
+            next_seq: Default::default(),
+        };
+        st.append(
+            &ident(),
+            Some(sch.clone()),
+            &[batch(&sch, &[1, 2])],
+            Some(&tail),
+            None,
+        )
+        .unwrap_err();
+        // Union reads still serve the claimed generation ...
+        assert!(st.overlay_with(&ident(), |_| false).unwrap().is_some());
+        // ... but the tail API does not.
+        let ts = st.tail_snapshot(&ident()).unwrap().unwrap();
+        assert!(ts.items.is_empty());
+    }
+
+    // F15: the concurrent TailSubscribe budget — 64 streams live, the 65th
+    // is refused, and a finished stream returns its slot.
+    #[test]
+    fn tail_subscriber_cap_bounds_concurrent_streams() {
+        let subs = TailSubscribers::default();
+        let mut permits: Vec<_> = (0..TAIL_MAX_SUBSCRIBERS)
+            .map(|i| {
+                subs.try_acquire()
+                    .unwrap_or_else(|| panic!("stream {i} fits the cap"))
+            })
+            .collect();
+        assert!(
+            subs.try_acquire().is_none(),
+            "stream {} exceeds the cap and is refused",
+            TAIL_MAX_SUBSCRIBERS + 1
+        );
+        permits.pop();
+        assert!(
+            subs.try_acquire().is_some(),
+            "a finished stream frees its slot"
+        );
     }
 }

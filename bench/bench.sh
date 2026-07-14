@@ -613,6 +613,37 @@ point = timed_query("SELECT * FROM demo.trips WHERE trip_id = 7", 20)
 bigfilter = timed_query(
     "SELECT count(*), avg(fare) FROM demo.trips_big WHERE distance_km > 25.0", 10)
 
+# flight_q1_ms (P1): bench/compare/compare.py's exact q1 recipe so the
+# number is apples-to-apples with COMPARISON.md's flightsql leg — fresh
+# cursor per sample, execute + fetchall, 3 warmup + 15 timed, p50=median.
+def timed_q1(n=15, warmup=3):
+    import statistics as _st
+    sql = ("SELECT trip_id, city, distance_km, fare, ts "
+           "FROM demo.trips WHERE trip_id = 137")
+    times = []
+    for i in range(n + warmup):
+        c2 = conn.cursor()
+        t0 = time.perf_counter()
+        c2.execute(sql)
+        c2.fetchall()
+        dt = (time.perf_counter() - t0) * 1000
+        c2.close()
+        if i >= warmup:
+            times.append(dt)
+    xs = sorted(times)
+    return {"p50": round(_st.median(xs), 2),
+            "p95": round(xs[min(n - 1, int(round(0.95 * n)) - 1)], 2),
+            "n": n}
+
+flight_q1 = timed_q1()
+# P1 latency gate (docs/p1-open-tail-scope.md §3): the release binary's
+# flight q1 p50 must meet the <=15 ms target. Asserted HERE — the one
+# place the release binary is measured — so a Flight-path regression
+# fails the bench run instead of shipping green.
+assert flight_q1["p50"] <= 15.0, (
+    f"P1 target MISSED: flight q1 p50={flight_q1['p50']}ms > 15ms "
+    "(GetFlightInfo->DoGet plan-once path regressed?)")
+
 # Bulk ingest: 100k rows per run, 3 runs; each run appends ONE commit. The
 # per-run rows/s uses the full client-observed wall time of adbc_ingest.
 N = 100_000
@@ -638,6 +669,7 @@ snapshots = len(cur.fetchall())
 assert snapshots == 3, f"expected 3 ingest commits, saw {snapshots} snapshots"
 
 out = {
+    "flight_q1_ms": flight_q1,
     "adbc_query_point_ms": point,
     "adbc_query_bigfilter_ms": bigfilter,
     "adbc_bulk_ingest_100k_rows_s": {
@@ -661,12 +693,76 @@ PYEOF
     kill -9 "$fpid" 2>/dev/null || true
   fi
   rm -f "$RUN_DIR/bench-flight.pid"
+
+  # flight_q1_fresh_ms (P1): the SAME q1 recipe against a fresh
+  # `flight-serve --freshness-ms 25` server — the mode the README's
+  # freshness-Flight number describes, measured by its own metric (the
+  # default-mode flight_q1_ms above can never produce it: without
+  # --freshness-ms plans are never pinned and every DoGet re-plans).
+  log "measuring flight_q1_fresh_ms (icegres flight-serve --freshness-ms 25 on :$FLIGHT_PORT)"
+  "$BIN" flight-serve --host "$PG_HOST" --port "$FLIGHT_PORT" --freshness-ms 25 \
+    >>"$RUN_DIR/bench-flight.log" 2>&1 &
+  echo $! >"$RUN_DIR/bench-flight.pid"
+  flight_fresh_up=0
+  for _ in $(seq 1 60); do
+    if python3 -c "import socket,sys; s=socket.socket(); s.settimeout(0.3);
+sys.exit(0 if s.connect_ex(('127.0.0.1', $FLIGHT_PORT))==0 else 1)" 2>/dev/null; then
+      flight_fresh_up=1; break
+    fi
+    sleep 0.5
+  done
+  [[ "$flight_fresh_up" == 1 ]] || fatal "icegres flight-serve --freshness-ms not listening on :$FLIGHT_PORT"
+  ADBC_FRESH_JSON="$RUN_DIR/bench-adbc-fresh.json"
+  FLIGHT_PORT="$FLIGHT_PORT" OUT="$ADBC_FRESH_JSON" python3 - <<'PYEOF' \
+    || { tail -n 20 "$RUN_DIR/bench-flight.log" >&2; fatal "flight_q1_fresh_ms failed"; }
+import json, os, statistics, time, warnings
+warnings.filterwarnings("ignore")
+import adbc_driver_flightsql.dbapi as fs
+
+port = os.environ["FLIGHT_PORT"]
+conn = fs.connect(f"grpc://127.0.0.1:{port}")
+
+# Identical recipe to flight_q1_ms (compare.py's q1): fresh cursor per
+# sample, execute + fetchall, 3 warmup + 15 timed, p50 = median.
+def timed_q1(n=15, warmup=3):
+    sql = ("SELECT trip_id, city, distance_km, fare, ts "
+           "FROM demo.trips WHERE trip_id = 137")
+    times = []
+    for i in range(n + warmup):
+        c2 = conn.cursor()
+        t0 = time.perf_counter()
+        c2.execute(sql)
+        c2.fetchall()
+        dt = (time.perf_counter() - t0) * 1000
+        c2.close()
+        if i >= warmup:
+            times.append(dt)
+    xs = sorted(times)
+    return {"p50": round(statistics.median(xs), 2),
+            "p95": round(xs[min(n - 1, int(round(0.95 * n)) - 1)], 2),
+            "n": n}
+
+out = {"flight_q1_fresh_ms": timed_q1()}
+conn.close()
+with open(os.environ["OUT"], "w") as f:
+    json.dump({"metrics": out}, f)
+print("flight freshness extra:", json.dumps(out))
+PYEOF
+
+  fpid=$(cat "$RUN_DIR/bench-flight.pid" 2>/dev/null || true)
+  if [[ -n "$fpid" ]] && kill -0 "$fpid" 2>/dev/null \
+      && [[ "$(ps -o comm= -p "$fpid" 2>/dev/null)" == icegres ]]; then
+    kill "$fpid" 2>/dev/null || true
+    for _ in $(seq 1 20); do kill -0 "$fpid" 2>/dev/null || break; sleep 0.25; done
+    kill -9 "$fpid" 2>/dev/null || true
+  fi
+  rm -f "$RUN_DIR/bench-flight.pid"
   # Leave demo.adbc_ingest in its canonical empty state for the next run.
   drop_adbc_ingest
   "$BIN" seed >>"$RUN_DIR/bench-flight.log" 2>&1 || true
-  jq -s '.[0] * {metrics: (.[0].metrics + .[1].metrics)}' \
-    "$OUT_JSON" "$ADBC_JSON" >"$OUT_JSON.tmp" && mv "$OUT_JSON.tmp" "$OUT_JSON"
-  log "ADBC extras merged (ungated): $(jq -c '.metrics | {adbc_bulk_ingest_100k_rows_s, adbc_query_point_ms}' "$OUT_JSON")"
+  jq -s '.[0] * {metrics: (.[0].metrics + .[1].metrics + .[2].metrics)}' \
+    "$OUT_JSON" "$ADBC_JSON" "$ADBC_FRESH_JSON" >"$OUT_JSON.tmp" && mv "$OUT_JSON.tmp" "$OUT_JSON"
+  log "ADBC extras merged (ungated): $(jq -c '.metrics | {adbc_bulk_ingest_100k_rows_s, adbc_query_point_ms, flight_q1_ms, flight_q1_fresh_ms}' "$OUT_JSON")"
 fi
 
 # ---------------------------------------------------------------------------
@@ -712,7 +808,8 @@ fi
        "durable_ack_dir_ms","durable_ack_pg_ms","durable_ack_quorum_ms",
        "cold_start_via_proxy_ms",
        "connect_via_proxy_ms","qps_via_proxy_8conn",
-       "adbc_query_point_ms","adbc_query_bigfilter_ms","adbc_bulk_ingest_100k_rows_s"][] ) as $k |
+       "adbc_query_point_ms","adbc_query_bigfilter_ms","adbc_bulk_ingest_100k_rows_s",
+       "flight_q1_ms","flight_q1_fresh_ms"][] ) as $k |
     row($k; $m[$k])
   ' "$OUT_JSON"
 } >>"$SCORECARD"

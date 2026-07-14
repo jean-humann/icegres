@@ -280,6 +280,81 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
   sync-exact, and it sees another server's in-window keyed ops only at
   the commit cadence (the existing cross-server freshness rule).
 
+## Open tail API + peer overlays (opt-in, `--tail-api-port` / `--peer-tail`)
+
+- **The freshness bonus dies with the buffering compute.** Peer mirrors and
+  external tail readers get event-bound visibility ONLY while the buffering
+  server is up. If it dies, consumers drop their mirrors and fall back to
+  commit-cadence freshness — silently, by design (one WARN per outage; the
+  per-peer `icegres_peer_tail_age_ms{peer=…}` gauge keeps growing, and
+  `icegres_peer_tail_age_max_ms` carries the worst case for alerting).
+  Nothing is lost but the bonus: acked rows are tail-durable and land via
+  replay + flush on the next boot/takeover, and the watermark rule keeps
+  every consumer exactly-once across the gap.
+- **Replay is keyed to the tail IDENTITY, not the machine.** Acked
+  un-flushed rows replay on a SAME-identity restart — the same tail dir
+  (its persisted `identity` file), tail database, or quorum log.
+  Re-minting the tail identity (a fresh/emptied tail dir, a new
+  `icegres_tail` schema, wiped acceptors) abandons the old identity's
+  un-flushed frames: nothing replays them, and their
+  `icegres.tail-seq.<old-id>` watermark no longer describes anything a new
+  writer produces. Point a replacement server at the SAME tail identity if
+  the acked window must survive the restart.
+- **A hung peer is served for at most the mirror age bound.** The peer
+  subscriber channel runs HTTP/2 keepalive pings (10 s interval, 5 s
+  timeout, plus TCP keepalive), so a dead/partitioned peer surfaces as a
+  stream error and drops its mirror. Independently, scans stop consulting
+  a mirror whose peer delivered no event (heartbeats included, so a
+  healthy idle peer never trips it) for over 5 s — the mirror is treated
+  as ABSENT (commit-cadence fallback, one WARN per stall) and serving
+  resumes with the next applied event. Protocol v1's handshake carries no
+  flush-cadence hint, so the bound is a constant (≥ 3× the 1 Hz heartbeat
+  interval).
+- **`--peer-tail` + `--freshness-ms` raises mirror retention.** A reader
+  whose committed metadata may be ~S ms stale must not GC mirror items its
+  snapshot has not caught up to, or rows would transiently vanish from the
+  union. Watermark-covered mirror items are therefore retained for
+  max(30 s, 4×S) — computed at startup, with a WARN stating the retention
+  chosen — and, while scans are actively consulting the mirror,
+  additionally until a scan's OWN metadata has observed the covering
+  watermark (the stale-read-on-catalog-error default can freeze scan
+  metadata for the length of a reader-side catalog outage, unbounded by S);
+  the cost is memory, never correctness.
+- **Single buffering writer per table, unchanged.** Peer overlays are
+  read-side only; there is no cross-compute write coordination. Two servers
+  buffering writes to the same table remains an unsupported deployment
+  (the tail one-writer locks fence it), and a reader mirroring two peers
+  that both claim a table WARNs once and keeps the FIRST claim — the
+  second peer's ingest/drop are refused so it can neither interleave its
+  seq space into the owner's mirror nor kill it, and it takes over
+  automatically when the owner's mirror drops.
+- **The tail API is read-only and plaintext (v1).** The listener rejects
+  every Flight write (a write executed there would bypass the pgwire
+  ordering fences); auth rides `--auth-file` basic-auth — the `--peer-tail`
+  subscriber authenticates with `ICEGRES_PEER_TAIL_USER` /
+  `ICEGRES_PEER_TAIL_PASSWORD` (one identity for all peers) — but there is
+  no TLS on this port yet: run it on a trusted network. Concurrent
+  TailSubscribe streams are capped at 64 per server (RESOURCE_EXHAUSTED
+  beyond). SQL SELECTs on it are served (union reads), which is a
+  feature, not an accident.
+- **Peer mirror visibility is best-effort, not a bound.** Discovery polls
+  the peer every ~2 s and events ride a broadcast channel; a lagged/slow
+  consumer is disconnected (DATA_LOSS) and must re-snapshot. Expect
+  sub-second visibility in steady state, a few seconds after a table's
+  first-ever write or a reconnect — always strictly better than the flush
+  cadence it falls back to, never a guaranteed event bound.
+- **Flight plan-once tickets are version-validated, never blindly pinned.**
+  GetFlightInfo still builds the physical plan once (the double-planning
+  fix), but the paired DoGet executes it ONLY if every planned table is
+  still at its plan-time metadata version — the same rule as the pgwire
+  plan cache — and re-plans on any mismatch (a miss, never an error). Plans
+  the server cannot re-validate are never pinned at all: default mode (no
+  `--freshness-ms`), overlay-bearing (buffered/mirrored) tables, and
+  time-travel/volatile statements always re-plan at DoGet. Consequently a
+  ticket can never serve results staler than the freshness bound already
+  allows, and in default mode DoGet keeps the exact per-scan catalog
+  check.
+
 ## Bounded-staleness reads (opt-in, `--freshness-ms`)
 
 - **`--freshness-ms N` with `N > 0` trades exact freshness for read latency,

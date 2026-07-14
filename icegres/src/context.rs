@@ -105,6 +105,29 @@ pub async fn build_session_context(catalog: Arc<dyn Catalog>) -> Result<SessionC
     build_session_context_with(catalog, None, None, None, 0).await
 }
 
+/// [`build_session_context_with`] plus peer tail mirrors (`--peer-tail`,
+/// peer.rs): every plain-table scan additionally unions the peers' mirrored
+/// tail windows under the property-watermark exactly-once rule. `None` (all
+/// other callers) keeps scans byte-identical.
+pub async fn build_session_context_with_peers(
+    catalog: Arc<dyn Catalog>,
+    target_partitions: Option<usize>,
+    write_buffer: Option<Arc<WriteBuffer>>,
+    branch: Option<String>,
+    freshness_ms: u64,
+    peer_mirrors: Option<Arc<crate::peer::PeerMirrors>>,
+) -> Result<SessionContext> {
+    build_session_context_inner(
+        catalog,
+        target_partitions,
+        write_buffer,
+        branch,
+        freshness_ms,
+        peer_mirrors,
+    )
+    .await
+}
+
 /// Total system memory in bytes from `/proc/meminfo`, if readable.
 fn system_memory_bytes() -> Option<usize> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
@@ -173,6 +196,25 @@ pub async fn build_session_context_with(
     branch: Option<String>,
     freshness_ms: u64,
 ) -> Result<SessionContext> {
+    build_session_context_inner(
+        catalog,
+        target_partitions,
+        write_buffer,
+        branch,
+        freshness_ms,
+        None,
+    )
+    .await
+}
+
+async fn build_session_context_inner(
+    catalog: Arc<dyn Catalog>,
+    target_partitions: Option<usize>,
+    write_buffer: Option<Arc<WriteBuffer>>,
+    branch: Option<String>,
+    freshness_ms: u64,
+    peer_mirrors: Option<Arc<crate::peer::PeerMirrors>>,
+) -> Result<SessionContext> {
     let ctx = SessionContext::new_with_config_rt(
         session_config(target_partitions)?,
         build_runtime_env()?,
@@ -200,6 +242,7 @@ pub async fn build_session_context_with(
                 write_buffer.clone(),
                 branch.clone(),
                 freshness_ms > 0,
+                peer_mirrors.clone(),
             )
             .await
             .with_context(|| format!("failed to build caching provider for {schema_name}"))?;

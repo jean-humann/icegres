@@ -90,7 +90,7 @@ use datafusion::common::{ParamValues, ScalarValue};
 use datafusion::dataframe::DataFrameWriteOptions;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::prelude::{DataFrame, SessionContext};
-use futures::{stream, Stream, TryStreamExt};
+use futures::{stream, Stream, StreamExt, TryStreamExt};
 use prost::Message;
 use tonic::metadata::MetadataValue;
 use tonic::transport::Server;
@@ -98,10 +98,14 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, warn};
 
 use crate::authz::{self, Action as AuthzAction, SharedAuthorizer, TableRef};
+use crate::buffer::WriteBuffer;
+use crate::cache::MetadataVersion;
 use crate::context::{self, CATALOG_NAME, DEFAULT_SCHEMA};
 use crate::ops::BasicAuthVerifier;
 use crate::overwrite::{quote_ident, CommitConflict, ConstraintViolation, OverwriteEngine};
+use crate::plancache::{self, PlanCache, PlanKey};
 use crate::{dml, CatalogOpts};
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 
@@ -127,9 +131,20 @@ struct Prepared {
     params: Vec<Vec<ScalarValue>>,
     /// Dataset (result) schema, planned once at create time. `GetFlightInfo`
     /// answers from this instead of re-planning the SQL a second time; a
-    /// SELECT's result schema does not depend on the data snapshot, so this is
-    /// safe while `DoGet` still re-plans for snapshot-fresh execution.
+    /// SELECT's result schema does not depend on the data snapshot, so this
+    /// is safe regardless of whether `DoGet` executes the version-validated
+    /// create-time plan or re-plans.
     schema: SchemaRef,
+    /// The PHYSICAL plan built at create time for the zero-params case,
+    /// consumed ONE-SHOT by the paired `DoGet` (ADBC's dbapi prepares every
+    /// statement, so create→execute→close is one query — planning once for
+    /// it is the pgwire-simple-statement semantic; see the plan-once notes
+    /// on [`FlightSqlServiceImpl::physical_plan`]). `None` for DML, for
+    /// statements that cannot physical-plan unbound (e.g. `$n`
+    /// placeholders), and for statements ineligible to pin at all
+    /// ([`StashedPlan`]'s soundness rules); DoGet then re-plans (via the
+    /// SQL-keyed cache in freshness mode).
+    plan: Option<StashedPlan>,
 }
 
 /// Lifetime of a bearer token minted by a handshake. After this the client
@@ -159,6 +174,103 @@ struct FlightSqlServiceImpl {
     tokens: Mutex<HashMap<String, TokenEntry>>,
     prepared: Mutex<HashMap<String, Prepared>>,
     sql_info: SqlInfoData,
+    /// Buffered-write overlay source. `Some` only on the tail-api listener
+    /// inside `icegres serve --tail-api-port` (the buffering compute is the
+    /// only process holding the overlay state); `flight-serve` always runs
+    /// with `None` and answers tail tickets with FAILED_PRECONDITION. Powers
+    /// the open tail read API (tailapi.rs, docs/open-tail-protocol.md).
+    write_buffer: Option<Arc<WriteBuffer>>,
+    /// Read-only posture (the tail-api listener): every WRITE RPC is
+    /// rejected, because a Flight write executed inside the serve process
+    /// would bypass the pgwire BufferHook ordering fences. Reads (plain SQL
+    /// and tail tickets) are served — on the tail-api listener they are
+    /// union reads over the same providers the pgwire listener uses.
+    read_only: bool,
+    /// SQL-keyed reusable physical-plan cache — the same machinery, key
+    /// shape, and freshness/overlay eligibility rules as pgwire's
+    /// plancache.rs. Only ever populated in freshness mode (default mode's
+    /// `plan_cache_version` is `None`, so `analyze` rejects every table).
+    plans: PlanCache,
+    /// One-shot physical plans stashed by GetFlightInfo for the paired
+    /// DoGet (the double-planning fix): the ticket carries `{handle, sql}`
+    /// and DoGet consumes the stashed plan instead of re-planning; a miss
+    /// (TTL expiry, table-version mismatch, eviction, retry, restart)
+    /// degrades to a re-plan, never to an error.
+    stash: Mutex<HashMap<String, StashedPlan>>,
+}
+
+/// A physical plan stashed for its paired one-shot DoGet. Only plans that
+/// satisfy the plan cache's eligibility rules (plancache::analyze — every
+/// scan a fresh, overlay-free `CachingTableProvider`; no volatile
+/// expressions; `plan_safe_to_cache`) are ever stashed, so default mode,
+/// overlay-bearing tables, and time-travel/volatile statements always
+/// re-plan at DoGet — an Iceberg physical plan pins the file list of the
+/// snapshot it was planned against, and executing it after those tables
+/// moved would serve a stale read.
+struct StashedPlan {
+    plan: Arc<dyn ExecutionPlan>,
+    created: Instant,
+    /// Every table the plan scans, at the metadata version the plan was
+    /// built against (plancache::analyze); re-validated when the plan is
+    /// consumed.
+    tables: Vec<(String, MetadataVersion)>,
+}
+
+impl StashedPlan {
+    /// Consume the one-shot plan iff it is still sound to execute: within
+    /// [`STASH_TTL`] AND every planned table still at its plan-time version
+    /// (`resolve` = [`plancache::current_version`] in production — the same
+    /// validation a plan-cache hit performs). `None` = the caller re-plans
+    /// (a miss, never an error).
+    fn take_if_valid_with(
+        self,
+        resolve: impl Fn(&str) -> Option<MetadataVersion>,
+    ) -> Option<Arc<dyn ExecutionPlan>> {
+        (self.created.elapsed() < STASH_TTL
+            && plancache::versions_current_with(&self.tables, resolve))
+        .then_some(self.plan)
+    }
+
+    fn take_if_valid(self) -> Option<Arc<dyn ExecutionPlan>> {
+        self.take_if_valid_with(plancache::current_version)
+    }
+}
+
+/// How long a stashed one-shot plan stays consumable. A GetFlightInfo→DoGet
+/// (or prepare→execute) pair on a real client is milliseconds apart; the
+/// TTL only bounds abandoned entries' memory — staleness is governed by the
+/// per-table version re-validation in [`StashedPlan::take_if_valid`], so a
+/// DoGet can never execute a plan whose tables moved, however young the
+/// entry.
+const STASH_TTL: Duration = Duration::from_secs(60);
+
+/// Bound on abandoned stash entries (GetFlightInfo whose DoGet never came).
+const STASH_CAP: usize = 512;
+
+/// Marker + separators for a plan-carrying statement ticket:
+/// `IGRESP1 \x1f handle \x1f sql`. A ticket without the marker is treated as
+/// raw SQL (the pre-P1 format), so older tickets and hand-built ones keep
+/// working.
+const PLAN_TICKET_PREFIX: &str = "IGRESP1\x1f";
+
+/// Encode a statement ticket carrying the one-shot plan handle AND the SQL
+/// (the miss fallback: eviction/restart degrades to today's re-plan).
+fn encode_plan_ticket(handle: &str, sql: &str) -> Vec<u8> {
+    format!("{PLAN_TICKET_PREFIX}{handle}\x1f{sql}").into_bytes()
+}
+
+/// Decode a statement ticket: `(one-shot plan handle, sql)`. Tickets without
+/// the marker are raw SQL.
+fn decode_plan_ticket(bytes: &[u8]) -> Result<(Option<String>, String), Status> {
+    let text = String::from_utf8(bytes.to_vec())
+        .map_err(|e| Status::invalid_argument(format!("ticket is not utf-8: {e}")))?;
+    match text.strip_prefix(PLAN_TICKET_PREFIX) {
+        Some(rest) => match rest.split_once('\x1f') {
+            Some((handle, sql)) => Ok((Some(handle.to_string()), sql.to_string())),
+            None => Err(Status::invalid_argument("malformed icegres plan ticket")),
+        },
+        None => Ok((None, text)),
+    }
 }
 
 impl FlightSqlServiceImpl {
@@ -211,6 +323,16 @@ impl FlightSqlServiceImpl {
         Ok(())
     }
 
+    /// Gate a tail-API read (which carries no SQL statement) as a read on
+    /// the target table — the same ReBAC decision a `SELECT` would get.
+    fn check_read(
+        &self,
+        principal: &Option<String>,
+        ident: &iceberg::TableIdent,
+    ) -> Result<(), Status> {
+        check_read_with(&self.authorizer, principal, ident)
+    }
+
     /// Gate a bulk-ingest append (which carries no SQL statement) as a write on
     /// the target table.
     fn check_write(
@@ -244,6 +366,204 @@ impl FlightSqlServiceImpl {
             .map_err(|e| Status::invalid_argument(format!("planning failed: {e}")))
     }
 
+    /// Plan `sql` to a ready-to-execute PHYSICAL plan via ONE `SessionState`
+    /// snapshot, consulting the SQL-keyed reusable plan cache first and
+    /// feeding it on an eligible miss (identical rules to pgwire's
+    /// plancache.rs: freshness mode only, versions validated before AND
+    /// after physical planning, overlay-bearing/volatile/table-less shapes
+    /// excluded). `stage` names the `ICEGRES_QUERY_TIMING` record for the
+    /// miss path; a hit records `plan_cache_hit`. The DoGet/execution path.
+    async fn physical_plan(
+        &self,
+        sql: &str,
+        stage: &'static str,
+    ) -> Result<Arc<dyn ExecutionPlan>, Status> {
+        let timing = crate::timing::enabled();
+        let t = timing.then(Instant::now);
+        let state = self.ctx.state();
+        let key = PlanKey::from_state(&state, sql.to_string());
+        if let Some((plan, _schema, _tables)) = self.plans.lookup(&key) {
+            // Rebuild internal nodes so per-instance execution state starts
+            // fresh (plancache::reset_plan docs); leaf scans are reused.
+            let plan = plancache::reset_plan(plan)
+                .map_err(|e| Status::internal(format!("plan reset failed: {e}")))?;
+            if let Some(t) = t {
+                crate::timing::record("plan_cache_hit", t.elapsed());
+            }
+            return Ok(plan);
+        }
+        let logical = state
+            .create_logical_plan(sql)
+            .await
+            .map_err(|e| Status::invalid_argument(format!("planning failed: {e}")))?;
+        // Cacheability + versions BEFORE physical planning …
+        let tables_before = plancache::analyze(&logical);
+        let plan = state
+            .create_physical_plan(&logical)
+            .await
+            .map_err(|e| Status::invalid_argument(format!("planning failed: {e}")))?;
+        // … and UNCHANGED after (a write/refresh racing the planning window
+        // skips caching) — the same soundness dance as PlanCacheHook::run.
+        if self.plans.is_enabled() {
+            if let Ok(tables) = tables_before {
+                if plancache::versions_current(&tables)
+                    && !tables.is_empty()
+                    && plancache::plan_safe_to_cache(&plan)
+                {
+                    self.plans.insert(key, plan.clone(), plan.schema(), tables);
+                }
+            }
+        }
+        if let Some(t) = t {
+            crate::timing::record(stage, t.elapsed());
+        }
+        Ok(plan)
+    }
+
+    /// The GetFlightInfo/prepared-create planning pass: the statement's
+    /// result schema, plus the physical plan (as a ready [`StashedPlan`])
+    /// when — and only when — it is sound to pin for the paired DoGet
+    /// (plancache eligibility: freshness mode, every scan a fresh
+    /// overlay-free `CachingTableProvider`, no volatile expressions,
+    /// versions unchanged across physical planning, `plan_safe_to_cache`).
+    /// Ineligible statements (default mode, overlay-bearing tables,
+    /// time-travel/volatile shapes) skip physical planning entirely — the
+    /// schema comes from the logical plan (a SELECT's result schema does
+    /// not depend on the data snapshot; the pre-P1 wire shape) and the
+    /// paired DoGet re-plans, which is where default mode's per-scan
+    /// catalog check lives.
+    async fn plan_for_schema(&self, sql: &str) -> Result<(SchemaRef, Option<StashedPlan>), Status> {
+        let timing = crate::timing::enabled();
+        let t = timing.then(Instant::now);
+        let state = self.ctx.state();
+        let key = PlanKey::from_state(&state, sql.to_string());
+        if let Some((plan, schema, tables)) = self.plans.lookup(&key) {
+            // No reset here: execution resets at DoGet, so the cache's Arc
+            // stays reusable.
+            if let Some(t) = t {
+                crate::timing::record("plan_cache_hit", t.elapsed());
+            }
+            let pinned = StashedPlan {
+                plan,
+                created: Instant::now(),
+                tables,
+            };
+            return Ok((schema, Some(pinned)));
+        }
+        let logical = state
+            .create_logical_plan(sql)
+            .await
+            .map_err(|e| Status::invalid_argument(format!("planning failed: {e}")))?;
+        let Ok(tables) = plancache::analyze(&logical) else {
+            let schema: SchemaRef = Arc::new(logical.schema().as_arrow().clone());
+            if let Some(t) = t {
+                crate::timing::record("flight_info_plan", t.elapsed());
+            }
+            return Ok((schema, None));
+        };
+        let plan = state
+            .create_physical_plan(&logical)
+            .await
+            .map_err(|e| Status::invalid_argument(format!("planning failed: {e}")))?;
+        // Versions must be UNCHANGED across physical planning (a racing
+        // write/refresh skips caching AND pinning) — the same soundness
+        // dance as PlanCacheHook::run.
+        let pin = plancache::versions_current(&tables) && plancache::plan_safe_to_cache(&plan);
+        if pin && self.plans.is_enabled() && !tables.is_empty() {
+            // Table-less plans are pinnable (nothing to go stale) but,
+            // exactly like pgwire, not worth an LRU slot.
+            self.plans
+                .insert(key, plan.clone(), plan.schema(), tables.clone());
+        }
+        if let Some(t) = t {
+            crate::timing::record("flight_info_plan", t.elapsed());
+        }
+        let schema = plan.schema();
+        Ok((
+            schema,
+            pin.then(|| StashedPlan {
+                plan,
+                created: Instant::now(),
+                tables,
+            }),
+        ))
+    }
+
+    /// Stash a pin-eligible one-shot plan for its paired DoGet; returns the
+    /// ticket handle. Expired/overflow entries are pruned here so abandoned
+    /// GetFlightInfos cannot grow the map without bound.
+    fn stash_plan(&self, entry: StashedPlan) -> String {
+        let handle = uuid::Uuid::new_v4().to_string();
+        let mut stash = self.stash.lock().expect("plan stash lock");
+        stash.retain(|_, e| e.created.elapsed() < STASH_TTL);
+        while stash.len() >= STASH_CAP {
+            let Some(oldest) = stash
+                .iter()
+                .min_by_key(|(_, e)| e.created)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            stash.remove(&oldest);
+        }
+        stash.insert(handle.clone(), entry);
+        handle
+    }
+
+    /// Consume a stashed one-shot plan (`None` on miss, TTL expiry, or a
+    /// table-version mismatch — the caller re-plans against fresh state).
+    fn take_stashed(&self, handle: &str) -> Option<Arc<dyn ExecutionPlan>> {
+        let entry = self.stash.lock().expect("plan stash lock").remove(handle)?;
+        entry.take_if_valid()
+    }
+
+    /// Execute a physical plan into a DoGet Arrow stream. Streaming in
+    /// normal operation; with `ICEGRES_QUERY_TIMING=1`, collect-then-encode
+    /// so the `flight_execute` / `flight_encode` stages can be recorded
+    /// (the same disclosed buffered-not-streamed diagnostic divergence as
+    /// timing.rs and plancache.rs).
+    async fn plan_to_stream(&self, plan: Arc<dyn ExecutionPlan>) -> Result<DoGetStream, Status> {
+        let task_ctx = self.ctx.task_ctx();
+        let schema = plan.schema();
+        if crate::timing::enabled() {
+            let t = Instant::now();
+            let batches = datafusion::physical_plan::collect(plan, task_ctx)
+                .await
+                .map_err(|e| Status::internal(format!("execution failed: {e}")))?;
+            crate::timing::record("flight_execute", t.elapsed());
+            let t = Instant::now();
+            let data: Vec<Result<arrow_flight::FlightData, Status>> =
+                FlightDataEncoderBuilder::new()
+                    .with_schema(schema)
+                    .build(stream::iter(batches.into_iter().map(Ok)))
+                    .map_err(Status::from)
+                    .collect::<Vec<_>>()
+                    .await;
+            crate::timing::record("flight_encode", t.elapsed());
+            return Ok(Box::pin(stream::iter(data)));
+        }
+        let stream = datafusion::physical_plan::execute_stream(plan, task_ctx)
+            .map_err(|e| Status::internal(format!("execution failed: {e}")))?;
+        let flight = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .build(stream.map_err(|e| FlightError::ExternalError(Box::new(e))))
+            .map_err(Status::from);
+        Ok(Box::pin(flight))
+    }
+
+    /// Reject writes on a read-only listener (the tail-api port inside
+    /// `icegres serve`): a Flight write executed in the serve process would
+    /// bypass the pgwire BufferHook ordering fences.
+    fn reject_if_read_only(&self) -> Result<(), Status> {
+        if self.read_only {
+            return Err(Status::permission_denied(
+                "this Flight endpoint is read-only (icegres serve --tail-api-port); \
+                 send writes through the pgwire listener",
+            ));
+        }
+        Ok(())
+    }
+
     /// UPDATE/DELETE arriving through the QUERY flow (ADBC `cursor.execute`
     /// runs everything as ExecuteQuery → GetFlightInfo/DoGet): execute
     /// through the copy-on-write engine and answer with a DataFusion-style
@@ -255,6 +575,7 @@ impl FlightSqlServiceImpl {
         let Some((stmt, _tag)) = parsed else {
             return Ok(None);
         };
+        self.reject_if_read_only()?;
         let outcome = self.engine.execute(&stmt).await.map_err(engine_status)?;
         let batch = RecordBatch::try_new(
             Arc::new(count_schema()),
@@ -311,6 +632,7 @@ impl FlightSqlServiceImpl {
     /// and sqlstate-typed errors); everything else executes through the
     /// session context (INSERT = iceberg-datafusion append, one commit).
     async fn execute_update(&self, sql: &str, params: Option<ParamValues>) -> Result<i64, Status> {
+        self.reject_if_read_only()?;
         let dml_stmt =
             dml::parse_single_dml(sql).map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
         if let Some((stmt, _tag)) = dml_stmt {
@@ -335,6 +657,34 @@ impl FlightSqlServiceImpl {
             .map_err(|e| Status::internal(format!("execution failed: {e}")))?;
         Ok(count_from_batches(&batches))
     }
+}
+
+/// The ReadData ReBAC check behind [`FlightSqlServiceImpl::check_read`],
+/// free-standing so the Tables discovery filter (do_get_fallback) is
+/// unit-testable: TailSnapshot/TailSubscribe deny with this exact decision,
+/// and discovery filters with it, so a denied principal sees the table in
+/// neither discovery nor data.
+fn check_read_with(
+    authorizer: &Option<SharedAuthorizer>,
+    principal: &Option<String>,
+    ident: &iceberg::TableIdent,
+) -> Result<(), Status> {
+    let Some(authorizer) = authorizer else {
+        return Ok(());
+    };
+    let user = principal.as_deref().unwrap_or("");
+    let target = TableRef {
+        namespace: ident.namespace().clone().inner().join("."),
+        table: ident.name().to_string(),
+    };
+    if let authz::Decision::Deny { action, target } =
+        authorizer.check(user, AuthzAction::ReadData, &target)
+    {
+        return Err(Status::permission_denied(authz::deny_message(
+            user, action, &target,
+        )));
+    }
+    Ok(())
 }
 
 /// Map engine errors preserving the DML hook's typed semantics: constraint
@@ -533,13 +883,38 @@ impl FlightSqlService for FlightSqlServiceImpl {
         let sql = query.query.clone();
         self.check_sql(&principal, &sql)?;
         debug!(%sql, "GetFlightInfo(CommandStatementQuery)");
-        // Plan once to expose the result schema; the ticket carries the SQL
-        // text and DoGet re-plans and executes it.
-        let df = self.plan(&sql).await?;
-        let schema = df.schema().as_arrow().clone();
-        let ticket = TicketStatementQuery {
-            statement_handle: sql.into_bytes().into(),
+        // UPDATE/DELETE cannot physical-plan (append-only providers): keep
+        // the historical shape — logical plan for the schema, raw-SQL ticket,
+        // DoGet routes through the engine.
+        if dml::parse_single_dml(&sql)
+            .map_err(|e| Status::invalid_argument(format!("{e:#}")))?
+            .is_some()
+        {
+            let df = self.plan(&sql).await?;
+            let schema = df.schema().as_arrow().clone();
+            let ticket = TicketStatementQuery {
+                statement_handle: sql.into_bytes().into(),
+            };
+            return Ok(Response::new(Self::make_info(
+                &schema,
+                ticket,
+                request.into_inner(),
+            )?));
+        }
+        // Plan ONCE — to the physical plan when it is sound to pin
+        // (freshness-mode eligible; versions re-validated at DoGet) — and
+        // hand DoGet the stashed result through the ticket, killing the
+        // historical double planning (bench/COMPARISON.md caveat 4). The
+        // SQL rides in the ticket as the miss fallback (version mismatch/
+        // TTL/eviction/restart degrades to a re-plan); ineligible
+        // statements (default mode, overlays, volatile shapes) get a
+        // raw-SQL ticket so DoGet always re-plans them against fresh state.
+        let (schema, pinned) = self.plan_for_schema(&sql).await?;
+        let statement_handle = match pinned {
+            Some(entry) => encode_plan_ticket(&self.stash_plan(entry), &sql).into(),
+            None => sql.into_bytes().into(),
         };
+        let ticket = TicketStatementQuery { statement_handle };
         Ok(Response::new(Self::make_info(
             &schema,
             ticket,
@@ -553,15 +928,32 @@ impl FlightSqlService for FlightSqlServiceImpl {
         request: Request<Ticket>,
     ) -> Result<Response<<Self::FlightService as FlightService>::DoGetStream>, Status> {
         let principal = self.authorize(&request)?;
-        let sql = String::from_utf8(ticket.statement_handle.to_vec())
-            .map_err(|e| Status::invalid_argument(format!("ticket is not utf-8 SQL: {e}")))?;
+        let (handle, sql) = decode_plan_ticket(&ticket.statement_handle)?;
+        // Authorization stays per-RPC: the ticket's SQL is re-checked even
+        // when the plan itself comes from the stash.
         self.check_sql(&principal, &sql)?;
         debug!(%sql, "DoGet(TicketStatementQuery)");
         if let Some(stream) = self.dml_via_doget(&sql).await? {
             return Ok(Response::new(stream));
         }
-        let df = self.plan(&sql).await?;
-        Ok(Response::new(self.df_to_stream(df).await?))
+        // One-shot stash hit: execute the plan GetFlightInfo already built —
+        // only after take_stashed re-validated every table's current
+        // version against the plan-time set.
+        if let Some(plan) = handle.as_deref().and_then(|h| self.take_stashed(h)) {
+            let timing = crate::timing::enabled();
+            let t = timing.then(Instant::now);
+            let plan = plancache::reset_plan(plan)
+                .map_err(|e| Status::internal(format!("plan reset failed: {e}")))?;
+            if let Some(t) = t {
+                crate::timing::record("flight_doget_stash_hit", t.elapsed());
+            }
+            return Ok(Response::new(self.plan_to_stream(plan).await?));
+        }
+        // Miss (version mismatch/expired/evicted/retried/foreign ticket):
+        // re-plan — via the reusable SQL-keyed cache in freshness mode,
+        // from scratch otherwise.
+        let plan = self.physical_plan(&sql, "flight_doget_plan").await?;
+        Ok(Response::new(self.plan_to_stream(plan).await?))
     }
 
     // ------------------------------------------------------------------
@@ -579,8 +971,30 @@ impl FlightSqlService for FlightSqlServiceImpl {
         debug!(%sql, "CreatePreparedStatement");
         // Plan for the dataset schema; a plan with untyped `$n` placeholders
         // that DataFusion cannot infer still yields a schema for SELECTs.
-        let df = self.plan(&sql).await?;
-        let schema_ref: SchemaRef = Arc::new(df.schema().as_arrow().clone());
+        // For plain (non-DML) statements, ALSO try to physical-plan now so
+        // the paired zero-params DoGet executes instead of re-planning
+        // (ADBC's dbapi prepares EVERY statement, so this is the hot path).
+        // DML and placeholder-bearing statements cannot physical-plan here;
+        // they keep the logical-only schema pass.
+        let is_dml = dml::parse_single_dml(&sql)
+            .map_err(|e| Status::invalid_argument(format!("{e:#}")))?
+            .is_some();
+        let (schema_ref, plan): (SchemaRef, Option<StashedPlan>) = if is_dml {
+            let df = self.plan(&sql).await?;
+            (Arc::new(df.schema().as_arrow().clone()), None)
+        } else {
+            // Pins the create-time plan only when it is version-validatable
+            // (freshness-mode eligible); otherwise DoGet re-plans against
+            // fresh state. A statement plan_for_schema cannot plan at all
+            // falls back to the upstream logical pass for the schema.
+            match self.plan_for_schema(&sql).await {
+                Ok((schema, pinned)) => (schema, pinned),
+                Err(_) => {
+                    let df = self.plan(&sql).await?;
+                    (Arc::new(df.schema().as_arrow().clone()), None)
+                }
+            }
+        };
         let dataset_schema = encode_schema(&schema_ref)?;
         // Parameter types are not inferred (DataFusion resolves them at bind
         // time); advertise an empty parameter schema.
@@ -592,6 +1006,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
                 sql,
                 params: Vec::new(),
                 schema: schema_ref,
+                plan,
             },
         );
         Ok(ActionCreatePreparedStatementResult {
@@ -665,12 +1080,14 @@ impl FlightSqlService for FlightSqlServiceImpl {
         let principal = self.authorize(&request)?;
         let handle = String::from_utf8(cmd.prepared_statement_handle.to_vec())
             .map_err(|_| Status::invalid_argument("invalid prepared statement handle"))?;
-        let (sql, params) = {
-            let prepared = self.prepared.lock().expect("prepared lock");
+        let (sql, params, stashed) = {
+            let mut prepared = self.prepared.lock().expect("prepared lock");
             let entry = prepared
-                .get(&handle)
+                .get_mut(&handle)
                 .ok_or_else(|| Status::not_found(format!("unknown prepared statement {handle}")))?;
-            (entry.sql.clone(), entry.params.clone())
+            // The create-time physical plan is consumed ONE-SHOT (a second
+            // execute of the same handle re-plans for a fresh snapshot).
+            (entry.sql.clone(), entry.params.clone(), entry.plan.take())
         };
         self.check_sql(&principal, &sql)?;
         debug!(%sql, bound_rows = params.len(), "DoGet(CommandPreparedStatementQuery)");
@@ -680,6 +1097,17 @@ impl FlightSqlService for FlightSqlServiceImpl {
             if let Some(stream) = self.dml_via_doget(&sql).await? {
                 return Ok(Response::new(stream));
             }
+            // Zero-params SELECT: execute the plan built at create time
+            // (the double-planning fix) — only if every planned table is
+            // still at its plan-time version; a mismatch or TTL expiry
+            // re-plans instead.
+            if let Some(plan) = stashed.and_then(StashedPlan::take_if_valid) {
+                let plan = plancache::reset_plan(plan)
+                    .map_err(|e| Status::internal(format!("plan reset failed: {e}")))?;
+                return Ok(Response::new(self.plan_to_stream(plan).await?));
+            }
+            let plan = self.physical_plan(&sql, "flight_doget_plan").await?;
+            return Ok(Response::new(self.plan_to_stream(plan).await?));
         } else if dml::parse_single_dml(&sql)
             .map_err(|e| Status::invalid_argument(format!("{e:#}")))?
             .is_some()
@@ -771,6 +1199,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
         let principal = self.authorize(&request)?;
+        self.reject_if_read_only()?;
         if ticket.transaction_id.is_some() {
             return Err(Status::unimplemented(
                 "ingest transactions are not supported",
@@ -1076,32 +1505,66 @@ impl FlightSqlService for FlightSqlServiceImpl {
         Ok(Response::new(Self::batch_to_stream(batch)))
     }
 
+    /// The open tail read API (tailapi.rs, docs/open-tail-protocol.md):
+    /// `Tables` / `TailSnapshot` / `TailSubscribe` arrive as DoGet tickets
+    /// with icegres.tail.v1.* type URLs. Served only where a WriteBuffer is
+    /// attached (the tail-api listener inside a buffering `icegres serve`);
+    /// `flight-serve` answers FAILED_PRECONDITION so consumers get a
+    /// precise story instead of a generic unimplemented.
+    async fn do_get_fallback(
+        &self,
+        request: Request<Ticket>,
+        message: arrow_flight::sql::Any,
+    ) -> Result<Response<<Self::FlightService as FlightService>::DoGetStream>, Status> {
+        let principal = self.authorize(&request)?;
+        let ticket = crate::tailapi::TailTicket::from_any(&message)
+            .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
+        let Some(ticket) = ticket else {
+            return Err(Status::unimplemented(format!(
+                "do_get: The defined request is invalid: {}",
+                message.type_url
+            )));
+        };
+        let Some(buffer) = &self.write_buffer else {
+            return Err(Status::failed_precondition(
+                "this endpoint is not buffering: the open tail API is served by the \
+                 buffering `icegres serve` process (--write-buffer-ms + a durable tail \
+                 + --tail-api-port); reads here already see committed data exactly",
+            ));
+        };
+        match ticket {
+            crate::tailapi::TailTicket::Tables => {
+                // Discovery is filtered per table by the SAME ReadData check
+                // the Snapshot/Subscribe arms enforce, so a denied principal
+                // sees the table in neither discovery nor data.
+                Ok(Response::new(crate::tailapi::tables_stream(
+                    buffer,
+                    |ident| check_read_with(&self.authorizer, &principal, ident).is_ok(),
+                )?))
+            }
+            crate::tailapi::TailTicket::Snapshot { table } => {
+                self.check_read(&principal, &table)?;
+                Ok(Response::new(crate::tailapi::snapshot_stream(
+                    buffer, &table,
+                )?))
+            }
+            crate::tailapi::TailTicket::Subscribe { table, from_seq } => {
+                self.check_read(&principal, &table)?;
+                Ok(Response::new(crate::tailapi::subscribe_stream(
+                    buffer, &table, from_seq,
+                )?))
+            }
+        }
+    }
+
     async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}
 }
 
-/// Run the Flight SQL endpoint (blocks until SIGINT).
-pub async fn run(
-    opts: &CatalogOpts,
-    host: &str,
-    port: u16,
-    auth_file: Option<PathBuf>,
-    authorizer: Option<SharedAuthorizer>,
-    tls: Option<(String, String)>,
-) -> Result<()> {
-    let start = std::time::Instant::now();
-    // Build the TLS acceptor up front so a bad cert/key aborts startup (no
-    // silent plaintext fallback), exactly like the pgwire listener.
-    let tls_acceptor = match &tls {
-        // gRPC is HTTP/2 over TLS: advertise the `h2` ALPN token so clients
-        // negotiate HTTP/2 instead of refusing the connection.
-        Some((cert, key)) => Some(crate::ops::build_tls_acceptor_with_alpn(
-            cert,
-            key,
-            &[b"h2"],
-        )?),
-        None => None,
-    };
-    let auth: Option<Arc<dyn BasicAuthVerifier>> = match &auth_file {
+/// Load the basic-auth verifier for a Flight listener (`--auth-file`, same
+/// file and semantics as pgwire; managed add-on). `None` = permissive, with
+/// the same startup WARN as pgwire.
+fn load_basic_auth(auth_file: &Option<PathBuf>) -> Result<Option<Arc<dyn BasicAuthVerifier>>> {
+    match auth_file {
         Some(path) => {
             #[cfg(feature = "managed")]
             {
@@ -1111,7 +1574,7 @@ pub async fn run(
                     users = source.user_count(),
                     "Flight SQL basic-auth handshake enabled (bearer tokens per connection)"
                 );
-                Some(source as Arc<dyn BasicAuthVerifier>)
+                Ok(Some(source as Arc<dyn BasicAuthVerifier>))
             }
             #[cfg(not(feature = "managed"))]
             {
@@ -1128,9 +1591,98 @@ pub async fn run(
                 "authentication is DISABLED on the Flight SQL endpoint — any/no credentials \
                  accepted; pass --auth-file (env ICEGRES_AUTH_FILE) to require basic auth"
             );
-            None
+            Ok(None)
         }
+    }
+}
+
+/// Bind and spawn the tail-api Flight listener inside a buffering
+/// `icegres serve` (`--tail-api-port`): the SAME Flight SQL service as
+/// `flight-serve`, but constructed read-only and holding the serve
+/// process's WriteBuffer — the only process that can answer
+/// TailSnapshot/TailSubscribe (docs/open-tail-protocol.md). SQL reads on
+/// this listener are union reads over the serve providers. The bind fails
+/// startup loudly; the serving task then runs until process shutdown.
+/// Plaintext only in v1 (run it on a trusted network; the pgwire listener
+/// keeps its own TLS posture).
+#[allow(clippy::too_many_arguments)]
+pub async fn spawn_tail_api(
+    ctx: Arc<SessionContext>,
+    engine: Arc<OverwriteEngine>,
+    buffer: Arc<WriteBuffer>,
+    host: &str,
+    port: u16,
+    auth_file: Option<PathBuf>,
+    authorizer: Option<SharedAuthorizer>,
+) -> Result<()> {
+    let auth = load_basic_auth(&auth_file)?;
+    let service = FlightSqlServiceImpl {
+        ctx,
+        engine,
+        auth,
+        authorizer,
+        default_namespace: DEFAULT_SCHEMA.to_string(),
+        tokens: Mutex::new(HashMap::new()),
+        prepared: Mutex::new(HashMap::new()),
+        sql_info: build_sql_info(),
+        write_buffer: Some(buffer),
+        read_only: true,
+        plans: PlanCache::from_env(),
+        stash: Mutex::new(HashMap::new()),
     };
+    let addr: std::net::SocketAddr = format!("{host}:{port}")
+        .parse()
+        .with_context(|| format!("invalid tail-api listen address {host}:{port}"))?;
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("cannot bind the tail-api listener on {addr}"))?;
+    info!(
+        %addr,
+        "tail-api listener ready (open tail read API over Arrow Flight; read-only)"
+    );
+    let svc = FlightServiceServer::new(service)
+        .max_decoding_message_size(64 * 1024 * 1024)
+        .max_encoding_message_size(64 * 1024 * 1024);
+    let shutdown = async {
+        let sig = crate::ops::shutdown_signal().await;
+        info!(signal = %sig, "shutdown signal received; draining tail-api RPCs");
+    };
+    tokio::spawn(async move {
+        if let Err(e) = Server::builder()
+            .add_service(svc)
+            .serve_with_incoming_shutdown(tcp_incoming(listener), shutdown)
+            .await
+        {
+            tracing::error!("tail-api listener failed: {e:#}");
+        }
+    });
+    Ok(())
+}
+
+/// Run the Flight SQL endpoint (blocks until SIGINT).
+pub async fn run(
+    opts: &CatalogOpts,
+    host: &str,
+    port: u16,
+    auth_file: Option<PathBuf>,
+    authorizer: Option<SharedAuthorizer>,
+    tls: Option<(String, String)>,
+    freshness_ms: u64,
+) -> Result<()> {
+    let start = std::time::Instant::now();
+    // Build the TLS acceptor up front so a bad cert/key aborts startup (no
+    // silent plaintext fallback), exactly like the pgwire listener.
+    let tls_acceptor = match &tls {
+        // gRPC is HTTP/2 over TLS: advertise the `h2` ALPN token so clients
+        // negotiate HTTP/2 instead of refusing the connection.
+        Some((cert, key)) => Some(crate::ops::build_tls_acceptor_with_alpn(
+            cert,
+            key,
+            &[b"h2"],
+        )?),
+        None => None,
+    };
+    let auth = load_basic_auth(&auth_file)?;
 
     info!(
         catalog_uri = %opts.catalog_uri,
@@ -1144,8 +1696,24 @@ pub async fn run(
     let engine = Arc::new(OverwriteEngine::connect(catalog.clone(), opts, false, None).await?);
     // Same session wiring as `icegres serve`: snapshot-aware caching schema
     // providers (cache.rs) — reads refresh on snapshot change, so flight
-    // clients see pgwire commits and vice versa.
-    let ctx = context::build_session_context(catalog).await?;
+    // clients see pgwire commits and vice versa. `--freshness-ms > 0` rides
+    // the same bounded-staleness machinery as `icegres serve` (freshness.rs)
+    // and enables the reusable plan cache below.
+    if freshness_ms > 0 {
+        warn!(
+            freshness_ms,
+            "bounded-staleness reads are ENABLED on the Flight SQL endpoint \
+             (--freshness-ms): scans serve the cached snapshot with NO per-scan \
+             catalog check; commits from OTHER writers become visible within ~{} ms \
+             plus one refresh round trip (same contract as `icegres serve`). Also \
+             enables the physical-plan cache for repeated statements.",
+            freshness_ms
+        );
+    }
+    let ctx = context::build_session_context_with(catalog, None, None, None, freshness_ms).await?;
+    if freshness_ms > 0 {
+        crate::freshness::spawn_refresher(Duration::from_millis(freshness_ms));
+    }
 
     if authorizer.is_some() {
         info!("ReBAC authorization enabled on the Flight SQL endpoint (managed add-on; per-RPC gating, same policy as pgwire)");
@@ -1159,6 +1727,10 @@ pub async fn run(
         tokens: Mutex::new(HashMap::new()),
         prepared: Mutex::new(HashMap::new()),
         sql_info: build_sql_info(),
+        write_buffer: None,
+        read_only: false,
+        plans: PlanCache::from_env(),
+        stash: Mutex::new(HashMap::new()),
     };
 
     let addr: std::net::SocketAddr = format!("{host}:{port}")
@@ -1345,6 +1917,83 @@ mod tests {
         assert!(like_match("demo", "demo"));
         assert!(like_match("", ""));
         assert!(!like_match("", "x"));
+    }
+
+    #[test]
+    fn plan_ticket_roundtrip_and_raw_sql_fallback() {
+        // Plan-carrying tickets round-trip handle + SQL (the SQL may itself
+        // contain the separator — only the FIRST split counts) …
+        let bytes = encode_plan_ticket("abc-123", "select * from t where x = '\x1f? no'");
+        let (handle, sql) = decode_plan_ticket(&bytes).unwrap();
+        assert_eq!(handle.as_deref(), Some("abc-123"));
+        assert_eq!(sql, "select * from t where x = '\x1f? no'");
+        // … and a marker-less ticket (pre-P1 / hand-built) is raw SQL.
+        let (handle, sql) = decode_plan_ticket(b"select 1").unwrap();
+        assert_eq!(handle, None);
+        assert_eq!(sql, "select 1");
+    }
+
+    #[test]
+    fn stashed_plan_version_mismatch_forces_replan() {
+        use datafusion::physical_plan::empty::EmptyExec;
+        let schema = Arc::new(Schema::empty());
+        let v1: MetadataVersion = (Some("v1".into()), Some(1));
+        let v2: MetadataVersion = (Some("v2".into()), Some(2));
+        let entry = |tables: Vec<(String, MetadataVersion)>, created: Instant| StashedPlan {
+            plan: Arc::new(EmptyExec::new(schema.clone())),
+            created,
+            tables,
+        };
+        let pinned = vec![("demo\u{1f}t".to_string(), v1.clone())];
+        // Fresh entry, every table still at its plan-time version: the
+        // one-shot plan is consumable.
+        assert!(entry(pinned.clone(), Instant::now())
+            .take_if_valid_with(|_| Some(v1.clone()))
+            .is_some());
+        // The table committed since plan time (current version moved): NOT
+        // consumable — DoGet re-plans (the stale-ticket fix). Never an error.
+        assert!(entry(pinned.clone(), Instant::now())
+            .take_if_valid_with(|_| Some(v2.clone()))
+            .is_none());
+        // Table no longer resolvable (invalidated/deregistered/default
+        // mode): re-plan.
+        assert!(entry(pinned.clone(), Instant::now())
+            .take_if_valid_with(|_| None)
+            .is_none());
+        // TTL still bounds abandoned entries, version match notwithstanding.
+        let expired = Instant::now() - (STASH_TTL + Duration::from_secs(1));
+        assert!(entry(pinned, expired)
+            .take_if_valid_with(|_| Some(v1.clone()))
+            .is_none());
+        // A table-less plan has no version to go stale.
+        assert!(entry(Vec::new(), Instant::now())
+            .take_if_valid_with(|_| None)
+            .is_some());
+    }
+
+    #[cfg(feature = "managed")]
+    #[test]
+    fn tables_discovery_filter_hides_denied_tables() {
+        // The exact filter do_get_fallback applies to Tables discovery:
+        // a principal denied ReadData on a table must not learn the table
+        // exists (same decision the Snapshot/Subscribe arms enforce).
+        let policy = std::env::temp_dir().join(format!("icegres-authz-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&policy, "grant alice read demo.visible\n").unwrap();
+        let authorizer: Option<SharedAuthorizer> = Some(Arc::new(
+            crate::authz::FileAuthorizer::load(&policy).unwrap(),
+        ));
+        std::fs::remove_file(&policy).ok();
+        let ident = |name: &str| iceberg::TableIdent::from_strs(["demo", name]).unwrap();
+        let mut tables = vec![ident("visible"), ident("secret")];
+        let principal = Some("alice".to_string());
+        tables.retain(|t| check_read_with(&authorizer, &principal, t).is_ok());
+        assert_eq!(tables, vec![ident("visible")]);
+        // Snapshot/Subscribe deny the same table with the same decision.
+        assert!(check_read_with(&authorizer, &principal, &ident("secret")).is_err());
+        // Without an authorizer (open mode) nothing is filtered.
+        let mut tables = vec![ident("visible"), ident("secret")];
+        tables.retain(|t| check_read_with(&None, &principal, t).is_ok());
+        assert_eq!(tables.len(), 2);
     }
 
     #[test]

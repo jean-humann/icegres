@@ -125,7 +125,7 @@ const DEFAULT_CAPACITY: usize = 256;
 /// derivation and planning, permanently filing a plan under a key that
 /// describes different planning state.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-struct PlanKey {
+pub(crate) struct PlanKey {
     catalog: String,
     schema: String,
     timezone: String,
@@ -135,7 +135,7 @@ struct PlanKey {
 impl PlanKey {
     /// Derive the key from `state` — the SAME snapshot the caller plans
     /// with (see the type docs for why they must not diverge).
-    fn from_state(state: &SessionState, sql: String) -> Self {
+    pub(crate) fn from_state(state: &SessionState, sql: String) -> Self {
         let options = state.config_options();
         Self {
             catalog: options.catalog.default_catalog.clone(),
@@ -146,6 +146,14 @@ impl PlanKey {
     }
 }
 
+/// A cache hit: the reusable plan, its schema, and the validated
+/// `(table, version)` set the hit was checked against.
+pub(crate) type CachedPlan = (
+    Arc<dyn ExecutionPlan>,
+    ArrowSchemaRef,
+    Vec<(String, MetadataVersion)>,
+);
+
 struct Entry {
     plan: Arc<dyn ExecutionPlan>,
     schema: ArrowSchemaRef,
@@ -155,8 +163,11 @@ struct Entry {
     last_used: u64,
 }
 
-/// Bounded LRU of physical plans.
-struct PlanCache {
+/// Bounded LRU of physical plans. Shared machinery: the pgwire
+/// [`PlanCacheHook`] and the Flight SQL endpoint (flight.rs) both key their
+/// reusable-plan caches on it, so the freshness/eligibility rules are
+/// enforced identically on both wire protocols.
+pub(crate) struct PlanCache {
     entries: StdMutex<(HashMap<PlanKey, Entry>, u64)>,
     capacity: usize,
 }
@@ -169,15 +180,41 @@ impl PlanCache {
         }
     }
 
+    /// Capacity from `ICEGRES_PLAN_CACHE_ENTRIES` (default
+    /// [`DEFAULT_CAPACITY`]; `0` disables). L5: an unparseable override
+    /// WARNs and falls back — never a silent default.
+    pub(crate) fn from_env() -> Self {
+        let capacity = match std::env::var("ICEGRES_PLAN_CACHE_ENTRIES") {
+            Ok(raw) => raw.trim().parse::<usize>().unwrap_or_else(|_| {
+                tracing::warn!(
+                    value = %raw,
+                    default = DEFAULT_CAPACITY,
+                    "invalid ICEGRES_PLAN_CACHE_ENTRIES; using default"
+                );
+                DEFAULT_CAPACITY
+            }),
+            Err(_) => DEFAULT_CAPACITY,
+        };
+        Self::new(capacity)
+    }
+
+    /// Whether the cache can hold anything (`ICEGRES_PLAN_CACHE_ENTRIES=0`
+    /// disables it).
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.capacity > 0
+    }
+
     /// Look up `key`, validating every referenced table's current version
     /// through `resolve` (production: [`current_version`]). A version
     /// mismatch or vanished table removes the entry (miss) — the caller's
-    /// re-plan re-inserts the fresh plan under the same key.
+    /// re-plan re-inserts the fresh plan under the same key. A hit also
+    /// returns the validated `(table, version)` set so callers that pin the
+    /// plan elsewhere (the Flight ticket stash) can re-validate it later.
     fn lookup_with(
         &self,
         key: &PlanKey,
         resolve: impl Fn(&str) -> Option<MetadataVersion>,
-    ) -> Option<(Arc<dyn ExecutionPlan>, ArrowSchemaRef)> {
+    ) -> Option<CachedPlan> {
         // M3: recover a poisoned lock instead of panicking — the cache is
         // shared across every connection, and one panic under the lock
         // must not turn every later SELECT into a panic. Worst case after
@@ -186,24 +223,24 @@ impl PlanCache {
         let mut guard = crate::freshness::recover("plan cache", self.entries.lock());
         let (map, clock) = &mut *guard;
         let entry = map.get_mut(key)?;
-        let valid = entry
-            .tables
-            .iter()
-            .all(|(table, version)| resolve(table).as_ref() == Some(version));
-        if !valid {
+        if !versions_current_with(&entry.tables, &resolve) {
             map.remove(key);
             return None;
         }
         *clock += 1;
         entry.last_used = *clock;
-        Some((entry.plan.clone(), entry.schema.clone()))
+        Some((
+            entry.plan.clone(),
+            entry.schema.clone(),
+            entry.tables.clone(),
+        ))
     }
 
-    fn lookup(&self, key: &PlanKey) -> Option<(Arc<dyn ExecutionPlan>, ArrowSchemaRef)> {
+    pub(crate) fn lookup(&self, key: &PlanKey) -> Option<CachedPlan> {
         self.lookup_with(key, current_version)
     }
 
-    fn insert(
+    pub(crate) fn insert(
         &self,
         key: PlanKey,
         plan: Arc<dyn ExecutionPlan>,
@@ -247,13 +284,32 @@ impl PlanCache {
 /// `key` in the freshness registry: `Some` only when the table's provider
 /// is live, freshness-managed, currently fresh, and overlay-free
 /// ([`CachingTableProvider::plan_cache_version`]).
-fn current_version(key: &str) -> Option<MetadataVersion> {
+pub(crate) fn current_version(key: &str) -> Option<MetadataVersion> {
     crate::freshness::provider(key)?.plan_cache_version()
+}
+
+/// True when every `(table, version)` pair still IS the table's current
+/// cacheable version — the validation a cache hit performs, shared by the
+/// insert-side "unchanged after physical planning" check and the Flight
+/// ticket stash's re-validation at DoGet (flight.rs). Trivially true for an
+/// empty set (a table-less plan has no version to go stale).
+pub(crate) fn versions_current(tables: &[(String, MetadataVersion)]) -> bool {
+    versions_current_with(tables, current_version)
+}
+
+/// [`versions_current`] with an injectable resolver (tests).
+pub(crate) fn versions_current_with(
+    tables: &[(String, MetadataVersion)],
+    resolve: impl Fn(&str) -> Option<MetadataVersion>,
+) -> bool {
+    tables
+        .iter()
+        .all(|(table, version)| resolve(table).as_ref() == Some(version))
 }
 
 /// Why a planned statement cannot be cached (kept for tests/debugging).
 #[derive(Debug, PartialEq)]
-enum Uncacheable {
+pub(crate) enum Uncacheable {
     /// A scalar function that is not `Immutable` (now(), random(), ...), a
     /// placeholder, or a config variable.
     NonImmutableExpr,
@@ -266,7 +322,7 @@ enum Uncacheable {
 /// Walk the (pre-optimization) logical plan — including subquery plans —
 /// and either collect every scanned table's `(registry key, current
 /// version)` or report why the statement must not be cached.
-fn analyze(plan: &LogicalPlan) -> Result<Vec<(String, MetadataVersion)>, Uncacheable> {
+pub(crate) fn analyze(plan: &LogicalPlan) -> Result<Vec<(String, MetadataVersion)>, Uncacheable> {
     let mut tables: HashMap<String, MetadataVersion> = HashMap::new();
     let mut blocker: Option<Uncacheable> = None;
     plan.apply_with_subqueries(|node| {
@@ -352,22 +408,8 @@ pub struct PlanCacheHook {
 
 impl PlanCacheHook {
     pub fn new() -> Self {
-        // L5: an unparseable override WARNs and falls back, matching the
-        // other knobs (ICEGRES_SCAN_CONCURRENCY & co.) — never a silent
-        // default.
-        let capacity = match std::env::var("ICEGRES_PLAN_CACHE_ENTRIES") {
-            Ok(raw) => raw.trim().parse::<usize>().unwrap_or_else(|_| {
-                tracing::warn!(
-                    value = %raw,
-                    default = DEFAULT_CAPACITY,
-                    "invalid ICEGRES_PLAN_CACHE_ENTRIES; using default"
-                );
-                DEFAULT_CAPACITY
-            }),
-            Err(_) => DEFAULT_CAPACITY,
-        };
         Self {
-            cache: PlanCache::new(capacity),
+            cache: PlanCache::from_env(),
             parser: PostgresCompatibilityParser::new(),
         }
     }
@@ -394,7 +436,7 @@ impl PlanCacheHook {
 
         // HIT: every referenced table is fresh at the planned version.
         let lookup_started = Instant::now();
-        if let Some((plan, schema)) = self.cache.lookup(&key) {
+        if let Some((plan, schema, _tables)) = self.cache.lookup(&key) {
             // Rebuild the plan's internal nodes so per-instance execution
             // state starts fresh (see [`reset_plan`]) — the expensive leaf
             // scans (pruned file lists) are reused as-is.
@@ -458,9 +500,7 @@ impl PlanCacheHook {
             // Table-less statements (`select 1`, health probes) are not
             // cached: planning them is already cheap and they would churn
             // the LRU and the hit/miss counters for no measurable win.
-            let unchanged = tables
-                .iter()
-                .all(|(table, version)| current_version(table).as_ref() == Some(version));
+            let unchanged = versions_current(&tables);
             if unchanged && !tables.is_empty() && plan_safe_to_cache(&plan) {
                 self.cache.insert(key, plan.clone(), schema.clone(), tables);
             }
@@ -479,7 +519,9 @@ impl PlanCacheHook {
 /// while the LEAF nodes — the Iceberg/parquet scans holding the expensive
 /// plan-time manifest pruning and file lists — are reused as-is (they build
 /// fresh streams on every `execute` call).
-fn reset_plan(plan: Arc<dyn ExecutionPlan>) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+pub(crate) fn reset_plan(
+    plan: Arc<dyn ExecutionPlan>,
+) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
     let children = plan.children();
     if children.is_empty() {
         return Ok(plan);
@@ -494,7 +536,7 @@ fn reset_plan(plan: Arc<dyn ExecutionPlan>) -> datafusion::error::Result<Arc<dyn
 /// Reject the rare node kinds whose execution state [`reset_plan`] cannot
 /// safely rebuild: recursive-CTE nodes share a work table ACROSS nodes of
 /// the same plan, so reconstructing them independently could tear that link.
-fn plan_safe_to_cache(plan: &Arc<dyn ExecutionPlan>) -> bool {
+pub(crate) fn plan_safe_to_cache(plan: &Arc<dyn ExecutionPlan>) -> bool {
     if matches!(plan.name(), "RecursiveQueryExec" | "WorkTableExec") {
         return false;
     }
