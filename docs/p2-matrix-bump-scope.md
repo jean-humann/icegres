@@ -68,6 +68,11 @@ snapshot expiry + orphan GC), at zero dependency risk.
    - Tables bearing delete manifests (foreign-written DVs/position
      deletes): REFUSE loudly (the machinery already bails) — compacting
      under deletes we cannot apply would corrupt semantics.
+   - Schema-divergent tables (any manifest carrying a schema id other
+     than the current one — foreign engines legally evolve schemas):
+     REFUSE loudly — the rewrite aligns columns by position + name, not
+     field id, so touching old-schema files could silently resurrect
+     dropped-column values.
    - Buffered/keyed tables: compact coordinates with the local buffer
      exactly like other maintenance (no interleaving with an in-flight
      flush of the same table).
@@ -78,8 +83,10 @@ snapshot expiry + orphan GC), at zero dependency risk.
    grouping); e2e legs — row-set identity pre/post (count + checksum
    query), foreign reader (pyiceberg/REST leg per existing harness
    conventions) agrees post-compact, dry-run mutates nothing, conflict
-   abort clean, refusal on delete-manifest tables, expiry-then-GC
-   reclaims replaced files, time travel to pre-compact snapshot intact.
+   abort clean, refusal on delete-manifest tables, refusal on
+   schema-divergent tables (REST-evolved schema, nothing mutated),
+   expiry-then-GC reclaims replaced files, time travel to pre-compact
+   snapshot intact.
 5. Bench: new ungated extra `compact_scan_restore_ms` — fragment
    demo-scale table into many small files (loop of small INSERTs), record
    degraded scan p50, compact, record restored p50 ≈ pre-fragmentation

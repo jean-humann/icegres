@@ -55,6 +55,17 @@
 //!   unpartitioned-only (see overwrite.rs), so rewriting partitioned
 //!   layouts is refused rather than guessed at. Same for historical
 //!   partition-spec ids and non-v2 format versions.
+//! * **Schema-divergent tables refuse loudly.** Only files whose manifests
+//!   carry the table's CURRENT schema id are rewritten: the rewrite reads
+//!   Parquet raw and aligns each batch to the current schema by position +
+//!   case-insensitive name (overwrite::align_batch — same-schema type
+//!   widening only), with NO field-id projection. On files from an older
+//!   schema version that mapping could silently resurrect a dropped
+//!   column's values under a re-added name of the same shape. A manifest
+//!   with a divergent schema id (foreign engines legally evolve schemas)
+//!   refuses the whole run before anything is written — rewrite the old
+//!   files under the current schema (full-table rewrite), or wait for
+//!   field-id-aware compaction.
 //! * **Row-count identity is asserted** before the commit is posted: the
 //!   rewritten outputs must carry exactly the input row count, or the run
 //!   aborts with every new file left as an unreferenced orphan (standard
@@ -273,6 +284,15 @@ pub async fn run(
                 manifest_file.manifest_path
             )
         })?;
+        // SAFETY: schema divergence is only visible here — the manifest
+        // LIST entry carries no schema id, so this rail cannot live with
+        // the list-level guards above.
+        ensure_manifest_schema_current(
+            &ident.to_string(),
+            &manifest_file.manifest_path,
+            manifest.metadata().schema_id(),
+            metadata.current_schema_id(),
+        )?;
         let (entries, _meta) = manifest.into_parts();
         for entry in &entries {
             if !entry.is_alive() {
@@ -372,9 +392,11 @@ pub async fn run(
     for g in &groups {
         // One rolling writer per partition group; files are read one at a
         // time (peak memory = one input file's decoded batches, the same
-        // bound as the DML engine) and every batch is aligned to the
-        // CURRENT schema, so files written under older schema versions come
-        // out canonicalized.
+        // bound as the DML engine). Every input was written under the
+        // CURRENT schema id (the schema guard above refused anything
+        // else), so align_batch's position+name mapping is sound here: it
+        // only casts physical types (e.g. same-schema widening) onto the
+        // canonical field-id-annotated Arrow shape.
         let mut writer =
             overwrite::new_compact_data_writer(&tbl, &commit_uuid, target_bytes as usize).await?;
         for idx in &g.inputs {
@@ -616,6 +638,34 @@ pub async fn run(
     }
 }
 
+/// Fail-closed schema rail for one loaded manifest: refuse the whole run
+/// when its schema id diverges from the table's current one. The rewrite
+/// path has no field-id projection (overwrite::align_batch maps columns by
+/// position + case-insensitive name), so a file from an older schema
+/// version could silently come out with a dropped column's values
+/// resurrected under a re-added name — corruption a row-count identity
+/// check cannot see. Runs during the manifest walk, strictly before any
+/// output is staged or committed.
+fn ensure_manifest_schema_current(
+    table: &str,
+    manifest_path: &str,
+    manifest_schema_id: i32,
+    current_schema_id: i32,
+) -> Result<()> {
+    if manifest_schema_id != current_schema_id {
+        bail!(
+            "refusing to compact {table}: manifest {manifest_path} was written under \
+             schema {manifest_schema_id} (current schema is {current_schema_id}) — \
+             compaction is not field-id-aware (batches are aligned to the current \
+             schema by position and name), so rewriting files from a divergent schema \
+             version could silently corrupt values. Rewrite the old files under the \
+             current schema (full-table rewrite) or wait for field-id-aware \
+             compaction; nothing was rewritten"
+        );
+    }
+    Ok(())
+}
+
 /// Canonical partition key of a data file's partition struct — the
 /// planner's grouping key. Unpartitioned tables (the only kind the
 /// executor accepts today) always produce the empty struct, i.e. ONE
@@ -695,6 +745,25 @@ mod tests {
         let files = [f("a", 512 * MB, 1, ""), f("b", 300 * MB, 1, "")];
         assert!(plan_compaction(&files, 128 * MB, 2).is_empty());
         assert!(plan_compaction(&[], 128 * MB, 2).is_empty());
+    }
+
+    #[test]
+    fn schema_guard_refuses_divergent_manifest_schema() {
+        let err = ensure_manifest_schema_current("demo.t", "s3://b/metadata/m0.avro", 0, 1)
+            .expect_err("divergent schema id must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("refusing to compact demo.t"), "{msg}");
+        assert!(msg.contains("s3://b/metadata/m0.avro"), "{msg}");
+        assert!(msg.contains("schema 0"), "{msg}");
+        assert!(msg.contains("current schema is 1"), "{msg}");
+        assert!(msg.contains("nothing was rewritten"), "{msg}");
+    }
+
+    #[test]
+    fn schema_guard_passes_matching_manifest_schema() {
+        // Matching ids (any value, not just 0) must not refuse.
+        ensure_manifest_schema_current("demo.t", "s3://b/metadata/m0.avro", 0, 0).unwrap();
+        ensure_manifest_schema_current("demo.t", "s3://b/metadata/m1.avro", 3, 3).unwrap();
     }
 
     #[test]

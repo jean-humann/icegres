@@ -2559,6 +2559,12 @@ pass "P1 section cleanup (servers stopped, scratch table dropped)"
 #          (hand-built manifest list carrying a content=deletes entry —
 #          the same Avro OCF recipe as the (j2) nested fixture) is refused
 #          loudly, since icegres cannot apply foreign deletes;
+#        - refusal on schema-divergent tables: evolving the schema over
+#          the REST catalog (add-schema + set-current-schema — what a
+#          foreign engine's ALTER leaves behind) makes the head snapshot's
+#          manifests carry an old schema id; compact --execute refuses
+#          loudly and mutates nothing (align_batch maps columns by
+#          position + name, not field id — see compact.rs's schema rail);
 #        - expiry-then-GC after a follow-up compact reclaims the replaced
 #          files (the GC keeps whatever the retained snapshot's DELETED
 #          entries still name — one generation back, exactly like (y)).
@@ -2785,6 +2791,50 @@ grep -q 'Nothing was rewritten' "$E2E_DIR/compact-mor.log" \
   || { cat "$E2E_DIR/compact-mor.log" >&2; fail "refusal did not assert nothing was rewritten"; }
 pass "compact refuses delete-manifest (merge-on-read) tables loudly"
 curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_mor?purgeRequested=true" >/dev/null 2>&1 || true
+
+# --- refusal on schema-divergent tables (foreign schema evolution) ---
+# Fixture: a fresh fragmented table whose schema is then evolved over the
+# REST catalog (add-schema + set-current-schema — exactly what a foreign
+# engine's ALTER TABLE leaves behind). The head snapshot's manifests still
+# carry the OLD schema id, and compact's rewrite is not field-id-aware, so
+# it must refuse loudly BEFORE writing anything. The non-evolved happy path
+# is already proven by the demo.e2e_compact legs above.
+q 'drop table if exists demo.e2e_evo' >/dev/null 2>&1 || true
+q 'create table demo.e2e_evo (id bigint, v text)' >/dev/null
+for i in 1 2 3; do
+  q "insert into demo.e2e_evo (id, v) values ($i, 'r$i')" >/dev/null
+done
+evo_meta=$(curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_evo") \
+  || fail "could not load demo.e2e_evo's metadata over REST"
+evo_new_schema=$(jq -c '.metadata as $m
+  | ($m.schemas[] | select(."schema-id" == $m."current-schema-id"))
+  | ."schema-id" += 1
+  | .fields += [{"id": ($m."last-column-id" + 1), "name": "evo_extra",
+                 "required": false, "type": "string"}]' <<<"$evo_meta")
+evo_last_col=$(jq '.metadata."last-column-id" + 1' <<<"$evo_meta")
+curl -sf -X POST "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_evo" \
+  -H 'Content-Type: application/json' -d "{
+  \"requirements\": [],
+  \"updates\": [
+    {\"action\":\"add-schema\",\"schema\": $evo_new_schema,
+     \"last-column-id\": $evo_last_col},
+    {\"action\":\"set-current-schema\",\"schema-id\": -1}
+  ]
+}" >/dev/null || fail "could not evolve demo.e2e_evo's schema over REST"
+evo_snaps_before=$(count_snaps e2e_evo)
+if "$BIN" maintain compact --table demo.e2e_evo --execute \
+    >"$E2E_DIR/compact-evo.log" 2>&1; then
+  cat "$E2E_DIR/compact-evo.log" >&2
+  fail "compact on a schema-divergent table must be refused"
+fi
+grep -q 'was written under schema 0 (current schema is 1)' "$E2E_DIR/compact-evo.log" \
+  || { cat "$E2E_DIR/compact-evo.log" >&2; fail "refusal did not name the divergent schema ids"; }
+grep -q 'nothing was rewritten' "$E2E_DIR/compact-evo.log" \
+  || { cat "$E2E_DIR/compact-evo.log" >&2; fail "refusal did not assert nothing was rewritten"; }
+assert_eq "schema-divergence refusal committed nothing (snapshot count unchanged)" \
+  "$evo_snaps_before" "$(count_snaps e2e_evo)"
+pass "compact refuses schema-divergent tables loudly (manifests behind the current schema id)"
+curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_evo?purgeRequested=true" >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
 log "all assertions passed ($PASS_COUNT)"

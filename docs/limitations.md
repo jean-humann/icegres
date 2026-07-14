@@ -89,8 +89,15 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
   first-committer-wins abort on any concurrent commit. Its edges are loud
   refusals, not silent risk: tables bearing **foreign merge-on-read delete
   manifests** (deletion vectors / position deletes written by Spark, Trino,
-  moonlink, …) are refused — see the next bullet — and **partitioned
-  tables** are refused (the icegres write stack is unpartitioned-only).
+  moonlink, …) are refused — see the next bullet — **partitioned
+  tables** are refused (the icegres write stack is unpartitioned-only), and
+  **schema-divergent tables** are refused: any manifest carrying a schema id
+  other than the table's current one (a foreign engine legally evolved the
+  schema) refuses the whole run, because the rewrite aligns columns by
+  position and name rather than field id and could otherwise resurrect a
+  dropped column's values under a re-added name. Rewrite the old files under
+  the current schema (full-table rewrite) or wait for field-id-aware
+  compaction.
   Buffered/tail mode still fixes the *source* of small files — cadence
   commits write one well-sized file per flush window instead of one per
   INSERT — so compaction is mostly for tables fed by per-statement commits
