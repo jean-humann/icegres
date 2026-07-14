@@ -191,7 +191,7 @@ protect them like `.pgpass`.
 
 ---
 
-## 8. Table maintenance (snapshot expiry + orphan GC)
+## 8. Table maintenance (snapshot expiry + orphan GC + compaction)
 
 Every write adds an Iceberg snapshot forever; unbounded, `$snapshots` and the
 metadata JSON the catalog re-reads on every table open grow without limit. Run
@@ -247,10 +247,35 @@ deleted), so a failed run leaves everything in place and is safe to re-run.
 Schedule it as a second `CronJob` after the expiry one — expiry first, GC
 after — per hot table.
 
-There is intentionally no `compact` command yet (pinned iceberg-rust 0.9.1 has
-no rewrite-files action); drop-and-reseed remains the canonicalization path,
-and buffered/tail mode's per-window group commits keep new files well-sized at
-the source.
+The third command is bin-pack compaction. Tables written one small commit at
+a time (per-statement INSERTs, foreign micro-batchers) fragment into many
+under-sized Parquet files, and every extra file costs a scan an object-store
+round trip. Compaction rewrites them in place:
+
+```bash
+# dry-run first: prints the plan (candidates per partition, projected
+# outputs), rewrites nothing
+icegres maintain compact --table demo.trips
+# then rewrite + commit; tune the output size / payoff bar if needed
+icegres maintain compact --table demo.trips --execute
+icegres maintain compact --table demo.trips --target-file-mb 256 --min-input-files 4 --execute
+```
+
+Each partition's data files under `--target-file-mb` (default 128) are
+rewritten into ~target-size files as ONE `replace` snapshot — the row set is
+identical, and the old files stay time-travel-readable until the expiry + GC
+pair above reclaims them (they are NOT orphans while any retained snapshot
+references them; the GC understands this). Live-safe by construction: the
+commit is anchored to the exact snapshot the plan was computed against, so
+any concurrent writer — a foreign engine, a serving endpoint's DML or
+buffered flush — makes the compact abort cleanly with nothing changed
+(first-committer-wins; just re-run it in a quieter window). It refuses loudly
+on tables bearing foreign merge-on-read delete manifests (icegres cannot
+apply those deletes) and on partitioned tables. Schedule it per hot
+fragmented table BEFORE the expiry + GC pair — compact, then expire, then GC
+reclaims the replaced files one cycle later. Buffered/tail mode already keeps
+new files well-sized at the source (one file per flush window), so computes
+running with a write buffer need compaction far less often.
 
 ---
 

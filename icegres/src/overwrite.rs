@@ -1429,6 +1429,19 @@ impl PreparedCommit {
     pub fn snapshot_id(&self) -> i64 {
         self.snapshot_id
     }
+
+    /// Wrap an externally-assembled maintenance commit (every file it
+    /// references already durable) so it can be POSTed through
+    /// [`OverwriteEngine::post_prepared`] — compact.rs builds its
+    /// `replace` snapshot this way. Maintenance commits carry no op list,
+    /// so `rows_by_op` stays empty.
+    pub(crate) fn for_maintenance(request: CommitTableRequest, snapshot_id: i64) -> Self {
+        Self {
+            request,
+            rows_by_op: Vec::new(),
+            snapshot_id,
+        }
+    }
 }
 
 /// Parse and validate the `icegres.primary-key` table property.
@@ -2123,7 +2136,7 @@ pub async fn prepare_commit(
 }
 
 /// Read one Parquet data file fully into record batches.
-async fn read_parquet_file(
+pub(crate) async fn read_parquet_file(
     file_io: &iceberg::io::FileIO,
     data_file: &DataFile,
 ) -> Result<Vec<RecordBatch>> {
@@ -2497,7 +2510,44 @@ async fn new_data_writer(
         .map_err(|e| anyhow!("failed to build data file writer: {e}"))
 }
 
-fn new_manifest_writer(table: &Table, snapshot_id: i64, path: &str) -> Result<ManifestWriter> {
+/// The same writer stack as [`new_data_writer`] with an EXPLICIT rolling
+/// target file size and a `compact-` file-name prefix: `maintain compact`
+/// sizes its outputs by `--target-file-mb` instead of the library default.
+pub(crate) async fn new_compact_data_writer(
+    table: &Table,
+    commit_uuid: &Uuid,
+    target_file_size: usize,
+) -> Result<impl IcebergWriter<arrow::array::RecordBatch, Vec<DataFile>>> {
+    let parquet_builder = ParquetWriterBuilder::new_with_match_mode(
+        datafusion::parquet::file::properties::WriterProperties::default(),
+        table.metadata().current_schema().clone(),
+        FieldMatchMode::Name,
+    );
+    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())
+        .map_err(|e| anyhow!("failed to build location generator: {e}"))?;
+    let file_name_generator = DefaultFileNameGenerator::new(
+        format!("compact-{commit_uuid}"),
+        None,
+        DataFileFormat::Parquet,
+    );
+    let rolling = RollingFileWriterBuilder::new(
+        parquet_builder,
+        target_file_size,
+        table.file_io().clone(),
+        location_generator,
+        file_name_generator,
+    );
+    DataFileWriterBuilder::new(rolling)
+        .build(None)
+        .await
+        .map_err(|e| anyhow!("failed to build compaction data file writer: {e}"))
+}
+
+pub(crate) fn new_manifest_writer(
+    table: &Table,
+    snapshot_id: i64,
+    path: &str,
+) -> Result<ManifestWriter> {
     let output = table
         .file_io()
         .new_output(path)
@@ -2514,7 +2564,7 @@ fn new_manifest_writer(table: &Table, snapshot_id: i64, path: &str) -> Result<Ma
 
 /// Random snapshot id not colliding with any existing one (same scheme as
 /// iceberg-rust's `SnapshotProducer`).
-fn generate_unique_snapshot_id(table: &Table) -> i64 {
+pub(crate) fn generate_unique_snapshot_id(table: &Table) -> i64 {
     loop {
         let (lhs, rhs) = Uuid::new_v4().as_u64_pair();
         let id = ((lhs ^ rhs) as i64).abs();
@@ -2525,8 +2575,9 @@ fn generate_unique_snapshot_id(table: &Table) -> i64 {
 }
 
 /// Sabotage the `assert-ref-snapshot-id` requirement so the catalog is
-/// guaranteed to reject the commit with 409 (test-only; see module docs).
-fn corrupt_ref_requirement(request: &mut CommitTableRequest) {
+/// guaranteed to reject the commit with 409 (test-only; see module docs
+/// and compact.rs's ICEGRES_COMPACT_INJECT_CONFLICT knob).
+pub(crate) fn corrupt_ref_requirement(request: &mut CommitTableRequest) {
     for req in &mut request.requirements {
         if let TableRequirement::RefSnapshotIdMatch { snapshot_id, .. } = req {
             *snapshot_id = Some(snapshot_id.map(|id| id.wrapping_add(1)).unwrap_or(1));

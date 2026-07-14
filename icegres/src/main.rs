@@ -8,6 +8,7 @@ mod authz;
 mod branch;
 mod buffer;
 mod cache;
+mod compact;
 mod compat;
 mod context;
 mod dml;
@@ -104,12 +105,7 @@ struct Cli {
     command: Command,
 }
 
-/// Subcommands. Note there is deliberately NO `compact` subcommand yet: the
-/// pinned iceberg-rust 0.9.1 `Transaction` API has no replace-files/rewrite
-/// action (only `fast_append` + metadata updates). The copy-on-write DML
-/// machinery in `overwrite.rs` could carry a compaction (`replace`
-/// operation) in the future; until then drop-and-reseed is the documented
-/// canonicalization path (see the module docs in `seed.rs`).
+/// Subcommands.
 #[derive(Subcommand)]
 enum Command {
     /// Serve the lakehouse over the Postgres wire protocol.
@@ -392,8 +388,8 @@ enum Command {
         #[command(subcommand)]
         cmd: BranchCmd,
     },
-    /// Table lifecycle maintenance (snapshot expiry). No `compact` yet — see
-    /// the note above `Command`.
+    /// Table lifecycle maintenance (snapshot expiry, orphan-file GC,
+    /// bin-pack compaction).
     Maintain {
         #[command(subcommand)]
         cmd: MaintainCmd,
@@ -528,6 +524,37 @@ enum MaintainCmd {
         #[arg(long)]
         unsafe_grace: bool,
     },
+    /// Bin-pack compaction: rewrite each partition's under-target data
+    /// files into ~target-size files as ONE `replace` snapshot — the row
+    /// set is identical, and the old files stay time-travel-readable until
+    /// snapshot expiry (pair with expire-snapshots + remove-orphans to
+    /// reclaim them). Dry-run by default: prints the plan (candidates per
+    /// partition, projected outputs) and rewrites nothing; --execute
+    /// commits. First-committer-wins: the commit is anchored to the
+    /// snapshot the plan was computed against, so any concurrent writer
+    /// (foreign engine, DML, buffered flush) makes it abort cleanly with
+    /// nothing changed — re-run it. Tables with delete manifests (foreign
+    /// merge-on-read deletes) and partitioned tables are refused loudly.
+    Compact {
+        #[command(flatten)]
+        catalog: CatalogOpts,
+        /// Target table: <table> or <namespace>.<table>.
+        #[arg(long)]
+        table: String,
+        /// Target output file size in MiB: data files under this size are
+        /// compaction candidates, and rewritten output rolls over to a new
+        /// file at it.
+        #[arg(long, default_value_t = 128)]
+        target_file_mb: u64,
+        /// Only rewrite a partition when it has at least this many
+        /// candidate files (values < 2 are refused: rewriting fewer than 2
+        /// files cannot reduce the file count).
+        #[arg(long, default_value_t = 2)]
+        min_input_files: usize,
+        /// Actually rewrite and commit (default: dry run, nothing changes).
+        #[arg(long)]
+        execute: bool,
+    },
 }
 
 #[tokio::main]
@@ -660,6 +687,13 @@ async fn main() -> Result<()> {
                 maintain::remove_orphans(&catalog, &table, older_than_hours, execute, unsafe_grace)
                     .await
             }
+            MaintainCmd::Compact {
+                catalog,
+                table,
+                target_file_mb,
+                min_input_files,
+                execute,
+            } => compact::run(&catalog, &table, target_file_mb, min_input_files, execute).await,
         },
         Command::Sql {
             catalog,

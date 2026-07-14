@@ -2533,4 +2533,258 @@ curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_p1?purgeR
 pass "P1 section cleanup (servers stopped, scratch table dropped)"
 
 # ---------------------------------------------------------------------------
+# (aa) Bin-pack compaction (roadmap-v2 §P2 re-scoped, docs/
+#      p2-matrix-bump-scope.md): `icegres maintain compact` rewrites a
+#      fragmented table's under-target data files into ~target-size files
+#      as ONE `replace` snapshot, row set identical. Contract under test
+#      (icegres/src/compact.rs):
+#        - dry-run by DEFAULT: prints the plan, mutates NOTHING;
+#        - --execute commits ONE Operation::Replace snapshot: count +
+#          checksum identical, snapshot count +1, summary operation
+#          `replace`, live file count collapses to 1;
+#        - orphan-GC interplay: right after the compact the replaced files
+#          are NOT orphans (pre-compact snapshots and the retained DELETED
+#          manifest entries still reference them: remove-orphans finds 0);
+#        - time travel to the pre-compact snapshot reads the old layout
+#          with identical rows;
+#        - a foreign reader (pyiceberg via the REST catalog + S3 — the
+#          parity C1 convention) agrees with the server post-compact;
+#        - conflict abort: a racing commit (test-only knob
+#          ICEGRES_COMPACT_INJECT_CONFLICT forces a REAL server-side 409)
+#          aborts the compact cleanly with nothing changed
+#          (first-committer-wins; the same anchored-commit discipline that
+#          keeps compaction from interleaving with a buffered server's
+#          in-flight flush);
+#        - refusal on delete-manifest tables: a merge-on-read snapshot
+#          (hand-built manifest list carrying a content=deletes entry —
+#          the same Avro OCF recipe as the (j2) nested fixture) is refused
+#          loudly, since icegres cannot apply foreign deletes;
+#        - expiry-then-GC after a follow-up compact reclaims the replaced
+#          files (the GC keeps whatever the retained snapshot's DELETED
+#          entries still name — one generation back, exactly like (y)).
+#      Uses the main permissive server on :$PG_PORT + the CLI binary.
+# ---------------------------------------------------------------------------
+log "(aa) bin-pack compaction (maintain compact)"
+q 'drop table if exists demo.e2e_compact' >/dev/null 2>&1 || true
+q 'create table demo.e2e_compact (id bigint, v text)' >/dev/null
+for i in 1 2 3 4 5 6; do
+  q "insert into demo.e2e_compact (id, v) values ($i, 'r$i')" >/dev/null
+done
+cx_checksum() { # count + sum(id) + sum(length(v)): the row-set identity probe
+  q 'select count(*), coalesce(sum(id), 0), coalesce(sum(length(v)), 0) from demo.e2e_compact'
+}
+cx_before=$(cx_checksum)
+assert_eq "six single-row inserts land (count|sum(id)|sum(len))" "6|21|12" "$cx_before"
+cx_loc=$(curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_compact" | jq -r '.metadata.location')
+[[ "$cx_loc" == s3://lakehouse/* ]] || fail "unexpected table location for demo.e2e_compact: $cx_loc"
+cx_key=${cx_loc#s3://lakehouse/}
+count_cx_parquet() {
+  aws --endpoint-url "$S3_ENDPOINT" s3 ls --recursive "s3://lakehouse/$cx_key/data/" \
+    | grep -c '\.parquet$' || true
+}
+assert_eq "fragmented layout: one data file per insert" "6" "$(count_cx_parquet)"
+cx_snap_pre=$(q 'select snapshot_id from demo."e2e_compact$snapshots" order by committed_at desc limit 1')
+
+# --- dry run (the default): prints the plan, mutates NOTHING ---
+"$BIN" maintain compact --table demo.e2e_compact >"$E2E_DIR/compact-dry.log" 2>&1 \
+  || { cat "$E2E_DIR/compact-dry.log" >&2; fail "compact dry run failed"; }
+grep -q 'DRY RUN — nothing rewritten' "$E2E_DIR/compact-dry.log" \
+  || { cat "$E2E_DIR/compact-dry.log" >&2; fail "dry run did not announce itself"; }
+grep -q 'partition <unpartitioned>: 6 file(s)' "$E2E_DIR/compact-dry.log" \
+  || { cat "$E2E_DIR/compact-dry.log" >&2; fail "dry-run plan does not name the 6 candidates"; }
+assert_eq "dry run wrote no data file" "6" "$(count_cx_parquet)"
+assert_eq "dry run committed no snapshot" "6" "$(count_snaps e2e_compact)"
+
+# --- execute: ONE replace snapshot; row set identical ---
+"$BIN" maintain compact --table demo.e2e_compact --execute >"$E2E_DIR/compact-exec.log" 2>&1 \
+  || { cat "$E2E_DIR/compact-exec.log" >&2; fail "compact --execute failed"; }
+grep -q 'compacted 6 file(s)' "$E2E_DIR/compact-exec.log" \
+  || { cat "$E2E_DIR/compact-exec.log" >&2; fail "compact did not report rewriting the 6 files"; }
+assert_eq "row set identical post-compact (count|sum(id)|sum(len))" "$cx_before" "$(cx_checksum)"
+assert_eq "compact adds exactly ONE snapshot" "7" "$(count_snaps e2e_compact)"
+# The head snapshot's summary, read via the REST catalog: a `replace`
+# operation with exact file/record accounting (6 replaced by 1, rows equal).
+cx_summary=$(curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_compact" \
+  | jq -r '.metadata as $m | $m.refs.main."snapshot-id" as $h
+           | $m.snapshots[] | select(."snapshot-id" == $h)
+           | "\(.summary.operation)|\(.summary."added-data-files")|\(.summary."deleted-data-files")|\(.summary."total-data-files")|\(.summary."total-records")"')
+assert_eq "head snapshot is a replace with exact accounting (op|added|deleted|total-files|total-records)" \
+  "replace|1|6|1|6" "$cx_summary"
+assert_eq "replaced files still present in the store (snapshot lineage preserved)" "7" \
+  "$(count_cx_parquet)"
+
+# --- orphan-GC interplay: replaced files are NOT orphans ---
+"$BIN" maintain remove-orphans demo.e2e_compact --older-than-hours 0 --unsafe-grace \
+  >"$E2E_DIR/compact-orphans.log" 2>&1 \
+  || { cat "$E2E_DIR/compact-orphans.log" >&2; fail "remove-orphans after compact failed"; }
+grep -q 'found 0 orphan file(s)' "$E2E_DIR/compact-orphans.log" \
+  || { cat "$E2E_DIR/compact-orphans.log" >&2; \
+       fail "replaced files were mis-classified as orphans right after compact"; }
+pass "replaced files are NOT orphans (pre-compact snapshots still reference them)"
+
+# --- time travel to the pre-compact snapshot ---
+assert_eq "time travel to the pre-compact snapshot reads identical rows" "6|21|12" \
+  "$(q "select count(*), coalesce(sum(id), 0), coalesce(sum(length(v)), 0) from demo.\"e2e_compact@$cx_snap_pre\"")"
+
+# --- foreign reader agreement (pyiceberg over REST + S3, parity C1 style) ---
+if python3 -c 'import pyiceberg, pyarrow' 2>/dev/null; then
+  cx_ext=$(python3 - <<EOF 2>&1 | tail -n 1
+from pyiceberg.catalog import load_catalog
+import pyarrow.compute as pc
+cat = load_catalog("lakekeeper", **{
+    "type": "rest", "uri": "$CATALOG_URI", "warehouse": "$WAREHOUSE",
+    "s3.endpoint": "$S3_ENDPOINT", "s3.access-key-id": "$AWS_ACCESS_KEY_ID",
+    "s3.secret-access-key": "$AWS_SECRET_ACCESS_KEY", "s3.region": "us-east-1",
+    "s3.path-style-access": "true",
+})
+t = cat.load_table("demo.e2e_compact").scan().to_arrow()
+print(f"{len(t)}|{pc.sum(t.column('id')).as_py() or 0}|{pc.sum(pc.utf8_length(t.column('v'))).as_py() or 0}")
+EOF
+)
+  assert_eq "foreign reader (pyiceberg) agrees with the server post-compact" \
+    "$cx_before" "$cx_ext"
+else
+  log "    SKIPPED foreign-reader leg: pyiceberg/pyarrow not importable" \
+      "(pip install 'pyiceberg[pyarrow]' s3fs)"
+fi
+
+# --- conflict abort: a REAL server-side 409, aborted cleanly ---
+for i in 7 8; do
+  q "insert into demo.e2e_compact (id, v) values ($i, 'r$i')" >/dev/null
+done
+cx_snaps_before_conflict=$(count_snaps e2e_compact)
+if ICEGRES_COMPACT_INJECT_CONFLICT=1 "$BIN" maintain compact --table demo.e2e_compact --execute \
+    >"$E2E_DIR/compact-conflict.log" 2>&1; then
+  cat "$E2E_DIR/compact-conflict.log" >&2
+  fail "compact with an injected commit conflict (409) must abort"
+fi
+grep -q 'NOTHING changed' "$E2E_DIR/compact-conflict.log" \
+  || { cat "$E2E_DIR/compact-conflict.log" >&2; fail "conflict abort did not announce a clean abort"; }
+assert_eq "conflict abort committed nothing (snapshot count unchanged)" \
+  "$cx_snaps_before_conflict" "$(count_snaps e2e_compact)"
+assert_eq "conflict abort left the rows intact" "8|36|16" "$(cx_checksum)"
+pass "compact aborts cleanly on a commit conflict (first-committer-wins, nothing applied)"
+
+# --- follow-up compact, then expiry + GC reclaims the replaced files ---
+# Candidates now: the first compact's output + the two fresh insert files.
+"$BIN" maintain compact --table demo.e2e_compact --execute >"$E2E_DIR/compact-exec2.log" 2>&1 \
+  || { cat "$E2E_DIR/compact-exec2.log" >&2; fail "second compact failed"; }
+grep -q 'compacted 3 file(s)' "$E2E_DIR/compact-exec2.log" \
+  || { cat "$E2E_DIR/compact-exec2.log" >&2; fail "second compact did not rewrite the 3 live files"; }
+assert_eq "row set identical after the second compact" "8|36|16" "$(cx_checksum)"
+"$BIN" maintain expire-snapshots demo.e2e_compact --keep 1 >"$E2E_DIR/compact-expire.log" 2>&1 \
+  || { cat "$E2E_DIR/compact-expire.log" >&2; fail "expire-snapshots after compact failed"; }
+"$BIN" maintain remove-orphans demo.e2e_compact --older-than-hours 0 --execute --unsafe-grace \
+  >"$E2E_DIR/compact-gc.log" 2>&1 \
+  || { cat "$E2E_DIR/compact-gc.log" >&2; fail "remove-orphans --execute after expiry failed"; }
+grep -q 'deleted .* orphan file(s)' "$E2E_DIR/compact-gc.log" \
+  || { cat "$E2E_DIR/compact-gc.log" >&2; fail "expiry-then-GC reclaimed nothing"; }
+# Live after expiry+GC: the second compact's output + the three files its
+# DELETED entries still name (first output + the two conflict-leg inserts)
+# = 4 Parquet files; the SIX insert-era originals AND the aborted conflict
+# attempt's staged (never-committed) file are reclaimed.
+assert_eq "expiry-then-GC reclaims the replaced files (6 originals + 1 staged gone)" \
+  "4" "$(count_cx_parquet)"
+assert_eq "table fully readable after the reclaim" "8|36|16" "$(cx_checksum)"
+pass "compaction lifecycle: compact -> not-orphans -> expire+GC reclaims ($(count_cx_parquet) live files left)"
+q 'drop table demo.e2e_compact' >/dev/null 2>&1 || true
+
+# --- refusal on delete-manifest (merge-on-read) tables ---
+# Fixture: a fresh table whose head snapshot's manifest list names ONE
+# manifest with content=1 (deletes) — hand-built Avro OCF (the (j2) recipe
+# plus one record) uploaded to the table's metadata dir and committed over
+# REST, exactly what a foreign merge-on-read writer leaves behind.
+q 'drop table if exists demo.e2e_mor' >/dev/null 2>&1 || true
+q 'create table demo.e2e_mor (id bigint)' >/dev/null
+mor_loc=$(curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_mor" | jq -r '.metadata.location')
+[[ "$mor_loc" == s3://lakehouse/* ]] || fail "unexpected table location for demo.e2e_mor: $mor_loc"
+MOR_SNAP=555000111
+python3 - "$E2E_DIR/mor-manifest-list.avro" "$mor_loc/metadata/e2e-fake-deletes-m0.avro" "$MOR_SNAP" <<'PYEOF' \
+  || fail "could not generate the merge-on-read manifest list"
+import json, os, sys
+schema = {"type": "record", "name": "manifest_file", "fields": [
+    {"name": "manifest_path", "type": "string", "field-id": 500},
+    {"name": "manifest_length", "type": "long", "field-id": 501},
+    {"name": "partition_spec_id", "type": "int", "field-id": 502},
+    {"name": "content", "type": "int", "field-id": 517},
+    {"name": "sequence_number", "type": "long", "field-id": 515},
+    {"name": "min_sequence_number", "type": "long", "field-id": 516},
+    {"name": "added_snapshot_id", "type": "long", "field-id": 503},
+    {"name": "added_files_count", "type": "int", "field-id": 504},
+    {"name": "existing_files_count", "type": "int", "field-id": 505},
+    {"name": "deleted_files_count", "type": "int", "field-id": 506},
+    {"name": "added_rows_count", "type": "long", "field-id": 512},
+    {"name": "existing_rows_count", "type": "long", "field-id": 513},
+    {"name": "deleted_rows_count", "type": "long", "field-id": 514},
+    {"name": "partitions", "field-id": 507, "type": ["null", {
+        "type": "array", "element-id": 508, "items": {
+            "type": "record", "name": "r508", "fields": [
+                {"name": "contains_null", "type": "boolean", "field-id": 509},
+                {"name": "contains_nan", "type": ["null", "boolean"], "field-id": 518},
+                {"name": "lower_bound", "type": ["null", "bytes"], "field-id": 510},
+                {"name": "upper_bound", "type": ["null", "bytes"], "field-id": 511}]},
+    }]},
+]}
+def vlong(n):  # Avro zigzag varint
+    n = (n << 1) ^ (n >> 63)
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+out_path, manifest_path, snap = sys.argv[1], sys.argv[2], int(sys.argv[3])
+rec = vlong(len(manifest_path.encode())) + manifest_path.encode()
+rec += vlong(4242)  # manifest_length
+rec += vlong(0)     # partition_spec_id
+rec += vlong(1)     # content = 1 (DELETES): the refusal trigger
+rec += vlong(1) + vlong(1)             # sequence_number, min_sequence_number
+rec += vlong(snap)                     # added_snapshot_id
+rec += vlong(1) + vlong(0) + vlong(0)  # added/existing/deleted_files_count
+rec += vlong(1) + vlong(0) + vlong(0)  # added/existing/deleted_rows_count
+rec += vlong(0)                        # partitions: union branch 0 = null
+meta = {"avro.schema": json.dumps(schema).encode(),
+        "avro.codec": b"null", "format-version": b"2"}
+buf = b"Obj\x01" + vlong(len(meta))
+for k, v in meta.items():
+    buf += vlong(len(k.encode())) + k.encode() + vlong(len(v)) + v
+buf += vlong(0)  # end of the header metadata map
+sync = os.urandom(16)
+buf += sync + vlong(1) + vlong(len(rec)) + rec + sync  # one data block
+open(out_path, "wb").write(buf)
+PYEOF
+aws --endpoint-url "$S3_ENDPOINT" s3 cp "$E2E_DIR/mor-manifest-list.avro" \
+  "$mor_loc/metadata/snap-$MOR_SNAP-0-e2e-mor.avro" >/dev/null \
+  || fail "could not upload the merge-on-read manifest list for demo.e2e_mor"
+curl -sf -X POST "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_mor" \
+  -H 'Content-Type: application/json' -d "{
+  \"requirements\": [{\"type\":\"assert-ref-snapshot-id\",\"ref\":\"main\",\"snapshot-id\":null}],
+  \"updates\": [
+    {\"action\":\"add-snapshot\",\"snapshot\":{
+      \"snapshot-id\": $MOR_SNAP,
+      \"sequence-number\": 1,
+      \"timestamp-ms\": $(date +%s%3N),
+      \"manifest-list\": \"$mor_loc/metadata/snap-$MOR_SNAP-0-e2e-mor.avro\",
+      \"summary\": {\"operation\":\"append\"},
+      \"schema-id\": 0
+    }},
+    {\"action\":\"set-snapshot-ref\",\"ref-name\":\"main\",
+     \"type\":\"branch\",\"snapshot-id\": $MOR_SNAP}
+  ]
+}" >/dev/null || fail "could not commit the merge-on-read snapshot to demo.e2e_mor"
+if "$BIN" maintain compact --table demo.e2e_mor >"$E2E_DIR/compact-mor.log" 2>&1; then
+  cat "$E2E_DIR/compact-mor.log" >&2
+  fail "compact on a delete-manifest table must be refused"
+fi
+grep -q 'delete manifests' "$E2E_DIR/compact-mor.log" \
+  || { cat "$E2E_DIR/compact-mor.log" >&2; fail "refusal did not name the delete manifests"; }
+grep -q 'Nothing was rewritten' "$E2E_DIR/compact-mor.log" \
+  || { cat "$E2E_DIR/compact-mor.log" >&2; fail "refusal did not assert nothing was rewritten"; }
+pass "compact refuses delete-manifest (merge-on-read) tables loudly"
+curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_mor?purgeRequested=true" >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
 log "all assertions passed ($PASS_COUNT)"

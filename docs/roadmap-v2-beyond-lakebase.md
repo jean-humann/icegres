@@ -47,21 +47,32 @@ Measured targets: peer-compute freshness ≤ tail-event latency (~ms, vs
 flush-window today); a demo external reader doing a merged-fresh read.
 
 ### P2 — The matrix bump: deletion vectors + compaction (one gated unlock, three wins)
-The pinned iceberg-rust 0.9.1 gates the two biggest remaining economics
-items. One deliberate, fully-gated dependency-matrix bump (iceberg-rust ≥
-the rev with DV/puffin writes + replace-files, arrow/datafusion aligned;
-moonlink's tree is the existence proof) unlocks:
-1. **Merge-on-read keyed flushes**: hot-row windows apply as deletion
-   vectors + appends instead of COW file rewrites — flush cost stops
-   scaling with file size; hot-row throughput ceiling rises accordingly.
-2. **Bin-pack compaction** (`maintain compact`): closes the last
-   maintenance gap; pairs with the shipped orphan GC.
-3. Native multi-table txn support if the lib gained it (drop our raw-REST
-   shim only if byte-equivalent).
-Risk-managed: its own increment, full ladder (269 tests / 71 durability /
-173 e2e / bench A/B) must hold BEFORE any feature uses the new surface;
-revert-on-regression per house rule. This is the highest-leverage single
-increment on the board.
+**Status (2026-07): recon FALSIFIED the premise; re-scoped and shipped as
+`maintain compact` at the current pin** (docs/p2-matrix-bump-scope.md).
+Stage-0 recon against apache/iceberg-rust 0.9.1, v0.10.0-rc.3, AND main:
+no rev delivers ANY of the three payloads — DV/puffin writes don't exist
+(no delete writer, `fast_append` rejects delete content, `PuffinWriter`
+hides blob offsets), DV READ application doesn't either
+(`caching_delete_file_loader`: puffin-DV loader is a TODO), there is no
+rewrite/replace-files action, and the Catalog trait still commits one
+table at a time. The bump had zero payload, so every pin stays put, and:
+1. **Merge-on-read keyed flushes (2a): blocked upstream, both directions**
+   — the read side is the hard blocker (icegres could never read its own
+   DVs; violates I2). Waits for the library.
+2. **Bin-pack compaction (2b): SHIPPED at the current pin** — `icegres
+   maintain compact` rides the existing hand-built-manifest + raw-REST
+   machinery (`Operation::Replace` exists at 0.9.1); dry-run default,
+   first-committer-wins abort, loud refusal on foreign delete-manifest
+   tables, e2e-proven row-set identity + foreign-reader agreement + GC
+   interplay; bench `compact_scan_restore_ms`.
+3. **Native multi-table txn (2c): absent at every rev** — our raw-REST
+   shim stays (per the original scope: not a failure).
+Re-check trigger: revisit the bump when a crates.io release ships DV write
++ puffin-DV read application (watch `caching_delete_file_loader`) or a
+rewrite action. The rc.3 candidate churn map (API renames, datafusion
+53.1/arrow 58.3/datafusion-postgres 0.16 pairing, MSRV clear at 1.96.1)
+is recorded in the session recon log so the future bump starts from a
+worksheet, not from scratch.
 
 ### P3 — icegresd-ha: automated failover + autoscaling-lite (their managed-ops edge, self-hosted)
 Neon's control plane is proprietary (study, refuted claim #2) — the OSS
