@@ -1,92 +1,99 @@
-# Scope: P2 — the dependency-matrix bump (deletion vectors + compaction)
+# Scope: P2 — re-scoped after recon: `maintain compact` at the current pin
 
-Roadmap-v2 P2 (docs/roadmap-v2-beyond-lakebase.md §P2). The pinned
-iceberg-rust 0.9.1 gates the two biggest remaining economics items vs
-Lakebase: hot-row flush cost (COW file rewrites) and table compaction.
-One PR, two hard-gated stages with independent revert points.
+> Original scope: bump the pinned matrix past iceberg-rust 0.9.1 to unlock
+> deletion-vector keyed flushes, bin-pack compaction, and native
+> multi-table transactions. Stage-0 recon (binding, evidence-first)
+> falsified the premise, so this document records the verdict and the
+> re-scoped increment. The gate discipline working as designed: the bump
+> died at the recon gate, before any churn.
 
-## Stage 0 — recon (binding)
+## Stage-0 verdict (2026-07-14, apache/iceberg-rust main @ 85c365f5)
 
-Determine the TARGET MATRIX with evidence, not hope:
-- The newest iceberg-rust (crates.io release preferred; an exact git-rev
-  pin like moonlink's is acceptable if no release suffices — Apache-2.0,
-  exact pins only) that has: positional/deletion-vector (puffin) WRITE
-  support, replace-files/rewrite-files transaction actions, and a read
-  path that applies deletes through iceberg-datafusion.
-- The datafusion + arrow pair that iceberg-datafusion rev requires, the
-  datafusion-postgres release matching that datafusion (pgwire layer),
-  sqlparser alignment, arrow-flight/tonic compatibility, opendal (GC)
-  compatibility, and the MSRV — the pinned toolchain 1.96.1 may bump if
-  and only if the matrix requires it (rust-toolchain.toml stays exact).
-- Existence proof harvest: moonlink pins iceberg-rust git rev 4a6ea15
-  (arrow 56 / datafusion 50) for its DV path — an OLDER matrix than ours,
-  so it proves the FEATURE exists in-tree, not which version we want.
-  Map the API entry points it uses (DV write, puffin, rewrite) to their
-  shape at the target rev.
-- Output: the exact pin set, the API-churn map for every icegres call
-  site (overwrite.rs transaction paths, scan/provider integration,
-  catalog REST types, maintain.rs snapshot APIs), and a go/no-go per
-  stage-2 feature (DV flush, compact, native multi-table txn).
+**No rev of iceberg-rust — 0.9.1 (crates.io max), v0.10.0-rc.3, or main —
+delivers any of the three features.** The bump has zero payload and is
+skipped; every pin stays exactly where it is (iceberg =0.9.1, datafusion
+=52.5.0, arrow =57.3.1, datafusion-postgres =0.15.0, toolchain 1.96.1).
 
-## Stage 1 — the bump alone (its own revert point)
+- **Deletion-vector flushes (2a): blocked upstream, both directions.**
+  Read is the hard blocker: the delete-file loader cannot apply puffin
+  deletion vectors (`caching_delete_file_loader.rs:54` "TODO: Delete
+  Vector loader from Puffin files"; the dataflow diagram marks Del Vec
+  "Not yet Implemented") — icegres could never read its own DVs,
+  violating this repo's I2 (foreign readers) and the scope's
+  "reads apply DVs everywhere" bar. Write: no DV/position-delete writer
+  exists; `fast_append` hard-rejects delete content; `PuffinWriter` hides
+  the per-blob offsets `DataFile.content_offset/content_size_in_bytes`
+  require. Moonlink (BSL, study-only) proves the gap the hard way: it
+  unsafe-transmutes `PuffinWriter` to reach private fields and ships its
+  own non-iceberg-datafusion read path. Not a road we take.
+- **Rewrite/replace-files action (for 2b): absent at every rev** (the
+  transaction layer has fast_append, expire_snapshots, replace_sort_order
+  and update_* only). But icegres does not need it: `overwrite.rs`
+  already hand-builds EXISTING/DELETED/ADDED manifests, the manifest
+  list, the Snapshot, and commits over raw REST — and `Operation::Replace`
+  exists at 0.9.1. **Compaction is GO at the current pin.**
+- **Native multi-table transactions (2c): absent at every rev** (the
+  Catalog trait commits one table at a time; the REST client has no
+  `/transactions/commit`). Our raw-REST shim stays — per the original
+  scope, "not a failure".
+- Re-check trigger: revisit the bump when a crates.io release ships DV
+  write + puffin-DV read application (watch `caching_delete_file_loader`)
+  or a rewrite action. A candidate churn map for the v0.10 line (API
+  renames, datafusion 53.1/arrow 58.3/datafusion-postgres 0.16 pairing,
+  MSRV all-clear at 1.96.1) is recorded in the session recon log so the
+  future bump starts from a worksheet, not from scratch.
 
-Apply the target matrix with ZERO feature/behavior change. Every call
-site mechanically migrated; semantics identical. Gate: the FULL ladder —
-fmt/clippy -D warnings; cargo test --release (live env); tail_durability
-(71); FULL e2e (191); bench A/B vs the preserved pre-P2 baseline binary
-(scratchpad icegres-pre-p2 + bench-20260711T223700Z.json), three-way
-drift control if deltas exceed noise. Any unfixable regression ⇒ revert
-the bump; the PR dies here honestly. No stage-2 work may begin before
-stage 1 is fully green.
+## The increment that ships: `maintain compact` (bin-pack)
 
-## Stage 2 — the three unlocks (each gated, in this order)
+Closes the last table-maintenance gap vs Lakebase (pairs with the shipped
+snapshot expiry + orphan GC), at zero dependency risk.
 
-### 2a. Merge-on-read keyed flushes
-Keyed tail windows (icegres.tail-upsert tables) flush as deletion
-vectors + appended data files instead of COW rewrites of every touched
-file. Requirements:
-- The watermark/property protocol is UNTOUCHED: same atomic commit stamps
-  icegres.tail-seq.<id>; exactly-once semantics and the tail durability
-  suites must pass unchanged.
-- Reads apply DVs everywhere rows are served: local scans, time travel,
-  branches, the tail API union, peer mirrors, foreign readers (I2 — a
-  DV-writing table must stay readable/writable by other engines; verify
-  with the harness's existing foreign-engine legs).
-- Fallback: tables/writers where DV write is unsupported keep COW —
-  per-table opt-in via property (icegres.flush-mode=dv|cow, default cow
-  in this PR; flipping the default is a later decision) so the default
-  path stays byte-identical (I3).
-- Orphan GC (maintain remove-orphans) MUST recognize puffin/DV files as
-  live — extend the manifest walk before any DV write ships; add an e2e
-  leg proving GC never deletes a live DV.
-- New bench metric keyed_flush_ms at two table sizes (small + after a
-  10× data load): the DV curve must be ~flat where COW scales with size.
+### Deliverables
+1. `icegres maintain compact --table <ns.t> [--target-file-mb N]
+   [--min-input-files N] [--execute]` — dry-run by DEFAULT (prints the
+   plan: candidate files per partition, projected output); `--execute`
+   commits. Follows `maintain remove-orphans` CLI conventions.
+2. Mechanics: per partition, select under-target data files (respecting
+   partition spec + current schema), stream-read them, rewrite as
+   combined files via the existing `new_data_writer` stack, commit ONE
+   snapshot with `Operation::Replace` carrying DELETED(old)+ADDED(new)
+   entries through the existing hand-built-manifest machinery. Row set
+   byte-identical; snapshot lineage preserved (old files remain reachable
+   via time travel until snapshot expiry).
+3. Safety rails:
+   - First-committer-wins: the commit races foreign writers through the
+     same requirement-checked REST commit as every other icegres write;
+     on conflict the compact aborts cleanly (retry is the operator's
+     choice) — never a blind overwrite.
+   - Tables bearing delete manifests (foreign-written DVs/position
+     deletes): REFUSE loudly (the machinery already bails) — compacting
+     under deletes we cannot apply would corrupt semantics.
+   - Buffered/keyed tables: compact coordinates with the local buffer
+     exactly like other maintenance (no interleaving with an in-flight
+     flush of the same table).
+   - Orphan-GC interplay: replaced files are NOT orphans (still
+     referenced by older snapshots); an e2e leg proves remove-orphans
+     keeps them until expiry, and expiry+GC after compact reclaims them.
+4. Tests/e2e: unit tests on the planner (selection, thresholds, partition
+   grouping); e2e legs — row-set identity pre/post (count + checksum
+   query), foreign reader (pyiceberg/REST leg per existing harness
+   conventions) agrees post-compact, dry-run mutates nothing, conflict
+   abort clean, refusal on delete-manifest tables, expiry-then-GC
+   reclaims replaced files, time travel to pre-compact snapshot intact.
+5. Bench: new ungated extra `compact_scan_restore_ms` — fragment
+   demo-scale table into many small files (loop of small INSERTs), record
+   degraded scan p50, compact, record restored p50 ≈ pre-fragmentation
+   baseline; plus compact wall-time. Recorded in SCORECARD.
+6. Docs: README maintenance row, deployment.md operator section,
+   limitations.md gains the honest upstream-DV paragraph (the flush-
+   economics gap stays open at the library layer; roadmap-v2 §P2 updated
+   with the verdict and re-check trigger).
 
-### 2b. maintain compact (bin-pack)
-Data-file bin-pack via the rewrite/replace-files action: combine
-under-sized files per partition, one atomic commit, snapshot lineage
-preserved, dry-run default like remove-orphans, size threshold flags.
-e2e: row-set identical pre/post, foreign reader agrees, orphan GC +
-snapshot expiry interplay, compaction of a DV-bearing table preserves
-delete semantics (or refuses loudly if the lib cannot — honest scope).
-Bench: fragmented-table scan p50 restored to near-baseline post-compact.
-
-### 2c. Native multi-table transactions (conditional)
-Only if the target rev ships multi-table/transactions commit support:
-prove byte-equivalence with the raw-REST shim (same REST bodies against
-Lakekeeper, same conflict semantics incl. the capability probe), then
-swap and delete the shim. Otherwise: document and keep the shim — not a
-failure.
-
-## Constraints
-Invariants I1–I4. Exact pins only (crates.io version or git rev). No new
-runtime dependencies beyond what the bumped libs pull. Default behavior
-byte-identical (DV mode opt-in). Neon/moonlink code may be studied;
-moonlink is BSL 1.1 — study-only, no code copying (docs/sota-roadmap.md
-§2 posture unchanged).
-
-## Gates (per stage, all foreground)
-fmt/clippy -D warnings → cargo test --release (live) → tail_durability
-71 → FULL e2e (191 + new legs) → bench A/B vs icegres-pre-p2 with drift
-control → a11 ADBC probe green → parity.sh green. Fix-or-revert per
-house rule at every stage boundary.
+### Constraints & gates
+Invariants I1–I4 unchanged; zero dependency changes of any kind; default
+behavior untouched (compact runs only when invoked). Full ladder on the
+increment: fmt/clippy -D warnings → cargo test --release (live) →
+tail_durability (71) → FULL e2e (191 + new legs) → bench A/B vs the
+pre-P2 baseline (scratchpad icegres-pre-p2 + bench-20260711T223700Z.json,
+drift-controlled) → a11 ADBC probe → parity.sh. Fix-or-revert per house
+rule.
