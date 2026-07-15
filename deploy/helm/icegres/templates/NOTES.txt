@@ -1,0 +1,53 @@
+icegres {{ .Chart.AppVersion }} deployed as release {{ .Release.Name }}.
+
+Client endpoint (pgwire, through the icegresd control plane):
+
+  {{ include "icegres.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.icegresd.service.port }}
+
+  psql "host={{ include "icegres.fullname" . }}.{{ .Release.Namespace }}.svc port={{ .Values.icegresd.service.port }} user=postgres dbname=icegres"
+{{- if gt (int .Values.computes.readReplicas) 0 }}
+
+Read endpoint ({{ .Values.computes.readReplicas }} stateless replicas over the same single copy):
+
+  {{ include "icegres.fullname" . }}-read.{{ .Release.Namespace }}.svc:{{ .Values.computes.service.port }}
+{{- end }}
+{{- if .Values.tls.enabled }}
+
+TLS terminates AT THE COMPUTES. Clients with sslmode=require must connect
+directly to the writer (or -read) Service, not through icegresd:
+
+  {{ include "icegres.fullname" . }}-writer.{{ .Release.Namespace }}.svc:{{ .Values.writer.port }}
+{{- end }}
+{{- if not .Values.auth.enabled }}
+
+WARNING: auth.enabled=false — the computes run UNAUTHENTICATED
+(ICEGRES_INSECURE=true) and anything in-cluster can connect. Enable
+SCRAM (values: auth) for real deployments.
+{{- end }}
+{{- if eq .Values.tail.mode "quorum" }}
+
+Durable tail: quorum (2-of-3 icekeeperd fsync before every buffered ack).
+A wedged/fenced writer fails its /health liveness probe and is replaced;
+the replacement fences the old term and replays the un-flushed window.
+{{- else if eq .Values.tail.mode "dir" }}
+
+Durable tail: dir (single-node WAL on the writer PVC). Survives a writer
+crash on the same volume; NO automated failover (docs/limitations.md).
+{{- else }}
+
+Durable tail: none — writes commit synchronously to Iceberg.
+{{- end }}
+{{- if .Values.ha.enabled }}
+
+icegresd HA: leader lease over the -lease acceptor trio; standbys leave
+the Service via the leadership readiness probe and answer 57P03 if
+dialed directly.
+{{- end }}
+{{- if .Values.k8sScaling.enabled }}
+
+Scale-to-zero: icegresd wakes the writer StatefulSet on connect and
+parks it after {{ .Values.icegresd.idleShutdownSecs }}s idle (RBAC: get/patch on exactly that one
+scale subresource).
+{{- end }}
+
+Runbook (what heals itself, what pages a human): docs/deployment.md §11.

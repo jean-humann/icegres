@@ -1,0 +1,7 @@
+# Profile: control-plane HA + k8s scaling — 2 icegresd behind one Service
+# with the leader lease over the dedicated -lease trio, plus the
+# scale-subresource RBAC and wake/park wiring for the writer.
+ha:
+  enabled: true
+k8sScaling:
+  enabled: true

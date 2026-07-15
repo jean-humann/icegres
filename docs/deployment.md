@@ -18,7 +18,9 @@ the env var is the deployment-friendly form and is what the examples use.
 
 The repository ships a multi-stage `Dockerfile` (pinned `rust:1.96.1` builder →
 `debian:bookworm-slim` runtime, non-root UID 10001, CA certificates + tini for
-signal forwarding). It builds both binaries (`icegres`, `icegresd`).
+signal forwarding). It builds all three binaries (`icegres`, `icegresd`,
+`icekeeperd`) — one image runs any role, which is what the Helm chart
+(§11) relies on.
 
 ```bash
 docker build -t icegres:$(git rev-parse --short HEAD) .
@@ -357,4 +359,223 @@ ICEKEEPER_HOST, ICEKEEPER_PORT, ICEKEEPER_DATA_DIR, ICEKEEPER_NODE_ID   (icekeep
 ICEGRES_IDLE_SHUTDOWN_SECS
 # Observability
 ICEGRES_LOG_FORMAT=json, RUST_LOG
+```
+
+---
+
+## 11. Kubernetes: the Helm chart + HA runbook
+
+The chart lives at `deploy/helm/icegres` (apiVersion v2). One `helm
+install` deploys the whole topology; the HA values light up exactly the
+flag-gated machinery the process-mode e2e suite proves (`icegres/tests/
+e2e.sh` section (ha)) — same code paths, pod-shaped.
+
+```bash
+# Build and push the image first (no public registry is published):
+docker build -t registry.example.com/icegres:0.1.0 .
+docker push registry.example.com/icegres:0.1.0
+
+helm install icegres deploy/helm/icegres \
+  --namespace icegres --create-namespace \
+  --set image.repository=registry.example.com/icegres \
+  --set catalog.uri=https://catalog.example.com/catalog \
+  --set s3.endpoint=https://s3.example.com \
+  --set s3.existingSecret=my-s3-creds
+```
+
+Clients connect to the `<release>-icegres` Service (pgwire through
+icegresd). The writer compute is a StatefulSet behind a headless
+`-writer` Service; icegresd runs in **k8s mode** (`--k8s-compute`): it
+never forks processes — it dials the writer Service and, with
+`k8sScaling.enabled`, wakes/parks the writer by patching its scale
+subresource (RBAC scoped to exactly that one object, verbs
+`get`+`patch`).
+
+### Install matrix
+
+| Values | What you get | HA promise |
+|---|---|---|
+| defaults | icegresd + 1 always-on writer | none (crash = kubelet restart; buffered window would be lost, so buffering is off by default) |
+| `tail.mode=dir` + `writer.writeBufferMs` | buffered writes, WAL on a writer PVC | survives writer crash/restart on the same volume; **no** automated node failover |
+| `tail.mode=quorum` + `writer.writeBufferMs` | `-keeper` icekeeperd trio (anti-affinity required, PDB minAvailable 2), 2-of-3 fsync per ack | acked rows survive losing the writer pod/node and any single acceptor; **automated failover** at the container/pod level — a HARD writer-node loss needs one manual force-delete on clusters without node-lifecycle GC (runbook below) |
+| `ha.enabled` | ≥2 icegresd + dedicated `-lease` trio, leader lease | endpoint survives icegresd pod/node loss within ~1–2× `ha.leaseTtlMs` |
+| `k8sScaling.enabled` | scale-subresource RBAC + wake/park wiring | writer scale-to-zero: parks after `icegresd.idleShutdownSecs` idle, wakes on the next connection |
+| `computes.readReplicas=N` | `-read` Deployment + Service, peer-tailed to the writer with `computes.freshnessMs` bounds | read capacity scales independently; add a plain HPA (values comment) — deliberately no chart-managed HPA |
+| `auth.enabled` / `tls.*` | SCRAM on every compute, TLS at the computes | without auth the computes run `ICEGRES_INSECURE=true` and anything in-cluster can connect |
+
+### HA runbook — what fails how, what heals itself, what pages a human
+
+**Writer container dies or pod is deleted (OOM, `kill -9`, eviction,
+liveness kill).** Kubelet restarts the container / the StatefulSet
+controller replaces the pod. The replacement's `--tail-quorum` open()
+FENCES the old term at the acceptors and replays the
+acked-but-unflushed window **before** its pgwire listener binds — zero
+acked-row loss (quorum mode; `dir` replays only on the same PVC; with
+no tail there is no window to lose). Clients see connection resets and
+reconnect; nobody is paged.
+
+**Writer NODE dies or becomes unreachable (power/kernel/network).**
+Honesty required here: a StatefulSet pod on an unreachable node is
+**never replaced automatically** — the at-most-one guarantee makes the
+controller wait until the old pod object is confirmed gone, and a dead
+kubelet can never confirm the pending delete. On managed clouds the
+node-lifecycle controller usually deletes the Node object after a few
+minutes, after which the pod reschedules; on self-hosted/bare-metal
+clusters (no such GC) the writer sits `Terminating` **indefinitely** —
+an unbounded write outage. **This pages a human**: confirm the node is
+really down, then
+
+```bash
+kubectl -n <ns> delete pod <release>-writer-0 --grace-period=0 --force
+# (or delete the Node object / apply the out-of-service taint)
+```
+
+Safe in quorum mode even if the old machine later comes back: the
+replacement's election has already fenced the old writer (it can never
+ack again), and the acked window replays from the acceptors. For
+`tail.mode=dir` the force-delete only helps if the PVC can follow the
+pod to another node — dir stays single-node HA (limitations.md).
+
+**Writer wedges without dying** (fenced by a competing writer, or its
+quorum went unreachable → the tail poisons itself: the process still
+accepts TCP but can never ack a buffered write again). Its `/health`
+answers `503 tail unhealthy: ...`, the liveness probe fails 3×, the
+kubelet restarts the container, fence-and-replay as above. This is the
+k8s translation of `icegresd --health-check-ms` — the kubelet is the
+health checker, so that flag is refused in k8s mode. Heals itself.
+
+**One acceptor of three dies.** Writes continue (2-of-3). The
+StatefulSet restarts it; the live proposer catches it up. The PDB stops
+voluntary disruptions from taking a second one. Heals itself — but **a
+second acceptor down stops buffered writes** (statement errors,
+backpressure, never silent loss) until one returns: that pages a human
+if it persists (check PVCs/nodes; `kubectl -n <ns> get pods -l
+app.kubernetes.io/component=keeper`).
+
+**icegresd leader pod dies (`ha.enabled`).** A standby observes the
+lease log frozen for ≥ TTL, takes it over (fenced election), flips its
+leadership readiness probe, and enters the Service endpoints; the old
+leader — if merely partitioned, not dead — fails its next renew and
+demotes (refuses clients with a retryable `57P03`). Expect ~1–2× TTL
+(default 6 s → ~6–12 s) of connection errors; clients retry/reconnect.
+Heals itself. Both icegresd instances point at the SAME writer Service,
+so no compute is restarted on control-plane failover.
+
+**The lease trio loses quorum.** The leader demotes within ~TTL even if
+the data path is healthy (an unrenewable lease cannot exclude a second
+leader) — the endpoint goes dark with `57P03` until the lease trio is
+back. Pages a human. (The data trio and the lease trio are DISJOINT
+StatefulSets by construction; icegresd refuses a shared address at
+boot.)
+
+**Catalog or S3 outage.** Computes stay alive (liveness never touches
+the catalog) but turn unready (`/ready` 503, catalog-aware). The writer
+stays REACHABLE through it: its headless Service publishes not-ready
+addresses (the wake signal is "no pod", not "unready pod"), so icegresd
+keeps dialing/splicing and buffered writes keep acking against the tail
+(the catalog is needed at flush, not at ack) — established sessions and
+new connections both work, statements that need fresh metadata error.
+Read replicas with `computes.freshnessMs > 0` deliberately keep their
+readiness OFF the catalog (`/health`): they exist to serve bounded-stale
+reads through exactly this outage (`ICEGRES_STALE_READ_ON_CATALOG_ERROR`
+defaults on with a freshness bound). Exact-freshness replicas
+(`freshnessMs: 0`) leave the `-read` Service until the catalog returns.
+Heals itself when the dependency returns; page whoever owns the catalog.
+
+**What is NOT automated, stated plainly** (see `docs/limitations.md`):
+writer **node**-loss replacement on clusters without node-lifecycle GC
+(one `kubectl delete pod --force` — the StatefulSet bullet above);
+`tail.mode=dir` node failover (manual: the PVC must follow); a
+`helm upgrade` resets a parked writer to 1 replica (the idle loop parks
+it again); scale-to-zero counts only traffic THROUGH icegresd — clients
+connecting to the writer Service directly (e.g. TLS-require) hold no
+idle clock; branch endpoints are process-mode only (deploy a per-branch
+compute instead); the acceptor protocol has no TLS/auth — keep it
+namespace-internal (enable `networkPolicy.enabled`).
+
+### Chart validation (offline) — and an honest label
+
+`tests/helm.sh` is the CI gate for the chart: pinned `helm` v3.21.3 and
+`kubeconform` v0.8.0 built from source (shas hardcoded; overridable with
+`ICEGRES_HELM_BIN`/`ICEGRES_KUBECONFORM_BIN`/`ICEGRES_K8S_SCHEMA_DIR`),
+`helm lint`, committed golden renders for five values profiles
+(`deploy/helm/tests/`), strict schema validation of every manifest
+against Kubernetes v1.31.0 AND v1.34.0 (vendored schemas fetched by
+commit sha), and invariant asserts (anti-affinity, PDBs, probe paths,
+runAsNonRoot everywhere, RBAC scoped to the one scale subresource, no
+tail/buffer env on read replicas). **It renders and validates manifests;
+it does not run a cluster.** The procedure below is how an operator
+smoke-tests the chart on a real cluster — it is NOT executed by this
+repository's CI (the gate box has no Docker daemon or cluster).
+
+### Real-cluster smoke procedure (kind) — not CI-run
+
+```bash
+kind create cluster --name icegres
+docker build -t icegres:smoke . && kind load docker-image icegres:smoke --name icegres
+
+helm install icegres deploy/helm/icegres -n icegres --create-namespace \
+  --set image.repository=icegres --set image.tag=smoke \
+  --set catalog.uri=http://<your-lakekeeper>/catalog \
+  --set s3.endpoint=http://<your-s3> \
+  --set s3.accessKey=... --set s3.secretKey=... \
+  --set tail.mode=quorum --set writer.writeBufferMs=200 \
+  --set k8sScaling.enabled=true --set ha.enabled=true \
+  --set keeper.antiAffinity=soft --set lease.antiAffinity=soft   # single-node kind
+
+kubectl -n icegres get pods
+# expected: icegres-<hash> x2 (one 1/1 READY — the leader; one 0/1 —
+# the standby, by design), icegres-writer-0 1/1, icegres-keeper-{0,1,2}
+# and icegres-lease-{0,1,2} 1/1
+
+# 1. wake-on-connect + a write through the endpoint
+kubectl -n icegres run psql --rm -it --image=postgres:16 --command -- \
+  psql "host=icegres port=5432 user=postgres dbname=icegres" \
+  -c "create table demo.t (a int)" -c "insert into demo.t values (1)"
+
+# 2. writer failover under a wedged tail: fence it by scaling a second
+#    writer is not possible here, so kill the acceptor quorum instead:
+kubectl -n icegres delete pod icegres-keeper-0 icegres-keeper-1
+#    inserts error (backpressure) until the pods return; then succeed.
+
+# 3. writer kill: the pod is REALLY replaced and acked rows survive.
+#    (Do NOT `kubectl exec ... kill -9 1`: PID 1 in the container is
+#    tini, and the kernel silently ignores SIGKILL sent to a PID
+#    namespace's init from inside it — nothing dies and the "check"
+#    passes without any failover having happened.)
+OLD_UID=$(kubectl -n icegres get pod icegres-writer-0 -o jsonpath='{.metadata.uid}')
+kubectl -n icegres delete pod icegres-writer-0 --grace-period=0 --force
+kubectl -n icegres wait --for=condition=Ready pod/icegres-writer-0 --timeout=180s
+NEW_UID=$(kubectl -n icegres get pod icegres-writer-0 -o jsonpath='{.metadata.uid}')
+[ "$OLD_UID" != "$NEW_UID" ] && echo "REPLACED (new pod identity)" \
+  || echo "FAIL: same pod — no failover was exercised"
+# the replacement ran the quorum election + replay before binding pgwire
+# (a fresh term FENCES the old writer; either line proves the path ran):
+kubectl -n icegres logs icegres-writer-0 | grep -E 'recovered .* rows|nothing to replay'
+kubectl -n icegres run psql2 --rm -it --image=postgres:16 --command -- \
+  psql "host=icegres port=5432 user=postgres dbname=icegres" \
+  -c "select count(*) from demo.t"   # acked row survived the pod's death
+
+# 4. icegresd leader kill: the WARM STANDBY takes over within ~2x TTL.
+#    Delete ONLY the leader — the standby is unready (0/1) but its pod
+#    phase is still Running, so a `--field-selector status.phase=Running`
+#    delete would kill BOTH pods and "validate" a cold restart instead of
+#    the standby takeover ha.enabled pays two replicas for. The leader is
+#    the Ready pod:
+LEADER=$(kubectl -n icegres get pods -l app.kubernetes.io/component=icegresd \
+  -o jsonpath='{range .items[?(@.status.conditions[?(@.type=="Ready")].status=="True")]}{.metadata.name}{"\n"}{end}')
+STANDBY=$(kubectl -n icegres get pods -l app.kubernetes.io/component=icegresd \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep -v "^$LEADER\$")
+echo "leader: $LEADER  standby: $STANDBY"
+kubectl -n icegres delete pod "$LEADER" --grace-period=0 --force
+# the PRE-EXISTING standby must turn 1/1 within ~2x ha.leaseTtlMs — that
+# is the warm standby HOLDING THE LEASE, not a restart of the deleted pod:
+kubectl -n icegres wait --for=condition=Ready "pod/$STANDBY" --timeout=30s
+kubectl -n icegres exec "$STANDBY" -- grep -o '"leader": true' /tmp/icegresd-status.json
+
+# 5. scale-to-zero: with no traffic for icegresd.idleShutdownSecs,
+kubectl -n icegres get statefulset icegres-writer   # replicas 0
+#    then connect again (step 1) — the writer scales back to 1 and serves.
+
+kind delete cluster --name icegres
 ```

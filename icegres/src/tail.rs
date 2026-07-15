@@ -318,9 +318,35 @@ impl StagedAppend {
     /// replay (the backend rolls back / clamps it away).
     pub fn wait_durable(self) -> Result<u64> {
         if let Some(wait) = self.waiter {
-            wait()?;
+            block_runtime_friendly(wait)?;
         }
         Ok(self.seq)
+    }
+}
+
+/// Run a BLOCKING wait without wedging the async runtime it may be sitting
+/// on. The durability waits (a group fsync, a tail-database round trip, a
+/// quorum ack) are synchronous by contract but usually execute on a tokio
+/// worker thread; normally they block for ~ms, but a backend riding out an
+/// outage blocks for its full timeout (seconds) — and a worker parked in a
+/// sync wait can leave the runtime's I/O driver unpolled, freezing EVERY
+/// connection on the server (including `/health`, which must stay
+/// answerable precisely then: the supervisor's wedged-compute detection
+/// depends on it — measured: a 2 s quorum stall froze `select 1`,
+/// `/health` AND `/metrics` for its full duration). On a MULTI-THREAD
+/// tokio runtime, `block_in_place` hands the worker's core (and the I/O
+/// driver duties) to another thread before blocking; on a blocking-pool or
+/// `block_on` thread it degrades to a direct call (verified non-panicking
+/// on tokio 1.52 for both). On a current-thread runtime — where
+/// `block_in_place` WOULD panic — and outside any runtime, it is a direct
+/// call.
+pub(crate) fn block_runtime_friendly<T>(f: impl FnOnce() -> T) -> T {
+    if tokio::runtime::Handle::try_current()
+        .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
     }
 }
 
@@ -397,6 +423,18 @@ pub trait TailStore: Send + Sync {
     /// stamped in the commit keeps replay exact; skipping the truncate is
     /// a bounded leak, not a loss.
     fn record_watermark(&self, _table: &TableIdent, _seq: u64) -> Result<()> {
+        Ok(())
+    }
+
+    /// Can this tail still ack appends? `Err` = permanently wedged for
+    /// this process (e.g. the quorum tail poisoned itself after being
+    /// fenced or timing out a quorum ack) — surfaced through the compute's
+    /// `/health` endpoint so a supervisor (icegresd) can replace a
+    /// wedged-but-alive compute instead of routing writes that can never
+    /// ack. Default: healthy — the local WAL and Postgres tails fail
+    /// per-statement and recover per-statement, they never wedge the
+    /// process.
+    fn health(&self) -> Result<()> {
         Ok(())
     }
 }
@@ -1681,6 +1719,33 @@ mod tests {
     use std::sync::Arc;
 
     static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    // block_runtime_friendly must be a plain call in every context where
+    // block_in_place is unavailable or would panic — and must not panic on
+    // a multi-thread runtime from ANY thread class (worker task, blocking
+    // pool, the block_on thread). One stalled durability wait wedging the
+    // runtime's I/O driver is exactly the failure it exists to prevent.
+    #[test]
+    fn block_runtime_friendly_outside_any_runtime() {
+        assert_eq!(block_runtime_friendly(|| 7), 7);
+    }
+
+    #[tokio::test]
+    async fn block_runtime_friendly_on_a_current_thread_runtime() {
+        // block_in_place panics on current_thread; the helper must not.
+        assert_eq!(block_runtime_friendly(|| 7), 7);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn block_runtime_friendly_on_a_multi_thread_runtime() {
+        let a = tokio::spawn(async { block_runtime_friendly(|| 1) })
+            .await
+            .unwrap();
+        let b = tokio::task::spawn_blocking(|| block_runtime_friendly(|| 2))
+            .await
+            .unwrap();
+        assert_eq!((a, b), (1, 2));
+    }
 
     /// Fresh per-test directory (unique per process run; cleaned by the OS
     /// temp policy — tests must not depend on pre-existing state).

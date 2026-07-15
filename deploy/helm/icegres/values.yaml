@@ -1,0 +1,268 @@
+# Default values for the icegres chart.
+#
+# The defaults deploy the SMALLEST honest topology: one icegresd control
+# plane pod (the single client endpoint) in front of one always-on writer
+# compute — no tail, no lease, no read replicas, no RBAC. Every HA option
+# below lights up the same flag-gated machinery the process-mode e2e suite
+# proves (docs/p3-ha-scope.md); nothing here changes icegres defaults.
+#
+# The install matrix (see docs/deployment.md §11 for the runbook):
+#   defaults ................ scale-to-zero-ready proxy + 1 writer
+#   tail.mode=quorum ........ consensus-durable buffered writes; a wedged/
+#                             fenced writer FAILS its /health liveness and
+#                             the kubelet replaces it (fence + replay)
+#   ha.enabled=true ......... 2+ icegresd behind one Service, leader lease
+#                             over a dedicated icekeeperd trio
+#   k8sScaling.enabled=true . icegresd wakes/parks the writer workload via
+#                             the scale subresource (needs the chart Role)
+#   computes.readReplicas>0 . stateless read computes over the same single
+#                             copy, peer-tailed to the writer's un-flushed
+#                             window; clients connect to the -read Service
+
+image:
+  # The image built by the repository Dockerfile (ships icegres, icegresd,
+  # icekeeperd). No public registry is published yet: build and push it to
+  # your own registry, then point repository/tag at it.
+  repository: icegres
+  # Defaults to the chart appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+# Extra labels stamped on every rendered object.
+commonLabels: {}
+
+# --- Lakehouse wiring (ConfigMap; every compute gets these) -----------------
+catalog:
+  # Iceberg REST catalog (e.g. Lakekeeper) and warehouse.
+  uri: "http://lakekeeper:8181/catalog"
+  warehouse: "lakehouse"
+
+s3:
+  endpoint: "http://rustfs:9000"
+  region: "us-east-1"
+  # Inline credentials render into a chart-managed Secret. Prefer
+  # existingSecret in anything beyond a demo.
+  accessKey: ""
+  secretKey: ""
+  # Name of a Secret with keys `s3-access-key` and `s3-secret-key`;
+  # overrides accessKey/secretKey above.
+  existingSecret: ""
+
+# --- Security ----------------------------------------------------------------
+auth:
+  # SCRAM authentication on every compute (--auth-file). When DISABLED the
+  # computes are started with ICEGRES_INSECURE=true (they refuse a public
+  # bind without it — secure by default); the chart keeps them ClusterIP-
+  # internal, but anything in-cluster can connect. Enable this for real
+  # deployments. NOTE: with auth enabled icegresd cannot pre-authenticate
+  # warm pool sessions, so the chart disables session pooling.
+  enabled: false
+  # Inline auth-file content (`icegres auth hash` lines) for the
+  # chart-managed Secret. Prefer existingSecret.
+  users: ""
+  # Name of a Secret with key `users` (the auth file). With readReplicas>0
+  # and a durable tail it must also carry `peer-tail-password` (and
+  # peerTailUser below must name a user in the auth file): replicas run
+  # the Flight basic-auth handshake against the writer's tail API.
+  existingSecret: ""
+  peerTailUser: ""
+  # Inline peer-tail password for the chart-managed Secret (ignored when
+  # existingSecret is set).
+  peerTailPassword: ""
+
+tls:
+  # TLS terminates AT THE COMPUTES (writer/read pods). icegresd itself
+  # speaks plain TCP and answers SSLRequest with 'N' (libpq sslmode=prefer
+  # falls back); clients that REQUIRE TLS must connect to a compute
+  # Service directly (see NOTES.txt).
+  enabled: false
+  # Name of a kubernetes.io/tls Secret (keys tls.crt / tls.key). Required
+  # when enabled (the chart never mints certificates).
+  existingSecret: ""
+
+# --- icegresd (the client endpoint) ------------------------------------------
+icegresd:
+  # Forced to >= 2 when ha.enabled (a lease with one holder is a no-op).
+  replicas: 1
+  port: 5432
+  service:
+    # LoadBalancer to expose the endpoint outside the cluster.
+    type: ClusterIP
+    port: 5432
+    annotations: {}
+  # Cold-connect budget: pod scheduling + image pull, not a process fork.
+  wakeTimeoutMs: 120000
+  # With k8sScaling.enabled: zero proxied sessions for this long scales
+  # the writer workload to 0 replicas (0 disables the scale-down half).
+  idleShutdownSecs: 300
+  # Warm session pool per compute (forced to 0 when auth.enabled).
+  poolSize: 8
+  poolUser: postgres
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { memory: 256Mi }
+  extraEnv: []
+
+ha:
+  # icegresd redundancy: replicas>=2, one leader elected/fenced through a
+  # DEDICATED icekeeperd lease trio (rendered as the -lease StatefulSet;
+  # never the data trio — sharing a log would fence the tail writer).
+  # Standbys answer clients with a retryable 57P03 and are pulled from the
+  # Service by a leadership readiness probe, so traffic follows the lease.
+  enabled: false
+  leaseTtlMs: 6000
+
+k8sScaling:
+  # Let icegresd wake (0->1 on connect) and park (->0 after
+  # icegresd.idleShutdownSecs) the writer StatefulSet by patching its
+  # apps/v1 scale subresource. Renders a Role/RoleBinding scoped to
+  # EXACTLY that one object's scale subresource, verbs [get, patch], and
+  # mounts the serviceaccount token into the icegresd pod (no other pod
+  # gets one). Off: the writer stays always-on at 1 replica and no RBAC
+  # is rendered.
+  enabled: false
+
+# --- Durable tail for buffered writes ----------------------------------------
+tail:
+  # none   — writes commit synchronously to Iceberg (writer.writeBufferMs
+  #          must stay 0); no durability machinery rendered.
+  # dir    — single-node WAL on a writer PVC: survives a writer crash on
+  #          the same node/volume. Single-node by nature; no automated
+  #          failover (docs/limitations.md).
+  # quorum — the icekeeperd trio (rendered as the -keeper StatefulSet):
+  #          2-of-3 fsync before every ack; acked rows survive losing the
+  #          writer PODS AND any single acceptor; the replacement writer's
+  #          tail election fences the old one and replays the window.
+  mode: none
+  # ICEGRES_TAIL_QUORUM_TIMEOUT_MS (quorum mode; min 1000).
+  quorumTimeoutMs: 10000
+  dir:
+    size: 1Gi
+    storageClass: ""
+
+# --- Writer compute -----------------------------------------------------------
+writer:
+  # ICEGRES_WRITE_BUFFER_MS: required > 0 when tail.mode != none (the tail
+  # is the durability of the buffered window). 0 = synchronous commits.
+  writeBufferMs: 0
+  port: 5439
+  healthPort: 8080
+  # Startup headroom before the liveness probe arms: /health binds only
+  # AFTER the catalog session is built — and on the quorum failover path
+  # after the tail election + replay too — so a slow boot (big warehouse,
+  # slow-but-answering catalog) must not be kubelet-killed into a
+  # permanent CrashLoopBackOff. Budget = periodSeconds x failureThreshold
+  # (default 2s x 60 = 120s, matching icegresd.wakeTimeoutMs); raise
+  # failureThreshold for warehouses whose boot enumerates many tables.
+  startupProbe:
+    periodSeconds: 2
+    failureThreshold: 60
+  # The open-tail read API (Arrow Flight) read replicas subscribe to;
+  # only served with readReplicas > 0 and a durable tail.
+  tailApiPort: 5499
+  resources:
+    requests: { cpu: 500m, memory: 1Gi }
+    limits: { memory: 4Gi }
+  extraEnv: []
+
+# --- Read replicas (stateless computes over the same single copy) -------------
+computes:
+  # Fixed replica count of the -read Deployment. Clients connect to the
+  # <release>-icegres-read Service DIRECTLY (reads never need waking; a
+  # Service load-balances ready pods natively). 0 renders nothing.
+  #
+  # AUTOSCALING GUIDANCE (there is deliberately no chart-managed HPA):
+  # read computes are stateless and cheap, so a plain HPA on this
+  # Deployment is the whole story, e.g.
+  #   kubectl autoscale deployment <release>-icegres-read \
+  #     --min 1 --max 8 --cpu-percent 70
+  # Keep minReplicas >= 1: only the writer has a wake-on-connect path
+  # (k8sScaling); a scaled-to-zero read Deployment stays down until HPA
+  # scales it on load it can only see once traffic already flows.
+  readReplicas: 0
+  # ICEGRES_FRESHNESS_MS on the replicas (bounded-staleness reads;
+  # 0 = exact freshness with a per-scan catalog round trip).
+  freshnessMs: 0
+  # Startup headroom for the replicas (same reason as writer.startupProbe:
+  # /health binds only after the catalog session is built).
+  startupProbe:
+    periodSeconds: 2
+    failureThreshold: 60
+  service:
+    type: ClusterIP
+    port: 5439
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { memory: 2Gi }
+  extraEnv: []
+
+# --- icekeeperd trios ----------------------------------------------------------
+# Data quorum trio (tail.mode=quorum). Acceptors are tiny (an fsync'd
+# record log; no catalog/S3 access) and MUST land on different nodes for
+# the 2-of-3 promise to mean node-level durability.
+keeper:
+  port: 5471
+  # required — refuse to co-schedule acceptors (pending pods on a smaller
+  # cluster are the honest signal); soft — prefer to spread (single-node
+  # dev clusters, kind).
+  antiAffinity: required
+  storage:
+    size: 1Gi
+    storageClass: ""
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { memory: 256Mi }
+
+# Lease trio (ha.enabled) — same daemon, DEDICATED log.
+lease:
+  port: 5471
+  antiAffinity: required
+  storage:
+    size: 256Mi
+    storageClass: ""
+  resources:
+    requests: { cpu: 25m, memory: 32Mi }
+    limits: { memory: 128Mi }
+
+# --- Optional integrations -----------------------------------------------------
+metrics:
+  serviceMonitor:
+    # Prometheus Operator ServiceMonitor scraping /metrics on the compute
+    # health ports (writer + read replicas). Requires the CRD.
+    enabled: false
+    interval: 30s
+    # Extra labels for the ServiceMonitor (e.g. a Prometheus selector).
+    labels: {}
+
+networkPolicy:
+  # Ingress-only NetworkPolicies: client ports admit from clientFrom (empty
+  # = any in-cluster peer), compute/acceptor internals admit only this
+  # release's pods, health ports stay open for kubelet probes and scrapes.
+  enabled: false
+  # NetworkPolicyPeer list for client-facing ports (icegresd, -read, and
+  # the writer's pgwire port for TLS-direct clients).
+  clientFrom: []
+
+serviceAccount:
+  create: true
+  name: ""
+
+# --- Pod hardening (applied to every pod) ---------------------------------------
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+nodeSelector: {}
+tolerations: []

@@ -1,0 +1,137 @@
+{{- include "icegres.validate" . -}}
+{{- if .Values.networkPolicy.enabled }}
+{{/*
+Ingress-only segmentation (egress left open: computes need the catalog,
+S3, and cluster DNS — all deployment-specific):
+  - client ports (icegresd pgwire, -read pgwire, writer pgwire for
+    TLS-direct clients) admit networkPolicy.clientFrom (empty = any peer)
+  - internals (writer tail API, acceptor ports) admit ONLY this
+    release's pods — the acceptor protocol has no TLS/auth of its own
+    (docs/limitations.md), this is its trust boundary
+  - health ports admit anything: kubelet probes and metrics scrapes
+    arrive from CNI-specific sources
+*/}}
+{{- $release := dict "matchLabels" (dict "app.kubernetes.io/name" (include "icegres.name" .) "app.kubernetes.io/instance" .Release.Name) }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "icegres.fullname" . }}-icegresd
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegres.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "icegres.selectorLabels" (dict "ctx" $ "component" "icegresd") | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    - ports:
+        - port: {{ int .Values.icegresd.port }}
+      {{- with .Values.networkPolicy.clientFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "icegres.fullname" . }}-writer
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegres.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "icegres.selectorLabels" (dict "ctx" $ "component" "writer") | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    # pgwire: icegresd's splices, and TLS-direct clients (NOTES.txt sends
+    # sslmode=require clients HERE — they are not release pods). Same
+    # contract as the other client ports: empty clientFrom = any peer;
+    # when set, release pods + clientFrom.
+    - ports:
+        - port: {{ int .Values.writer.port }}
+      {{- if .Values.networkPolicy.clientFrom }}
+      from:
+        - podSelector:
+            {{- toYaml $release | nindent 12 }}
+        {{- toYaml .Values.networkPolicy.clientFrom | nindent 8 }}
+      {{- end }}
+    {{- if eq (include "icegres.tailApiEnabled" .) "true" }}
+    # Open-tail read API: release pods only (read replicas subscribe).
+    - ports:
+        - port: {{ int .Values.writer.tailApiPort }}
+      from:
+        - podSelector:
+            {{- toYaml $release | nindent 12 }}
+    {{- end }}
+    # Health/metrics: kubelet probes + scrapes.
+    - ports:
+        - port: {{ int .Values.writer.healthPort }}
+{{- if gt (int .Values.computes.readReplicas) 0 }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "icegres.fullname" . }}-read
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegres.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "icegres.selectorLabels" (dict "ctx" $ "component" "read") | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    - ports:
+        - port: {{ int .Values.computes.service.port }}
+      {{- with .Values.networkPolicy.clientFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    - ports:
+        - port: {{ int .Values.writer.healthPort }}
+{{- end }}
+{{- if eq .Values.tail.mode "quorum" }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "icegres.fullname" . }}-keeper
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegres.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "icegres.selectorLabels" (dict "ctx" $ "component" "keeper") | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    - ports:
+        - port: {{ int .Values.keeper.port }}
+      from:
+        - podSelector:
+            {{- toYaml $release | nindent 12 }}
+{{- end }}
+{{- if .Values.ha.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "icegres.fullname" . }}-lease
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegres.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "icegres.selectorLabels" (dict "ctx" $ "component" "lease") | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    - ports:
+        - port: {{ int .Values.lease.port }}
+      from:
+        - podSelector:
+            {{- toYaml $release | nindent 12 }}
+{{- end }}
+{{- end }}

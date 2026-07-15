@@ -393,6 +393,21 @@ psql -h 127.0.0.1 -p 5432 -U postgres -d 'icegres@dev'
   off), `--pool-user` (default `postgres`), `--pool-idle-secs` (default
   60); env `ICEGRESD_*` equivalents exist for all.
 
+* **Kubernetes mode (`--k8s-compute` / `--k8s-scale`, opt-in).** In a
+  cluster icegresd never forks: `--k8s-compute` makes the main compute a
+  REMOTE pod dialed at `--compute-host:--main-port` (the writer Service),
+  and `--k8s-scale deployments/<name>|statefulsets/<name>` (implies
+  `--k8s-compute`) adds wake-on-connect (scale 0 → 1, then the normal
+  readiness poll) and idle scale-to-zero (zero proxied sessions for
+  `--idle-shutdown-secs` → scale to 0) by patching that workload's
+  apps/v1 scale subresource with the pod serviceaccount — RBAC needed:
+  `get`+`patch` on exactly that one object's scale. Process-mode-only
+  features are refused loudly in k8s mode (`--health-check-ms` — the
+  kubelet's liveness probe owns compute replacement; `--read-replicas-max`
+  — use a Deployment + HPA; branch endpoints — deploy per-branch
+  computes). The Helm chart at `deploy/helm/icegres` wires all of this
+  (see `docs/deployment.md` §11).
+
 ### Health checks (`--health-port`)
 
 The pgwire port itself is health-checkable with a plain TCP connect (e.g.

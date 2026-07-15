@@ -1067,6 +1067,16 @@ impl Quorum {
         self.advance_horizon_locked(&mut log)
     }
 
+    /// The poison reason, if the tail has poisoned itself (superseded by a
+    /// newer proposer, or a quorum-ack timeout). `None` = the tail can
+    /// still ack appends. Surfaced through the compute's `/health` so a
+    /// supervisor can tell a wedged-but-alive process (accepts TCP, can
+    /// never ack a write) from a healthy one and replace it — the
+    /// replacement's election fences the old term and replays.
+    pub fn poison_reason(&self) -> Option<String> {
+        self.shared.poisoned()
+    }
+
     /// Last acked flush positions, for tests/diagnostics.
     #[cfg(test)]
     pub fn peer_flushes(&self) -> Vec<u64> {

@@ -1,0 +1,504 @@
+---
+# Source: icegres/templates/keeper-trio.yaml
+# Writes survive any single acceptor failure; voluntary disruptions must
+# never take the second one.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: icegres-keeper
+  namespace: icegres-system
+  labels:
+    helm.sh/chart: icegres-0.1.0
+    app.kubernetes.io/name: icegres
+    app.kubernetes.io/instance: icegres
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: keeper
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: icegres
+      app.kubernetes.io/instance: icegres
+      app.kubernetes.io/component: keeper
+---
+# Source: icegres/templates/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: icegres
+  namespace: icegres-system
+  labels:
+    helm.sh/chart: icegres-0.1.0
+    app.kubernetes.io/name: icegres
+    app.kubernetes.io/instance: icegres
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+# No pod mounts a token by default; only the icegresd pod opts back in,
+# and only when k8sScaling.enabled needs the scale-subresource PATCH.
+automountServiceAccountToken: false
+---
+# Source: icegres/templates/secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: icegres
+  namespace: icegres-system
+  labels:
+    helm.sh/chart: icegres-0.1.0
+    app.kubernetes.io/name: icegres
+    app.kubernetes.io/instance: icegres
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+type: Opaque
+stringData:
+  s3-access-key: ""
+  s3-secret-key: ""
+---
+# Source: icegres/templates/configmap.yaml
+# Lakehouse wiring shared by every compute (writer + read replicas):
+# non-secret, envFrom'd as ICEGRES_* variables.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: icegres
+  namespace: icegres-system
+  labels:
+    helm.sh/chart: icegres-0.1.0
+    app.kubernetes.io/name: icegres
+    app.kubernetes.io/instance: icegres
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+data:
+  ICEGRES_CATALOG_URI: "http://lakekeeper:8181/catalog"
+  ICEGRES_WAREHOUSE: "lakehouse"
+  ICEGRES_S3_ENDPOINT: "http://rustfs:9000"
+  ICEGRES_S3_REGION: "us-east-1"
+---
+# Source: icegres/templates/icegresd-service.yaml
+# The client endpoint (pgwire). With ha.enabled the leadership readiness
+# probe keeps standbys out of the endpoints, so this Service always
+# points at the lease holder.
+apiVersion: v1
+kind: Service
+metadata:
+  name: icegres
+  namespace: icegres-system
+  labels:
+    helm.sh/chart: icegres-0.1.0
+    app.kubernetes.io/name: icegres
+    app.kubernetes.io/instance: icegres
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: icegresd
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: icegres
+    app.kubernetes.io/instance: icegres
+    app.kubernetes.io/component: icegresd
+  ports:
+    - name: pgwire
+      port: 5432
+      targetPort: pgwire
+---
+# Source: icegres/templates/keeper-trio.yaml
+# Headless governing Service: stable per-acceptor DNS
+# (icegres-keeper-{0,1,2}.icegres-keeper) for the quorum address list.
+# Not-ready addresses are published: a restarting acceptor must stay
+# resolvable so the live proposer can catch it up.
+apiVersion: v1
+kind: Service
+metadata:
+  name: icegres-keeper
+  namespace: icegres-system
+  labels:
+    helm.sh/chart: icegres-0.1.0
+    app.kubernetes.io/name: icegres
+    app.kubernetes.io/instance: icegres
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: keeper
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: icegres
+    app.kubernetes.io/instance: icegres
+    app.kubernetes.io/component: keeper
+  ports:
+    - name: acceptor
+      port: 5471
+      targetPort: acceptor
+---
+# Source: icegres/templates/writer-service.yaml
+# Headless: the StatefulSet's governing Service, what icegresd dials (a
+# scaled-to-zero writer resolves to nothing, which is the wake signal),
+# what read replicas peer-tail, and where TLS-requiring clients connect
+# directly (icegresd answers SSLRequest with 'N'; TLS terminates here).
+apiVersion: v1
+kind: Service
+metadata:
+  name: icegres-writer
+  namespace: icegres-system
+  labels:
+    helm.sh/chart: icegres-0.1.0
+    app.kubernetes.io/name: icegres
+    app.kubernetes.io/instance: icegres
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: writer
+spec:
+  clusterIP: None
+  # Not-ready addresses ARE published. The wake signal is "no pod at
+  # all" (a scaled-to-zero writer has no pod, so DNS is empty either
+  # way), and everything that dials this name treats TCP-accept as
+  # readiness: icegres binds pgwire only after the catalog session is
+  # built (+ tail election/replay), so an accepting compute is servable.
+  # Without this, the catalog-aware /ready turns a catalog blip into a
+  # black-hole: the alive writer vanishes from DNS, icegresd's wake poll
+  # can never resolve it, and every NEW connection hangs for
+  # icegresd.wakeTimeoutMs even though buffered writes only need the
+  # catalog at flush.
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: icegres
+    app.kubernetes.io/instance: icegres
+    app.kubernetes.io/component: writer
+  ports:
+    - name: pgwire
+      port: 5439
+      targetPort: pgwire
+    - name: health
+      port: 8080
+      targetPort: health
+---
+# Source: icegres/templates/icegresd-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: icegres
+  namespace: icegres-system
+  labels:
+    helm.sh/chart: icegres-0.1.0
+    app.kubernetes.io/name: icegres
+    app.kubernetes.io/instance: icegres
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: icegresd
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: icegres
+      app.kubernetes.io/instance: icegres
+      app.kubernetes.io/component: icegresd
+  template:
+    metadata:
+      labels:
+        helm.sh/chart: icegres-0.1.0
+        app.kubernetes.io/name: icegres
+        app.kubernetes.io/instance: icegres
+        app.kubernetes.io/version: "0.1.0"
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/component: icegresd
+    spec:
+      serviceAccountName: icegres
+      # The token exists solely for the scale-subresource PATCH.
+      automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: icegresd
+          image: "icegres:0.1.0"
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/bin/tini", "--", "/usr/local/bin/icegresd"]
+          args: ["serve"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          env:
+            - name: ICEGRESD_HOST
+              value: "0.0.0.0"
+            - name: ICEGRESD_PORT
+              value: "5432"
+            # k8s mode: the main compute is the writer Service, never a
+            # forked child (see `icegresd serve --help`).
+            - name: ICEGRESD_K8S_COMPUTE
+              value: "true"
+            - name: ICEGRESD_COMPUTE_HOST
+              value: "icegres-writer"
+            - name: ICEGRESD_MAIN_PORT
+              value: "5439"
+            - name: ICEGRESD_WAKE_TIMEOUT_MS
+              value: "120000"
+            - name: ICEGRESD_STATUS_FILE
+              value: /tmp/icegresd-status.json
+            - name: ICEGRESD_POOL_SIZE
+              value: "8"
+            - name: ICEGRESD_POOL_USER
+              value: "postgres"
+          ports:
+            - name: pgwire
+              containerPort: 5432
+          livenessProbe:
+            tcpSocket:
+              port: pgwire
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: pgwire
+            periodSeconds: 5
+          resources:
+            limits:
+              memory: 256Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # readOnlyRootFilesystem: the status file needs a writable /tmp.
+        - name: tmp
+          emptyDir: {}
+---
+# Source: icegres/templates/keeper-trio.yaml
+# Data quorum trio: 2-of-3 fsync before every buffered-write ack (tail.mode=quorum). A replacement writer's tail election fences the old one here.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: icegres-keeper
+  namespace: icegres-system
+  labels:
+    helm.sh/chart: icegres-0.1.0
+    app.kubernetes.io/name: icegres
+    app.kubernetes.io/instance: icegres
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: keeper
+spec:
+  # Exactly three: the consensus is 2-of-3 by construction.
+  replicas: 3
+  serviceName: icegres-keeper
+  # Acceptors are independent; start them together.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: icegres
+      app.kubernetes.io/instance: icegres
+      app.kubernetes.io/component: keeper
+  template:
+    metadata:
+      labels:
+        helm.sh/chart: icegres-0.1.0
+        app.kubernetes.io/name: icegres
+        app.kubernetes.io/instance: icegres
+        app.kubernetes.io/version: "0.1.0"
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/component: keeper
+    spec:
+      serviceAccountName: icegres
+      automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          # Two acceptors on one node quietly reduce the 2-of-3 promise
+          # to that node's survival: refuse to co-schedule (set
+          # keeper.antiAffinity=soft only on dev clusters).
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: icegres
+                  app.kubernetes.io/instance: icegres
+                  app.kubernetes.io/component: keeper
+      containers:
+        - name: icekeeperd
+          image: "icegres:0.1.0"
+          imagePullPolicy: IfNotPresent
+          # --node-id from the ordinal in the pod hostname (<name>-0/1/2).
+          command: ["/usr/bin/tini", "--", "/bin/sh", "-c"]
+          args:
+            - >-
+              exec /usr/local/bin/icekeeperd serve --host 0.0.0.0
+              --port 5471
+              --data-dir /var/lib/icekeeper
+              --node-id "${HOSTNAME##*-}"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          ports:
+            - name: acceptor
+              containerPort: 5471
+          livenessProbe:
+            tcpSocket:
+              port: acceptor
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: acceptor
+            periodSeconds: 5
+          resources:
+            limits:
+              memory: 256Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/icekeeper
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+---
+# Source: icegres/templates/writer-statefulset.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: icegres-writer
+  namespace: icegres-system
+  labels:
+    helm.sh/chart: icegres-0.1.0
+    app.kubernetes.io/name: icegres
+    app.kubernetes.io/instance: icegres
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: writer
+spec:
+  # One buffering writer per lake — always. With k8sScaling.enabled,
+  # icegresd parks this at 0 replicas when idle and wakes it on connect
+  # (a `helm upgrade` resets it to 1; the idle loop parks it again).
+  replicas: 1
+  serviceName: icegres-writer
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: icegres
+      app.kubernetes.io/instance: icegres
+      app.kubernetes.io/component: writer
+  template:
+    metadata:
+      labels:
+        helm.sh/chart: icegres-0.1.0
+        app.kubernetes.io/name: icegres
+        app.kubernetes.io/instance: icegres
+        app.kubernetes.io/version: "0.1.0"
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/component: writer
+    spec:
+      serviceAccountName: icegres
+      automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      # > the 30 s in-flight drain + buffered-write flush on SIGTERM.
+      terminationGracePeriodSeconds: 40
+      containers:
+        - name: writer
+          image: "icegres:0.1.0"
+          imagePullPolicy: IfNotPresent
+          args: ["serve", "--host", "0.0.0.0"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          envFrom:
+            - configMapRef:
+                name: icegres
+          env:
+            - name: ICEGRES_PORT
+              value: "5439"
+            - name: ICEGRES_HEALTH_PORT
+              value: "8080"
+            - name: ICEGRES_S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: icegres
+                  key: s3-access-key
+            - name: ICEGRES_S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: icegres
+                  key: s3-secret-key
+            # icegres refuses an unauthenticated public bind without this
+            # explicit acknowledgement. The Service is cluster-internal,
+            # but ANYTHING in-cluster can connect: enable auth for real
+            # deployments (values: auth.enabled).
+            - name: ICEGRES_INSECURE
+              value: "true"
+            - name: ICEGRES_WRITE_BUFFER_MS
+              value: "200"
+            - name: ICEGRES_TAIL_QUORUM
+              value: "icegres-keeper-0.icegres-keeper:5471,icegres-keeper-1.icegres-keeper:5471,icegres-keeper-2.icegres-keeper:5471"
+            - name: ICEGRES_TAIL_QUORUM_TIMEOUT_MS
+              value: "10000"
+          ports:
+            - name: pgwire
+              containerPort: 5439
+            - name: health
+              containerPort: 8080
+          # Startup headroom: /health binds only AFTER the catalog session
+          # build (+ quorum election + tail replay on the failover path).
+          # Without this the liveness probe below would kill a slow boot
+          # ~20-30s in, forever — CrashLoopBackOff on the chart's own
+          # failover trigger. Tunable via writer.startupProbe.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: health
+            periodSeconds: 2
+            failureThreshold: 60
+          # Liveness must NOT touch the catalog (a catalog blip is not a
+          # reason to restart) — but it DOES report a wedged durable tail
+          # as 503, which is exactly what must kill this pod.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: health
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: health
+            periodSeconds: 5
+          resources:
+            limits:
+              memory: 4Gi
+            requests:
+              cpu: 500m
+              memory: 1Gi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

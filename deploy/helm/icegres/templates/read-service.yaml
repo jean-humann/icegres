@@ -1,0 +1,29 @@
+{{- include "icegres.validate" . -}}
+{{- if gt (int .Values.computes.readReplicas) 0 }}
+# The read endpoint: clients connect HERE for reads (native Service
+# load-balancing across ready replicas). Routing is by endpoint
+# identity, never SQL parsing — and it is a convention, not an
+# enforcement: a write sent here executes (docs/limitations.md).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "icegres.fullname" . }}-read
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegres.labels" . | nindent 4 }}
+    app.kubernetes.io/component: read
+    {{- if .Values.metrics.serviceMonitor.enabled }}
+    icegres.io/metrics: "true"
+    {{- end }}
+spec:
+  type: {{ .Values.computes.service.type }}
+  selector:
+    {{- include "icegres.selectorLabels" (dict "ctx" $ "component" "read") | nindent 4 }}
+  ports:
+    - name: pgwire
+      port: {{ int .Values.computes.service.port }}
+      targetPort: pgwire
+    - name: health
+      port: {{ int .Values.writer.healthPort }}
+      targetPort: health
+{{- end }}

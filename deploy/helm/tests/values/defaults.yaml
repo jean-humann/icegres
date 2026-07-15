@@ -1,0 +1,3 @@
+# Profile: chart defaults — icegresd + always-on writer, no tail, no HA,
+# no RBAC. The smallest honest topology.
+{}

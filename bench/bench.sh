@@ -848,6 +848,85 @@ jq --argjson m "{\"degraded_p50\": $degraded_p50, \"restored_p50\": $restored_p5
 log "compact extra: degraded p50 ${degraded_p50}ms over $files_before files -> restored p50 ${restored_p50}ms over $files_after file(s); compact wall ${compact_wall_ms}ms (ungated)"
 
 # ---------------------------------------------------------------------------
+# 4h. Failover extra (ADDITIONAL, ungated): failover_ms — kill -9 the
+#     quorum-tailed writer compute under icegresd and measure kill -> first
+#     successful client INSERT through the UNCHANGED proxy endpoint (the P3
+#     icegresd-ha metric; e2e section (ha1) proves the zero-acked-row-loss
+#     half of the same failover). Own icekeeperd trio on 5461-5463 (4f
+#     stopped its trio) and the 4c/4d proxy ports (both stopped). Writer
+#     env: buffered (10-min cadence, so replay is the only path) + the
+#     quorum tail + a 2 s append timeout; icegresd runs --health-check-ms
+#     250 (the wedged-tail detector; the kill -9 path itself recovers via
+#     the dead-port probe / supervised restart, whichever wins).
+# ---------------------------------------------------------------------------
+FAILOVER_RUNS=5
+if [[ -x "$DBIN" && -x "$KEEPER_BIN" ]]; then
+  log "measuring failover_ms ($FAILOVER_RUNS kill -> first-write cycles via icegresd on :$PROXY_PORT)"
+  if port_answers "$PROXY_PORT" || port_answers "$PROXY_COMPUTE"; then
+    fatal "port :$PROXY_PORT or :$PROXY_COMPUTE is occupied — free it first (failover extra)"
+  fi
+  for port in 5461 5462 5463; do
+    if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+      exec 3>&- 3<&-
+      fatal "port :$port is occupied — free it first (failover extra)"
+    fi
+  done
+  drop_scratch
+  create_scratch || fatal "could not re-create demo.$SCRATCH_TABLE for the failover extra"
+  rm -rf "$RUN_DIR"/bench-keeper-{1,2,3}
+  for n in 1 2 3; do start_keeper_bench "$n"; done
+  stop_icegresd_pidfile
+  rm -f "$PROXY_STATUS"
+  : >"$RUN_DIR/bench-icegresd-failover.log"
+  env ICEGRES_WRITE_BUFFER_MS=600000 ICEGRES_TAIL_QUORUM="$QUORUM_ADDRS_BENCH" \
+      ICEGRES_TAIL_QUORUM_TIMEOUT_MS=2000 \
+    "$DBIN" serve --host "$PG_HOST" --port "$PROXY_PORT" --main-port "$PROXY_COMPUTE" \
+    --icegres-bin "$BIN" --idle-shutdown-secs 300 --pool-size 0 --health-check-ms 250 \
+    --status-file "$PROXY_STATUS" >>"$RUN_DIR/bench-icegresd-failover.log" 2>&1 &
+  echo $! >"$RUN_DIR/bench-icegresd.pid"
+  proxy_up=0
+  for _ in $(seq 1 40); do
+    if (exec 3<>"/dev/tcp/$PG_HOST/$PROXY_PORT") 2>/dev/null; then exec 3>&- 3<&-; proxy_up=1; break; fi
+    sleep 0.25
+  done
+  [[ "$proxy_up" == 1 ]] || fatal "failover icegresd not listening on :$PROXY_PORT"
+  fo_insert() { # fo_insert <id> — one buffered INSERT through the proxy
+    psql -h "$PG_HOST" -p "$PROXY_PORT" -U postgres -d icegres -tA -c \
+      "insert into demo.$SCRATCH_TABLE (trip_id, city, distance_km, fare, ts)
+       values ($1, 'failover', 1.0, 1.0, TIMESTAMP '2026-07-15 00:00:00')" >/dev/null 2>&1
+  }
+  fo_id=6000000
+  fo_insert "$fo_id" || fatal "failover extra: the warm-up INSERT failed"
+  fo_runs=()
+  for i in $(seq 1 "$FAILOVER_RUNS"); do
+    cpid=$(jq -r '.computes[] | select(.key=="main") | .pid' "$PROXY_STATUS" 2>/dev/null)
+    [[ "$cpid" =~ ^[0-9]+$ ]] || fatal "no compute pid before failover run $i"
+    t0=$(($(date +%s%N) / 1000000))
+    kill -9 "$cpid" || fatal "could not SIGKILL compute $cpid (run $i)"
+    fo_ok=0
+    for _ in $(seq 1 600); do
+      fo_id=$((fo_id + 1))
+      if fo_insert "$fo_id"; then fo_ok=1; break; fi
+      sleep 0.05
+    done
+    [[ "$fo_ok" == 1 ]] || { tail -n 30 "$RUN_DIR/bench-icegresd-failover.log" >&2; fatal "failover run $i never recovered"; }
+    t1=$(($(date +%s%N) / 1000000))
+    fo_runs+=($((t1 - t0)))
+    sleep 1 # settle before the next cycle
+  done
+  stop_icegresd_pidfile
+  for n in 1 2 3; do stop_keeper_bench "$n"; done
+  rm -rf "$RUN_DIR"/bench-keeper-{1,2,3}
+  fo_json=$(printf '%s\n' "${fo_runs[@]}" | jq -s \
+    '{p50: (sort | .[(length*0.5|floor)]), p95: (sort | .[-1]), n: length, runs: .}')
+  jq --argjson m "$fo_json" '.metrics.failover_ms = $m' \
+    "$OUT_JSON" >"$OUT_JSON.tmp" && mv "$OUT_JSON.tmp" "$OUT_JSON"
+  log "failover_ms: $(printf '%s ' "${fo_runs[@]}")(ms; kill -9 quorum writer -> first successful write via icegresd; ungated extra metric)"
+else
+  log "icegresd/icekeeperd release binaries not found — skipping failover_ms"
+fi
+
+# ---------------------------------------------------------------------------
 # 5. Append human table to SCORECARD.md
 # ---------------------------------------------------------------------------
 if [[ ! -f "$SCORECARD" ]]; then
@@ -889,7 +968,7 @@ fi
        "cold_start_ms","binary_size_mb","rss_idle_mb","rss_peak_mb","rss_after_load_mb",
        "insert_single_buffered_ms","freshness_buffered_ms",
        "durable_ack_dir_ms","durable_ack_pg_ms","durable_ack_quorum_ms",
-       "cold_start_via_proxy_ms",
+       "cold_start_via_proxy_ms","failover_ms",
        "connect_via_proxy_ms","qps_via_proxy_8conn",
        "adbc_query_point_ms","adbc_query_bigfilter_ms","adbc_bulk_ingest_100k_rows_s",
        "flight_q1_ms","flight_q1_fresh_ms","compact_scan_restore_ms"][] ) as $k |

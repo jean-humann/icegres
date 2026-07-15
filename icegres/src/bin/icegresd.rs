@@ -83,6 +83,72 @@
 //!   uptime) and logged loudly. A connection arriving during backoff
 //!   short-circuits the wait and respawns immediately.
 //!
+//! * **Automated tail-writer failover (`--health-check-ms N`, opt-in).**
+//!   Computes are spawned with an ephemeral `--health-port` and each
+//!   running compute is polled over HTTP `/health` every N ms. A compute
+//!   that fails [`HEALTH_MAX_FAILS`] consecutive probes — crashed, hung,
+//!   or WEDGED-BUT-ALIVE (its durable quorum tail poisoned itself after
+//!   being fenced or losing its quorum: such a process still accepts TCP
+//!   and answers queries but can never ack a buffered write again; the
+//!   compute's `/health` reports it as 503) — is killed and respawned by
+//!   the supervisor. The replacement's `--tail-quorum` open() runs the
+//!   consensus election: it FENCES the old term (a zombie writer can never
+//!   ack) and replays the un-flushed window before the pgwire listener
+//!   binds, so "compute accepts TCP" already means "fenced + replayed".
+//!   Quorum tail mode only: `--tail-dir` is single-node by nature and
+//!   `--tail-url` failover is the tail database's own HA (documented as
+//!   manual in docs/limitations.md).
+//!
+//! * **Leader lease (`--lease-quorum h:p,h:p,h:p`, opt-in).** N icegresd
+//!   instances, one leader: a tiny lease log served by three DEDICATED
+//!   icekeeperd acceptors (never the computes' data trio), held by owning
+//!   the proposer election on it and renewed every TTL/3 with quorum-acked
+//!   holder records. Standbys poll the acceptors read-only and take over
+//!   once the log sits frozen at a quorum for >= TTL; the old leader's
+//!   next renew is term-fenced, so it DEMOTES (refuses new clients,
+//!   terminates its computes, re-enters standby). Honesty: until that
+//!   renew a deposed leader does not KNOW it lost — it can still route,
+//!   and a demote racing a compute (re)spawn can still spawn a writer
+//!   (both spawn paths re-check leadership under the spawn lock, which
+//!   shrinks the window to the spawn itself but cannot close it). Data
+//!   stays safe — the writers fence each other on the data tail — but
+//!   the fencing can land on the NEW leader's writer, so with a quorum
+//!   data tail the health checker below defaults ON as the recovery
+//!   route. See `src/lease.rs`.
+//!
+//! * **Autoscaling-lite (`--read-replicas-max N`, opt-in).** Clients
+//!   connecting with database `<db>:ro` are routed to a pool of up to N
+//!   stateless READ computes over the same single copy of the data,
+//!   spawned on demand when every running replica already carries
+//!   `--read-replica-sessions` active sessions (least-loaded routing
+//!   otherwise) and reaped by the existing idle scale-to-zero. Replicas
+//!   are spawned with the buffered-write/tail environment STRIPPED (a
+//!   replica must never open the writer's tail — it would fence it) and,
+//!   when configured, `--peer-tail`/`--freshness-ms` toward the writer's
+//!   tail API so they see its un-flushed window. Honest scope: sessions
+//!   (not qps) drive the threshold, single-digit nodes, process mode — in
+//!   Kubernetes this maps to HPA guidance instead.
+//!
+//! * **Kubernetes mode (`--k8s-compute` / `--k8s-scale`, opt-in).** In a
+//!   cluster the compute is a POD behind a Service, so icegresd never
+//!   forks: `--k8s-compute` makes the main endpoint REMOTE — dialed at
+//!   `--compute-host:--main-port` (the writer Service DNS name), TCP-
+//!   readiness-polled, never spawned or supervised (the kubelet's
+//!   liveness probe on the compute's `/health` owns replacement — the
+//!   same wedged-tail 503 the process-mode health checker acts on).
+//!   `--k8s-scale deployments/<name>|statefulsets/<name>` (implies
+//!   `--k8s-compute`) adds the two halves a Service cannot provide, by
+//!   patching that workload's apps/v1 `scale` subresource with the pod
+//!   serviceaccount (src/k8s.rs): wake-on-connect (`GET` scale, `PATCH`
+//!   replicas 0 -> 1, then the normal readiness poll) and idle
+//!   scale-to-zero (zero proxied sessions for `--idle-shutdown-secs` →
+//!   `PATCH` replicas -> 0, leader-gated). Process-mode-only features are
+//!   refused loudly in k8s mode: `--health-check-ms` (kubelet liveness
+//!   owns compute health), `--read-replicas-max` (read replicas are a
+//!   Deployment behind their own Service; scale them with HPA), and
+//!   branch endpoints (deploy a per-branch compute and connect to its
+//!   Service). Session pooling still applies — warm conns are plain TCP.
+//!
 //! * **Status.** The daemon rewrites `--status-file` (JSON) on every state
 //!   change; `icegresd status` pretty-prints it: computes, branches, ports,
 //!   PIDs, active connections, idle timers, restart counts.
@@ -98,6 +164,22 @@
 //!   port, ...) apply to every compute it spawns; `--host/--port/--branch/
 //!   --idle-shutdown-secs` are passed explicitly as flags and therefore
 //!   always win over stray env.
+
+// The consensus tree is shared source with `icegres`/`icekeeperd` (this
+// crate has no lib target); icegresd drives only the proposer half — via
+// the leader lease (src/lease.rs). src/quorum/mod.rs documents that
+// nothing in the tree touches the arrow/iceberg/datafusion stack, so
+// icegresd keeps linking a few MB, not 120.
+#[path = "../k8s.rs"]
+mod k8s;
+#[path = "../lease.rs"]
+mod lease;
+#[allow(dead_code)]
+#[path = "../quorum/mod.rs"]
+mod quorum;
+#[allow(dead_code)]
+#[path = "../segment.rs"]
+mod segment;
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -125,6 +207,16 @@ const RESTART_BASE_DELAY: Duration = Duration::from_millis(500);
 const RESTART_MAX_ATTEMPTS: u32 = 3;
 const HEALTHY_UPTIME: Duration = Duration::from_secs(10);
 
+/// Consecutive `--health-check-ms` probe failures before the compute is
+/// killed for supervised replacement (one blip is a GC pause; three in a
+/// row is a corpse or a wedged tail).
+const HEALTH_MAX_FAILS: u32 = 3;
+
+/// `--health-check-ms` default when the leader lease runs over a quorum
+/// data tail in process mode (see [`effective_health_check_ms`]): the
+/// wedged-writer recovery route must exist, so 0 means this, not off.
+const LEASE_QUORUM_HEALTH_CHECK_MS: u64 = 1_000;
+
 #[derive(Parser)]
 #[command(
     name = "icegresd",
@@ -140,7 +232,9 @@ struct Cli {
 #[derive(Subcommand)]
 enum DCommand {
     /// Run the control plane: listen publicly, spawn/route/supervise computes.
-    Serve(ServeArgs),
+    /// (Boxed: ServeArgs outgrew the other variant by enough that clippy
+    /// flags the size spread — the daemon parses argv exactly once.)
+    Serve(Box<ServeArgs>),
     /// Print the daemon's status file (computes, branches, ports, idle
     /// timers, restart counts).
     Status {
@@ -207,6 +301,94 @@ struct ServeArgs {
     /// re-warms on the next wake.
     #[arg(long, env = "ICEGRESD_POOL_IDLE_SECS", default_value_t = 60)]
     pool_idle_secs: u64,
+
+    /// Poll each running compute's HTTP /health every N ms (0 = off,
+    /// byte-identical to before the flag existed — EXCEPT with
+    /// --lease-quorum plus a quorum data tail in process mode, where 0
+    /// defaults to 1000: a demote racing a (re)spawn can leave the new
+    /// leader's writer fenced-but-alive, and only this loop replaces it;
+    /// see the module docs). Computes are spawned with an ephemeral
+    /// --health-port; a compute failing 3 consecutive probes — crashed,
+    /// hung, or wedged-but-alive (its quorum tail poisoned itself: still
+    /// accepts TCP, can never ack a write) — is killed and respawned by
+    /// the supervisor, whose --tail-quorum open() fences the old term and
+    /// replays the un-flushed window (automated tail-writer failover).
+    #[arg(long, env = "ICEGRESD_HEALTH_CHECK_MS", default_value_t = 0)]
+    health_check_ms: u64,
+
+    /// Leader lease for icegresd redundancy: exactly three DEDICATED
+    /// icekeeperd acceptors (host:port,host:port,host:port) forming the
+    /// lease log — a different trio from the computes' data quorum (one
+    /// acceptor process serves one log; sharing an address is refused at
+    /// boot). When set, this icegresd serves clients and spawns computes
+    /// only while it HOLDS the lease; otherwise it answers connections
+    /// with a retryable error. Off when unset (single-instance behavior,
+    /// byte-identical).
+    #[arg(long, env = "ICEGRESD_LEASE_QUORUM")]
+    lease_quorum: Option<String>,
+
+    /// Lease TTL in ms (floor 1000): the leader renews every TTL/3;
+    /// standbys take over after observing the lease log frozen at a
+    /// quorum of acceptors for >= TTL.
+    #[arg(long, env = "ICEGRESD_LEASE_TTL_MS", default_value_t = 6000)]
+    lease_ttl_ms: u64,
+
+    /// Holder id written into lease records (diagnostics; default
+    /// icegresd-<pid>@<host>:<port>).
+    #[arg(long, env = "ICEGRESD_LEASE_HOLDER_ID")]
+    lease_holder_id: Option<String>,
+
+    /// Autoscaling-lite: route clients whose startup database is
+    /// "<db>:ro" across up to N stateless READ computes, spawned on
+    /// demand (see --read-replica-sessions) and reaped by the normal idle
+    /// scale-to-zero. Replicas never inherit the buffered-write/tail
+    /// environment (a replica opening the writer's tail would fence it).
+    /// 0 = off (byte-identical; "<db>:ro" then routes like any other
+    /// database name).
+    #[arg(long, env = "ICEGRESD_READ_REPLICAS_MAX", default_value_t = 0)]
+    read_replicas_max: usize,
+
+    /// Spawn another read replica when every running one already carries
+    /// this many active sessions (least-loaded routing below that; at
+    /// --read-replicas-max the least-loaded replica absorbs the overflow
+    /// — never a refusal).
+    #[arg(long, env = "ICEGRESD_READ_REPLICA_SESSIONS", default_value_t = 4)]
+    read_replica_sessions: usize,
+
+    /// --peer-tail address passed to every read replica (the writer
+    /// compute's --tail-api-port listener), so replicas serve the
+    /// writer's acked-but-unflushed window instead of waiting for the
+    /// commit cadence.
+    #[arg(long, env = "ICEGRESD_REPLICA_PEER_TAIL")]
+    replica_peer_tail: Option<String>,
+
+    /// --freshness-ms passed to every read replica (bounded-staleness
+    /// reads; see `icegres serve --freshness-ms`).
+    #[arg(long, env = "ICEGRESD_REPLICA_FRESHNESS_MS")]
+    replica_freshness_ms: Option<u64>,
+
+    /// Kubernetes mode: the main compute is a POD dialed at
+    /// --compute-host:--main-port (the compute Service's DNS name) —
+    /// icegresd never forks, supervises, or health-kills processes (the
+    /// kubelet's liveness probe on the compute's /health owns
+    /// replacement). Off by default (process mode, byte-identical).
+    #[arg(long, env = "ICEGRESD_K8S_COMPUTE", num_args = 0..=1,
+          default_missing_value = "true", default_value = "false",
+          value_parser = clap::builder::BoolishValueParser::new())]
+    k8s_compute: bool,
+
+    /// apps/v1 scale target ("deployments/<name>" or
+    /// "statefulsets/<name>", same namespace as this pod) icegresd may
+    /// GET/PATCH with its serviceaccount; implies --k8s-compute. Adds
+    /// wake-on-connect (scale 0 -> 1 on a cold connection, then the
+    /// normal TCP-readiness poll — budget --wake-timeout-ms, which pod
+    /// scheduling + image pull deserve more of than a process fork) and
+    /// idle scale-to-zero (zero proxied sessions for --idle-shutdown-secs
+    /// scales the workload to 0; leader-gated; 0 disables the
+    /// scale-down). Needs RBAC for exactly [get, patch] on that one
+    /// object's scale subresource. Off by default.
+    #[arg(long, env = "ICEGRESD_K8S_SCALE")]
+    k8s_scale: Option<String>,
 }
 
 fn default_status_file() -> PathBuf {
@@ -223,7 +405,7 @@ async fn main() -> Result<()> {
         .init();
 
     match Cli::parse().command {
-        DCommand::Serve(args) => run_serve(args).await,
+        DCommand::Serve(args) => run_serve(*args).await,
         DCommand::Status { status_file } => {
             let path = status_file.unwrap_or_else(default_status_file);
             let raw = std::fs::read_to_string(&path).with_context(|| {
@@ -273,6 +455,9 @@ struct SlotState {
     phase: Phase,
     pid: Option<u32>,
     port: u16,
+    /// The compute's --health-port (ephemeral, allocated per spawn) when
+    /// --health-check-ms is on; None otherwise.
+    health_port: Option<u16>,
     spawned_at: Option<SystemTime>,
     last_exit: Option<String>,
 }
@@ -341,11 +526,22 @@ impl Pool {
     }
 }
 
-/// One compute endpoint: the main one (`branch == None`, fixed port) or a
-/// per-branch one (ephemeral port, `icegres serve --branch <name>`).
+/// One compute endpoint: the main one (`branch == None`, fixed port), a
+/// per-branch one (ephemeral port, `icegres serve --branch <name>`), or an
+/// autoscaled read replica (`replica == true`, ephemeral port, stateless).
 struct ComputeSlot {
     key: String,
     branch: Option<String>,
+    /// An autoscaled read compute: ephemeral port, buffered/tail env
+    /// stripped at spawn, optional --peer-tail/--freshness-ms wiring,
+    /// pooling disabled (its endpoint identity "<db>:ro" never matches
+    /// the pool's canonical database).
+    replica: bool,
+    /// A REMOTE compute (k8s mode): a pod dialed at
+    /// --compute-host:--main-port, never spawned/supervised here. Waking
+    /// it is `ensure_remote` (optionally a scale PATCH); everything
+    /// process-shaped (monitors, health kills, PIDs) never applies.
+    remote: bool,
     /// Serializes spawn/respawn decisions for this slot.
     spawn_lock: tokio::sync::Mutex<()>,
     state: Mutex<SlotState>,
@@ -381,9 +577,25 @@ struct Daemon {
     /// Flipped to `true` exactly once, on daemon shutdown: monitor tasks
     /// then terminate AND REAP their computes (see `monitor_compute`).
     shutdown: tokio::sync::watch::Sender<bool>,
+    /// Leadership: constant `true` when --lease-quorum is unset (the
+    /// sender is dropped after init; a watch keeps serving its last
+    /// value); driven by the lease loop otherwise. Gates client routing
+    /// and compute spawning; monitors terminate computes on demote.
+    leader: tokio::sync::watch::Receiver<bool>,
+    lease_enabled: bool,
+    /// --k8s-compute (or --k8s-scale): computes are pods, never children.
+    k8s_mode: bool,
+    /// --k8s-scale: the workload whose scale subresource wake-on-connect
+    /// and idle scale-to-zero PATCH.
+    k8s: Option<k8s::K8sScaler>,
 }
 
 impl Daemon {
+    /// Does this instance currently hold the lease (or run lease-less)?
+    fn is_leader(&self) -> bool {
+        *self.leader.borrow()
+    }
+
     fn slot(self: &Arc<Self>, branch: Option<&str>) -> Arc<ComputeSlot> {
         let key = match branch {
             None => "main".to_string(),
@@ -396,6 +608,10 @@ impl Daemon {
                 Arc::new(ComputeSlot {
                     key,
                     branch: branch.map(str::to_string),
+                    replica: false,
+                    // In k8s mode the main endpoint is the remote compute
+                    // Service (branches are refused before slot lookup).
+                    remote: self.k8s_mode && branch.is_none(),
                     spawn_lock: tokio::sync::Mutex::new(()),
                     state: Mutex::new(SlotState {
                         phase: Phase::Stopped,
@@ -407,6 +623,7 @@ impl Daemon {
                         } else {
                             0
                         },
+                        health_port: None,
                         spawned_at: None,
                         last_exit: None,
                     }),
@@ -419,6 +636,61 @@ impl Daemon {
             .clone()
     }
 
+    /// The read-replica slot at `idx` (created on first use). Pooling is
+    /// disabled per slot: a replica's endpoint identity ("<db>:ro") never
+    /// matches the pool's canonical database, so warm conns would only rot.
+    fn replica_slot(self: &Arc<Self>, idx: usize) -> Arc<ComputeSlot> {
+        let key = format!("replica:{idx}");
+        let mut slots = self.slots.lock().expect("slots lock poisoned");
+        slots
+            .entry(key.clone())
+            .or_insert_with(|| {
+                let slot = Arc::new(ComputeSlot {
+                    key,
+                    branch: None,
+                    replica: true,
+                    remote: false, // k8s mode refuses --read-replicas-max at boot
+                    spawn_lock: tokio::sync::Mutex::new(()),
+                    state: Mutex::new(SlotState {
+                        phase: Phase::Stopped,
+                        pid: None,
+                        port: 0, // ephemeral at each (re)spawn
+                        health_port: None,
+                        spawned_at: None,
+                        last_exit: None,
+                    }),
+                    generation: AtomicU64::new(0),
+                    active: AtomicUsize::new(0),
+                    restarts: AtomicU64::new(0),
+                    pool: Pool::new(),
+                });
+                slot.pool.disabled.store(true, Ordering::SeqCst);
+                slot
+            })
+            .clone()
+    }
+
+    /// Pick the read-replica slot for a new "<db>:ro" session (see
+    /// [`route_read`] for the decision itself, kept pure for tests).
+    fn read_slot(self: &Arc<Self>) -> Arc<ComputeSlot> {
+        let max = self.args.read_replicas_max;
+        let states: Vec<Option<usize>> = {
+            let slots = self.slots.lock().expect("slots lock poisoned");
+            (0..max)
+                .map(|i| {
+                    slots.get(&format!("replica:{i}")).and_then(|s| {
+                        let running = {
+                            let st = s.state.lock().expect("slot state lock poisoned");
+                            matches!(st.phase, Phase::Running | Phase::Starting)
+                        };
+                        running.then(|| s.active.load(Ordering::SeqCst))
+                    })
+                })
+                .collect()
+        };
+        self.replica_slot(route_read(&states, self.args.read_replica_sessions.max(1)))
+    }
+
     /// Rewrite the status file. Failures are logged, never fatal.
     fn write_status(&self) {
         let computes: Vec<serde_json::Value> = {
@@ -429,7 +701,7 @@ impl Daemon {
                 .map(|s| {
                     let st = s.state.lock().expect("slot state lock poisoned");
                     let pool_on = self.pool_enabled && !s.pool.disabled.load(Ordering::SeqCst);
-                    serde_json::json!({
+                    let mut entry = serde_json::json!({
                         "key": s.key,
                         "branch": s.branch,
                         "port": st.port,
@@ -446,17 +718,35 @@ impl Daemon {
                             "pooled_sessions": s.pool.handouts.load(Ordering::SeqCst),
                             "direct_sessions": s.pool.direct.load(Ordering::SeqCst),
                         },
-                    })
+                    });
+                    // Present only with --health-check-ms (I3: the default
+                    // status document stays byte-identical without flags).
+                    if let Some(hp) = st.health_port {
+                        entry["health_port"] = hp.into();
+                    }
+                    entry
                 })
                 .collect()
         };
-        let doc = serde_json::json!({
+        let mut doc = serde_json::json!({
             "daemon_pid": std::process::id(),
             "listen": format!("{}:{}", self.args.host, self.args.port),
             "icegres_bin": self.bin.display().to_string(),
             "updated_at_epoch_ms": epoch_ms(SystemTime::now()),
             "computes": computes,
         });
+        // Present only with --lease-quorum (I3, as above).
+        if self.lease_enabled {
+            doc["lease_enabled"] = true.into();
+            doc["leader"] = self.is_leader().into();
+        }
+        // Present only with --k8s-compute / --k8s-scale (I3, as above).
+        if self.k8s_mode {
+            doc["k8s_compute"] = true.into();
+            if let Some(k8s) = &self.k8s {
+                doc["k8s_scale"] = k8s.target().into();
+            }
+        }
         // Atomic replace (write tmp + rename): readers polling the file
         // must never observe a truncated document.
         let tmp = self.status_file.with_extension("json.tmp");
@@ -472,7 +762,7 @@ fn epoch_ms(t: SystemTime) -> u128 {
     t.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()
 }
 
-async fn run_serve(args: ServeArgs) -> Result<()> {
+async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let bin = match &args.icegres_bin {
         Some(p) => p.clone(),
         None => {
@@ -521,6 +811,126 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         );
     }
 
+    // Leader lease (opt-in): validate the trio up front — a lease trio
+    // overlapping the computes' data quorum must fail loudly at boot, not
+    // fence the tail writer at the first election.
+    let lease_cfg = match &args.lease_quorum {
+        Some(spec) => {
+            let data_env = std::env::var("ICEGRES_TAIL_QUORUM").ok();
+            let addrs = lease::parse_lease_addrs(spec, data_env.as_deref())?;
+            let ttl = Duration::from_millis(args.lease_ttl_ms.max(1_000));
+            let holder_id = args.lease_holder_id.clone().unwrap_or_else(|| {
+                format!(
+                    "icegresd-{}@{}:{}",
+                    std::process::id(),
+                    args.host,
+                    args.port
+                )
+            });
+            Some(lease::LeaseConfig {
+                addrs,
+                ttl,
+                holder_id,
+            })
+        }
+        None => None,
+    };
+    let lease_enabled = lease_cfg.is_some();
+    let (leader_tx, leader_rx) = tokio::sync::watch::channel(!lease_enabled);
+
+    // A fenced-but-alive writer accepts TCP but can never ack a buffered
+    // write again — invisible to the dial path's bare TCP probe. With the
+    // lease on AND a quorum data tail in the computes' environment, a
+    // demote racing a compute (re)spawn can put the NEW leader's writer in
+    // exactly that state (module docs), and only the health loop recovers
+    // it: default the checker ON for that combination. Process mode only —
+    // in k8s mode the kubelet's liveness probe owns compute health (and
+    // --health-check-ms is refused below). Explicit flag always wins.
+    let k8s_mode = args.k8s_compute || args.k8s_scale.is_some();
+    let effective = effective_health_check_ms(
+        args.health_check_ms,
+        lease_enabled,
+        std::env::var_os("ICEGRES_TAIL_QUORUM").is_some(),
+        k8s_mode,
+    );
+    if effective != args.health_check_ms {
+        warn!(
+            health_check_ms = effective,
+            "--lease-quorum with a quorum data tail and no --health-check-ms: \
+             defaulting the compute health checker ON — without it a demote racing \
+             a compute (re)spawn can fence this leader's writer into a permanent \
+             wedged-but-alive write outage (set --health-check-ms to tune)"
+        );
+        args.health_check_ms = effective;
+    }
+
+    if args.health_check_ms > 0 {
+        info!(
+            health_check_ms = args.health_check_ms,
+            "compute health checks enabled: computes spawn with --health-port; \
+             {HEALTH_MAX_FAILS} consecutive /health failures (crash, hang, or a \
+             poisoned/fenced quorum tail) kill the compute for supervised \
+             replacement (fence + replay by the replacement's tail election)"
+        );
+    }
+    if args.read_replicas_max > 0 {
+        info!(
+            read_replicas_max = args.read_replicas_max,
+            read_replica_sessions = args.read_replica_sessions,
+            replica_peer_tail = args.replica_peer_tail.as_deref().unwrap_or("(none)"),
+            "autoscaling-lite enabled: database '<db>:ro' routes across up to \
+             {} read computes (spawn at {} sessions each; reap = idle \
+             scale-to-zero; buffered/tail env stripped from replicas)",
+            args.read_replicas_max,
+            args.read_replica_sessions
+        );
+    }
+
+    // Kubernetes mode (opt-in): computes are pods behind Services, so the
+    // process-shaped features cannot mean anything — refuse them loudly at
+    // boot instead of doing something subtly wrong at the first connection.
+    let k8s_scaler = if k8s_mode {
+        if args.health_check_ms > 0 {
+            bail!(
+                "--health-check-ms is process mode only: in k8s mode the kubelet's \
+                 liveness probe on the compute's /health kills a wedged compute \
+                 (same 503, same fence-and-replay on the replacement) — remove the flag"
+            );
+        }
+        if args.read_replicas_max > 0 {
+            bail!(
+                "--read-replicas-max is process mode only: in k8s mode read replicas \
+                 are a Deployment behind their own Service (scale with HPA or \
+                 spec.replicas) — remove the flag"
+            );
+        }
+        // The scaler is built (and the serviceaccount contract checked) at
+        // boot: a pod that cannot reach the API must fail its first rollout,
+        // not its first cold connection.
+        let scaler = match &args.k8s_scale {
+            Some(target) => Some(k8s::K8sScaler::from_env(target)?),
+            None => None,
+        };
+        info!(
+            compute = format!("{}:{}", args.compute_host, args.main_port),
+            k8s_scale = args
+                .k8s_scale
+                .as_deref()
+                .unwrap_or("(none: no scale PATCH)"),
+            idle_shutdown_secs = args.idle_shutdown_secs,
+            "k8s mode: the main compute is a remote pod (never forked); wake = \
+             TCP-readiness poll{}",
+            if scaler.is_some() {
+                " after a scale-subresource PATCH 0 -> 1; idle scale-to-zero PATCHes back to 0"
+            } else {
+                ""
+            }
+        );
+        scaler
+    } else {
+        None
+    };
+
     let daemon = Arc::new(Daemon {
         args,
         bin,
@@ -528,11 +938,38 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         slots: Mutex::new(HashMap::new()),
         pool_enabled,
         shutdown: tokio::sync::watch::channel(false).0,
+        leader: leader_rx,
+        lease_enabled,
+        k8s_mode,
+        k8s: k8s_scaler,
     });
     daemon.write_status();
 
     if daemon.pool_enabled {
         tokio::spawn(pool_idle_drain_loop(daemon.clone()));
+    }
+    if daemon.k8s.is_some() && daemon.args.idle_shutdown_secs > 0 {
+        tokio::spawn(k8s_idle_scale_loop(daemon.clone()));
+    }
+
+    match lease_cfg {
+        Some(cfg) => {
+            // Keep the status file honest about leadership flips.
+            let daemon2 = daemon.clone();
+            let mut rx = daemon.leader.clone();
+            tokio::spawn(async move {
+                while rx.changed().await.is_ok() {
+                    daemon2.write_status();
+                }
+            });
+            tokio::spawn(lease::lease_loop(
+                cfg,
+                leader_tx,
+                daemon.shutdown.subscribe(),
+            ));
+        }
+        // No lease: drop the sender — the watch keeps serving `true`.
+        None => drop(leader_tx),
     }
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -565,7 +1002,8 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     for _ in 0..100 {
         let busy = {
             let slots = daemon.slots.lock().expect("slots lock poisoned");
-            slots.values().any(|s| {
+            // Remote (k8s) computes are not children: nothing to reap.
+            slots.values().filter(|s| !s.remote).any(|s| {
                 let st = s.state.lock().expect("slot state lock poisoned");
                 matches!(st.phase, Phase::Running | Phase::Starting)
             })
@@ -596,14 +1034,48 @@ async fn handle_client(daemon: Arc<Daemon>, mut client: TcpStream) -> Result<()>
             Err(_) => bail!("timed out waiting for the client startup message"),
         };
 
-    let branch = match route_branch(startup.database.as_deref()) {
-        Ok(b) => b,
+    if !daemon.is_leader() {
+        // Standby (or freshly demoted): never route, never wake. 57P03
+        // ("cannot connect now") is the retryable shape — clients fail
+        // over to the leader's endpoint and reconnect.
+        send_pg_error(
+            &mut client,
+            "57P03",
+            "icegresd: this instance does not hold the leader lease; retry against the \
+             current leader",
+        )
+        .await;
+        info!("refused a client connection while standby (not the lease leader)");
+        return Ok(());
+    }
+    let route = match route_database(
+        startup.database.as_deref(),
+        daemon.args.read_replicas_max > 0,
+    ) {
+        Ok(r) => r,
         Err(e) => {
             send_pg_error(&mut client, "3D000", &format!("icegresd: {e}")).await;
             return Err(e);
         }
     };
-    let slot = daemon.slot(branch.as_deref());
+    if daemon.k8s_mode {
+        if let Route::Branch(b) = &route {
+            // Spawning a per-branch child inside the icegresd pod would be
+            // exactly the process model k8s mode exists to avoid.
+            let e = anyhow::anyhow!(
+                "branch endpoint {b:?} is process mode only: in Kubernetes deploy a \
+                 per-branch compute (`icegres serve --branch {b}`) and connect to its \
+                 Service directly"
+            );
+            send_pg_error(&mut client, "3D000", &format!("icegresd: {e}")).await;
+            return Err(e);
+        }
+    }
+    let slot = match &route {
+        Route::Main => daemon.slot(None),
+        Route::Branch(b) => daemon.slot(Some(b)),
+        Route::Read => daemon.read_slot(),
+    };
 
     let t0 = Instant::now();
     let (port, woke) = match ensure_running(&daemon, &slot).await {
@@ -774,12 +1246,39 @@ async fn read_startup(client: &mut TcpStream) -> Result<Startup> {
     }
 }
 
+/// Where a client's requested database name routes.
+#[derive(Debug, PartialEq)]
+enum Route {
+    Main,
+    Branch(String),
+    /// The autoscaled read pool (`<db>:ro`, only with --read-replicas-max
+    /// > 0).
+    Read,
+}
+
 /// Map the requested database name to a compute: `icegres` (or anything
-/// without `@`, or none) -> main; `<db>@<branch>` -> the branch endpoint.
-fn route_branch(database: Option<&str>) -> Result<Option<String>> {
-    let Some(db) = database else { return Ok(None) };
+/// without `@`, or none) -> main; `<db>@<branch>` -> the branch endpoint;
+/// `<db>:ro` -> the read-replica pool WHEN autoscaling is on (off, the
+/// suffix means nothing and the name routes exactly as before —
+/// byte-identical default). Routing stays by endpoint IDENTITY, never SQL
+/// parsing; branch read pools (`<db>@<branch>:ro`) are not supported.
+fn route_database(database: Option<&str>, read_pool: bool) -> Result<Route> {
+    let Some(db) = database else {
+        return Ok(Route::Main);
+    };
+    if read_pool {
+        if let Some(base) = db.strip_suffix(":ro") {
+            if base.contains('@') {
+                bail!(
+                    "read-replica routing for a BRANCH endpoint ({db:?}) is not supported; \
+                     connect to <db>@<branch> directly"
+                );
+            }
+            return Ok(Route::Read);
+        }
+    }
     let Some((_, branch)) = db.split_once('@') else {
-        return Ok(None);
+        return Ok(Route::Main);
     };
     if branch.is_empty()
         || !branch
@@ -788,7 +1287,49 @@ fn route_branch(database: Option<&str>) -> Result<Option<String>> {
     {
         bail!("invalid branch endpoint {db:?} (expected <db>@<branch>, branch = [A-Za-z0-9_-]+)");
     }
-    Ok(Some(branch.to_string()))
+    Ok(Route::Branch(branch.to_string()))
+}
+
+/// The autoscale-lite routing decision, pure for unit tests: each read
+/// replica's state is `None` (not running) or `Some(active sessions)`.
+/// Least-loaded running replica while one has headroom (`active <
+/// sessions_per`); the first non-running slot once every running one is
+/// at/over the threshold (waking it IS the scale-up); at capacity the
+/// least-loaded absorbs the overflow — a read session is never refused.
+/// Nothing running: slot 0.
+fn route_read(states: &[Option<usize>], sessions_per: usize) -> usize {
+    let least = states
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| s.map(|active| (active, i)))
+        .min();
+    match least {
+        None => 0,
+        Some((active, idx)) if active < sessions_per => idx,
+        Some((_, idx)) => states.iter().position(Option::is_none).unwrap_or(idx),
+    }
+}
+
+/// The effective `--health-check-ms`, pure for unit tests: the flag value
+/// as given — except 0 (unset) with the leader lease on AND a quorum data
+/// tail in the computes' environment, in process mode, which defaults to
+/// [`LEASE_QUORUM_HEALTH_CHECK_MS`]. Rationale: in that combination a
+/// demote racing a compute (re)spawn can fence the NEW leader's writer
+/// into a wedged-but-alive state (accepts TCP, never acks — invisible to
+/// the dial path's TCP probe), and the health loop is the only automated
+/// recovery route. k8s mode never defaults it: the kubelet's liveness
+/// probe owns compute health there and the flag is refused at boot.
+fn effective_health_check_ms(
+    configured_ms: u64,
+    lease_enabled: bool,
+    quorum_tail_env: bool,
+    k8s_mode: bool,
+) -> u64 {
+    if configured_ms == 0 && lease_enabled && quorum_tail_env && !k8s_mode {
+        LEASE_QUORUM_HEALTH_CHECK_MS
+    } else {
+        configured_ms
+    }
 }
 
 /// Make sure the slot's compute is accepting connections, spawning it if
@@ -797,6 +1338,17 @@ fn route_branch(database: Option<&str>) -> Result<Option<String>> {
 /// process.
 async fn ensure_running(daemon: &Arc<Daemon>, slot: &Arc<ComputeSlot>) -> Result<(u16, bool)> {
     let _guard = slot.spawn_lock.lock().await;
+
+    // Defense in depth against a demote racing this connection: a standby
+    // must never spawn (the new leader owns the computes now).
+    if !daemon.is_leader() {
+        bail!("this instance does not hold the leader lease; retry against the current leader");
+    }
+
+    // Remote (k8s) compute: readiness-poll a pod, never spawn one.
+    if slot.remote {
+        return ensure_remote(daemon, slot).await;
+    }
 
     // Fast path: state says running AND the port actually accepts (the
     // probe catches a kill -9 the monitor task has not observed yet).
@@ -808,9 +1360,10 @@ async fn ensure_running(daemon: &Arc<Daemon>, slot: &Arc<ComputeSlot>) -> Result
         return Ok((port, false));
     }
 
-    let port = match slot.branch {
-        None => daemon.args.main_port,
-        Some(_) => ephemeral_port()?,
+    let port = if slot.branch.is_none() && !slot.replica {
+        daemon.args.main_port
+    } else {
+        ephemeral_port()?
     };
     info!(key = %slot.key, port, "waking compute (spawning `icegres serve`)");
     let (child, generation) = spawn_compute(daemon, slot, port).await?;
@@ -820,6 +1373,174 @@ async fn ensure_running(daemon: &Arc<Daemon>, slot: &Arc<ComputeSlot>) -> Result
         monitor_compute(daemon2, slot2, child, generation, port).await;
     });
     Ok((port, true))
+}
+
+/// k8s-mode `ensure_running` (caller holds `spawn_lock`): the compute is a
+/// pod at `--compute-host:--main-port`. Accepting TCP == ready, exactly as
+/// in process mode (the compute binds its listener only after the catalog
+/// session is built). Not accepting == cold or mid-(re)start: issue the
+/// wake PATCH if `--k8s-scale` is configured (0 -> 1 only; a workload an
+/// operator or HPA already scaled up is left alone), then poll readiness
+/// until `--wake-timeout-ms` — pod scheduling and image pulls deserve a
+/// far bigger budget than a process fork (the chart raises the default).
+async fn ensure_remote(daemon: &Arc<Daemon>, slot: &Arc<ComputeSlot>) -> Result<(u16, bool)> {
+    let host = &daemon.args.compute_host;
+    let port = daemon.args.main_port;
+    if tcp_ready(host, port).await {
+        let flipped = {
+            let mut st = slot.state.lock().expect("slot state lock poisoned");
+            let flip = st.phase != Phase::Running;
+            if flip {
+                st.phase = Phase::Running;
+                st.spawned_at.get_or_insert(SystemTime::now());
+            }
+            flip
+        };
+        if flipped {
+            daemon.write_status();
+        }
+        return Ok((port, false));
+    }
+
+    if let Some(k8s) = &daemon.k8s {
+        match k8s.wake().await {
+            Ok(true) => {
+                info!(
+                    key = %slot.key,
+                    target = k8s.target(),
+                    "compute workload scaled 0 -> 1 (wake-on-connect)"
+                );
+            }
+            Ok(false) => {} // replicas >= 1 already: pod starting/restarting
+            // A failed PATCH is not instantly fatal — the pod may be coming
+            // up anyway (rollout, HPA) — but it is loud: if replicas really
+            // is 0, the readiness poll below will time out and say so.
+            Err(e) => warn!(key = %slot.key, "k8s wake failed (still polling readiness): {e:#}"),
+        }
+    }
+
+    {
+        let mut st = slot.state.lock().expect("slot state lock poisoned");
+        st.phase = Phase::Starting;
+        st.spawned_at = Some(SystemTime::now());
+    }
+    daemon.write_status();
+    let deadline = Instant::now() + Duration::from_millis(daemon.args.wake_timeout_ms);
+    loop {
+        if tcp_ready(host, port).await {
+            {
+                let mut st = slot.state.lock().expect("slot state lock poisoned");
+                st.phase = Phase::Running;
+            }
+            daemon.write_status();
+            info!(key = %slot.key, port, "remote compute ready");
+            return Ok((port, true));
+        }
+        if Instant::now() >= deadline {
+            {
+                let mut st = slot.state.lock().expect("slot state lock poisoned");
+                st.phase = Phase::Stopped;
+                st.last_exit =
+                    Some("remote compute not ready within --wake-timeout-ms".to_string());
+            }
+            daemon.write_status();
+            bail!(
+                "remote compute for {} not accepting on {host}:{port} within {} ms \
+                 (pod still scheduling/pulling, or the scale PATCH was refused — \
+                 check the workload and the icegresd serviceaccount RBAC)",
+                slot.key,
+                daemon.args.wake_timeout_ms
+            );
+        }
+        // Pods come up in seconds, not milliseconds: poll gently (this also
+        // spares the cluster DNS a 10 ms hammering on Service names).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The scale-down half of k8s-mode scale-to-zero (`--k8s-scale` with
+/// `--idle-shutdown-secs > 0`): every few seconds, if this instance leads,
+/// the remote main compute is Running, and NO proxied client session has
+/// existed for `--idle-shutdown-secs` (the same pool clock the idle drain
+/// uses — touched at every session start and end), PATCH the workload to
+/// 0 replicas. The next cold connection wakes it back through
+/// [`ensure_remote`]. Honest edges: only traffic THROUGH icegresd counts
+/// (direct-to-Service clients are invisible — the chart keeps the compute
+/// Service cluster-internal for this reason), and a connection racing the
+/// PATCH is cut and must reconnect (the same race process mode has with
+/// `--idle-shutdown-secs` itself); after an icegresd restart the clock
+/// starts at boot, so an already-idle workload parks one idle window
+/// later.
+async fn k8s_idle_scale_loop(daemon: Arc<Daemon>) {
+    let idle = Duration::from_secs(daemon.args.idle_shutdown_secs);
+    let mut shutdown = daemon.shutdown.subscribe();
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+            _ = shutdown.changed() => return,
+        }
+        // Standbys never scale anything; the leader owns the lifecycle.
+        // (This watch snapshot lags a DEPOSED leader by up to ~TTL/3 + the
+        // lease append timeout — hence the second check right before the
+        // PATCH below, and the residual-window note in limitations.md.)
+        if !daemon.is_leader() {
+            continue;
+        }
+        let slot = daemon.slot(None);
+        // Serialize against wakes without ever delaying one: skip the tick
+        // if a connection is mid-wake.
+        let Ok(_guard) = slot.spawn_lock.try_lock() else {
+            continue;
+        };
+        {
+            let st = slot.state.lock().expect("slot state lock poisoned");
+            if st.phase != Phase::Running {
+                continue;
+            }
+        }
+        if slot.active.load(Ordering::SeqCst) != 0 {
+            continue;
+        }
+        let idle_for = slot
+            .pool
+            .last_client
+            .lock()
+            .expect("pool clock lock poisoned")
+            .elapsed();
+        if idle_for < idle {
+            continue;
+        }
+        let Some(k8s) = &daemon.k8s else { return };
+        // Re-verify leadership at the last instant, mirroring the spawn
+        // paths' re-checks: the PATCH target is the SHARED writer workload,
+        // and a deposed-but-unaware leader parking it would sever the true
+        // leader's live sessions (its own idle clock reads idle precisely
+        // BECAUSE traffic moved to the new leader). The re-check shrinks
+        // the stale-watch window to the PATCH round trip; the residual race
+        // is documented (recovery is automatic: the next cold connection
+        // re-wakes, fence + replay keep every acked row).
+        if !daemon.is_leader() {
+            continue;
+        }
+        match k8s.set_replicas(0).await {
+            Ok(()) => {
+                info!(
+                    key = %slot.key,
+                    target = k8s.target(),
+                    idle_secs = idle_for.as_secs(),
+                    "compute workload scaled to zero (idle); the next connection re-wakes it"
+                );
+                slot.pool.clear().await;
+                let mut st = slot.state.lock().expect("slot state lock poisoned");
+                st.phase = Phase::Stopped;
+                st.pid = None;
+                st.last_exit = Some("scaled to zero (idle)".to_string());
+                drop(st);
+                daemon.write_status();
+            }
+            Err(e) => warn!(key = %slot.key, "idle scale-to-zero PATCH failed: {e:#}"),
+        }
+    }
 }
 
 /// Spawn `icegres serve` for this slot on `port` and wait for TCP
@@ -841,6 +1562,43 @@ async fn spawn_compute(
     if let Some(b) = &slot.branch {
         cmd.arg("--branch").arg(b);
     }
+    if slot.replica {
+        // A read replica must NEVER inherit the buffered-write/tail
+        // environment: a replica opening the writer's --tail-quorum would
+        // run a higher-term election and FENCE the writer, and an
+        // inherited tail-api/health port would collide with the writer's
+        // listener. Replicas are stateless computes over the same single
+        // copy; their tail visibility comes from --peer-tail below.
+        for var in [
+            "ICEGRES_WRITE_BUFFER_MS",
+            "ICEGRES_WRITE_BUFFER_MAX_ROWS",
+            "ICEGRES_TAIL_DIR",
+            "ICEGRES_TAIL_URL",
+            "ICEGRES_TAIL_QUORUM",
+            "ICEGRES_TAIL_API_PORT",
+            "ICEGRES_HEALTH_PORT",
+            "ICEGRES_PEER_TAILS",
+            "ICEGRES_FRESHNESS_MS",
+        ] {
+            cmd.env_remove(var);
+        }
+        if let Some(peer) = &daemon.args.replica_peer_tail {
+            cmd.arg("--peer-tail").arg(peer);
+        }
+        if let Some(ms) = daemon.args.replica_freshness_ms {
+            cmd.arg("--freshness-ms").arg(ms.to_string());
+        }
+    }
+    // Health checking (--health-check-ms): every compute gets its own
+    // ephemeral --health-port (explicit flags beat any inherited
+    // ICEGRES_HEALTH_PORT, which would collide across computes).
+    let health_port = if daemon.args.health_check_ms > 0 {
+        let hp = ephemeral_port()?;
+        cmd.arg("--health-port").arg(hp.to_string());
+        Some(hp)
+    } else {
+        None
+    };
     // Compute logs interleave with icegresd's own stream (loud by design);
     // kill_on_drop is the backstop that reaps children if icegresd dies.
     cmd.stdin(Stdio::null())
@@ -857,6 +1615,7 @@ async fn spawn_compute(
         st.phase = Phase::Starting;
         st.pid = pid;
         st.port = port;
+        st.health_port = health_port;
         st.spawned_at = Some(SystemTime::now());
     }
     daemon.write_status();
@@ -895,6 +1654,15 @@ async fn spawn_compute(
     }
     daemon.write_status();
     info!(key = %slot.key, port, pid, "compute ready");
+    if let (Some(hp), Some(pid)) = (health_port, pid) {
+        tokio::spawn(health_watch(
+            daemon.clone(),
+            slot.clone(),
+            generation,
+            hp,
+            pid,
+        ));
+    }
     Ok((child, generation))
 }
 
@@ -921,9 +1689,37 @@ async fn monitor_compute(
     let mut attempts: u32 = 0;
     let mut started = Instant::now();
     let mut shutdown = daemon.shutdown.subscribe();
+    let mut leader = daemon.leader.clone();
     loop {
         let status = tokio::select! {
             status = child.wait() => status,
+            _ = demoted(&mut leader) => {
+                // Lost the leader lease: terminate the compute like a
+                // shutdown, but keep the daemon alive (standby). The new
+                // leader spawns its own compute, whose data-tail election
+                // fences this one anyway — a lingering fenced zombie would
+                // only burn the port and confuse the status file.
+                if let Some(pid) = child.id() {
+                    info!(key = %slot.key, pid, "lost the leader lease: sending SIGTERM to compute");
+                    let _ = std::process::Command::new("kill")
+                        .args(["-TERM", &pid.to_string()])
+                        .status();
+                }
+                if tokio::time::timeout(Duration::from_secs(2), child.wait())
+                    .await
+                    .is_err()
+                {
+                    warn!(key = %slot.key, "compute ignored SIGTERM for 2s after demote; killing");
+                    let _ = child.kill().await;
+                }
+                let mut st = slot.state.lock().expect("slot state lock poisoned");
+                st.phase = Phase::Stopped;
+                st.pid = None;
+                st.last_exit = Some("terminated: lost the leader lease".into());
+                drop(st);
+                daemon.write_status();
+                return;
+            }
             _ = shutdown.changed() => {
                 // Daemon shutdown: terminate politely, then reap — icegresd
                 // must not exit while its compute is alive or a zombie.
@@ -1013,11 +1809,41 @@ async fn monitor_compute(
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {}
                 _ = shutdown.changed() => return, // never respawn during shutdown
+                _ = demoted(&mut leader) => {
+                    // Never respawn while not the leader; the compute is
+                    // already dead, so just settle the slot.
+                    let mut st = slot.state.lock().expect("slot state lock poisoned");
+                    if st.phase == Phase::Backoff {
+                        st.phase = Phase::Stopped;
+                        st.last_exit = Some("not respawned: lost the leader lease".into());
+                    }
+                    drop(st);
+                    daemon.write_status();
+                    return;
+                }
             }
 
             let _guard = slot.spawn_lock.lock().await;
             if slot.generation.load(Ordering::SeqCst) != generation {
                 return; // a connection re-woke the compute during backoff
+            }
+            // Mirror ensure_running's defense in depth: a demote can land
+            // AFTER the backoff select's sleep arm already won, and a
+            // deposed leader must never spawn a writer — its --tail-quorum
+            // election would FENCE the new leader's healthy writer. (The
+            // residual window — a demote arriving DURING spawn_compute —
+            // cannot be closed without coupling the data-tail election to
+            // the lease term; the module docs state it, and the health
+            // checker is the recovery route.)
+            if !daemon.is_leader() {
+                let mut st = slot.state.lock().expect("slot state lock poisoned");
+                if st.phase == Phase::Backoff {
+                    st.phase = Phase::Stopped;
+                    st.last_exit = Some("not respawned: lost the leader lease".into());
+                }
+                drop(st);
+                daemon.write_status();
+                return;
             }
             match spawn_compute(&daemon, &slot, port).await {
                 Ok((c, g)) => {
@@ -1036,6 +1862,139 @@ async fn monitor_compute(
                 Err(e) => {
                     error!(key = %slot.key, "supervised restart attempt {attempts} failed: {e:#}");
                 }
+            }
+        }
+    }
+}
+
+/// Resolves when leadership is LOST (watch value `false`). With the lease
+/// disabled the value is a constant `true` and the sender is dropped, so
+/// this pends forever — the select arms built on it are inert.
+async fn demoted(rx: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if !*rx.borrow_and_update() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// One compute generation's health loop (`--health-check-ms`): probe
+/// `GET /health` every interval; [`HEALTH_MAX_FAILS`] consecutive failures
+/// — unreachable/hung, or a non-200 such as the `503 tail unhealthy` a
+/// compute with a POISONED quorum tail reports (alive on TCP, can never
+/// ack a write: the case a bare TCP probe misses) — kill the compute so
+/// the supervisor replaces it. The replacement's `--tail-quorum` open()
+/// fences the old term and replays the un-flushed window before its
+/// pgwire listener binds. The kill is logged with an epoch-ms timestamp
+/// for failover_ms measurement.
+async fn health_watch(
+    daemon: Arc<Daemon>,
+    slot: Arc<ComputeSlot>,
+    generation: u64,
+    health_port: u16,
+    pid: u32,
+) {
+    let interval = Duration::from_millis(daemon.args.health_check_ms.max(100));
+    let probe_timeout = interval.clamp(Duration::from_millis(250), Duration::from_secs(2));
+    let mut shutdown = daemon.shutdown.subscribe();
+    let mut fails: u32 = 0;
+    let mut last_err = String::new();
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = shutdown.changed() => return,
+        }
+        if slot.generation.load(Ordering::SeqCst) != generation {
+            return; // superseded by a newer spawn
+        }
+        {
+            let st = slot.state.lock().expect("slot state lock poisoned");
+            if st.phase != Phase::Running || st.pid != Some(pid) {
+                return; // exited/stopped: the monitor owns the aftermath
+            }
+        }
+        match http_health(&daemon.args.compute_host, health_port, probe_timeout).await {
+            Ok(()) => fails = 0,
+            Err(why) => {
+                fails += 1;
+                last_err = why;
+                warn!(
+                    key = %slot.key, pid, health_port, fails,
+                    "compute health probe failed ({fails}/{HEALTH_MAX_FAILS}): {last_err}"
+                );
+            }
+        }
+        if fails >= HEALTH_MAX_FAILS {
+            if slot.generation.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            error!(
+                key = %slot.key,
+                pid,
+                unhealthy_at_epoch_ms = epoch_ms(SystemTime::now()) as u64,
+                "compute failed {HEALTH_MAX_FAILS} consecutive health probes ({last_err}) \
+                 — killing it for supervised replacement (a wedged tail can never ack; \
+                 the replacement's quorum-tail election fences the old term and replays)"
+            );
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+            return; // monitor_compute observes the unclean exit and respawns
+        }
+    }
+}
+
+/// Minimal `GET /health` over raw TCP (the control plane carries no HTTP
+/// client): `Ok` on a 200 status line, `Err(reason)` otherwise.
+async fn http_health(host: &str, port: u16, timeout: Duration) -> Result<(), String> {
+    let probe = async {
+        let mut s = TcpStream::connect(format!("{host}:{port}"))
+            .await
+            .map_err(|e| format!("connect: {e}"))?;
+        s.write_all(b"GET /health HTTP/1.1\r\nhost: icegresd\r\nconnection: close\r\n\r\n")
+            .await
+            .map_err(|e| format!("write: {e}"))?;
+        let mut buf = Vec::with_capacity(512);
+        let mut chunk = [0u8; 512];
+        loop {
+            match s.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.len() >= 4096 {
+                        break;
+                    }
+                }
+                Err(e) => return Err(format!("read: {e}")),
+            }
+        }
+        parse_health_response(&buf)
+    };
+    match tokio::time::timeout(timeout, probe).await {
+        Ok(res) => res,
+        Err(_) => Err(format!("no response within {timeout:?}")),
+    }
+}
+
+/// Status-line check (pure, unit-tested): 200 = healthy; anything else is
+/// the failure reason, with the body carried along (e.g. `tail unhealthy:
+/// ... POISONED ...`) so the kill log names the real cause.
+fn parse_health_response(raw: &[u8]) -> Result<(), String> {
+    let text = String::from_utf8_lossy(raw);
+    let status = text.lines().next().unwrap_or("").trim().to_string();
+    let mut parts = status.split_whitespace();
+    match (parts.next(), parts.next()) {
+        (Some(proto), Some("200")) if proto.starts_with("HTTP/") => Ok(()),
+        _ if status.is_empty() => Err("empty response".to_string()),
+        _ => {
+            let body = text.split("\r\n\r\n").nth(1).unwrap_or("").trim();
+            if body.is_empty() {
+                Err(status)
+            } else {
+                Err(format!("{status} — {body}"))
             }
         }
     }
@@ -1328,4 +2287,105 @@ async fn send_pg_error(client: &mut TcpStream, sqlstate: &str, message: &str) {
     msg.extend_from_slice(&fields);
     let _ = client.write_all(&msg).await;
     let _ = client.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests: the routing decisions (endpoint identity + autoscale) and the
+// health-probe response parse. The lease state machine's own tests live in
+// src/lease.rs (compiled into this binary via the #[path] include).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -------- route_database: endpoint identity, never SQL parsing --------
+
+    #[test]
+    fn routes_main_branch_and_read_endpoints() {
+        assert_eq!(route_database(None, false).unwrap(), Route::Main);
+        assert_eq!(route_database(Some("icegres"), false).unwrap(), Route::Main);
+        assert_eq!(
+            route_database(Some("icegres@dev"), false).unwrap(),
+            Route::Branch("dev".into())
+        );
+        // ":ro" with the pool ON routes to the read pool; the prefix is
+        // ignored like main routing ignores the database name.
+        assert_eq!(
+            route_database(Some("icegres:ro"), true).unwrap(),
+            Route::Read
+        );
+        assert_eq!(
+            route_database(Some("anything:ro"), true).unwrap(),
+            Route::Read
+        );
+        // Branch read pools are refused loudly, not misrouted.
+        assert!(route_database(Some("icegres@dev:ro"), true).is_err());
+    }
+
+    #[test]
+    fn read_suffix_is_inert_when_the_pool_is_off() {
+        // Byte-identical default: without --read-replicas-max, ":ro" means
+        // nothing — same routing as before the flag existed.
+        assert_eq!(
+            route_database(Some("icegres:ro"), false).unwrap(),
+            Route::Main
+        );
+        // "<db>@<branch>:ro" was an invalid branch name before and stays one.
+        assert!(route_database(Some("icegres@dev:ro"), false).is_err());
+        assert!(route_database(Some("icegres@"), false).is_err());
+    }
+
+    // -------- route_read: the autoscale-lite decision --------
+
+    #[test]
+    fn read_routing_scales_up_at_the_threshold_and_never_refuses() {
+        // Nothing running: slot 0 (the wake IS the first scale-up).
+        assert_eq!(route_read(&[None, None, None], 4), 0);
+        // Headroom on a running replica: least-loaded wins.
+        assert_eq!(route_read(&[Some(3), Some(1), None], 4), 1);
+        // Every running replica at the threshold: wake the first free slot.
+        assert_eq!(route_read(&[Some(4), Some(5), None], 4), 2);
+        assert_eq!(route_read(&[None, Some(4), None], 4), 0);
+        // Pool maxed out: the least-loaded absorbs the overflow.
+        assert_eq!(route_read(&[Some(9), Some(4), Some(6)], 4), 1);
+        // Ties break toward the lowest index (stable, no flapping).
+        assert_eq!(route_read(&[Some(2), Some(2)], 4), 0);
+    }
+
+    // -------- effective_health_check_ms: the wedged-writer recovery route --------
+
+    #[test]
+    fn health_check_defaults_on_only_for_lease_plus_quorum_tail_in_process_mode() {
+        // The exact combination where a demote-racing-spawn fence would
+        // otherwise be a PERMANENT write outage: defaults on.
+        assert_eq!(
+            effective_health_check_ms(0, true, true, false),
+            LEASE_QUORUM_HEALTH_CHECK_MS
+        );
+        // An explicit flag always wins (never overridden).
+        assert_eq!(effective_health_check_ms(250, true, true, false), 250);
+        // Everything else stays byte-identical to the flag default (off).
+        assert_eq!(effective_health_check_ms(0, false, true, false), 0);
+        assert_eq!(effective_health_check_ms(0, true, false, false), 0);
+        assert_eq!(effective_health_check_ms(0, false, false, false), 0);
+        // k8s mode never defaults it: the kubelet's liveness probe owns
+        // compute health there and the flag is refused at boot.
+        assert_eq!(effective_health_check_ms(0, true, true, true), 0);
+    }
+
+    // -------- parse_health_response --------
+
+    #[test]
+    fn health_parse_accepts_200_and_names_the_503_cause() {
+        assert!(parse_health_response(b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\n\r\nok\n").is_ok());
+        let err = parse_health_response(
+            b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 60\r\n\r\n\
+              tail unhealthy: quorum tail is POISONED (superseded)\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("503"), "status carried: {err}");
+        assert!(err.contains("POISONED"), "cause carried: {err}");
+        assert!(parse_health_response(b"").is_err());
+        assert!(parse_health_response(b"garbage\r\n\r\n").is_err());
+    }
 }

@@ -1,0 +1,18 @@
+{{- include "icegres.validate" . -}}
+{{- if .Values.ha.enabled }}
+# Voluntary disruptions (drains, rollouts) must never evict both
+# icegresd instances at once — one stays to hold (or take) the lease.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "icegres.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegres.labels" . | nindent 4 }}
+    app.kubernetes.io/component: icegresd
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      {{- include "icegres.selectorLabels" (dict "ctx" $ "component" "icegresd") | nindent 6 }}
+{{- end }}

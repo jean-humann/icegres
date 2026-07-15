@@ -387,6 +387,147 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
   allows, and in default mode DoGet keeps the exact per-scan catalog
   check.
 
+## icegresd-ha (opt-in, `--health-check-ms` / `--lease-quorum` / `--read-replicas-max`)
+
+- **Automated writer failover is QUORUM-TAIL mode only.** icegresd's
+  health-check-and-replace loop (`--health-check-ms`) restores write
+  availability only because a replacement's `--tail-quorum` open() fences
+  the old term and replays the un-flushed window by consensus. `--tail-dir`
+  is single-node by nature (the tail IS that node's disk — a replacement on
+  another node has nothing to replay), and `--tail-url` failover is
+  MANUAL: the tail database's own HA answers for the frames; point a
+  replacement server at the same `--tail-url` yourself, after confirming
+  the old process is really gone (the advisory lock guards double-attach,
+  not liveness). The wedged-but-alive detection (a poisoned tail answers
+  `/health` 503 while still accepting TCP) applies to any tail backend,
+  but only the quorum backend heals without operator action.
+- **Failover is visible to clients as errors, not a pause.** In-flight
+  sessions on the killed/wedged compute get connection resets; new
+  connections during the respawn window can time out. Clients are expected
+  to retry (the e2e failover leg's load driver treats an errored INSERT as
+  not-acked and retries it). Measured on this box (debug build, e2e (ha1)):
+  kill -9 → first successful write ≈ 0.3–3 s; the bench `failover_ms`
+  extra records the release number.
+- **The leader lease needs its OWN icekeeperd trio.** One acceptor process
+  serves one log (the identity is adopted permanently), and the lease IS a
+  proposer election — running it against the computes' data trio would
+  fence the tail writer. icegresd refuses a `--lease-quorum` that shares an
+  address with `ICEGRES_TAIL_QUORUM` at boot — compared on RESOLVED socket
+  addresses, so plain host aliases (`localhost:7101` vs `127.0.0.1:7101`, a
+  DNS name vs its IPs) are refused too, not just byte-identical spellings.
+  The check is best-effort by nature: a spelling the resolver cannot see
+  through (resolution failure, split-horizon DNS, two hostnames for one
+  box that resolve differently) still slips past and the first lease
+  election then fences the tail writer into a mutual-fencing flap — keep
+  the trios OBVIOUSLY disjoint. The lease trio is one more
+  thing to keep alive: if IT loses quorum, the leader demotes (stops taking
+  new clients, terminates computes) within ~TTL/3 + the lease append
+  timeout (~TTL) even though the data path may be perfectly healthy —
+  deliberate, since an unrenewable lease cannot exclude a second leader.
+- **Split-brain window, stated plainly.** A deposed leader learns it lost
+  only at its next renew: for up to ~TTL/3 + TTL two icegresd instances can
+  both ANSWER connections — and both can SPAWN writers: a demote racing a
+  compute (re)spawn can slip a deposed leader's writer through (both spawn
+  paths re-check leadership under the spawn lock, which shrinks the window
+  to the spawn itself but cannot close it without coupling the data-tail
+  election to the lease term). Data stays safe regardless — the two
+  writers fence each other on the DATA tail, and a fenced writer errors,
+  never acks — but the fencing can land on the NEW leader's healthy
+  writer, leaving it wedged-but-alive (accepts TCP, never acks). That is
+  why `--lease-quorum` with a quorum data tail DEFAULTS `--health-check-ms`
+  on (1000 ms; set the flag to tune): the health loop replaces the wedged
+  writer, degrading the race to one spurious ~1 s failover cycle instead
+  of a permanent write outage. Clients still connected to the stale
+  leader see errors until they reconnect. Takeover itself needs >= TTL of
+  quorum-observed silence, so leader loss means ~1–2× TTL of write
+  unavailability (default TTL 6 s). A leader killed with `kill -9` cannot
+  terminate its computes; the orphaned writer keeps its port until fenced
+  and must be reaped by the operator/supervisor (SIGTERM shuts computes
+  down cleanly).
+- **Autoscaling-lite is sessions-based, process-mode, single-digit-node.**
+  `<db>:ro` is a ROUTING label, not enforcement: a client that issues
+  writes through it gets ordinary synchronous Iceberg commits (safe via
+  first-committer-wins, but unbuffered and outside the writer's tail —
+  keep writes on the main endpoint). Replicas are spawned with the
+  buffered/tail environment stripped (a replica opening the writer's tail
+  would fence it) and see the writer's un-flushed window only when
+  `--replica-peer-tail` points at its tail API — otherwise their freshness
+  is the commit cadence. The spawn threshold counts SESSIONS (icegresd's
+  own active-connection gauge), not qps; scale-up is one replica per
+  routing decision, reap is the existing idle scale-to-zero. In Kubernetes
+  this whole feature maps to HPA guidance instead (the chart's `-read`
+  Deployment + a plain HPA): in k8s mode icegresd scales exactly ONE
+  workload — the writer, for wake-on-connect/scale-to-zero via
+  `--k8s-scale` — and never the read pods.
+
+## Helm chart / Kubernetes mode (opt-in, `deploy/helm/icegres` + `--k8s-compute`/`--k8s-scale`)
+
+- **The chart gate renders and validates; it does not run a cluster.**
+  `tests/helm.sh` proves lint + committed golden renders + strict schema
+  validation (Kubernetes v1.31.0 and v1.34.0, vendored schemas pinned by
+  sha) + invariant asserts — offline. The real-cluster smoke procedure in
+  `docs/deployment.md` §11 is documented for operators and was NOT
+  CI-run here (this repo's gate box has no Docker daemon or cluster).
+  The k8s API client itself (the scale GET/PATCH) is unit-tested against
+  a mock API server and process-smoke-tested; the in-cluster CA/token
+  path is exercised only by the documented smoke.
+- **StatefulSet replacement re-mints the writer's tail identity.** A
+  container restart (the liveness kill on a wedged tail) or pod
+  reschedule starts a NEW server whose quorum election takes a higher
+  term: fencing and replay are the design, so this is safe — but it
+  means the nth incarnation of `writer-0` is a new proposer, not a
+  resumed one, and anything watching tail terms sees them advance on
+  every replacement. For `tail.mode=dir` the WAL PVC follows the POD
+  NAME: replay works across restarts/reschedules that reattach the
+  volume, and does not work across anything that cannot (zone-pinned
+  PVs, deleted claims) — dir stays single-node HA, in k8s as anywhere.
+  And the reschedule itself is NOT automatic on a hard node loss: a
+  StatefulSet pod on an unreachable node sits `Terminating` until the
+  pod object is confirmed gone, which on clusters without
+  node-lifecycle GC (self-hosted/bare-metal) takes a human running
+  `kubectl delete pod --force` — see the runbook's writer-node-loss
+  entry (docs/deployment.md §11).
+- **k8s scale-to-zero counts only proxied traffic.** The idle clock is
+  icegresd's; clients connecting to the writer Service directly (e.g.
+  `sslmode=require`, since TLS terminates at the computes and icegresd
+  answers `SSLRequest` with `N`) are invisible to it and can be cut by
+  an idle park. Keep direct-connect clients off scale-to-zero writers,
+  or k8sScaling off. A `helm upgrade` resets a parked writer to 1
+  replica (the chart pins `replicas: 1`); the idle loop parks it again.
+  A connection racing the park PATCH is severed and must reconnect —
+  the same race process mode has with `--idle-shutdown-secs` itself.
+  With `ha.enabled` there is one more residual race: a
+  deposed-but-unaware leader (its leadership watch lags a lost lease by
+  up to ~TTL/3 + the lease append timeout, and its idle clock reads
+  idle precisely because traffic moved) can park the SHARED writer
+  under the true leader's sessions. The scale loop re-checks
+  leadership immediately before the PATCH, shrinking the window to one
+  API round trip, but cannot close it; the damage is an availability
+  cut, never data loss — the severed sessions reconnect, the next cold
+  connection re-wakes the writer, and fence + replay keep every acked
+  row.
+- **Process-mode features are refused, not emulated, in k8s mode.**
+  `--health-check-ms` (the kubelet's liveness probe owns compute
+  replacement), `--read-replicas-max` (the `-read` Deployment + HPA owns
+  read scaling), and branch endpoints (`<db>@<branch>` answers a clear
+  error; deploy a per-branch compute and connect to its Service) — all
+  boot- or connect-time refusals with the reason spelled out.
+- **The chart renders `tail.mode` none|dir|quorum only.** `--tail-url`
+  (Postgres-backed tail) is deliberately not a chart mode: its HA story
+  is the tail database's own replication/failover, which the chart
+  cannot honestly manage; wire it via `writer.extraEnv` if you own that
+  database, and treat failover as manual (previous section).
+- **The acceptor protocol still has no TLS/auth** (hardening backlog):
+  the `-keeper`/`-lease` trios trust their network segment. The chart
+  keeps them on ClusterIP headless Services and, with
+  `networkPolicy.enabled`, restricts ingress to this release's pods —
+  that NetworkPolicy is only as good as the cluster's CNI enforcement.
+- **`ha.enabled` fails over the ENDPOINT, not the writer.** Both
+  icegresd instances front the same writer Service; icegresd failover
+  and writer failover are independent legs (see the runbook). The
+  standby is deliberately unready (0/1 in `kubectl get pods`) — that is
+  the leadership readiness probe, not a broken pod.
+
 ## Bounded-staleness reads (opt-in, `--freshness-ms`)
 
 - **`--freshness-ms N` with `N > 0` trades exact freshness for read latency,

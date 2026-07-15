@@ -1,0 +1,8 @@
+{{- include "icegres.validate" . -}}
+{{- if eq .Values.tail.mode "quorum" }}
+{{- include "icegres.trio" (dict
+      "ctx" $
+      "suffix" "keeper"
+      "cfg" .Values.keeper
+      "purpose" "Data quorum trio: 2-of-3 fsync before every buffered-write ack (tail.mode=quorum). A replacement writer's tail election fences the old one here.") }}
+{{- end }}
