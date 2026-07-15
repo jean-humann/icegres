@@ -83,14 +83,46 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
 
 ## Table maintenance
 
-- **No compaction command yet.** The pinned iceberg-rust 0.9.1 `Transaction`
-  API has no rewrite/replace-files action, so small-file compaction would
-  require correctness-critical manifest surgery on the custom copy-on-write
-  path plus cross-engine (Trino/Spark) verification; it stays gated behind the
-  dependency-matrix bump (which moves as a unit, see below). Until then,
-  drop-and-reseed is the documented canonicalization path, and buffered/tail
-  mode already fixes the *source* of small files — cadence commits write one
-  well-sized file per flush window instead of one per INSERT.
+- **Compaction ships, with honest edges.** `icegres maintain compact` (P2)
+  bin-packs each partition's under-target files into ~target-size files as
+  ONE `replace` snapshot — dry-run by default, row set identical,
+  first-committer-wins abort on any concurrent commit. Its edges are loud
+  refusals, not silent risk: tables bearing **foreign merge-on-read delete
+  manifests** (deletion vectors / position deletes written by Spark, Trino,
+  moonlink, …) are refused — see the next bullet — **partitioned
+  tables** are refused (the icegres write stack is unpartitioned-only), and
+  **schema-divergent files** are refused: before anything is staged, every
+  candidate input's Parquet footer is read and each column's embedded field
+  id (`PARQUET:field_id`) is verified against the table's current schema —
+  a mismatched or missing field id refuses the whole run, because the
+  rewrite aligns columns by position and name rather than field id and
+  could otherwise resurrect a dropped column's values under a re-added
+  name. (A manifest carrying a non-current schema id also refuses, but only
+  as a cheap fast path: a manifest's schema id records the manifest
+  writer's schema, not the schema its listed files were physically written
+  under — after a foreign `rewrite_manifests` or copy-on-write commit it
+  proves nothing, which is why the per-file check is the guarantee.)
+  Rewrite the old files under the current schema (full-table rewrite) or
+  wait for field-id-aware compaction.
+  Buffered/tail mode still fixes the *source* of small files — cadence
+  commits write one well-sized file per flush window instead of one per
+  INSERT — so compaction is mostly for tables fed by per-statement commits
+  or foreign micro-batchers.
+- **Upstream deletion-vector support does not exist yet, and that keeps two
+  gaps open.** As of iceberg-rust 0.9.1 — and verified against v0.10.0-rc.3
+  and main (2026-07) — the library can neither WRITE puffin deletion
+  vectors (no DV/position-delete writer; `fast_append` rejects delete
+  content; `PuffinWriter` hides the per-blob offsets the manifest needs)
+  nor APPLY them on READ (`caching_delete_file_loader.rs`: "TODO: Delete
+  Vector loader from Puffin files"). Consequences, stated plainly: (1) the
+  keyed-flush economics gap stays open — hot-row flushes remain
+  copy-on-write file rewrites instead of tiny DV appends, so flush cost
+  still scales with data-file size; (2) icegres refuses to write to or
+  compact any table where a foreign engine left delete manifests, because
+  it could not even read such a table correctly, let alone rewrite it.
+  This is an upstream library boundary, not a design choice — it re-opens
+  when a crates.io release ships DV write + puffin-DV read application
+  (see `docs/roadmap-v2-beyond-lakebase.md` §P2 for the re-check trigger).
 - **Snapshot expiry is metadata-only; pair it with `remove-orphans`.**
   `icegres maintain expire-snapshots` drops snapshots from table metadata but
   leaves their data/manifest files in object storage. The shipped counterpart,
@@ -457,7 +489,11 @@ an operational edge:
   datafusion 52.5.0, arrow 57.3.1, datafusion-postgres 0.15.0 (pgwire 0.38.3),
   sqlparser 0.62.0, tonic 0.14, prost 0.14, and the toolchain (1.96.1, in
   `rust-toolchain.toml`) are chosen to interlock. Bump them together, behind a
-  full gate run — never independently.
+  full gate run — never independently. The P2 recon (2026-07) verified there
+  is currently nothing to gain from a bump: no iceberg-rust rev up to main
+  ships DV writes, DV read application, a rewrite-files action, or
+  multi-table commit — the pins stay until the re-check trigger in
+  `docs/roadmap-v2-beyond-lakebase.md` §P2 fires.
 
 ---
 

@@ -102,9 +102,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context as _, Result};
 use arrow::array::{Array, AsArray, RecordBatch};
 use arrow::compute::{cast_with_options, CastOptions};
-use arrow::datatypes::{Int64Type, SchemaRef as ArrowSchemaRef};
+use arrow::datatypes::{Int64Type, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use datafusion::datasource::MemTable;
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use datafusion::parquet::arrow::parquet_to_arrow_schema;
+use datafusion::parquet::file::metadata::{FooterTail, ParquetMetaDataReader};
+use datafusion::parquet::file::FOOTER_SIZE;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use iceberg::arrow::{schema_to_arrow_schema, FieldMatchMode};
 use iceberg::spec::{
@@ -1429,6 +1432,19 @@ impl PreparedCommit {
     pub fn snapshot_id(&self) -> i64 {
         self.snapshot_id
     }
+
+    /// Wrap an externally-assembled maintenance commit (every file it
+    /// references already durable) so it can be POSTed through
+    /// [`OverwriteEngine::post_prepared`] — compact.rs builds its
+    /// `replace` snapshot this way. Maintenance commits carry no op list,
+    /// so `rows_by_op` stays empty.
+    pub(crate) fn for_maintenance(request: CommitTableRequest, snapshot_id: i64) -> Self {
+        Self {
+            request,
+            rows_by_op: Vec::new(),
+            snapshot_id,
+        }
+    }
 }
 
 /// Parse and validate the `icegres.primary-key` table property.
@@ -2123,7 +2139,7 @@ pub async fn prepare_commit(
 }
 
 /// Read one Parquet data file fully into record batches.
-async fn read_parquet_file(
+pub(crate) async fn read_parquet_file(
     file_io: &iceberg::io::FileIO,
     data_file: &DataFile,
 ) -> Result<Vec<RecordBatch>> {
@@ -2147,6 +2163,61 @@ async fn read_parquet_file(
     reader
         .collect::<std::result::Result<_, _>>()
         .with_context(|| format!("failed to decode Parquet file {}", data_file.file_path()))
+}
+
+/// Read ONLY the Parquet footer of `path` and return the file's Arrow
+/// schema, `PARQUET:field_id` metadata included — the physical record of
+/// which Iceberg schema version the file was written under. Two ranged
+/// reads (the 8-byte footer tail, then the metadata block); no row group
+/// is ever fetched or decoded, so this stays cheap on object storage
+/// regardless of file size. Used by compact's per-file schema guard
+/// (compact.rs) strictly before any output is staged.
+pub(crate) async fn read_parquet_arrow_schema(
+    file_io: &iceberg::io::FileIO,
+    path: &str,
+) -> Result<ArrowSchema> {
+    let input = file_io
+        .new_input(path)
+        .map_err(|e| anyhow!("bad data file path {path}: {e}"))?;
+    let size = input
+        .metadata()
+        .await
+        .map_err(|e| anyhow!("failed to stat data file {path}: {e}"))?
+        .size;
+    let footer_len = FOOTER_SIZE as u64;
+    if size < footer_len {
+        bail!("data file {path} is too small ({size} bytes) to be a Parquet file");
+    }
+    let reader = input
+        .reader()
+        .await
+        .map_err(|e| anyhow!("failed to open data file {path}: {e}"))?;
+    let tail = reader
+        .read(size - footer_len..size)
+        .await
+        .map_err(|e| anyhow!("failed to read the Parquet footer of {path}: {e}"))?;
+    let tail: [u8; FOOTER_SIZE] = tail
+        .as_ref()
+        .try_into()
+        .map_err(|_| anyhow!("short Parquet footer read on {path}"))?;
+    let meta_len = FooterTail::try_new(&tail)
+        .with_context(|| format!("invalid Parquet footer in {path}"))?
+        .metadata_length() as u64;
+    if size < footer_len + meta_len {
+        bail!(
+            "data file {path} declares a {meta_len}-byte Parquet metadata block but is \
+             only {size} bytes long"
+        );
+    }
+    let meta_bytes = reader
+        .read(size - footer_len - meta_len..size - footer_len)
+        .await
+        .map_err(|e| anyhow!("failed to read the Parquet metadata of {path}: {e}"))?;
+    let parquet_meta = ParquetMetaDataReader::decode_metadata(&meta_bytes)
+        .with_context(|| format!("failed to decode the Parquet metadata of {path}"))?;
+    let file_meta = parquet_meta.file_metadata();
+    parquet_to_arrow_schema(file_meta.schema_descr(), file_meta.key_value_metadata())
+        .with_context(|| format!("failed to derive the Arrow schema of {path}"))
 }
 
 /// Concatenate `batches` projected onto `cols` (by name) into one batch.
@@ -2497,7 +2568,44 @@ async fn new_data_writer(
         .map_err(|e| anyhow!("failed to build data file writer: {e}"))
 }
 
-fn new_manifest_writer(table: &Table, snapshot_id: i64, path: &str) -> Result<ManifestWriter> {
+/// The same writer stack as [`new_data_writer`] with an EXPLICIT rolling
+/// target file size and a `compact-` file-name prefix: `maintain compact`
+/// sizes its outputs by `--target-file-mb` instead of the library default.
+pub(crate) async fn new_compact_data_writer(
+    table: &Table,
+    commit_uuid: &Uuid,
+    target_file_size: usize,
+) -> Result<impl IcebergWriter<arrow::array::RecordBatch, Vec<DataFile>>> {
+    let parquet_builder = ParquetWriterBuilder::new_with_match_mode(
+        datafusion::parquet::file::properties::WriterProperties::default(),
+        table.metadata().current_schema().clone(),
+        FieldMatchMode::Name,
+    );
+    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())
+        .map_err(|e| anyhow!("failed to build location generator: {e}"))?;
+    let file_name_generator = DefaultFileNameGenerator::new(
+        format!("compact-{commit_uuid}"),
+        None,
+        DataFileFormat::Parquet,
+    );
+    let rolling = RollingFileWriterBuilder::new(
+        parquet_builder,
+        target_file_size,
+        table.file_io().clone(),
+        location_generator,
+        file_name_generator,
+    );
+    DataFileWriterBuilder::new(rolling)
+        .build(None)
+        .await
+        .map_err(|e| anyhow!("failed to build compaction data file writer: {e}"))
+}
+
+pub(crate) fn new_manifest_writer(
+    table: &Table,
+    snapshot_id: i64,
+    path: &str,
+) -> Result<ManifestWriter> {
     let output = table
         .file_io()
         .new_output(path)
@@ -2514,7 +2622,7 @@ fn new_manifest_writer(table: &Table, snapshot_id: i64, path: &str) -> Result<Ma
 
 /// Random snapshot id not colliding with any existing one (same scheme as
 /// iceberg-rust's `SnapshotProducer`).
-fn generate_unique_snapshot_id(table: &Table) -> i64 {
+pub(crate) fn generate_unique_snapshot_id(table: &Table) -> i64 {
     loop {
         let (lhs, rhs) = Uuid::new_v4().as_u64_pair();
         let id = ((lhs ^ rhs) as i64).abs();
@@ -2525,8 +2633,9 @@ fn generate_unique_snapshot_id(table: &Table) -> i64 {
 }
 
 /// Sabotage the `assert-ref-snapshot-id` requirement so the catalog is
-/// guaranteed to reject the commit with 409 (test-only; see module docs).
-fn corrupt_ref_requirement(request: &mut CommitTableRequest) {
+/// guaranteed to reject the commit with 409 (test-only; see module docs
+/// and compact.rs's ICEGRES_COMPACT_INJECT_CONFLICT knob).
+pub(crate) fn corrupt_ref_requirement(request: &mut CommitTableRequest) {
     for req in &mut request.requirements {
         if let TableRequirement::RefSnapshotIdMatch { snapshot_id, .. } = req {
             *snapshot_id = Some(snapshot_id.map(|id| id.wrapping_add(1)).unwrap_or(1));

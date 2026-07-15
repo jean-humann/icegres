@@ -69,6 +69,12 @@
 //! Both commands are safe to run against a live serving endpoint: expiry is
 //! anchored with `assert-table-uuid` + `assert-ref-snapshot-id main=<head>`,
 //! and the GC's grace window + reload check keep concurrent commits whole.
+//!
+//! The third maintenance command, `icegres maintain compact` (bin-pack
+//! small-file compaction, dry-run by default), lives in compact.rs — it
+//! rides the same anchored-commit discipline, and its replaced files are
+//! NOT orphans to this module's GC until expiry drops the snapshots that
+//! still reference them (the live set includes DELETED manifest entries).
 
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime};

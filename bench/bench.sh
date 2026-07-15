@@ -90,6 +90,15 @@ drop_scratch() { # drop the bench-owned scratch table (created by this script)
     >/dev/null 2>&1 || true
 }
 
+# Bench-owned fragmentation target for the compaction extra (section 4g).
+COMPACT_TABLE=bench_compact
+drop_compact_table() {
+  local prefix; prefix=$(catalog_prefix) || return 0
+  curl -sf -X DELETE \
+    "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/$COMPACT_TABLE?purgeRequested=true" \
+    >/dev/null 2>&1 || true
+}
+
 # --- demo.trips layout maintenance (drift control) --------------------------
 # e2e/parity runs append rows to demo.trips; append-only Iceberg turns every
 # such insert into an extra small Parquet file, and full-scan metrics degrade
@@ -118,12 +127,11 @@ drop_trips() {
 }
 
 # Rewrite demo.trips to the canonical single-file layout: drop (purged) and
-# re-seed. iceberg-rust 0.9.1 has no replace-files/rewrite transaction action
-# (only fast_append), so an in-place `icegres compact` cannot be implemented
-# safely against the pinned matrix — drop + single-commit reseed is the
-# documented canonicalization path (see icegres/src/seed.rs module docs).
-# Rows appended by e2e/parity (trip_id >= 900000) are disposable test
-# artifacts and are intentionally discarded.
+# re-seed. `icegres maintain compact` (P2) could now do this in place, but
+# reseed stays the canonicalization path HERE on purpose: rows appended by
+# e2e/parity (trip_id >= 900000) are disposable test artifacts that must be
+# DISCARDED for the deterministic read metrics, and compaction preserves the
+# row set. Compaction has its own ungated metric (section 4g).
 canonicalize_trips() {
   local files; files=$(trips_data_files)
   [[ "$files" =~ ^[0-9]+$ ]] || fatal "could not determine demo.trips data-file count (got: $files)"
@@ -215,6 +223,7 @@ cleanup() {
   stop_icegresd_pidfile
   for n in 1 2 3; do stop_keeper_bench "$n"; done
   drop_scratch
+  drop_compact_table
 }
 trap cleanup EXIT
 
@@ -766,6 +775,79 @@ PYEOF
 fi
 
 # ---------------------------------------------------------------------------
+# 4g. Compaction extra (ADDITIONAL, ungated): compact_scan_restore_ms —
+#     fragment a bench-owned scratch table with $COMPACT_FRAGMENTS single-row
+#     INSERT commits (append-only Iceberg: one Parquet file + one snapshot
+#     each), record the degraded full-scan p50, run
+#     `maintain compact --execute`, record the restored p50 and the compact
+#     wall time. Timed with psql round trips (client overhead ~ constant on
+#     both sides, so the degraded->restored delta is the compaction effect).
+#     The gated default-mode metrics above are unaffected (fresh server,
+#     bench-owned table dropped afterwards).
+# ---------------------------------------------------------------------------
+COMPACT_FRAGMENTS=24
+COMPACT_LOG="$RUN_DIR/bench-serve-compact.log"
+cq() { psql -h "$PG_HOST" -p "$PG_PORT" -U postgres -d icegres -tA -c "$1"; }
+compact_scan_p50() { # 3 warmup + 15 timed full scans, prints the p50 in ms
+  local runs=() t0 t1 r
+  for i in $(seq 1 18); do
+    t0=$(($(date +%s%N) / 1000000))
+    r=$(cq "select count(*), coalesce(sum(trip_id), 0) from demo.$COMPACT_TABLE") \
+      || fatal "compact-extra scan failed"
+    t1=$(($(date +%s%N) / 1000000))
+    (( i > 3 )) && runs+=($((t1 - t0)))
+  done
+  printf '%s\n' "${runs[@]}" | sort -n | awk '{a[NR]=$1} END {print a[int(NR*0.5)+1]}'
+}
+compact_live_files() { # added - deleted over the snapshots (see trips_data_files)
+  local prefix; prefix=$(catalog_prefix)
+  curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/$COMPACT_TABLE" \
+    | jq -r '([.metadata.snapshots[]?.summary."added-data-files" // "0" | tonumber] | add // 0)
+             - ([.metadata.snapshots[]?.summary."deleted-data-files" // "0" | tonumber] | add // 0)'
+}
+log "measuring compact_scan_restore_ms ($COMPACT_FRAGMENTS-file fragmentation -> maintain compact)"
+drop_compact_table
+stop_pidfile
+: >"$COMPACT_LOG"
+"$BIN" serve --host "$PG_HOST" --port "$PG_PORT" >>"$COMPACT_LOG" 2>&1 &
+COMPACT_PID=$!
+echo "$COMPACT_PID" >"$PID_FILE"
+for _ in $(seq 1 60); do
+  port_answers "$PG_PORT" && break
+  kill -0 "$COMPACT_PID" 2>/dev/null || { tail -n 20 "$COMPACT_LOG" >&2; fatal "compact-extra server exited during startup"; }
+  sleep 0.5
+done
+port_answers "$PG_PORT" || fatal "compact-extra server not ready on :$PG_PORT within 30s"
+cq "create table demo.$COMPACT_TABLE (trip_id bigint, city text, fare double precision)" >/dev/null \
+  || fatal "could not create demo.$COMPACT_TABLE"
+for i in $(seq 1 "$COMPACT_FRAGMENTS"); do
+  cq "insert into demo.$COMPACT_TABLE (trip_id, city, fare) values ($i, 'frag', $i.5)" >/dev/null \
+    || fatal "fragmentation insert $i failed"
+done
+files_before=$(compact_live_files)
+[[ "$files_before" == "$COMPACT_FRAGMENTS" ]] \
+  || fatal "expected $COMPACT_FRAGMENTS live data files before compact, got $files_before"
+degraded_p50=$(compact_scan_p50)
+compact_t0=$(($(date +%s%N) / 1000000))
+"$BIN" maintain compact --table "demo.$COMPACT_TABLE" --execute >"$RUN_DIR/bench-compact.log" 2>&1 \
+  || { tail -n 20 "$RUN_DIR/bench-compact.log" >&2; fatal "maintain compact --execute failed"; }
+compact_wall_ms=$(( $(date +%s%N) / 1000000 - compact_t0 ))
+files_after=$(compact_live_files)
+[[ "$files_after" == 1 ]] || fatal "expected 1 live data file after compact, got $files_after"
+restored_p50=$(compact_scan_p50)
+rows_after=$(cq "select count(*) from demo.$COMPACT_TABLE")
+[[ "$rows_after" == "$COMPACT_FRAGMENTS" ]] \
+  || fatal "row count changed across compact: $rows_after != $COMPACT_FRAGMENTS"
+stop_pidfile
+drop_compact_table
+jq --argjson m "{\"degraded_p50\": $degraded_p50, \"restored_p50\": $restored_p50, \
+                 \"compact_wall_ms\": $compact_wall_ms, \"files_before\": $files_before, \
+                 \"files_after\": $files_after, \"n\": 15}" \
+  '.metrics.compact_scan_restore_ms = $m' \
+  "$OUT_JSON" >"$OUT_JSON.tmp" && mv "$OUT_JSON.tmp" "$OUT_JSON"
+log "compact extra: degraded p50 ${degraded_p50}ms over $files_before files -> restored p50 ${restored_p50}ms over $files_after file(s); compact wall ${compact_wall_ms}ms (ungated)"
+
+# ---------------------------------------------------------------------------
 # 5. Append human table to SCORECARD.md
 # ---------------------------------------------------------------------------
 if [[ ! -f "$SCORECARD" ]]; then
@@ -798,6 +880,7 @@ fi
       elif (m | has("p50")) then "| \(name) | \(m.p50) | \(m.p95) | n=\(m.n) |"
       elif (name == "qps_8conn" or name == "qps_via_proxy_8conn") then "| \(name) | \(m.value) | — | median of \(m.windows // [] | map(tostring) | join(", ")) (\(m.connections) conns, \(m.window_s)s windows) |"
       elif name == "rss_peak_mb" then "| \(name) | \(m.value) | — | qps-window peak \(m.qps_window_peak_mb // "—") MB, \(m.samples // "?") samples @ \(m.interval_ms // "?")ms |"
+      elif name == "compact_scan_restore_ms" then "| \(name) | \(m.restored_p50) | — | degraded p50 \(m.degraded_p50) ms @ \(m.files_before) files -> restored p50 \(m.restored_p50) ms @ \(m.files_after) file(s); compact wall \(m.compact_wall_ms) ms |"
       else "| \(name) | \(m.value) | — | |"
       end;
     .metrics as $m |
@@ -809,7 +892,7 @@ fi
        "cold_start_via_proxy_ms",
        "connect_via_proxy_ms","qps_via_proxy_8conn",
        "adbc_query_point_ms","adbc_query_bigfilter_ms","adbc_bulk_ingest_100k_rows_s",
-       "flight_q1_ms","flight_q1_fresh_ms"][] ) as $k |
+       "flight_q1_ms","flight_q1_fresh_ms","compact_scan_restore_ms"][] ) as $k |
     row($k; $m[$k])
   ' "$OUT_JSON"
 } >>"$SCORECARD"

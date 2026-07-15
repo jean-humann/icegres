@@ -120,6 +120,7 @@ psql -h 127.0.0.1 -p 5439 -U postgres -d icegres
 | `icegres branch drop-all <name>` | Remove the ref from every table that has it in ONE atomic multi-table transaction (`main` refused; tables without the ref are skipped; errors if no table has it). |
 | `icegres maintain expire-snapshots <table> [--keep N]` | Trim table metadata to the newest `N` snapshots (default 10) **plus every snapshot still reachable from a branch/tag ref** — a metadata-only, live-safe REST commit (anchored with `assert-table-uuid` + `assert-ref-snapshot-id main=<head>`). Data/manifest files of the expired snapshots are left for `maintain remove-orphans` to reclaim. Long-lived tables need this so `$snapshots` and the per-open metadata JSON stop growing unbounded. |
 | `icegres maintain remove-orphans <table> [--older-than-hours N] [--execute] [--unsafe-grace]` | Orphan-file GC — the storage half of expiry: lists the table's S3 prefix, subtracts the LIVE set (every data file, manifest, and manifest list reachable from EVERY retained snapshot — all branches/tags, DELETED manifest entries included — plus the current metadata JSON, the metadata log, and statistics files), and reports the rest. **Dry-run by default** (count + bytes + up to 20 sample paths); `--execute` deletes. Only objects older than `--older-than-hours` (default 72) plus a fixed 15-minute clock-skew allowance are eligible — the grace window is THE guard for in-flight commits, ours or a foreign writer's; `--execute` also verifies real host-vs-store skew with a write/stat/delete probe under `metadata/` (abort beyond the allowance). `--execute` with a sub-1h window is refused without `--unsafe-grace` (quiescent tables only — concurrent writers WILL lose in-flight files). Fails closed: unreadable table metadata or any unreadable manifest aborts the whole run, a recorded path outside the listed bucket aborts the whole run (liveness unverifiable), unknown-age objects are never deleted, unrecognized objects under the prefix are skipped with a WARN, and a mid-run commit re-derives the live set (a UUID change aborts). |
+| `icegres maintain compact --table <table> [--target-file-mb N] [--min-input-files N] [--execute]` | Bin-pack compaction: rewrite each partition's data files under `--target-file-mb` (default 128 MiB) into ~target-size files as ONE `replace` snapshot — row set identical, old files time-travel-readable until expiry + GC. **Dry-run by default** (plan: candidates per partition, projected outputs); `--execute` commits. First-committer-wins: anchored to the snapshot the plan was computed against, so a concurrent commit aborts it cleanly with nothing changed (re-run). Refuses loudly on foreign merge-on-read (delete-manifest) tables and partitioned tables. |
 | `icegres sql -e '<query>'` | One-shot local execution against the catalog (debugging aid; no server involved). Honors `--enforce-pk`. |
 
 ### Configuration
@@ -758,14 +759,19 @@ commits diverge.
 
 ### Table maintenance (`icegres maintain`)
 
-Every commit adds a snapshot forever; long-lived tables need two periodic
-maintenance passes, both safe against a live serving endpoint:
+Every commit adds a snapshot forever; long-lived tables need three periodic
+maintenance passes, all safe against a live serving endpoint:
 
 ```sh
-# 1. Trim metadata: keep the newest 50 snapshots + everything a ref points at
+# 1. Bin-pack small files: dry-run prints the plan, --execute rewrites them
+#    into ~target-size files as ONE `replace` snapshot (row set identical)
+icegres maintain compact --table demo.trips
+icegres maintain compact --table demo.trips --execute
+
+# 2. Trim metadata: keep the newest 50 snapshots + everything a ref points at
 icegres maintain expire-snapshots demo.trips --keep 50
 
-# 2. Reclaim the bytes expiry stranded: dry-run first, then delete
+# 3. Reclaim the bytes expiry stranded: dry-run first, then delete
 icegres maintain remove-orphans demo.trips                  # report only
 icegres maintain remove-orphans demo.trips --execute        # delete (72h grace)
 ```
@@ -787,11 +793,19 @@ files. It fails closed on anything ambiguous: unreadable metadata or manifests
 abort the run, a recorded file path outside the listed bucket aborts the run
 (liveness cannot be verified against a listing that cannot see it),
 unknown-age objects and unrecognized files are never deleted, and a commit
-landing mid-run re-derives the live set. There is still no `compact` command
-(pinned iceberg-rust 0.9.1
-has no rewrite-files action — see `docs/limitations.md`); buffered/tail mode
-already keeps file sizes healthy by group-committing per window instead of
-per statement.
+landing mid-run re-derives the live set.
+
+`compact` bin-packs each partition's data files under `--target-file-mb`
+(default 128) into ~target-size files as ONE `replace` snapshot: the row set
+is identical, old files stay time-travel-readable until expiry + GC reclaim
+them (the GC knows they are not orphans), and the commit is anchored to the
+exact snapshot the plan was computed against — a concurrent commit (foreign
+writer, DML, buffered flush) makes it abort cleanly with nothing changed;
+re-run it. Tables bearing foreign merge-on-read delete manifests are refused
+loudly (icegres cannot apply those deletes — `docs/limitations.md`), as are
+partitioned tables. Buffered/tail mode already keeps file sizes healthy by
+group-committing per window instead of per statement, so compaction is mostly
+for tables fed by per-statement commits or foreign micro-batchers.
 
 ### Works with your ORM/BI tool
 

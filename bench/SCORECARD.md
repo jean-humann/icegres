@@ -2178,3 +2178,47 @@ warmups discarded: 3, iterations: 20, cold-start runs: 5, demo.trips data files:
 | adbc_bulk_ingest_100k_rows_s | 1089687 | — | |
 | flight_q1_ms | 8.83 | 9.1 | n=15 |
 | flight_q1_fresh_ms | 5.21 | 7.09 | n=15 |
+
+### Bench 20260714T134211Z
+
+Release binary `icegres/target/release/icegres` · raw: `bench/results/bench-20260714T134211Z.json` ·
+warmups discarded: 3, iterations: 20, cold-start runs: 5, demo.trips data files: 1
+
+| metric | p50 | p95 | n / detail |
+|--------|-----|-----|------------|
+| connect_ms | 0.17 | 0.3 | n=20 |
+| point_lookup_ms | 9.88 | 11.03 | n=20 |
+| filtered_scan_ms | 9.45 | 11.33 | n=20 |
+| aggregate_ms | 11.05 | 11.98 | n=20 |
+| join_ms | 14.01 | 16.3 | n=20 |
+| insert_single_ms | 79.48 | 111.86 | n=20 |
+| insert_batch100_ms | 142.82 | 152.95 | n=20 |
+| freshness_ms | 71.24 | 85.95 | n=20 |
+| qps_8conn | 369.6 | — | median of 323.2, 369.6, 394.0 (8 conns, 10s windows) |
+| cold_start_ms | 46.23 | 46.32 | n=5 |
+| binary_size_mb | 130.55 | — | |
+| rss_idle_mb | 83.1 | — | |
+| rss_peak_mb | 99.41 | — | qps-window peak 96.87 MB, 445 samples @ 100ms |
+| rss_after_load_mb | 98.36 | — | |
+| insert_single_buffered_ms | 1.4 | 1.71 | n=20 |
+| freshness_buffered_ms | 8.6 | 71.55 | n=20 |
+| durable_ack_dir_ms | 4.82 | 7.67 | n=20 |
+| durable_ack_pg_ms | 4.31 | 8.2 | n=20 |
+| durable_ack_quorum_ms | 4.88 | 9.16 | n=20 |
+| cold_start_via_proxy_ms | 86 | 106 | n=5 |
+| connect_via_proxy_ms | 0.5 | 2.0 | n=20 |
+| qps_via_proxy_8conn | 386.1 | — | median of 386.8, 386.1, 383.3 (8 conns, 10s windows) |
+| adbc_query_point_ms | 10.3 | 12.7 | n=20 |
+| adbc_query_bigfilter_ms | 7.9 | 8.6 | n=10 |
+| adbc_bulk_ingest_100k_rows_s | 776556 | — | |
+| flight_q1_ms | 10.27 | 11.34 | n=15 |
+| flight_q1_fresh_ms | 4.9 | 7.13 | n=15 |
+| compact_scan_restore_ms | 47 | — | degraded p50 56 ms @ 24 files -> restored p50 47 ms @ 1 file(s); compact wall 165 ms |
+
+**Drift control (P2 gate):** absolute latencies in this run are inflated vs the
+2026-07-11 baseline by shared-VM drift, not by code: the preserved pre-P2 binary
+re-benched in the same box state (`bench-20260714T134654Z.json`, `ICEGRES_BIN`
+override; its run exits 1 only because the old binary lacks the new
+`maintain compact` used by the 4g extra) shows the same inflation against its own
+2026-07-11 numbers. The paired gate old-binary-now -> candidate-now PASSES every
+metric (worst: insert_batch100_ms +11.1%, latency threshold 20% (rss 25%)).
