@@ -2240,3 +2240,84 @@ Zero acked-row loss across the same failover is asserted by e2e section
 (ha1) (every client-acked INSERT readable on the replacement), and the
 no-double-writer half by (ha1z) (SIGSTOP zombie's INSERT fails with the
 superseded fence).
+
+### Bench 20260715T181624Z
+
+Release binary `icegres/target/release/icegres` · raw: `bench/results/bench-20260715T181624Z.json` ·
+warmups discarded: 3, iterations: 20, cold-start runs: 5, demo.trips data files: 1
+
+| metric | p50 | p95 | n / detail |
+|--------|-----|-----|------------|
+| connect_ms | 0.25 | 0.44 | n=20 |
+| point_lookup_ms | 11.64 | 16.15 | n=20 |
+| filtered_scan_ms | 11.2 | 11.81 | n=20 |
+| aggregate_ms | 11.71 | 14.61 | n=20 |
+| join_ms | 15.52 | 21.29 | n=20 |
+| insert_single_ms | 59.01 | 69.51 | n=20 |
+| insert_batch100_ms | 95.43 | 110.92 | n=20 |
+| freshness_ms | 59.57 | 73.85 | n=20 |
+| qps_8conn | 287.9 | — | median of 285.2, 287.9, 295.5 (8 conns, 10s windows) |
+| cold_start_ms | 45.23 | 48.09 | n=5 |
+| binary_size_mb | 130.64 | — | |
+| rss_idle_mb | 86.4 | — | |
+| rss_peak_mb | 103.63 | — | qps-window peak 100.96 MB, 417 samples @ 100ms |
+| rss_after_load_mb | 102.17 | — | |
+| insert_single_buffered_ms | 1.54 | 1.89 | n=20 |
+| freshness_buffered_ms | 10.97 | 64.84 | n=20 |
+| durable_ack_dir_ms | 4.04 | 6.06 | n=20 |
+| durable_ack_pg_ms | 2.84 | 4.92 | n=20 |
+| durable_ack_quorum_ms | 4.39 | 7.23 | n=20 |
+| cold_start_via_proxy_ms | 82 | 85 | n=5 |
+| failover_ms | 96 | 106 | n=5 |
+| connect_via_proxy_ms | 0.4 | 0.63 | n=20 |
+| qps_via_proxy_8conn | 289.8 | — | median of 286.3, 291.2, 289.8 (8 conns, 10s windows) |
+| adbc_query_point_ms | 12.3 | 14.3 | n=20 |
+| adbc_query_bigfilter_ms | 9.9 | 12.0 | n=10 |
+| adbc_bulk_ingest_100k_rows_s | 798403 | — | |
+| flight_q1_ms | 12.25 | 13.99 | n=15 |
+| flight_q1_fresh_ms | 5.74 | 10.62 | n=15 |
+| compact_scan_restore_ms | 41 | — | degraded p50 45 ms @ 24 files -> restored p50 41 ms @ 1 file(s); compact wall 182 ms |
+
+**P3 gate (paired, drift-controlled):** candidate `bench-20260715T181624Z.json`
+vs the pre-P3 binary re-benched in the same box state
+(`bench-20260715T215515Z.json`, `ICEGRES_BIN` override): PASS on every metric
+(worst latency delta +5.2%, latency threshold 20%; qps and inserts slightly
+better on the candidate). failover_ms measured on the candidate: 94-106 ms
+per cycle (kill -9 quorum writer -> first successful write via icegresd).
+
+### Bench 20260715T215515Z
+
+Release binary `/tmp/claude-0/-home-user-icegres/5e800786-6af4-536d-92f8-1b93df45ac84/scratchpad/icegres-pre-p3` · raw: `bench/results/bench-20260715T215515Z.json` ·
+warmups discarded: 3, iterations: 20, cold-start runs: 5, demo.trips data files: 2
+
+| metric | p50 | p95 | n / detail |
+|--------|-----|-----|------------|
+| connect_ms | 0.21 | 0.28 | n=20 |
+| point_lookup_ms | 11.15 | 13.4 | n=20 |
+| filtered_scan_ms | 10.84 | 11.63 | n=20 |
+| aggregate_ms | 11.42 | 12.47 | n=20 |
+| join_ms | 15.29 | 18.51 | n=20 |
+| insert_single_ms | 60.79 | 73.03 | n=20 |
+| insert_batch100_ms | 101.61 | 115.55 | n=20 |
+| freshness_ms | 56.63 | 64.11 | n=20 |
+| qps_8conn | 272.9 | — | median of 266.8, 272.9, 273.0 (8 conns, 10s windows) |
+| cold_start_ms | 45.7 | 47.05 | n=5 |
+| binary_size_mb | 130.47 | — | |
+| rss_idle_mb | 83.42 | — | |
+| rss_peak_mb | 98.74 | — | qps-window peak 96.24 MB, 416 samples @ 100ms |
+| rss_after_load_mb | 98.46 | — | |
+| insert_single_buffered_ms | 166.02 | 181.94 | n=20 |
+| freshness_buffered_ms | 93.91 | 98.27 | n=20 |
+| durable_ack_dir_ms | 66.36 | 87.85 | n=20 |
+| durable_ack_pg_ms | 61.42 | 76.02 | n=20 |
+| durable_ack_quorum_ms | 60.19 | 69.72 | n=20 |
+| cold_start_via_proxy_ms | 79 | 81 | n=5 |
+| failover_ms | 92 | 275 | n=5 |
+| connect_via_proxy_ms | 0.38 | 0.52 | n=20 |
+| qps_via_proxy_8conn | 270.8 | — | median of 271.5, 269.6, 270.8 (8 conns, 10s windows) |
+| adbc_query_point_ms | 12.5 | 14.3 | n=20 |
+| adbc_query_bigfilter_ms | 10.6 | 11.3 | n=10 |
+| adbc_bulk_ingest_100k_rows_s | 763760 | — | |
+| flight_q1_ms | 13.23 | 13.89 | n=15 |
+| flight_q1_fresh_ms | 12.77 | 13.36 | n=15 |
+| compact_scan_restore_ms | 37 | — | degraded p50 43 ms @ 24 files -> restored p50 37 ms @ 1 file(s); compact wall 158 ms |
