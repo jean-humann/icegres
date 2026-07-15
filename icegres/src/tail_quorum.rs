@@ -109,6 +109,10 @@ enum Job {
         seq: u64,
         resp: std_mpsc::Sender<Result<()>>,
     },
+    /// Liveness probe for `/health` (TailStore::health): reports the
+    /// proposer's poison reason, if any — a poisoned proposer means this
+    /// process can never ack another append (fenced or quorum-timed-out).
+    Health { resp: std_mpsc::Sender<Result<()>> },
     /// Test-only: the per-acceptor acked flush positions (convergence
     /// checks in the in-process integration tests).
     #[cfg(test)]
@@ -211,7 +215,11 @@ impl QuorumTail {
 
     /// Round-trip one job to the worker: non-blocking send, blocking reply
     /// (the durable-ack wait — the same thread-blocking window the other
-    /// backends spend in fsync / the tail database round trip).
+    /// backends spend in fsync / the tail database round trip). The wait
+    /// runs through `block_runtime_friendly`: a caller on a tokio worker
+    /// (the flusher's truncate/watermark, a boot replay) must not park the
+    /// runtime's I/O driver for the reply — during an acceptor outage that
+    /// reply can take the full append timeout.
     fn call<T>(&self, build: impl FnOnce(std_mpsc::Sender<Result<T>>) -> Job) -> Result<T> {
         let (resp_tx, resp_rx) = std_mpsc::channel();
         self.job_tx
@@ -219,8 +227,7 @@ impl QuorumTail {
             .expect("job_tx lives until drop")
             .send(build(resp_tx))
             .map_err(|_| anyhow!("tail-quorum worker is gone; restart the server"))?;
-        resp_rx
-            .recv()
+        crate::tail::block_runtime_friendly(|| resp_rx.recv())
             .map_err(|_| anyhow!("tail-quorum worker dropped a request; restart the server"))?
     }
 
@@ -450,6 +457,17 @@ impl TailStore for QuorumTail {
         &self.prop_key
     }
 
+    /// Unhealthy exactly when this process can never ack another append:
+    /// the QuorumTail-level poison (ambiguous append outcome), the
+    /// proposer's poison (fenced by a newer server / quorum-ack timeout),
+    /// or a dead worker. The round trip to the worker is cheap — the job
+    /// loop never blocks on quorum waits (M2) — so `/health` polling at
+    /// ~1 Hz costs nothing.
+    fn health(&self) -> Result<()> {
+        self.check_poisoned()?;
+        self.call(|resp| Job::Health { resp })
+    }
+
     fn record_watermark(&self, table: &TableIdent, seq: u64) -> Result<()> {
         // The outcome is the caller's to act on (buffer.rs skips the
         // covered-frame truncate when this fails): report it honestly.
@@ -665,6 +683,12 @@ async fn run_job(
             // The caller blocks on `resp` for the quorum-durable outcome,
             // but the job LOOP must not (M2): submit here, wait spawned.
             append_watermark_off_loop(quorum, wm_max, key, seq, Some(resp));
+        }
+        Job::Health { resp } => {
+            let _ = resp.send(match quorum.poison_reason() {
+                None => Ok(()),
+                Some(why) => Err(anyhow!("quorum tail is POISONED ({why})")),
+            });
         }
         #[cfg(test)]
         Job::PeerFlushes { resp } => {
@@ -1028,6 +1052,35 @@ mod tests {
             new.append(&ident(), TailOpKind::Append, &[batch(&[2])])
                 .unwrap(),
             2
+        );
+    }
+
+    // P3 failover: /health visibility of the poison. A healthy quorum tail
+    // reports Ok through TailStore::health; a FENCED one (superseded by a
+    // newer server) reports the poison — the signal icegresd's
+    // --health-check-ms uses to replace a wedged-but-alive compute that a
+    // bare TCP probe would call fine (it still accepts connections, it
+    // just can never ack a write again).
+    #[test]
+    fn health_reports_the_fencing_poison() {
+        let (_acceptors, addrs) = spawn_cluster("health-poison");
+        let old = QuorumTail::open_with_config(cfg(&addrs, 5000)).unwrap();
+        old.append(&ident(), TailOpKind::Append, &[batch(&[1])])
+            .unwrap();
+        old.health().expect("a live, unfenced tail is healthy");
+        let _new = QuorumTail::open_with_config(cfg(&addrs, 5000)).unwrap();
+        // The old proposer learns it lost on its next append (the fence).
+        let err = old
+            .append(&ident(), TailOpKind::Append, &[batch(&[2])])
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("superseded by a newer server"),
+            "expected the fencing error, got: {err:#}"
+        );
+        let err = old.health().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("POISONED"),
+            "health must surface the fencing poison: {err:#}"
         );
     }
 

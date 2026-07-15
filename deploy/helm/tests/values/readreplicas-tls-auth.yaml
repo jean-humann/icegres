@@ -1,0 +1,27 @@
+# Profile: the full read-scale + security surface — 2 read replicas
+# peer-tailed to the quorum-backed writer with bounded staleness, SCRAM
+# auth (chart-managed Secret), TLS from an existing kubernetes.io/tls
+# Secret, ServiceMonitor and NetworkPolicies on.
+tail:
+  mode: quorum
+writer:
+  writeBufferMs: 200
+computes:
+  readReplicas: 2
+  freshnessMs: 250
+auth:
+  enabled: true
+  users: |
+    # generated with `icegres auth hash`
+    app SCRAM-SHA-256$4096:c2FsdA==$c3RvcmVk:c2VydmVy
+    tailsub SCRAM-SHA-256$4096:c2FsdA==$c3RvcmVk:c2VydmVy
+  peerTailUser: tailsub
+  peerTailPassword: tailsub-password
+tls:
+  enabled: true
+  existingSecret: icegres-tls
+metrics:
+  serviceMonitor:
+    enabled: true
+networkPolicy:
+  enabled: true

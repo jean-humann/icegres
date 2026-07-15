@@ -895,7 +895,14 @@ async fn catalog_ready(catalog: &Arc<dyn iceberg::Catalog>) -> bool {
 ///   pulls a compute out of rotation when its lakehouse dependency is down
 ///   instead of routing queries that will all fail (production-readiness #10).
 /// * Any other path (and a bare TCP connect) is a **liveness** probe →
-///   `200 ok`: the process is alive and accepting, regardless of the catalog.
+///   `200 ok`: the process is alive and accepting — UNLESS a durable tail is
+///   attached and has wedged itself (`buffer.tail_health()`, e.g. the quorum
+///   tail poisoned after being fenced or losing its quorum), in which case
+///   `/health` answers `503 tail unhealthy: ...`: such a compute still
+///   accepts TCP but can never ack a write, and a supervisor (icegresd
+///   `--health-check-ms`) must replace it rather than route to it. Without
+///   tail flags (`buffer` is `None` or has no tail) the response is exactly
+///   the previous unconditional `200 ok`.
 ///
 /// Binding errors are returned (loud at startup); per-connection errors are
 /// logged and ignored.
@@ -903,6 +910,7 @@ pub async fn spawn_health_listener(
     host: &str,
     port: u16,
     catalog: Arc<dyn iceberg::Catalog>,
+    buffer: Option<Arc<crate::buffer::WriteBuffer>>,
 ) -> Result<()> {
     let addr = format!("{host}:{port}");
     let listener = TcpListener::bind(&addr)
@@ -914,6 +922,7 @@ pub async fn spawn_health_listener(
             match listener.accept().await {
                 Ok((mut socket, _)) => {
                     let catalog = catalog.clone();
+                    let buffer = buffer.clone();
                     tokio::spawn(async move {
                         // Best-effort read of the request line (a plain TCP
                         // connect-and-close liveness check sends nothing).
@@ -939,19 +948,53 @@ pub async fn spawn_health_listener(
                             let _ = socket.shutdown().await;
                             return;
                         }
-                        let response: &[u8] = if path == "/ready" || path == "/readyz" {
+                        let response: Vec<u8> = if path == "/ready" || path == "/readyz" {
                             if catalog_ready(&catalog).await {
                                 b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n\
                                   content-length: 6\r\nconnection: close\r\n\r\nready\n"
+                                    .to_vec()
                             } else {
                                 b"HTTP/1.1 503 Service Unavailable\r\ncontent-type: text/plain\r\n\
                                   content-length: 10\r\nconnection: close\r\n\r\nnot ready\n"
+                                    .to_vec()
                             }
                         } else {
-                            b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n\
-                              content-length: 3\r\nconnection: close\r\n\r\nok\n"
+                            // Liveness. With a durable tail attached, a
+                            // wedged tail (poisoned: fenced/quorum-timeout)
+                            // means the process can never ack a write again
+                            // — report 503 so a supervisor replaces it. The
+                            // probe is a sync channel round trip, so it runs
+                            // off the async worker.
+                            let tail_wedged: Option<String> = match &buffer {
+                                Some(buf) if buf.tail_enabled() => {
+                                    let buf = buf.clone();
+                                    tokio::task::spawn_blocking(move || buf.tail_health())
+                                        .await
+                                        .unwrap_or_else(|e| {
+                                            Err(anyhow::anyhow!("tail health probe panicked: {e}"))
+                                        })
+                                        .err()
+                                        .map(|e| format!("{e:#}"))
+                                }
+                                _ => None,
+                            };
+                            match tail_wedged {
+                                None => b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n\
+                                          content-length: 3\r\nconnection: close\r\n\r\nok\n"
+                                    .to_vec(),
+                                Some(why) => {
+                                    let body = format!("tail unhealthy: {why}\n");
+                                    format!(
+                                        "HTTP/1.1 503 Service Unavailable\r\ncontent-type: \
+                                         text/plain\r\ncontent-length: {}\r\nconnection: \
+                                         close\r\n\r\n{body}",
+                                        body.len()
+                                    )
+                                    .into_bytes()
+                                }
+                            }
                         };
-                        let _ = socket.write_all(response).await;
+                        let _ = socket.write_all(&response).await;
                         let _ = socket.shutdown().await;
                     });
                 }

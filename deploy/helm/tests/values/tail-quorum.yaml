@@ -1,0 +1,7 @@
+# Profile: consensus-durable tail — the -keeper acceptor trio (2-of-3
+# fsync per ack), anti-affinity required, PDB minAvailable 2. The writer's
+# /health liveness probe is the failover trigger.
+tail:
+  mode: quorum
+writer:
+  writeBufferMs: 200

@@ -154,14 +154,30 @@ stop_pidfile_generic() { # pidfile — identity-checked kill
   fi
 }
 
-stop_icegresd() { # identity-checked kill of the control plane (comm=icegresd)
-  local pidfile="$E2E_DIR/icegresd.pid" pid
+stop_icegresd_at() { # pidfile — identity-checked kill of a control plane (comm=icegresd)
+  local pidfile=$1 pid
   if [[ -f "$pidfile" ]]; then
     pid=$(cat "$pidfile")
     if kill -0 "$pid" 2>/dev/null \
         && [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == icegresd ]]; then
       kill "$pid" 2>/dev/null || true # SIGTERM: icegresd terminates its computes
       for _ in $(seq 1 40); do kill -0 "$pid" 2>/dev/null || break; sleep 0.25; done
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$pidfile"
+  fi
+}
+
+stop_icegresd() { stop_icegresd_at "$E2E_DIR/icegresd.pid"; }
+
+stop_keeper_at() { # pidfile — identity-checked kill of an acceptor (comm=icekeeperd)
+  local pidfile=$1 pid
+  if [[ -f "$pidfile" ]]; then
+    pid=$(cat "$pidfile")
+    if kill -0 "$pid" 2>/dev/null \
+        && [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == icekeeperd ]]; then
+      kill "$pid" 2>/dev/null || true
+      for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.25; done
       kill -9 "$pid" 2>/dev/null || true
     fi
     rm -f "$pidfile"
@@ -187,6 +203,20 @@ cleanup() {
   stop_pidfile_generic "$E2E_DIR/serve-p1a.pid"
   stop_pidfile_generic "$E2E_DIR/serve-p1b.pid"
   stop_icegresd
+  # (ha) section leftovers: HA icegresd instances, fence pair, keepers.
+  stop_icegresd_at "$E2E_DIR/icegresd-ha.pid"
+  stop_icegresd_at "$E2E_DIR/icegresd-lease-a.pid"
+  stop_icegresd_at "$E2E_DIR/icegresd-lease-b.pid"
+  stop_icegresd_at "$E2E_DIR/icegresd-scale.pid"
+  stop_pidfile_generic "$E2E_DIR/serve-ha-z.pid"
+  stop_pidfile_generic "$E2E_DIR/serve-ha-w.pid"
+  for kp in "$E2E_DIR"/ha-keeper-*.pid; do
+    # `|| continue`, not `&&`: after a clean run no pidfile matches, and a
+    # false-status last command in the EXIT trap would (set -e) override
+    # the suite's exit code with 1.
+    [[ -f "$kp" ]] || continue
+    stop_keeper_at "$kp"
+  done
 }
 trap cleanup EXIT
 
@@ -2984,6 +3014,418 @@ assert_eq "laundered-file refusal committed nothing (snapshot count unchanged)" 
   "$evo2_snaps_before" "$(count_snaps e2e_evo2)"
 pass "compact --execute refuses laundered old-schema files (per-file Parquet field-id guard)"
 curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_evo2?purgeRequested=true" >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
+# (ha) P3 icegresd-ha, process mode: automated tail-writer failover
+#      (--health-check-ms), zombie-writer fencing (SIGSTOP live-zombie),
+#      icegresd leader lease over icekeeperd (--lease-quorum), and
+#      autoscaling-lite read replicas (--read-replicas-max) with peer-tail
+#      wiring. Ports (all above every existing reservation; 5471-5473
+#      belong to tests/tail_durability.sh, 5461-5463 to bench.sh):
+#        5481-5483 data icekeeperd trio     5484-5486 lease icekeeperd trio
+#        5487/5488 failover icegresd/main   5490-5493 lease icegresd A/B
+#        5494/5495 fence pair Z/W           5496-5498 autoscale/main/tail-api
+# ---------------------------------------------------------------------------
+HA_KBIN="$ICEGRES_DIR/target/debug/icekeeperd"
+HA_QUORUM="127.0.0.1:5481,127.0.0.1:5482,127.0.0.1:5483"
+HA_LEASE_QUORUM="127.0.0.1:5484,127.0.0.1:5485,127.0.0.1:5486"
+HA_BUF_MS=600000 # 10 min: the flusher never auto-commits; replay is the only path
+log "(ha) P3 HA: keepers up (data 5481-5483, lease 5484-5486), scratch table"
+[[ -x "$HA_KBIN" ]] || fail "icekeeperd binary not found at $HA_KBIN (cargo build builds all bins)"
+for p in 5481 5482 5483 5484 5485 5486 5487 5488 5490 5491 5492 5493 5494 5495 5496 5497 5498; do
+  if (exec 3<>"/dev/tcp/$PG_HOST/$p") 2>/dev/null; then
+    exec 3>&- 3<&-
+    fail "something is already listening on :$p — stop it first"
+  fi
+done
+
+start_ha_keeper() { # start_ha_keeper <name> <port>
+  local name=$1 port=$2 dir="$E2E_DIR/ha-keeper-$1" log="$E2E_DIR/ha-keeper-$1.log"
+  "$HA_KBIN" serve --host 127.0.0.1 --port "$port" --data-dir "$dir" --node-id "$port" \
+    >>"$log" 2>&1 &
+  echo $! >"$E2E_DIR/ha-keeper-$name.pid"
+  for _ in $(seq 1 40); do
+    if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then exec 3>&- 3<&-; return 0; fi
+    kill -0 "$(cat "$E2E_DIR/ha-keeper-$name.pid")" 2>/dev/null \
+      || { tail -n 20 "$log" >&2; fail "ha keeper $name exited during startup"; }
+    sleep 0.25
+  done
+  fail "ha keeper $name not accepting on :$port within 10s"
+}
+
+rm -rf "$E2E_DIR"/ha-keeper-*
+start_ha_keeper d1 5481; start_ha_keeper d2 5482; start_ha_keeper d3 5483
+start_ha_keeper l1 5484; start_ha_keeper l2 5485; start_ha_keeper l3 5486
+pass "6 icekeeperd acceptors up (data trio + DEDICATED lease trio)"
+
+# Scratch table for the HA legs (never touches demo.trips).
+curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_ha?purgeRequested=true" >/dev/null 2>&1 || true
+curl -sf -X POST "$CATALOG_URI/v1/$prefix/namespaces/demo/tables" \
+  -H 'Content-Type: application/json' -d @- <<'JSON' >/dev/null
+{
+  "name": "e2e_ha",
+  "schema": {
+    "type": "struct",
+    "schema-id": 0,
+    "fields": [
+      {"id": 1, "name": "id", "required": false, "type": "long"},
+      {"id": 2, "name": "note", "required": false, "type": "string"}
+    ]
+  }
+}
+JSON
+
+# --- ha1: automated tail-writer failover THROUGH icegresd. A quorum-tailed
+#     writer compute takes acked buffered INSERTs under continuous load; the
+#     compute is kill -9'd mid-load; icegresd detects it (dead-port probe +
+#     supervised restart; --health-check-ms covers the wedged-but-alive
+#     case in ha1w below) and spawns a replacement whose --tail-quorum
+#     open() FENCES the old term and REPLAYS the un-flushed window before
+#     accepting. Measured end-to-end: failover_ms = kill -> first
+#     successful client write via the SAME icegresd endpoint; asserted:
+#     EVERY client-acked insert is readable on the replacement.
+HA_PORT=5487
+HA_MAIN=5488
+HA_LOG="$E2E_DIR/icegresd-ha.log"
+HA_STATUS="$E2E_DIR/icegresd-ha-status.json"
+log "(ha1) writer failover under load: kill -9 the quorum-tailed compute via icegresd on :$HA_PORT"
+: >"$HA_LOG"
+rm -f "$HA_STATUS"
+env ICEGRES_WRITE_BUFFER_MS="$HA_BUF_MS" ICEGRES_TAIL_QUORUM="$HA_QUORUM" \
+    ICEGRES_TAIL_QUORUM_TIMEOUT_MS=2000 \
+  "$DBIN" serve --host "$PG_HOST" --port "$HA_PORT" --main-port "$HA_MAIN" \
+  --icegres-bin "$BIN" --idle-shutdown-secs 300 --pool-size 0 \
+  --health-check-ms 250 --status-file "$HA_STATUS" >>"$HA_LOG" 2>&1 &
+echo $! >"$E2E_DIR/icegresd-ha.pid"
+for _ in $(seq 1 40); do
+  if (exec 3<>"/dev/tcp/$PG_HOST/$HA_PORT") 2>/dev/null; then exec 3>&- 3<&-; break; fi
+  sleep 0.25
+done
+ha_status() { jq -r --arg k "$1" ".computes[] | select(.key == \$k) | $2" "$HA_STATUS" 2>/dev/null; }
+HAQ=(psql -h "$PG_HOST" -p "$HA_PORT" -U postgres -d icegres -tA)
+assert_eq "quorum-tailed compute wakes through icegresd" "1" "$("${HAQ[@]}" -c 'select 1')"
+grep -q "durable quorum tail" "$HA_LOG" \
+  || fail "the compute did not announce the quorum tail (env not inherited?)"
+
+# The load driver: sequential INSERTs; every ACKED id is recorded with its
+# ack timestamp (an errored insert is NOT acked and NOT recorded).
+HA_ACKED="$E2E_DIR/ha-acked.txt"
+HA_STOP="$E2E_DIR/ha-stop"
+rm -f "$HA_ACKED" "$HA_STOP"
+touch "$HA_ACKED"
+(
+  i=0
+  while [[ ! -f "$HA_STOP" ]]; do
+    i=$((i + 1))
+    if psql -h "$PG_HOST" -p "$HA_PORT" -U postgres -d icegres -tA \
+         -c "insert into demo.e2e_ha (id, note) values ($i, 'ha-load')" >/dev/null 2>&1; then
+      echo "$i $(($(date +%s%N) / 1000000))" >>"$HA_ACKED"
+    fi
+    sleep 0.02
+  done
+) &
+HA_LOAD_PID=$!
+# Let the load ack a healthy baseline first.
+for _ in $(seq 1 100); do
+  (( $(wc -l <"$HA_ACKED") >= 15 )) && break
+  sleep 0.2
+done
+(( $(wc -l <"$HA_ACKED") >= 15 )) || { touch "$HA_STOP"; fail "load driver never got 15 acked inserts"; }
+
+ha_cpid=$(ha_status main .pid)
+[[ "$ha_cpid" =~ ^[0-9]+$ ]] || { touch "$HA_STOP"; fail "no compute pid in $HA_STATUS"; }
+ha_kill_ms=$(($(date +%s%N) / 1000000))
+kill -9 "$ha_cpid" || { touch "$HA_STOP"; fail "could not SIGKILL compute $ha_cpid"; }
+# failover_ms = kill -> first ACKED insert on the replacement, as observed
+# by the CLIENT through the unchanged endpoint.
+ha_recovered_ms=""
+for _ in $(seq 1 300); do
+  ha_recovered_ms=$(awk -v k="$ha_kill_ms" '$2 > k { print $2; exit }' "$HA_ACKED")
+  [[ -n "$ha_recovered_ms" ]] && break
+  sleep 0.1
+done
+[[ -n "$ha_recovered_ms" ]] || { touch "$HA_STOP"; tail -n 30 "$HA_LOG" >&2; fail "no insert ever acked after the writer kill (no failover)"; }
+FAILOVER_MS=$((ha_recovered_ms - ha_kill_ms))
+(( FAILOVER_MS < 15000 )) || fail "failover took ${FAILOVER_MS}ms (>15s)"
+pass "failover_ms=${FAILOVER_MS} (kill -9 writer under load -> first successful write on the replacement, via icegresd; debug build)"
+sleep 1
+touch "$HA_STOP"
+wait "$HA_LOAD_PID" 2>/dev/null || true
+grep -q "exited UNCLEANLY" "$HA_LOG" || fail "the writer kill was not logged as an unclean exit"
+# The replacement may come from EITHER recovery path — the supervisor's
+# backoff restart, or a connection's dead-port probe re-waking the slot
+# first (usually faster; the supervisor's spawn is then superseded).
+# Either way a second compute generation must have come up.
+[[ "$(grep -c "compute ready" "$HA_LOG")" -ge 2 ]] \
+  || fail "no replacement compute came up after the writer kill"
+
+# ZERO acked-row loss: every recorded acked id is SELECTable through the
+# replacement (whose election replayed the killed writer's un-flushed
+# window; nothing was committed — the 10-min cadence never fired).
+ha_acked_ids=$(awk '{print $1}' "$HA_ACKED" | sort -n | uniq)
+ha_acked_n=$(wc -l <<<"$ha_acked_ids")
+ha_in_list=$(paste -sd, <<<"$ha_acked_ids")
+ha_present=$("${HAQ[@]}" -c "select count(distinct id) from demo.e2e_ha where id in ($ha_in_list)")
+assert_eq "ZERO acked-row loss through the failover ($ha_acked_n acked inserts, incl. pre-kill window)" \
+  "$ha_acked_n" "$ha_present"
+
+# --- ha1w: the wedged-but-alive case a TCP probe misses. SIGSTOP two data
+#     acceptors; the next INSERT times out and POISONS the compute's tail —
+#     the process still accepts TCP and answers reads, but /health reports
+#     503. The --health-check-ms loop must kill it; after the acceptors
+#     resume, the next client connection spawns a replacement that replays
+#     (including the timed-out AMBIGUOUS insert, exactly once).
+log "(ha1w) wedged-but-alive writer: poisoned tail detected via /health and replaced"
+ha_cpid=$(ha_status main .pid)
+ha_hport=$(ha_status main .health_port)
+[[ "$ha_hport" =~ ^[0-9]+$ ]] || fail "no health_port in status (health checks not wired?)"
+curl -sf "http://127.0.0.1:$ha_hport/health" >/dev/null || fail "healthy compute must answer 200 on /health"
+kill -STOP "$(cat "$E2E_DIR/ha-keeper-d2.pid")" "$(cat "$E2E_DIR/ha-keeper-d3.pid")"
+set +e
+ha_poison_out=$(timeout 30 psql -h "$PG_HOST" -p "$HA_PORT" -U postgres -d icegres -c \
+  "insert into demo.e2e_ha (id, note) values (700001, 'ambiguous')" 2>&1)
+ha_poison_rc=$?
+set -e
+[[ $ha_poison_rc -ne 0 ]] || fail "the quorum-less INSERT was acked: $ha_poison_out"
+grep -q "POISONED" <<<"$ha_poison_out" || fail "unexpected quorum-less INSERT error: $ha_poison_out"
+# The health loop (250ms x 3 fails) must kill the wedged compute.
+ha_wedge_gone=0
+for _ in $(seq 1 100); do
+  if ! kill -0 "$ha_cpid" 2>/dev/null; then ha_wedge_gone=1; break; fi
+  sleep 0.1
+done
+[[ "$ha_wedge_gone" == 1 ]] || fail "the poisoned compute was never killed by the health loop"
+grep -q "consecutive health probes" "$HA_LOG" \
+  || fail "the health loop did not log the probe failures"
+pass "poisoned (wedged-but-alive) compute detected via /health 503 and killed for replacement"
+kill -CONT "$(cat "$E2E_DIR/ha-keeper-d2.pid")" "$(cat "$E2E_DIR/ha-keeper-d3.pid")"
+# The replacement replays; the AMBIGUOUS timed-out insert became durable on
+# the surviving acceptor and must appear EXACTLY ONCE (never twice).
+ha_amb=""
+for _ in $(seq 1 60); do
+  ha_amb=$("${HAQ[@]}" -c "select count(*) from demo.e2e_ha where id = 700001" 2>/dev/null) && [[ -n "$ha_amb" ]] && break
+  sleep 1
+done
+assert_eq "ambiguous timed-out insert replayed exactly once on the replacement" "1" "$ha_amb"
+assert_eq "acked pre-wedge rows all present on the second replacement" \
+  "$ha_acked_n" "$("${HAQ[@]}" -c "select count(distinct id) from demo.e2e_ha where id in ($ha_in_list)")"
+stop_icegresd_at "$E2E_DIR/icegresd-ha.pid"
+
+# --- ha1z: the no-double-writer proof. A SIGSTOPped writer is a LIVE
+#     zombie: it still holds its socket and, once resumed, would keep
+#     acking if fencing were not real. Fail over to a second writer on the
+#     same quorum, resume the zombie, and its next INSERT must ERROR with
+#     the superseded fence — a fenced zombie cannot ack.
+log "(ha1z) zombie-writer fencing: SIGSTOP writer -> failover -> SIGCONT -> fenced"
+HAZ_PORT=5494
+HAW_PORT=5495
+HAZ_LOG="$E2E_DIR/serve-ha-z.log"; : >"$HAZ_LOG"
+HAW_LOG="$E2E_DIR/serve-ha-w.log"; : >"$HAW_LOG"
+env ICEGRES_TAIL_QUORUM_TIMEOUT_MS=2000 \
+  "$BIN" serve --host "$PG_HOST" --port "$HAZ_PORT" --write-buffer-ms "$HA_BUF_MS" \
+  --tail-quorum "$HA_QUORUM" >>"$HAZ_LOG" 2>&1 &
+echo $! >"$E2E_DIR/serve-ha-z.pid"
+HAZQ=(psql -h "$PG_HOST" -p "$HAZ_PORT" -U postgres -d icegres -tA)
+for _ in $(seq 1 60); do
+  "${HAZQ[@]}" -c 'select 1' >/dev/null 2>&1 && break
+  kill -0 "$(cat "$E2E_DIR/serve-ha-z.pid")" 2>/dev/null \
+    || { tail -n 20 "$HAZ_LOG" >&2; fail "zombie-leg writer Z exited during startup"; }
+  sleep 0.5
+done
+haz_before=$("${HAZQ[@]}" -c 'select count(*) from demo.e2e_ha')
+"${HAZQ[@]}" -c "insert into demo.e2e_ha (id, note) values (500001, 'pre-stop')" >/dev/null
+kill -STOP "$(cat "$E2E_DIR/serve-ha-z.pid")"
+# W = the replacement: its open() elects a higher term (fencing Z at the
+# acceptors) and replays Z's acked rows before the listener binds.
+env ICEGRES_TAIL_QUORUM_TIMEOUT_MS=2000 \
+  "$BIN" serve --host "$PG_HOST" --port "$HAW_PORT" --write-buffer-ms "$HA_BUF_MS" \
+  --tail-quorum "$HA_QUORUM" >>"$HAW_LOG" 2>&1 &
+echo $! >"$E2E_DIR/serve-ha-w.pid"
+HAWQ=(psql -h "$PG_HOST" -p "$HAW_PORT" -U postgres -d icegres -tA)
+for _ in $(seq 1 60); do
+  "${HAWQ[@]}" -c 'select 1' >/dev/null 2>&1 && break
+  kill -0 "$(cat "$E2E_DIR/serve-ha-w.pid")" 2>/dev/null \
+    || { tail -n 20 "$HAW_LOG" >&2; fail "replacement writer W exited during startup"; }
+  sleep 0.5
+done
+assert_eq "replacement W replayed the stopped writer's acked rows" \
+  "$((haz_before + 1))" "$("${HAWQ[@]}" -c 'select count(*) from demo.e2e_ha')"
+kill -CONT "$(cat "$E2E_DIR/serve-ha-z.pid")"
+set +e
+haz_fence_out=$(timeout 30 "${HAZQ[@]}" -c \
+  "insert into demo.e2e_ha (id, note) values (500002, 'zombie-must-fail')" 2>&1)
+haz_fence_rc=$?
+set -e
+[[ $haz_fence_rc -ne 0 ]] || fail "the resumed zombie writer ACKED an insert: $haz_fence_out"
+grep -q "superseded by a newer server" <<<"$haz_fence_out" \
+  || fail "unexpected zombie-fence error: $haz_fence_out"
+pass "resumed zombie writer is FENCED (INSERT fails with the superseded error; no double-writer)"
+"${HAWQ[@]}" -c "insert into demo.e2e_ha (id, note) values (500003, 'owner-writes')" >/dev/null \
+  || fail "the fencing owner W stopped accepting writes"
+assert_eq "zombie's refused row never appears; owner's row does" "0|1" \
+  "$("${HAWQ[@]}" -c 'select count(*) from demo.e2e_ha where id = 500002')|$("${HAWQ[@]}" -c 'select count(*) from demo.e2e_ha where id = 500003')"
+stop_pidfile_generic "$E2E_DIR/serve-ha-z.pid"
+stop_pidfile_generic "$E2E_DIR/serve-ha-w.pid"
+
+# --- ha2: icegresd leader lease over the DEDICATED lease trio. A and B run
+#     with --lease-quorum; exactly one leads. The standby refuses clients
+#     (retryable 57P03) and spawns NOTHING (no double-spawn). kill -9 the
+#     leader: the standby observes the lease frozen for >= TTL, takes it
+#     over (term-fenced against the old leader), and serves.
+LSA_PORT=5490; LSA_MAIN=5491
+LSB_PORT=5492; LSB_MAIN=5493
+LEASE_TTL_MS=3000
+LSA_LOG="$E2E_DIR/icegresd-lease-a.log"; : >"$LSA_LOG"
+LSB_LOG="$E2E_DIR/icegresd-lease-b.log"; : >"$LSB_LOG"
+LSA_STATUS="$E2E_DIR/icegresd-lease-a-status.json"; rm -f "$LSA_STATUS"
+LSB_STATUS="$E2E_DIR/icegresd-lease-b-status.json"; rm -f "$LSB_STATUS"
+log "(ha2) leader lease: icegresd A (:$LSA_PORT) + B (:$LSB_PORT), TTL ${LEASE_TTL_MS}ms"
+"$DBIN" serve --host "$PG_HOST" --port "$LSA_PORT" --main-port "$LSA_MAIN" \
+  --icegres-bin "$BIN" --idle-shutdown-secs 300 --pool-size 0 \
+  --lease-quorum "$HA_LEASE_QUORUM" --lease-ttl-ms "$LEASE_TTL_MS" \
+  --lease-holder-id e2e-a --status-file "$LSA_STATUS" >>"$LSA_LOG" 2>&1 &
+echo $! >"$E2E_DIR/icegresd-lease-a.pid"
+lsa_leader=0
+for _ in $(seq 1 60); do
+  if [[ "$(jq -r .leader "$LSA_STATUS" 2>/dev/null)" == "true" ]]; then lsa_leader=1; break; fi
+  sleep 0.25
+done
+[[ "$lsa_leader" == 1 ]] || { tail -n 20 "$LSA_LOG" >&2; fail "A never acquired the (virgin) lease"; }
+"$DBIN" serve --host "$PG_HOST" --port "$LSB_PORT" --main-port "$LSB_MAIN" \
+  --icegres-bin "$BIN" --idle-shutdown-secs 300 --pool-size 0 \
+  --lease-quorum "$HA_LEASE_QUORUM" --lease-ttl-ms "$LEASE_TTL_MS" \
+  --lease-holder-id e2e-b --status-file "$LSB_STATUS" >>"$LSB_LOG" 2>&1 &
+echo $! >"$E2E_DIR/icegresd-lease-b.pid"
+for _ in $(seq 1 40); do
+  if (exec 3<>"/dev/tcp/$PG_HOST/$LSB_PORT") 2>/dev/null; then exec 3>&- 3<&-; break; fi
+  sleep 0.25
+done
+assert_eq "leader A serves clients" "1" \
+  "$(psql -h "$PG_HOST" -p "$LSA_PORT" -U postgres -d icegres -tA -c 'select 1')"
+sleep 1
+assert_eq "B is standby (status leader=false)" "false" "$(jq -r .leader "$LSB_STATUS")"
+set +e
+lsb_refuse=$(psql -h "$PG_HOST" -p "$LSB_PORT" -U postgres -d icegres -tA -c 'select 1' 2>&1)
+lsb_rc=$?
+set -e
+[[ $lsb_rc -ne 0 ]] || fail "standby B served a client: $lsb_refuse"
+grep -q "does not hold the leader lease" <<<"$lsb_refuse" \
+  || fail "unexpected standby refusal: $lsb_refuse"
+assert_eq "standby B spawned NOTHING (no double-spawn)" "0" \
+  "$(jq -r '.computes | length' "$LSB_STATUS")"
+pass "one leader serves; the standby refuses clients (57P03) and spawns no computes"
+
+lsa_cpid=$(jq -r '.computes[] | select(.key=="main") | .pid' "$LSA_STATUS")
+lsa_kill_ms=$(($(date +%s%N) / 1000000))
+kill -9 "$(cat "$E2E_DIR/icegresd-lease-a.pid")"
+rm -f "$E2E_DIR/icegresd-lease-a.pid"
+lsb_leader=0
+for _ in $(seq 1 200); do
+  if [[ "$(jq -r .leader "$LSB_STATUS" 2>/dev/null)" == "true" ]]; then lsb_leader=1; break; fi
+  sleep 0.1
+done
+takeover_ms=$(( $(date +%s%N) / 1000000 - lsa_kill_ms ))
+[[ "$lsb_leader" == 1 ]] || { tail -n 20 "$LSB_LOG" >&2; fail "standby B never took the lease over"; }
+(( takeover_ms < 3 * LEASE_TTL_MS )) \
+  || fail "lease takeover took ${takeover_ms}ms (> 3x TTL ${LEASE_TTL_MS}ms)"
+pass "kill -9 leader: standby held the lease in ${takeover_ms}ms (TTL ${LEASE_TTL_MS}ms; expiry needs >= TTL of frozen observations by design)"
+assert_eq "clients reconnect against the new leader and keep working" "20" \
+  "$(psql -h "$PG_HOST" -p "$LSB_PORT" -U postgres -d icegres -tA -c 'select count(*) from demo.cities')"
+grep -q "taking over the icegresd lease" "$LSB_LOG" \
+  || fail "B did not log the lease takeover (previous holder record)"
+# kill -9 of A orphaned its compute (no clean shutdown); it is fenced by
+# design on the DATA tail in quorum deployments (proven in ha1z) — here it
+# is just reaped so the harness leaves nothing behind.
+if [[ "$lsa_cpid" =~ ^[0-9]+$ ]] && kill -0 "$lsa_cpid" 2>/dev/null \
+    && [[ "$(ps -o comm= -p "$lsa_cpid" 2>/dev/null)" == icegres ]]; then
+  kill -9 "$lsa_cpid" 2>/dev/null || true
+fi
+stop_icegresd_at "$E2E_DIR/icegresd-lease-b.pid"
+
+# --- ha3: autoscaling-lite. icegresd with a buffered quorum-tailed main
+#     compute (tail API on :5498) and --read-replicas-max 2 (threshold 1,
+#     idle 2s). Two held "<db>:ro" sessions scale the pool to two RUNNING
+#     replicas; replicas are spawned with the tail env STRIPPED (proof:
+#     the writer keeps acking buffered writes — a replica that opened the
+#     same quorum would have fenced it) and --replica-peer-tail wired
+#     (proof: the writer's acked-but-UNFLUSHED row is readable on a
+#     replica within the event bound, cadence 10 min). Idle reaps both
+#     (the existing scale-to-zero); the main slot is never woken by reads.
+SCL_PORT=5496; SCL_MAIN=5497; SCL_TAIL_API=5498
+SCL_LOG="$E2E_DIR/icegresd-scale.log"; : >"$SCL_LOG"
+SCL_STATUS="$E2E_DIR/icegresd-scale-status.json"; rm -f "$SCL_STATUS"
+log "(ha3) autoscaling-lite: '<db>:ro' pool on :$SCL_PORT (max 2, threshold 1, idle 2s)"
+env ICEGRES_WRITE_BUFFER_MS="$HA_BUF_MS" ICEGRES_TAIL_QUORUM="$HA_QUORUM" \
+    ICEGRES_TAIL_QUORUM_TIMEOUT_MS=2000 ICEGRES_TAIL_API_PORT="$SCL_TAIL_API" \
+  "$DBIN" serve --host "$PG_HOST" --port "$SCL_PORT" --main-port "$SCL_MAIN" \
+  --icegres-bin "$BIN" --idle-shutdown-secs 2 --pool-size 0 \
+  --read-replicas-max 2 --read-replica-sessions 1 \
+  --replica-peer-tail "127.0.0.1:$SCL_TAIL_API" --status-file "$SCL_STATUS" \
+  >>"$SCL_LOG" 2>&1 &
+echo $! >"$E2E_DIR/icegresd-scale.pid"
+for _ in $(seq 1 40); do
+  if (exec 3<>"/dev/tcp/$PG_HOST/$SCL_PORT") 2>/dev/null; then exec 3>&- 3<&-; break; fi
+  sleep 0.25
+done
+scl_status() { jq -r --arg k "$1" ".computes[] | select(.key == \$k) | $2" "$SCL_STATUS" 2>/dev/null; }
+SCLQ=(psql -h "$PG_HOST" -p "$SCL_PORT" -U postgres -d icegres -tA)
+SCLRO=(psql -h "$PG_HOST" -p "$SCL_PORT" -U postgres -d "icegres:ro" -tA)
+# Writer up + one acked-but-unflushed row (10-min cadence: never commits).
+"${SCLQ[@]}" -c "insert into demo.e2e_ha (id, note) values (600001, 'peer-visible')" >/dev/null \
+  || fail "buffered INSERT through the autoscale icegresd failed"
+# Hold two :ro sessions (threshold 1 => the 2nd session wakes replica:1).
+( sleep 12 | psql -h "$PG_HOST" -p "$SCL_PORT" -U postgres -d "icegres:ro" >/dev/null 2>&1 ) &
+SCL_S1=$!
+scl_r0=0
+for _ in $(seq 1 60); do
+  if [[ "$(scl_status replica:0 .state)" == "running" ]]; then scl_r0=1; break; fi
+  sleep 0.25
+done
+[[ "$scl_r0" == 1 ]] || { tail -n 20 "$SCL_LOG" >&2; fail "replica:0 never spawned for the first :ro session"; }
+( sleep 12 | psql -h "$PG_HOST" -p "$SCL_PORT" -U postgres -d "icegres:ro" >/dev/null 2>&1 ) &
+SCL_S2=$!
+scl_r1=0
+for _ in $(seq 1 60); do
+  if [[ "$(scl_status replica:1 .state)" == "running" ]]; then scl_r1=1; break; fi
+  sleep 0.25
+done
+[[ "$scl_r1" == 1 ]] || { tail -n 20 "$SCL_LOG" >&2; fail "replica:1 never spawned at the session threshold"; }
+pass "two held :ro sessions scaled the read pool to two RUNNING replicas (threshold 1)"
+# Peer-tail wiring: the writer's UNFLUSHED buffered row is visible on a
+# replica within the event bound (a replica without --peer-tail would wait
+# for the 10-minute commit cadence).
+scl_peer=0
+for _ in $(seq 1 120); do
+  if [[ "$("${SCLRO[@]}" -c 'select count(*) from demo.e2e_ha where id = 600001' 2>/dev/null)" == "1" ]]; then
+    scl_peer=1; break
+  fi
+  sleep 0.25
+done
+[[ "$scl_peer" == 1 ]] || { tail -n 20 "$SCL_LOG" >&2; fail "the writer's unflushed row never became visible on a read replica (peer-tail wiring)"; }
+pass "read replica serves the writer's acked-but-UNFLUSHED row (peer-tail wired; event-bound, not commit-cadence)"
+# Env-strip proof: the WRITER still acks buffered writes — a replica that
+# had inherited ICEGRES_TAIL_QUORUM would have run an election and FENCED it.
+"${SCLQ[@]}" -c "insert into demo.e2e_ha (id, note) values (600002, 'writer-not-fenced')" >/dev/null \
+  || fail "the writer was FENCED — a replica must never inherit the tail env"
+pass "writer keeps acking with two replicas up (replicas never opened the tail: env stripped)"
+wait "$SCL_S1" "$SCL_S2" 2>/dev/null || true
+# Reap: with zero sessions, the replicas idle-exit (scale-to-zero).
+scl_reaped=0
+for _ in $(seq 1 80); do
+  if [[ "$(scl_status replica:0 .state)" == "stopped" && "$(scl_status replica:1 .state)" == "stopped" ]]; then
+    scl_reaped=1; break
+  fi
+  sleep 0.25
+done
+[[ "$scl_reaped" == 1 ]] || fail "idle replicas were not reaped (r0=$(scl_status replica:0 .state), r1=$(scl_status replica:1 .state))"
+pass "idle read replicas reaped (existing idle scale-to-zero; next :ro connection re-wakes)"
+stop_icegresd_at "$E2E_DIR/icegresd-scale.pid"
+
+# HA section cleanup: keepers down, scratch table dropped.
+for kn in d1 d2 d3 l1 l2 l3; do stop_keeper_at "$E2E_DIR/ha-keeper-$kn.pid"; done
+rm -rf "$E2E_DIR"/ha-keeper-*
+curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_ha?purgeRequested=true" >/dev/null 2>&1 || true
+pass "HA section cleanup (keepers stopped, scratch dropped)"
 
 # ---------------------------------------------------------------------------
 log "all assertions passed ($PASS_COUNT)"

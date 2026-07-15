@@ -1737,6 +1737,19 @@ impl WriteBuffer {
         self.tail.is_some()
     }
 
+    /// The attached tail's health (`Ok` when no tail is attached): `Err`
+    /// means this process can no longer ack buffered writes — e.g. the
+    /// quorum tail poisoned itself after being fenced by a newer server or
+    /// timing out a quorum ack. Surfaced through `/health` (ops.rs) so a
+    /// supervisor replaces a wedged-but-alive compute; the replacement's
+    /// tail election fences the old term and replays the window.
+    pub fn tail_health(&self) -> Result<()> {
+        match &self.tail {
+            Some(tail) => tail.health(),
+            None => Ok(()),
+        }
+    }
+
     /// Boot-time recovery (`--tail-dir`): replay every surviving tail frame,
     /// drop those at or below each table's committed watermark (the
     /// `icegres.tail-seq.<tail-id>` property, belt-and-braced with the local

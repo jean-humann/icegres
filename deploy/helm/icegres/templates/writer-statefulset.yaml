@@ -1,0 +1,199 @@
+{{- include "icegres.validate" . -}}
+{{/*
+The single writer compute. A StatefulSet even at replicas=1: the tail
+lease wants a stable identity, and tail.mode=dir wants its WAL PVC to
+follow the pod. FAILOVER IS THE LIVENESS PROBE: /health answers 503 the
+moment the compute's durable tail wedges (poisoned after being fenced or
+losing its quorum — the process still accepts TCP but can never ack a
+buffered write again), the kubelet restarts the container, and the
+replacement's tail election fences the old term and replays the
+un-flushed window BEFORE the pgwire listener binds. Same machinery the
+process-mode e2e failover leg measures.
+*/}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "icegres.fullname" . }}-writer
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegres.labels" . | nindent 4 }}
+    app.kubernetes.io/component: writer
+spec:
+  # One buffering writer per lake — always. With k8sScaling.enabled,
+  # icegresd parks this at 0 replicas when idle and wakes it on connect
+  # (a `helm upgrade` resets it to 1; the idle loop parks it again).
+  replicas: 1
+  serviceName: {{ include "icegres.fullname" . }}-writer
+  selector:
+    matchLabels:
+      {{- include "icegres.selectorLabels" (dict "ctx" $ "component" "writer") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "icegres.labels" . | nindent 8 }}
+        app.kubernetes.io/component: writer
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "icegres.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # > the 30 s in-flight drain + buffered-write flush on SIGTERM.
+      terminationGracePeriodSeconds: 40
+      containers:
+        - name: writer
+          image: {{ include "icegres.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["serve", "--host", "0.0.0.0"]
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "icegres.fullname" . }}
+          env:
+            - name: ICEGRES_PORT
+              value: {{ .Values.writer.port | quote }}
+            - name: ICEGRES_HEALTH_PORT
+              value: {{ .Values.writer.healthPort | quote }}
+            - name: ICEGRES_S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "icegres.s3SecretName" . }}
+                  key: s3-access-key
+            - name: ICEGRES_S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "icegres.s3SecretName" . }}
+                  key: s3-secret-key
+            {{- if .Values.auth.enabled }}
+            - name: ICEGRES_AUTH_FILE
+              value: /etc/icegres/auth/users
+            {{- else }}
+            # icegres refuses an unauthenticated public bind without this
+            # explicit acknowledgement. The Service is cluster-internal,
+            # but ANYTHING in-cluster can connect: enable auth for real
+            # deployments (values: auth.enabled).
+            - name: ICEGRES_INSECURE
+              value: "true"
+            {{- end }}
+            {{- if .Values.tls.enabled }}
+            - name: ICEGRES_TLS_CERT
+              value: /etc/icegres/tls/tls.crt
+            - name: ICEGRES_TLS_KEY
+              value: /etc/icegres/tls/tls.key
+            {{- end }}
+            {{- if ne .Values.tail.mode "none" }}
+            - name: ICEGRES_WRITE_BUFFER_MS
+              value: {{ .Values.writer.writeBufferMs | quote }}
+            {{- end }}
+            {{- if eq .Values.tail.mode "dir" }}
+            - name: ICEGRES_TAIL_DIR
+              value: /var/lib/icegres/tail
+            {{- else if eq .Values.tail.mode "quorum" }}
+            - name: ICEGRES_TAIL_QUORUM
+              value: {{ include "icegres.trioAddrs" (dict "ctx" $ "suffix" "keeper" "port" .Values.keeper.port) | quote }}
+            - name: ICEGRES_TAIL_QUORUM_TIMEOUT_MS
+              value: {{ .Values.tail.quorumTimeoutMs | quote }}
+            {{- end }}
+            {{- if eq (include "icegres.tailApiEnabled" .) "true" }}
+            # Read replicas subscribe here for the acked-but-unflushed
+            # window (open-tail protocol).
+            - name: ICEGRES_TAIL_API_PORT
+              value: {{ .Values.writer.tailApiPort | quote }}
+            {{- end }}
+            {{- with .Values.writer.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: pgwire
+              containerPort: {{ int .Values.writer.port }}
+            - name: health
+              containerPort: {{ int .Values.writer.healthPort }}
+            {{- if eq (include "icegres.tailApiEnabled" .) "true" }}
+            - name: tail-api
+              containerPort: {{ int .Values.writer.tailApiPort }}
+            {{- end }}
+          # Startup headroom: /health binds only AFTER the catalog session
+          # build (+ quorum election + tail replay on the failover path).
+          # Without this the liveness probe below would kill a slow boot
+          # ~20-30s in, forever — CrashLoopBackOff on the chart's own
+          # failover trigger. Tunable via writer.startupProbe.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: health
+            periodSeconds: {{ int .Values.writer.startupProbe.periodSeconds }}
+            failureThreshold: {{ int .Values.writer.startupProbe.failureThreshold }}
+          # Liveness must NOT touch the catalog (a catalog blip is not a
+          # reason to restart) — but it DOES report a wedged durable tail
+          # as 503, which is exactly what must kill this pod.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: health
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: health
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.writer.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.auth.enabled }}
+            - name: auth
+              mountPath: /etc/icegres/auth
+              readOnly: true
+            {{- end }}
+            {{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: /etc/icegres/tls
+              readOnly: true
+            {{- end }}
+            {{- if eq .Values.tail.mode "dir" }}
+            - name: tail
+              mountPath: /var/lib/icegres/tail
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.auth.enabled }}
+        - name: auth
+          secret:
+            secretName: {{ include "icegres.authSecretName" . }}
+            items:
+              - key: users
+                path: users
+        {{- end }}
+        {{- if .Values.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.existingSecret }}
+        {{- end }}
+  {{- if eq .Values.tail.mode "dir" }}
+  volumeClaimTemplates:
+    - metadata:
+        name: tail
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.tail.dir.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.tail.dir.size }}
+  {{- end }}

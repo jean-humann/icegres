@@ -1,0 +1,184 @@
+{{- include "icegres.validate" . -}}
+{{- if gt (int .Values.computes.readReplicas) 0 }}
+{{/*
+Stateless read computes over the same single copy of the data — not
+replication streams. With a durable tail they mirror the writer's
+acked-but-unflushed window (--peer-tail); freshnessMs bounds staleness.
+Scale-out is a plain HPA on this Deployment (see values.yaml —
+deliberately no chart-managed HPA). NOTE: nothing here is rendered with
+the buffered-write/tail environment — a replica opening the writer's
+tail would fence it (asserted by tests/helm.sh).
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "icegres.fullname" . }}-read
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegres.labels" . | nindent 4 }}
+    app.kubernetes.io/component: read
+spec:
+  replicas: {{ int .Values.computes.readReplicas }}
+  selector:
+    matchLabels:
+      {{- include "icegres.selectorLabels" (dict "ctx" $ "component" "read") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "icegres.labels" . | nindent 8 }}
+        app.kubernetes.io/component: read
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "icegres.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "icegres.selectorLabels" (dict "ctx" $ "component" "read") | nindent 20 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: 40
+      containers:
+        - name: read
+          image: {{ include "icegres.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["serve", "--host", "0.0.0.0"]
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "icegres.fullname" . }}
+          env:
+            - name: ICEGRES_PORT
+              value: {{ .Values.computes.service.port | quote }}
+            - name: ICEGRES_HEALTH_PORT
+              value: {{ .Values.writer.healthPort | quote }}
+            - name: ICEGRES_S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "icegres.s3SecretName" . }}
+                  key: s3-access-key
+            - name: ICEGRES_S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "icegres.s3SecretName" . }}
+                  key: s3-secret-key
+            {{- if .Values.auth.enabled }}
+            - name: ICEGRES_AUTH_FILE
+              value: /etc/icegres/auth/users
+            {{- else }}
+            - name: ICEGRES_INSECURE
+              value: "true"
+            {{- end }}
+            {{- if .Values.tls.enabled }}
+            - name: ICEGRES_TLS_CERT
+              value: /etc/icegres/tls/tls.crt
+            - name: ICEGRES_TLS_KEY
+              value: /etc/icegres/tls/tls.key
+            {{- end }}
+            {{- if gt (int .Values.computes.freshnessMs) 0 }}
+            - name: ICEGRES_FRESHNESS_MS
+              value: {{ .Values.computes.freshnessMs | quote }}
+            {{- end }}
+            {{- if eq (include "icegres.tailApiEnabled" .) "true" }}
+            - name: ICEGRES_PEER_TAILS
+              value: {{ printf "%s-writer:%d" (include "icegres.fullname" .) (int .Values.writer.tailApiPort) | quote }}
+            {{- if .Values.auth.enabled }}
+            - name: ICEGRES_PEER_TAIL_USER
+              value: {{ .Values.auth.peerTailUser | quote }}
+            - name: ICEGRES_PEER_TAIL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "icegres.authSecretName" . }}
+                  key: peer-tail-password
+            {{- end }}
+            {{- end }}
+            {{- with .Values.computes.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: pgwire
+              containerPort: {{ int .Values.computes.service.port }}
+            - name: health
+              containerPort: {{ int .Values.writer.healthPort }}
+          # Startup headroom: /health binds only after the catalog session
+          # is built — a slow boot must not be liveness-killed forever
+          # (see writer.startupProbe). Tunable via computes.startupProbe.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: health
+            periodSeconds: {{ int .Values.computes.startupProbe.periodSeconds }}
+            failureThreshold: {{ int .Values.computes.startupProbe.failureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: health
+            periodSeconds: 10
+            failureThreshold: 3
+          {{- if gt (int .Values.computes.freshnessMs) 0 }}
+          # freshnessMs > 0 defaults ICEGRES_STALE_READ_ON_CATALOG_ERROR
+          # on: these replicas are BUILT to keep serving bounded-stale
+          # reads through a catalog outage, so their readiness must not be
+          # catalog-gated (a catalog-aware /ready would empty the -read
+          # Service in exactly the outage stale-serve exists for).
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: health
+            periodSeconds: 5
+          {{- else }}
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: health
+            periodSeconds: 5
+          {{- end }}
+          resources:
+            {{- toYaml .Values.computes.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.auth.enabled }}
+            - name: auth
+              mountPath: /etc/icegres/auth
+              readOnly: true
+            {{- end }}
+            {{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: /etc/icegres/tls
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.auth.enabled }}
+        - name: auth
+          secret:
+            secretName: {{ include "icegres.authSecretName" . }}
+            items:
+              - key: users
+                path: users
+        {{- end }}
+        {{- if .Values.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.existingSecret }}
+        {{- end }}
+{{- end }}

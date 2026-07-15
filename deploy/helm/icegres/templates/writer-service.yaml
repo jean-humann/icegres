@@ -1,0 +1,43 @@
+{{- include "icegres.validate" . -}}
+# Headless: the StatefulSet's governing Service, what icegresd dials (a
+# scaled-to-zero writer resolves to nothing, which is the wake signal),
+# what read replicas peer-tail, and where TLS-requiring clients connect
+# directly (icegresd answers SSLRequest with 'N'; TLS terminates here).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "icegres.fullname" . }}-writer
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegres.labels" . | nindent 4 }}
+    app.kubernetes.io/component: writer
+    {{- if .Values.metrics.serviceMonitor.enabled }}
+    icegres.io/metrics: "true"
+    {{- end }}
+spec:
+  clusterIP: None
+  # Not-ready addresses ARE published. The wake signal is "no pod at
+  # all" (a scaled-to-zero writer has no pod, so DNS is empty either
+  # way), and everything that dials this name treats TCP-accept as
+  # readiness: icegres binds pgwire only after the catalog session is
+  # built (+ tail election/replay), so an accepting compute is servable.
+  # Without this, the catalog-aware /ready turns a catalog blip into a
+  # black-hole: the alive writer vanishes from DNS, icegresd's wake poll
+  # can never resolve it, and every NEW connection hangs for
+  # icegresd.wakeTimeoutMs even though buffered writes only need the
+  # catalog at flush.
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "icegres.selectorLabels" (dict "ctx" $ "component" "writer") | nindent 4 }}
+  ports:
+    - name: pgwire
+      port: {{ int .Values.writer.port }}
+      targetPort: pgwire
+    - name: health
+      port: {{ int .Values.writer.healthPort }}
+      targetPort: health
+    {{- if eq (include "icegres.tailApiEnabled" .) "true" }}
+    - name: tail-api
+      port: {{ int .Values.writer.tailApiPort }}
+      targetPort: tail-api
+    {{- end }}

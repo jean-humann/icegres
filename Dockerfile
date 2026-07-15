@@ -28,6 +28,7 @@ COPY icegres/Cargo.toml icegres/Cargo.lock ./icegres/
 RUN mkdir -p icegres/src/bin \
  && echo 'fn main() {}' > icegres/src/main.rs \
  && echo 'fn main() {}' > icegres/src/bin/icegresd.rs \
+ && echo 'fn main() {}' > icegres/src/bin/icekeeperd.rs \
  && printf 'fn main() {}\n' > icegres/build.rs \
  && cargo build --release --manifest-path icegres/Cargo.toml \
  && rm -rf icegres/src icegres/build.rs
@@ -38,10 +39,12 @@ RUN mkdir -p icegres/src/bin \
 COPY .git ./.git
 COPY icegres ./icegres
 # Touch so cargo rebuilds the crate (not the cached deps) with real sources.
-RUN touch icegres/src/main.rs icegres/build.rs \
+RUN touch icegres/src/main.rs icegres/src/bin/icegresd.rs \
+          icegres/src/bin/icekeeperd.rs icegres/build.rs \
  && cargo build --release --manifest-path icegres/Cargo.toml \
- && cp icegres/target/release/icegres  /usr/local/bin/icegres \
- && cp icegres/target/release/icegresd /usr/local/bin/icegresd
+ && cp icegres/target/release/icegres    /usr/local/bin/icegres \
+ && cp icegres/target/release/icegresd   /usr/local/bin/icegresd \
+ && cp icegres/target/release/icekeeperd /usr/local/bin/icekeeperd
 
 # ---- runtime ---------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
@@ -58,8 +61,9 @@ RUN apt-get update \
 RUN groupadd --gid 10001 icegres \
  && useradd  --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin icegres
 
-COPY --from=builder /usr/local/bin/icegres  /usr/local/bin/icegres
-COPY --from=builder /usr/local/bin/icegresd /usr/local/bin/icegresd
+COPY --from=builder /usr/local/bin/icegres    /usr/local/bin/icegres
+COPY --from=builder /usr/local/bin/icegresd   /usr/local/bin/icegresd
+COPY --from=builder /usr/local/bin/icekeeperd /usr/local/bin/icekeeperd
 
 USER 10001:10001
 
