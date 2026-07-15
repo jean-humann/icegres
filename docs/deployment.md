@@ -461,6 +461,23 @@ demotes (refuses clients with a retryable `57P03`). Expect ~1–2× TTL
 Heals itself. Both icegresd instances point at the SAME writer Service,
 so no compute is restarted on control-plane failover.
 
+**icegresd leader NODE drained (`kubectl drain`, managed node-pool
+upgrade, cluster-autoscaler scale-down).** The eviction is allowed by
+design. Leadership readiness pins the icegresd Ready count at exactly 1,
+so ANY availability-demanding PDB would compute `disruptionsAllowed: 0`
+forever and deadlock the drain — the eviction API refuses (429) before
+any signal reaches the pod, the leader keeps renewing, and the standby
+can never turn Ready first; the chart's icegresd PDB is therefore
+`maxUnavailable: 100%`. On eviction a short preStop keeps the leader
+serving while its endpoint removal propagates, then SIGTERM stops lease
+renewal immediately (silence is the release — standbys watch the lease
+log freeze) and the pre-existing standby takes over exactly as in the
+leader-kill entry above: expect ~1–2× TTL (default 6 s → ~6–12 s) of
+connection errors, then the standby is 1/1. Heals itself; nobody is
+paged. Honest corollary: a parallel drain that evicts BOTH icegresd
+instances at once is also allowed — cost is one pod reschedule plus the
+same takeover.
+
 **The lease trio loses quorum.** The leader demotes within ~TTL even if
 the data path is healthy (an unrenewable lease cannot exclude a second
 leader) — the endpoint goes dark with `57P03` until the lease trio is

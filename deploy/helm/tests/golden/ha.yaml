@@ -1,7 +1,11 @@
 ---
 # Source: icegres/templates/icegresd-pdb.yaml
-# Voluntary disruptions (drains, rollouts) must never evict both
-# icegresd instances at once — one stays to hold (or take) the lease.
+# Leadership readiness pins the icegresd Ready count at exactly 1 (the
+# leader), so ANY availability-demanding budget computes
+# disruptionsAllowed = 0 forever and DEADLOCKS every voluntary eviction
+# of the leader (drains hang until a human force-deletes the pod).
+# Evictions are instead always allowed, on purpose: SIGTERM demote +
+# lease takeover recovers in ~1-2x ha.leaseTtlMs (deployment.md §11).
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
@@ -15,7 +19,7 @@ metadata:
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/component: icegresd
 spec:
-  minAvailable: 1
+  maxUnavailable: 100%
   selector:
     matchLabels:
       app.kubernetes.io/name: icegres
@@ -349,6 +353,19 @@ spec:
                 - "grep -q '\"leader\": true' /tmp/icegresd-status.json"
             periodSeconds: 2
             failureThreshold: 2
+          # Drain/eviction of the leader (the PDB deliberately allows it —
+          # see icegresd-pdb.yaml): deletion pulls the pod from the Service
+          # endpoints at Terminating; the brief preStop keeps the process
+          # serving while that propagates (a connection routed here in the
+          # same instant still lands on a live leader), then SIGTERM stops
+          # lease renewal IMMEDIATELY and the standby takes over within
+          # ~1-2x ha.leaseTtlMs. icegresd exits in well under the default
+          # 30 s terminationGracePeriodSeconds (k8s mode has no child
+          # computes to reap).
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 2"]
           resources:
             limits:
               memory: 256Mi

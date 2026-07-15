@@ -135,6 +135,21 @@ spec:
               port: pgwire
             periodSeconds: 5
           {{- end }}
+          {{- if .Values.ha.enabled }}
+          # Drain/eviction of the leader (the PDB deliberately allows it —
+          # see icegresd-pdb.yaml): deletion pulls the pod from the Service
+          # endpoints at Terminating; the brief preStop keeps the process
+          # serving while that propagates (a connection routed here in the
+          # same instant still lands on a live leader), then SIGTERM stops
+          # lease renewal IMMEDIATELY and the standby takes over within
+          # ~1-2x ha.leaseTtlMs. icegresd exits in well under the default
+          # 30 s terminationGracePeriodSeconds (k8s mode has no child
+          # computes to reap).
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 2"]
+          {{- end }}
           resources:
             {{- toYaml .Values.icegresd.resources | nindent 12 }}
           volumeMounts:

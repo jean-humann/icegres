@@ -588,6 +588,16 @@ struct Daemon {
     /// --k8s-scale: the workload whose scale subresource wake-on-connect
     /// and idle scale-to-zero PATCH.
     k8s: Option<k8s::K8sScaler>,
+    /// When this instance last BECAME leader (boot for the lease-less
+    /// case; refreshed by the leadership watch task on every
+    /// acquisition). The k8s idle-park loop refuses to park within one
+    /// idle window of a takeover: a demote in k8s mode terminates
+    /// nothing, so sessions that survived a failover keep flowing
+    /// through the DEPOSED instance — invisible to this instance's idle
+    /// clock, which reads idle precisely because traffic moved. The
+    /// grace window gives them time to drain before the shared writer
+    /// can be parked under them (see `k8s_park_decision`).
+    leader_since: Mutex<Instant>,
 }
 
 impl Daemon {
@@ -942,6 +952,7 @@ async fn run_serve(mut args: ServeArgs) -> Result<()> {
         lease_enabled,
         k8s_mode,
         k8s: k8s_scaler,
+        leader_since: Mutex::new(Instant::now()),
     });
     daemon.write_status();
 
@@ -954,11 +965,19 @@ async fn run_serve(mut args: ServeArgs) -> Result<()> {
 
     match lease_cfg {
         Some(cfg) => {
-            // Keep the status file honest about leadership flips.
+            // Keep the status file honest about leadership flips, and
+            // stamp the takeover instant (the idle-park loop's new-leader
+            // grace window — see `k8s_park_decision`).
             let daemon2 = daemon.clone();
             let mut rx = daemon.leader.clone();
             tokio::spawn(async move {
                 while rx.changed().await.is_ok() {
+                    if *rx.borrow() {
+                        *daemon2
+                            .leader_since
+                            .lock()
+                            .expect("leader clock lock poisoned") = Instant::now();
+                    }
                     daemon2.write_status();
                 }
             });
@@ -1458,12 +1477,60 @@ async fn ensure_remote(daemon: &Arc<Daemon>, slot: &Arc<ComputeSlot>) -> Result<
     }
 }
 
+/// One idle-park tick's verdict, from local state only (pure — the
+/// decision matrix is unit-tested below). `Park` = this instance proxied
+/// traffic to the workload (slot `Running`) and everything has been idle
+/// for one full window: park it. `ProbeThenPark` = everything local says
+/// idle but the slot phase is NOT `Running` — remote slots boot `Stopped`
+/// and only a proxied connection flips them, so after an icegresd restart
+/// (or a `helm upgrade` resetting a parked writer to the chart's pinned
+/// `replicas: 1`), and after a failed wake whose 0 -> 1 PATCH landed
+/// before the readiness poll timed out, an idle-but-up workload would
+/// otherwise NEVER park again: the caller must consult the authoritative
+/// source (the scale subresource) and park only a workload that is
+/// actually up. `Skip` = everything else: standby ticks (the leader owns
+/// the lifecycle — this snapshot lags a DEPOSED leader by up to ~TTL/3 +
+/// the lease append timeout, hence the caller's re-check right before
+/// the PATCH and the residual-window note in limitations.md), live
+/// sessions, a client inside the idle window, or leadership YOUNGER than
+/// one idle window — a NEW leader parking instantly could sever sessions
+/// still flowing through the demoted instance (a k8s demote terminates
+/// nothing, and those sessions are invisible to this instance's clocks),
+/// so they get one idle window to drain first.
+#[derive(Debug, PartialEq)]
+enum ParkDecision {
+    Skip,
+    Park,
+    ProbeThenPark,
+}
+
+fn k8s_park_decision(
+    is_leader: bool,
+    phase: &Phase,
+    active_sessions: usize,
+    idle_for: Duration,
+    led_for: Duration,
+    idle_window: Duration,
+) -> ParkDecision {
+    if !is_leader || active_sessions != 0 || idle_for < idle_window || led_for < idle_window {
+        return ParkDecision::Skip;
+    }
+    if *phase == Phase::Running {
+        ParkDecision::Park
+    } else {
+        ParkDecision::ProbeThenPark
+    }
+}
+
 /// The scale-down half of k8s-mode scale-to-zero (`--k8s-scale` with
-/// `--idle-shutdown-secs > 0`): every few seconds, if this instance leads,
-/// the remote main compute is Running, and NO proxied client session has
+/// `--idle-shutdown-secs > 0`): every few seconds, if this instance has
+/// led for at least one idle window, NO proxied client session has
 /// existed for `--idle-shutdown-secs` (the same pool clock the idle drain
-/// uses — touched at every session start and end), PATCH the workload to
-/// 0 replicas. The next cold connection wakes it back through
+/// uses — touched at every session start and end), and the workload is
+/// actually up ([`k8s_park_decision`]: the local slot phase when this
+/// instance proxied to it, a scale-subresource GET when it never did —
+/// fresh restart, `helm upgrade`, failed-wake residue), PATCH the
+/// workload to 0 replicas. The next cold connection wakes it back through
 /// [`ensure_remote`]. Honest edges: only traffic THROUGH icegresd counts
 /// (direct-to-Service clients are invisible — the chart keeps the compute
 /// Service cluster-internal for this reason), and a connection racing the
@@ -1479,38 +1546,58 @@ async fn k8s_idle_scale_loop(daemon: Arc<Daemon>) {
             _ = tokio::time::sleep(Duration::from_secs(5)) => {}
             _ = shutdown.changed() => return,
         }
-        // Standbys never scale anything; the leader owns the lifecycle.
-        // (This watch snapshot lags a DEPOSED leader by up to ~TTL/3 + the
-        // lease append timeout — hence the second check right before the
-        // PATCH below, and the residual-window note in limitations.md.)
-        if !daemon.is_leader() {
-            continue;
-        }
         let slot = daemon.slot(None);
         // Serialize against wakes without ever delaying one: skip the tick
         // if a connection is mid-wake.
         let Ok(_guard) = slot.spawn_lock.try_lock() else {
             continue;
         };
-        {
-            let st = slot.state.lock().expect("slot state lock poisoned");
-            if st.phase != Phase::Running {
-                continue;
-            }
-        }
-        if slot.active.load(Ordering::SeqCst) != 0 {
-            continue;
-        }
         let idle_for = slot
             .pool
             .last_client
             .lock()
             .expect("pool clock lock poisoned")
             .elapsed();
-        if idle_for < idle {
-            continue;
-        }
+        let decision = {
+            let phase = slot
+                .state
+                .lock()
+                .expect("slot state lock poisoned")
+                .phase
+                .clone();
+            let led_for = daemon
+                .leader_since
+                .lock()
+                .expect("leader clock lock poisoned")
+                .elapsed();
+            k8s_park_decision(
+                daemon.is_leader(),
+                &phase,
+                slot.active.load(Ordering::SeqCst),
+                idle_for,
+                led_for,
+                idle,
+            )
+        };
         let Some(k8s) = &daemon.k8s else { return };
+        match decision {
+            ParkDecision::Skip => continue,
+            ParkDecision::Park => {}
+            ParkDecision::ProbeThenPark => {
+                // The local phase proves nothing here (this process never
+                // proxied to the workload): ask the scale subresource.
+                // replicas == 0 = already parked, nothing to do; a GET
+                // error = skip, the next tick retries.
+                match k8s.replicas().await {
+                    Ok(n) if n > 0 => {}
+                    Ok(_) => continue,
+                    Err(e) => {
+                        warn!(key = %slot.key, "idle-park replica probe failed (skipping this tick): {e:#}");
+                        continue;
+                    }
+                }
+            }
+        }
         // Re-verify leadership at the last instant, mirroring the spawn
         // paths' re-checks: the PATCH target is the SHARED writer workload,
         // and a deposed-but-unaware leader parking it would sever the true
@@ -1518,7 +1605,10 @@ async fn k8s_idle_scale_loop(daemon: Arc<Daemon>) {
         // BECAUSE traffic moved to the new leader). The re-check shrinks
         // the stale-watch window to the PATCH round trip; the residual race
         // is documented (recovery is automatic: the next cold connection
-        // re-wakes, fence + replay keep every acked row).
+        // re-wakes, fence + replay keep every acked row). The OPPOSITE
+        // direction — the true leader parking under sessions surviving on
+        // a DEPOSED instance — is narrowed by the new-leader grace window
+        // in `k8s_park_decision`, and its residue is documented alongside.
         if !daemon.is_leader() {
             continue;
         }
@@ -2350,6 +2440,74 @@ mod tests {
         assert_eq!(route_read(&[Some(9), Some(4), Some(6)], 4), 1);
         // Ties break toward the lowest index (stable, no flapping).
         assert_eq!(route_read(&[Some(2), Some(2)], 4), 0);
+    }
+
+    // -------- k8s_park_decision: the idle scale-to-zero gate --------
+
+    #[test]
+    fn k8s_park_gate_decision_matrix() {
+        let w = Duration::from_secs(300); // the idle window
+        let long = Duration::from_secs(301);
+        let short = Duration::from_secs(299);
+        let gate = k8s_park_decision;
+        // The plain park: leader for a while, slot proxied traffic
+        // (Running), zero sessions, idle a full window.
+        assert_eq!(
+            gate(true, &Phase::Running, 0, long, long, w),
+            ParkDecision::Park
+        );
+        // Exactly at the window counts as elapsed (>=, not >).
+        assert_eq!(gate(true, &Phase::Running, 0, w, w, w), ParkDecision::Park);
+        // Standby ticks never park anything: the leader owns the lifecycle.
+        assert_eq!(
+            gate(false, &Phase::Running, 0, long, long, w),
+            ParkDecision::Skip
+        );
+        // Live sessions, or a client seen inside the window, keep it up.
+        assert_eq!(
+            gate(true, &Phase::Running, 3, long, long, w),
+            ParkDecision::Skip
+        );
+        assert_eq!(
+            gate(true, &Phase::Running, 0, short, long, w),
+            ParkDecision::Skip
+        );
+        // A NEW leader gets no instant park: sessions that survived the
+        // failover on the DEPOSED instance (k8s demote severs nothing, and
+        // they are invisible to this instance's clocks) drain for one idle
+        // window first.
+        assert_eq!(
+            gate(true, &Phase::Running, 0, long, short, w),
+            ParkDecision::Skip
+        );
+        // Restart / helm-upgrade / failed-wake residue: the slot never saw
+        // a proxied connection (remote slots boot Stopped) — park only if
+        // the workload probes as actually up, so the caller must probe.
+        assert_eq!(
+            gate(true, &Phase::Stopped, 0, long, long, w),
+            ParkDecision::ProbeThenPark
+        );
+        assert_eq!(
+            gate(true, &Phase::Starting, 0, long, long, w),
+            ParkDecision::ProbeThenPark
+        );
+        // ... and every Skip reason still applies on the probe path.
+        assert_eq!(
+            gate(true, &Phase::Stopped, 0, short, long, w),
+            ParkDecision::Skip
+        );
+        assert_eq!(
+            gate(true, &Phase::Stopped, 0, long, short, w),
+            ParkDecision::Skip
+        );
+        assert_eq!(
+            gate(true, &Phase::Stopped, 1, long, long, w),
+            ParkDecision::Skip
+        );
+        assert_eq!(
+            gate(false, &Phase::Stopped, 0, long, long, w),
+            ParkDecision::Skip
+        );
     }
 
     // -------- effective_health_check_ms: the wedged-writer recovery route --------

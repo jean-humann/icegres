@@ -493,9 +493,14 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
   answers `SSLRequest` with `N`) are invisible to it and can be cut by
   an idle park. Keep direct-connect clients off scale-to-zero writers,
   or k8sScaling off. A `helm upgrade` resets a parked writer to 1
-  replica (the chart pins `replicas: 1`); the idle loop parks it again.
-  A connection racing the park PATCH is severed and must reconnect —
-  the same race process mode has with `--idle-shutdown-secs` itself.
+  replica (the chart pins `replicas: 1`); the idle loop parks it again
+  one idle window later — the loop trusts the scale subresource, not
+  only its own connection history, so a writer this icegresd instance
+  never proxied to (fresh restart, an upgrade-reset replica, a wake
+  whose 0 → 1 PATCH landed but whose readiness poll timed out) still
+  parks once the window elapses. A connection racing the park PATCH is
+  severed and must reconnect — the same race process mode has with
+  `--idle-shutdown-secs` itself.
   With `ha.enabled` there is one more residual race: a
   deposed-but-unaware leader (its leadership watch lags a lost lease by
   up to ~TTL/3 + the lease append timeout, and its idle clock reads
@@ -505,7 +510,16 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
   API round trip, but cannot close it; the damage is an availability
   cut, never data loss — the severed sessions reconnect, the next cold
   connection re-wakes the writer, and fence + replay keep every acked
-  row.
+  row. The MIRROR image exists too: a demote in k8s mode terminates
+  nothing (deliberate — no compute is icegresd's child), so sessions
+  established through the DEPOSED instance keep flowing to the shared
+  writer, invisible to the NEW leader's idle clock. The new leader
+  therefore refuses to park within one idle window of taking over —
+  a drain window for those surviving sessions — but a session that
+  outlives it can still be severed by a legitimate park. Same damage,
+  same recovery: clean errors on the demoted proxy, reconnects land on
+  the leader, the next cold connection re-wakes the writer, no acked
+  row is lost.
 - **Process-mode features are refused, not emulated, in k8s mode.**
   `--health-check-ms` (the kubelet's liveness probe owns compute
   replacement), `--read-replicas-max` (the `-read` Deployment + HPA owns
@@ -526,7 +540,21 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
   icegresd instances front the same writer Service; icegresd failover
   and writer failover are independent legs (see the runbook). The
   standby is deliberately unready (0/1 in `kubectl get pods`) — that is
-  the leadership readiness probe, not a broken pod.
+  the leadership readiness probe, not a broken pod. The same readiness
+  design fixes the DRAIN semantics: with the Ready count pinned at 1,
+  any availability-demanding PDB would compute disruptionsAllowed = 0
+  forever and deadlock every `kubectl drain` (or node-pool upgrade, or
+  autoscaler scale-down) of the leader's node — the eviction API
+  refuses before any signal reaches the pod, so the leader never stops
+  renewing and the standby can never turn Ready first. The chart's
+  icegresd PDB is therefore `maxUnavailable: 100%`: drains always
+  proceed, and evicting the LEADER costs ~1–2× `ha.leaseTtlMs` of
+  endpoint unavailability while a standby takes the lease (the evicted
+  leader stops renewing at SIGTERM — silence is the release; a
+  "released" append would only reset the standbys' expiry clocks). A
+  parallel drain that evicts BOTH instances at once is also allowed;
+  its cost is one pod reschedule plus the same takeover. Runbook:
+  docs/deployment.md §11.
 
 ## Bounded-staleness reads (opt-in, `--freshness-ms`)
 

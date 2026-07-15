@@ -2281,9 +2281,21 @@ warmups discarded: 3, iterations: 20, cold-start runs: 5, demo.trips data files:
 **P3 gate (paired, drift-controlled):** candidate `bench-20260715T181624Z.json`
 vs the pre-P3 binary re-benched in the same box state
 (`bench-20260715T215515Z.json`, `ICEGRES_BIN` override): PASS on every metric
-(worst latency delta +5.2%, latency threshold 20%; qps and inserts slightly
-better on the candidate). failover_ms measured on the candidate: 94-106 ms
-per cycle (kill -9 quorum writer -> first successful write via icegresd).
+(worst latency delta connect_ms +19.0% = 0.21 -> 0.25 ms — an absolute
+sub-ms noise floor, as in the R6 record; worst delta above the noise floor
+freshness_ms +5.2%; thresholds latency 20% / rss 25%; qps and inserts
+slightly better on the candidate). failover_ms measured on the candidate:
+94-106 ms per cycle (kill -9 quorum writer -> first successful write via
+icegresd). Baseline-file honesty note: in `bench-20260715T215515Z.json`
+only the GATED metrics are meaningful — its ungated extras
+(buffered/durable-ack/failover rows) ran this PR's NEW bench sections
+against the pre-P3 compute (with the tree-built post-P3
+icegresd/icekeeperd driving the proxy legs, which the "Release binary
+.../icegres-pre-p3" header cannot convey) and are anomalous vs the same
+code's own accepted record (e.g. insert_single_buffered_ms 166.02 here vs
+1.4 in `bench-20260714T134211Z.json`); the candidate's extras match the
+historical records, so those deltas are baseline-run harness/box
+artifacts, not code.
 
 ### Bench 20260715T215515Z
 

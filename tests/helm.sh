@@ -307,6 +307,19 @@ doc "$r" StatefulSet "$RELEASE-lease" >/dev/null \
     && ok "ha renders the dedicated lease trio" || bad "ha lease trio missing"
 [ "$(count "$r" '^kind: PodDisruptionBudget$')" = 2 ] \
     && ok "ha renders both PDBs (icegresd + lease trio)" || bad "ha PDB count wrong"
+# Leadership readiness pins the Ready count at 1 (only the leader), so ANY
+# availability-demanding icegresd budget computes disruptionsAllowed = 0
+# forever and deadlocks every drain of the leader's node. The icegresd PDB
+# must always allow eviction (SIGTERM demote + lease takeover is the
+# recovery); the lease trio keeps its real budget.
+doc "$r" PodDisruptionBudget "$RELEASE" | grep -q 'maxUnavailable: 100%' \
+    && ok "icegresd PDB never blocks a leader eviction (maxUnavailable 100%)" \
+    || bad "icegresd PDB demands availability — leader drains deadlock (Ready count is pinned at 1)"
+doc "$r" PodDisruptionBudget "$RELEASE-lease" | grep -q 'minAvailable: 2' \
+    && ok "lease trio PDB keeps minAvailable 2" || bad "lease trio PDB wrong"
+doc "$r" Deployment "$RELEASE" | grep -q 'preStop:' \
+    && ok "icegresd preStop covers endpoint-removal propagation on eviction" \
+    || bad "icegresd preStop missing (evicted leader vanishes before endpoints update)"
 grep -q 'requiredDuringSchedulingIgnoredDuringExecution' "$r" \
     && ok "ha lease trio anti-affinity is required" || bad "ha anti-affinity missing"
 grep -qF '\"leader\": true' "$r" \

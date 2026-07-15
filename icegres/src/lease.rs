@@ -472,6 +472,16 @@ pub(crate) async fn lease_loop(
                 _ = tokio::time::sleep(renew_every) => {}
                 _ = shutdown.changed() => {}
             }
+            // Shutdown (SIGTERM — a drain/eviction, a rollout, a plain
+            // stop): stop renewing IMMEDIATELY and exit. Under this
+            // protocol silence IS the release — standbys watch only the
+            // acceptors' (term, flush_lsn) freeze, so a farewell
+            // "released" append would ADVANCE flush and reset their
+            // expiry clocks, DELAYING takeover by a full TTL from the
+            // farewell; saying nothing hands over within ~TTL of the
+            // last renew (~1-2x TTL end to end with poll granularity
+            // and the election — the number the chart docs quote for a
+            // leader eviction).
             if *shutdown.borrow() {
                 let _ = leader_tx.send_replace(false);
                 return;
