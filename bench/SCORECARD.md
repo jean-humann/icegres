@@ -2221,4 +2221,4 @@ re-benched in the same box state (`bench-20260714T134654Z.json`, `ICEGRES_BIN`
 override; its run exits 1 only because the old binary lacks the new
 `maintain compact` used by the 4g extra) shows the same inflation against its own
 2026-07-11 numbers. The paired gate old-binary-now -> candidate-now PASSES every
-metric (worst: insert_batch100_ms +11.1%, threshold 25%).
+metric (worst: insert_batch100_ms +11.1%, latency threshold 20% (rss 25%)).

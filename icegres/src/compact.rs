@@ -55,17 +55,27 @@
 //!   unpartitioned-only (see overwrite.rs), so rewriting partitioned
 //!   layouts is refused rather than guessed at. Same for historical
 //!   partition-spec ids and non-v2 format versions.
-//! * **Schema-divergent tables refuse loudly.** Only files whose manifests
-//!   carry the table's CURRENT schema id are rewritten: the rewrite reads
-//!   Parquet raw and aligns each batch to the current schema by position +
+//! * **Schema-divergent files refuse loudly.** The rewrite reads Parquet
+//!   raw and aligns each batch to the current schema by position +
 //!   case-insensitive name (overwrite::align_batch — same-schema type
-//!   widening only), with NO field-id projection. On files from an older
-//!   schema version that mapping could silently resurrect a dropped
-//!   column's values under a re-added name of the same shape. A manifest
-//!   with a divergent schema id (foreign engines legally evolve schemas)
-//!   refuses the whole run before anything is written — rewrite the old
-//!   files under the current schema (full-table rewrite), or wait for
-//!   field-id-aware compaction.
+//!   widening only), with NO field-id projection. On a file physically
+//!   written under an older schema version that mapping could silently
+//!   resurrect a dropped column's values under a re-added name of the
+//!   same shape. Two rails close that, both fail-closed and both running
+//!   strictly before anything is staged. The GUARANTEE is per data FILE:
+//!   every candidate input's Parquet FOOTER is read (no row group is
+//!   fetched) and each column's embedded field id (`PARQUET:field_id`) is
+//!   verified against the current schema — a mismatched OR missing field
+//!   id refuses the whole run. A manifest stamped with a non-current
+//!   schema id also refuses, but only as a cheap FAST PATH: a manifest's
+//!   schema id records the manifest WRITER's schema, not the schema its
+//!   listed files were encoded under, and any post-evolution manifest
+//!   rewrite (Spark rewrite_manifests, foreign copy-on-write DML,
+//!   icegres's own m0 carrying untouched files as EXISTING) re-stamps
+//!   old-schema files under the current id — so the manifest check alone
+//!   is NOT sufficient. On refusal: rewrite the old files under the
+//!   current schema (full-table rewrite), or wait for field-id-aware
+//!   compaction.
 //! * **Row-count identity is asserted** before the commit is posted: the
 //!   rewritten outputs must carry exactly the input row count, or the run
 //!   aborts with every new file left as an unreferenced orphan (standard
@@ -81,11 +91,12 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Result};
-use arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use arrow::datatypes::{Field as ArrowField, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
+use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::spec::{
-    DataFile, FormatVersion, ManifestContentType, ManifestFile, ManifestListWriter, Operation,
-    Snapshot, SnapshotReference, SnapshotRetention, Summary, MAIN_BRANCH,
+    DataFile, DataFileFormat, FormatVersion, ManifestContentType, ManifestFile, ManifestListWriter,
+    Operation, Snapshot, SnapshotReference, SnapshotRetention, Summary, MAIN_BRANCH,
     UNASSIGNED_SEQUENCE_NUMBER,
 };
 use iceberg::writer::IcebergWriter as _;
@@ -284,9 +295,11 @@ pub async fn run(
                 manifest_file.manifest_path
             )
         })?;
-        // SAFETY: schema divergence is only visible here — the manifest
-        // LIST entry carries no schema id, so this rail cannot live with
-        // the list-level guards above.
+        // SAFETY: the manifest-level schema FAST PATH — divergence is only
+        // visible here (the manifest LIST entry carries no schema id), so
+        // this rail cannot live with the list-level guards above. It is a
+        // pre-filter only: the per-file field-id verification below the
+        // planner is what actually guarantees the inputs' write schema.
         ensure_manifest_schema_current(
             &ident.to_string(),
             &manifest_file.manifest_path,
@@ -346,6 +359,42 @@ pub async fn run(
         );
         return Ok(());
     }
+
+    // ---- Per-file schema verification (fail closed — the GUARANTEE). ----
+    // The manifest-level fast path above only proves who WROTE each
+    // manifest: any post-evolution manifest rewrite re-stamps old-schema
+    // files under the current schema id. So, before anything is staged —
+    // and before the plan is even printed, exactly like the other refusal
+    // rails — read every candidate input's Parquet FOOTER (two ranged
+    // reads, no row group is fetched or decoded) and verify each column's
+    // embedded field id against the table's current schema. Both dry runs
+    // and --execute refuse here.
+    let schema = metadata.current_schema();
+    let arrow_target: ArrowSchemaRef = Arc::new(
+        schema_to_arrow_schema(schema).map_err(|e| anyhow!("schema conversion failed: {e}"))?,
+    );
+    for g in &groups {
+        for idx in &g.inputs {
+            let data_file = &live[*idx].data_file;
+            if data_file.file_format() != DataFileFormat::Parquet {
+                bail!(
+                    "refusing to compact {ident}: data file {} is not Parquet ({:?}), so \
+                     its write schema cannot be verified; nothing was rewritten",
+                    data_file.file_path(),
+                    data_file.file_format()
+                );
+            }
+            let file_schema =
+                overwrite::read_parquet_arrow_schema(file_io, data_file.file_path()).await?;
+            ensure_file_schema_current(
+                &ident.to_string(),
+                data_file.file_path(),
+                &file_schema,
+                &arrow_target,
+            )?;
+        }
+    }
+
     for g in &groups {
         let label = if g.partition.is_empty() {
             "<unpartitioned>"
@@ -383,20 +432,18 @@ pub async fn run(
     }
 
     // ---- Execute: stream-read the inputs, rewrite combined outputs. ----
-    let schema = metadata.current_schema();
-    let arrow_target: ArrowSchemaRef = Arc::new(
-        schema_to_arrow_schema(schema).map_err(|e| anyhow!("schema conversion failed: {e}"))?,
-    );
     let commit_uuid = Uuid::new_v4();
     let mut added_files: Vec<DataFile> = Vec::new();
     for g in &groups {
         // One rolling writer per partition group; files are read one at a
         // time (peak memory = one input file's decoded batches, the same
-        // bound as the DML engine). Every input was written under the
-        // CURRENT schema id (the schema guard above refused anything
-        // else), so align_batch's position+name mapping is sound here: it
-        // only casts physical types (e.g. same-schema widening) onto the
-        // canonical field-id-annotated Arrow shape.
+        // bound as the DML engine). Every input's Parquet footer was
+        // verified to carry exactly the current schema's field ids (the
+        // per-file guard above refused anything else — the manifest-level
+        // check alone would not be enough), so align_batch's position+name
+        // mapping is sound here: it only casts physical types (e.g.
+        // same-schema widening) onto the canonical field-id-annotated
+        // Arrow shape.
         let mut writer =
             overwrite::new_compact_data_writer(&tbl, &commit_uuid, target_bytes as usize).await?;
         for idx in &g.inputs {
@@ -638,14 +685,19 @@ pub async fn run(
     }
 }
 
-/// Fail-closed schema rail for one loaded manifest: refuse the whole run
-/// when its schema id diverges from the table's current one. The rewrite
-/// path has no field-id projection (overwrite::align_batch maps columns by
-/// position + case-insensitive name), so a file from an older schema
-/// version could silently come out with a dropped column's values
-/// resurrected under a re-added name — corruption a row-count identity
-/// check cannot see. Runs during the manifest walk, strictly before any
-/// output is staged or committed.
+/// Fail-closed schema FAST PATH for one loaded manifest: refuse the whole
+/// run when its schema id diverges from the table's current one. This
+/// catches simple divergence (a schema evolved after the head's manifests
+/// were written) before the planner even runs, but it is NOT the
+/// guarantee: a manifest's schema id records the schema of whoever WROTE
+/// the manifest, not the schema its listed data files were physically
+/// encoded under, and any post-evolution manifest rewrite (Spark
+/// rewrite_manifests, foreign copy-on-write DML, icegres's own m0 carrying
+/// untouched files as EXISTING entries) re-stamps old-schema files under
+/// the current id. The per-file Parquet field-id verification
+/// ([`ensure_file_schema_current`], run on every candidate input) is what
+/// actually closes the dropped-column-resurrection hazard. Runs during the
+/// manifest walk, strictly before any output is staged or committed.
 fn ensure_manifest_schema_current(
     table: &str,
     manifest_path: &str,
@@ -664,6 +716,92 @@ fn ensure_manifest_schema_current(
         );
     }
     Ok(())
+}
+
+/// Fail-closed schema GUARANTEE for one candidate input file: verify that
+/// the file's Parquet-embedded field ids (`PARQUET:field_id` in the Arrow
+/// field metadata — embedded by every Iceberg Parquet writer: icegres's
+/// own iceberg-rust stack, pyiceberg, Spark) match the table's current
+/// schema column for column. The rewrite aligns batches by position +
+/// case-insensitive name (overwrite::align_batch), so a
+/// dropped-then-re-added column of the same name and shape passes every
+/// structural check while carrying the OLD values — only the physical
+/// field id betrays the file's true write schema, and a manifest's schema
+/// id cannot (it records the manifest writer's schema). Missing or
+/// unparseable field-id metadata refuses too: the write schema cannot be
+/// verified, so it is never trusted. Runs on every group input strictly
+/// before any output is staged.
+fn ensure_file_schema_current(
+    table: &str,
+    file_path: &str,
+    file_schema: &ArrowSchema,
+    target: &ArrowSchemaRef,
+) -> Result<()> {
+    const WORKAROUND: &str = "Rewrite the old files under the current schema (full-table \
+                              rewrite) or wait for field-id-aware compaction; nothing was \
+                              rewritten";
+    if file_schema.fields().len() != target.fields().len() {
+        bail!(
+            "refusing to compact {table}: data file {file_path} has {} column(s) but the \
+             table's current schema has {} — the file was physically written under a \
+             different schema version. {WORKAROUND}",
+            file_schema.fields().len(),
+            target.fields().len()
+        );
+    }
+    for (i, target_field) in target.fields().iter().enumerate() {
+        let file_field = file_schema.field(i);
+        // The canonical Arrow conversion of an Iceberg schema annotates
+        // every field id; anything else is an upstream bug — refuse
+        // rather than guess.
+        let Some(expected) = parquet_field_id(target_field) else {
+            bail!(
+                "refusing to compact {table}: the current schema's column {:?} carries \
+                 no field id in its Arrow conversion, so data files cannot be verified \
+                 against it; nothing was rewritten",
+                target_field.name()
+            );
+        };
+        if !file_field.name().eq_ignore_ascii_case(target_field.name()) {
+            bail!(
+                "refusing to compact {table}: data file {file_path} column {i} is named \
+                 {:?} but the table's current schema names it {:?} — the file was \
+                 physically written under a different schema version. {WORKAROUND}",
+                file_field.name(),
+                target_field.name()
+            );
+        }
+        match parquet_field_id(file_field) {
+            None => bail!(
+                "refusing to compact {table}: data file {file_path} column {:?} \
+                 (position {i}) carries no Parquet field-id metadata, so the schema it \
+                 was physically written under cannot be verified against the current \
+                 schema (field id {expected} expected). {WORKAROUND}",
+                file_field.name()
+            ),
+            Some(found) if found != expected => bail!(
+                "refusing to compact {table}: data file {file_path} column {:?} \
+                 (position {i}) was physically written with Parquet field id {found}, \
+                 but the table's current schema assigns field id {expected} — the file \
+                 predates a schema evolution (e.g. a dropped-then-re-added column), and \
+                 rewriting it by position and name could silently resurrect stale \
+                 values under the current field id. {WORKAROUND}",
+                file_field.name()
+            ),
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// The `PARQUET:field_id` annotation of one Arrow field (None when the
+/// key is absent or unparseable — the caller refuses either way).
+fn parquet_field_id(field: &ArrowField) -> Option<i32> {
+    field
+        .metadata()
+        .get(PARQUET_FIELD_ID_META_KEY)?
+        .parse()
+        .ok()
 }
 
 /// Canonical partition key of a data file's partition struct — the
@@ -764,6 +902,207 @@ mod tests {
         // Matching ids (any value, not just 0) must not refuse.
         ensure_manifest_schema_current("demo.t", "s3://b/metadata/m0.avro", 0, 0).unwrap();
         ensure_manifest_schema_current("demo.t", "s3://b/metadata/m1.avro", 3, 3).unwrap();
+    }
+
+    /// Arrow schema of a (possibly old) data FILE: columns with optional
+    /// `PARQUET:field_id` metadata, exactly what
+    /// overwrite::read_parquet_arrow_schema surfaces from a footer.
+    fn arrow_file_schema(cols: &[(&str, arrow::datatypes::DataType, Option<i32>)]) -> ArrowSchema {
+        ArrowSchema::new(
+            cols.iter()
+                .map(|(name, dt, id)| {
+                    let field = ArrowField::new(*name, dt.clone(), true);
+                    match id {
+                        Some(id) => field.with_metadata(HashMap::from([(
+                            PARQUET_FIELD_ID_META_KEY.to_string(),
+                            id.to_string(),
+                        )])),
+                        None => field,
+                    }
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// The post-evolution CURRENT schema: `v` was dropped and re-added, so
+    /// it keeps its name, position and type but carries a NEW field id (3,
+    /// not the original 2). Built through the real Iceberg->Arrow
+    /// conversion, which also proves that conversion annotates field ids.
+    fn evolved_target() -> ArrowSchemaRef {
+        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        let schema = iceberg::spec::Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(3, "v", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .expect("iceberg schema builds");
+        Arc::new(schema_to_arrow_schema(&schema).expect("arrow conversion"))
+    }
+
+    #[test]
+    fn file_guard_passes_matching_field_ids() {
+        use arrow::datatypes::DataType;
+        let target = evolved_target();
+        let file = arrow_file_schema(&[
+            ("id", DataType::Int64, Some(1)),
+            ("v", DataType::Utf8, Some(3)),
+        ]);
+        ensure_file_schema_current("demo.t", "s3://b/data/f.parquet", &file, &target)
+            .expect("matching field ids must pass");
+        // Case-insensitive names are fine (align_batch's own rule).
+        let file = arrow_file_schema(&[
+            ("ID", DataType::Int64, Some(1)),
+            ("V", DataType::Utf8, Some(3)),
+        ]);
+        ensure_file_schema_current("demo.t", "s3://b/data/f.parquet", &file, &target)
+            .expect("case-insensitive name match must pass");
+    }
+
+    #[test]
+    fn file_guard_refuses_mismatched_field_id() {
+        use arrow::datatypes::DataType;
+        // The laundered dropped-then-re-added column: same name, same
+        // position, same type — OLD field id. A manifest re-stamped to the
+        // current schema id sails past the manifest fast path; only this
+        // per-file check catches it.
+        let target = evolved_target();
+        let file = arrow_file_schema(&[
+            ("id", DataType::Int64, Some(1)),
+            ("v", DataType::Utf8, Some(2)),
+        ]);
+        let msg = ensure_file_schema_current("demo.t", "s3://b/data/old.parquet", &file, &target)
+            .expect_err("stale field id must refuse")
+            .to_string();
+        assert!(msg.contains("refusing to compact demo.t"), "{msg}");
+        assert!(msg.contains("s3://b/data/old.parquet"), "{msg}");
+        assert!(msg.contains("\"v\""), "{msg}");
+        assert!(msg.contains("Parquet field id 2"), "{msg}");
+        assert!(msg.contains("assigns field id 3"), "{msg}");
+        assert!(msg.contains("nothing was rewritten"), "{msg}");
+    }
+
+    #[test]
+    fn file_guard_refuses_missing_field_id_metadata() {
+        use arrow::datatypes::DataType;
+        // No field-id metadata at all: the write schema is unverifiable,
+        // so the guard fails closed instead of trusting position + name.
+        let target = evolved_target();
+        let file = arrow_file_schema(&[
+            ("id", DataType::Int64, Some(1)),
+            ("v", DataType::Utf8, None),
+        ]);
+        let msg = ensure_file_schema_current("demo.t", "s3://b/data/bare.parquet", &file, &target)
+            .expect_err("missing field-id metadata must refuse")
+            .to_string();
+        assert!(msg.contains("refusing to compact demo.t"), "{msg}");
+        assert!(msg.contains("s3://b/data/bare.parquet"), "{msg}");
+        assert!(msg.contains("no Parquet field-id metadata"), "{msg}");
+        assert!(msg.contains("field id 3 expected"), "{msg}");
+        assert!(msg.contains("nothing was rewritten"), "{msg}");
+    }
+
+    #[test]
+    fn file_guard_refuses_structural_divergence() {
+        use arrow::datatypes::DataType;
+        let target = evolved_target();
+        // Column count drift (e.g. a file predating an added column).
+        let file = arrow_file_schema(&[("id", DataType::Int64, Some(1))]);
+        let msg = ensure_file_schema_current("demo.t", "s3://b/data/f.parquet", &file, &target)
+            .expect_err("column count divergence must refuse")
+            .to_string();
+        assert!(msg.contains("1 column(s)"), "{msg}");
+        assert!(msg.contains("nothing was rewritten"), "{msg}");
+        // Renamed column at the same position.
+        let file = arrow_file_schema(&[
+            ("id", DataType::Int64, Some(1)),
+            ("w", DataType::Utf8, Some(3)),
+        ]);
+        let msg = ensure_file_schema_current("demo.t", "s3://b/data/f.parquet", &file, &target)
+            .expect_err("column name divergence must refuse")
+            .to_string();
+        assert!(msg.contains("\"w\""), "{msg}");
+        assert!(msg.contains("\"v\""), "{msg}");
+        assert!(msg.contains("nothing was rewritten"), "{msg}");
+    }
+
+    /// End to end over REAL Parquet footers: write fixtures with the
+    /// arrow/parquet writer (the same stack the engine uses), read their
+    /// schemas back through overwrite::read_parquet_arrow_schema (footer
+    /// only), and run the guard — proving field ids round-trip through
+    /// physical Parquet bytes exactly as the rail assumes.
+    #[tokio::test]
+    async fn file_guard_reads_field_ids_from_real_parquet_footers() {
+        use arrow::array::{ArrayRef, Int64Array, StringArray};
+        use arrow::record_batch::RecordBatch;
+        use datafusion::parquet::arrow::ArrowWriter;
+
+        let dir = std::env::temp_dir().join(format!("icegres-file-guard-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create fixture dir");
+        let write = |name: &str, schema: ArrowSchema| -> String {
+            let path = dir.join(name);
+            let schema = Arc::new(schema);
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ];
+            let batch = RecordBatch::try_new(schema.clone(), columns).expect("fixture batch");
+            let file = std::fs::File::create(&path).expect("create fixture file");
+            let mut writer = ArrowWriter::try_new(file, schema, None).expect("fixture writer");
+            writer.write(&batch).expect("write fixture");
+            writer.close().expect("close fixture");
+            path.to_string_lossy().into_owned()
+        };
+        use arrow::datatypes::DataType;
+        let current = write(
+            "current.parquet",
+            arrow_file_schema(&[
+                ("id", DataType::Int64, Some(1)),
+                ("v", DataType::Utf8, Some(3)),
+            ]),
+        );
+        let stale = write(
+            "stale.parquet",
+            arrow_file_schema(&[
+                ("id", DataType::Int64, Some(1)),
+                ("v", DataType::Utf8, Some(2)),
+            ]),
+        );
+        let bare = write(
+            "bare.parquet",
+            arrow_file_schema(&[("id", DataType::Int64, None), ("v", DataType::Utf8, None)]),
+        );
+
+        let file_io = iceberg::io::FileIO::new_with_fs();
+        let target = evolved_target();
+
+        let schema = overwrite::read_parquet_arrow_schema(&file_io, &current)
+            .await
+            .expect("footer-only read of the current-schema fixture");
+        ensure_file_schema_current("demo.t", &current, &schema, &target)
+            .expect("matching physical field ids must pass");
+
+        let schema = overwrite::read_parquet_arrow_schema(&file_io, &stale)
+            .await
+            .expect("footer-only read of the stale-schema fixture");
+        let msg = ensure_file_schema_current("demo.t", &stale, &schema, &target)
+            .expect_err("stale physical field id must refuse")
+            .to_string();
+        assert!(msg.contains("Parquet field id 2"), "{msg}");
+        assert!(msg.contains("assigns field id 3"), "{msg}");
+        assert!(msg.contains("nothing was rewritten"), "{msg}");
+
+        let schema = overwrite::read_parquet_arrow_schema(&file_io, &bare)
+            .await
+            .expect("footer-only read of the id-less fixture");
+        let msg = ensure_file_schema_current("demo.t", &bare, &schema, &target)
+            .expect_err("id-less physical file must refuse")
+            .to_string();
+        assert!(msg.contains("no Parquet field-id metadata"), "{msg}");
+        assert!(msg.contains("nothing was rewritten"), "{msg}");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

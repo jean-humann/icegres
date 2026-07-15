@@ -102,9 +102,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context as _, Result};
 use arrow::array::{Array, AsArray, RecordBatch};
 use arrow::compute::{cast_with_options, CastOptions};
-use arrow::datatypes::{Int64Type, SchemaRef as ArrowSchemaRef};
+use arrow::datatypes::{Int64Type, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use datafusion::datasource::MemTable;
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use datafusion::parquet::arrow::parquet_to_arrow_schema;
+use datafusion::parquet::file::metadata::{FooterTail, ParquetMetaDataReader};
+use datafusion::parquet::file::FOOTER_SIZE;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use iceberg::arrow::{schema_to_arrow_schema, FieldMatchMode};
 use iceberg::spec::{
@@ -2160,6 +2163,61 @@ pub(crate) async fn read_parquet_file(
     reader
         .collect::<std::result::Result<_, _>>()
         .with_context(|| format!("failed to decode Parquet file {}", data_file.file_path()))
+}
+
+/// Read ONLY the Parquet footer of `path` and return the file's Arrow
+/// schema, `PARQUET:field_id` metadata included — the physical record of
+/// which Iceberg schema version the file was written under. Two ranged
+/// reads (the 8-byte footer tail, then the metadata block); no row group
+/// is ever fetched or decoded, so this stays cheap on object storage
+/// regardless of file size. Used by compact's per-file schema guard
+/// (compact.rs) strictly before any output is staged.
+pub(crate) async fn read_parquet_arrow_schema(
+    file_io: &iceberg::io::FileIO,
+    path: &str,
+) -> Result<ArrowSchema> {
+    let input = file_io
+        .new_input(path)
+        .map_err(|e| anyhow!("bad data file path {path}: {e}"))?;
+    let size = input
+        .metadata()
+        .await
+        .map_err(|e| anyhow!("failed to stat data file {path}: {e}"))?
+        .size;
+    let footer_len = FOOTER_SIZE as u64;
+    if size < footer_len {
+        bail!("data file {path} is too small ({size} bytes) to be a Parquet file");
+    }
+    let reader = input
+        .reader()
+        .await
+        .map_err(|e| anyhow!("failed to open data file {path}: {e}"))?;
+    let tail = reader
+        .read(size - footer_len..size)
+        .await
+        .map_err(|e| anyhow!("failed to read the Parquet footer of {path}: {e}"))?;
+    let tail: [u8; FOOTER_SIZE] = tail
+        .as_ref()
+        .try_into()
+        .map_err(|_| anyhow!("short Parquet footer read on {path}"))?;
+    let meta_len = FooterTail::try_new(&tail)
+        .with_context(|| format!("invalid Parquet footer in {path}"))?
+        .metadata_length() as u64;
+    if size < footer_len + meta_len {
+        bail!(
+            "data file {path} declares a {meta_len}-byte Parquet metadata block but is \
+             only {size} bytes long"
+        );
+    }
+    let meta_bytes = reader
+        .read(size - footer_len - meta_len..size - footer_len)
+        .await
+        .map_err(|e| anyhow!("failed to read the Parquet metadata of {path}: {e}"))?;
+    let parquet_meta = ParquetMetaDataReader::decode_metadata(&meta_bytes)
+        .with_context(|| format!("failed to decode the Parquet metadata of {path}"))?;
+    let file_meta = parquet_meta.file_metadata();
+    parquet_to_arrow_schema(file_meta.schema_descr(), file_meta.key_value_metadata())
+        .with_context(|| format!("failed to derive the Arrow schema of {path}"))
 }
 
 /// Concatenate `batches` projected onto `cols` (by name) into one batch.

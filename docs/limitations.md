@@ -91,13 +91,19 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
   manifests** (deletion vectors / position deletes written by Spark, Trino,
   moonlink, …) are refused — see the next bullet — **partitioned
   tables** are refused (the icegres write stack is unpartitioned-only), and
-  **schema-divergent tables** are refused: any manifest carrying a schema id
-  other than the table's current one (a foreign engine legally evolved the
-  schema) refuses the whole run, because the rewrite aligns columns by
-  position and name rather than field id and could otherwise resurrect a
-  dropped column's values under a re-added name. Rewrite the old files under
-  the current schema (full-table rewrite) or wait for field-id-aware
-  compaction.
+  **schema-divergent files** are refused: before anything is staged, every
+  candidate input's Parquet footer is read and each column's embedded field
+  id (`PARQUET:field_id`) is verified against the table's current schema —
+  a mismatched or missing field id refuses the whole run, because the
+  rewrite aligns columns by position and name rather than field id and
+  could otherwise resurrect a dropped column's values under a re-added
+  name. (A manifest carrying a non-current schema id also refuses, but only
+  as a cheap fast path: a manifest's schema id records the manifest
+  writer's schema, not the schema its listed files were physically written
+  under — after a foreign `rewrite_manifests` or copy-on-write commit it
+  proves nothing, which is why the per-file check is the guarantee.)
+  Rewrite the old files under the current schema (full-table rewrite) or
+  wait for field-id-aware compaction.
   Buffered/tail mode still fixes the *source* of small files — cadence
   commits write one well-sized file per flush window instead of one per
   INSERT — so compaction is mostly for tables fed by per-statement commits

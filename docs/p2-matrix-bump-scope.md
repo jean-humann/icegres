@@ -68,11 +68,16 @@ snapshot expiry + orphan GC), at zero dependency risk.
    - Tables bearing delete manifests (foreign-written DVs/position
      deletes): REFUSE loudly (the machinery already bails) — compacting
      under deletes we cannot apply would corrupt semantics.
-   - Schema-divergent tables (any manifest carrying a schema id other
-     than the current one — foreign engines legally evolve schemas):
+   - Schema-divergent files (foreign engines legally evolve schemas):
      REFUSE loudly — the rewrite aligns columns by position + name, not
      field id, so touching old-schema files could silently resurrect
-     dropped-column values.
+     dropped-column values. The guarantee is per data FILE: every
+     candidate input's Parquet footer is verified column-by-column
+     against the current schema's field ids (`PARQUET:field_id`),
+     refusing fail-closed on any mismatch or missing id. A non-current
+     manifest schema id also refuses, but only as a fast path — a
+     manifest's schema id records its writer's schema, not its files'
+     write schema, so it launders after any foreign manifest rewrite.
    - Buffered/keyed tables: compact coordinates with the local buffer
      exactly like other maintenance (no interleaving with an in-flight
      flush of the same table).

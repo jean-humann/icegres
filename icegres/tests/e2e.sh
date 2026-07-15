@@ -2565,6 +2565,12 @@ pass "P1 section cleanup (servers stopped, scratch table dropped)"
 #          manifests carry an old schema id; compact --execute refuses
 #          loudly and mutates nothing (align_batch maps columns by
 #          position + name, not field id — see compact.rs's schema rail);
+#        - refusal on LAUNDERED schema-divergent files: re-stamping the
+#          head's manifests to the current schema id (what a foreign
+#          rewrite_manifests / copy-on-write commit leaves behind) sails
+#          past the manifest-level fast path, so compact must STILL
+#          refuse via the per-file Parquet field-id guard — in dry-run
+#          AND --execute, mutating nothing;
 #        - expiry-then-GC after a follow-up compact reclaims the replaced
 #          files (the GC keeps whatever the retained snapshot's DELETED
 #          entries still name — one generation back, exactly like (y)).
@@ -2835,6 +2841,149 @@ assert_eq "schema-divergence refusal committed nothing (snapshot count unchanged
   "$evo_snaps_before" "$(count_snaps e2e_evo)"
 pass "compact refuses schema-divergent tables loudly (manifests behind the current schema id)"
 curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_evo?purgeRequested=true" >/dev/null 2>&1 || true
+
+# --- refusal on LAUNDERED schema-divergent files (per-file field-id guard) ---
+# A manifest's schema id records the manifest WRITER's schema, not the
+# schema its listed data files were physically encoded under: any
+# post-evolution manifest rewrite (Spark rewrite_manifests, a foreign
+# copy-on-write commit, icegres's own m0 EXISTING carries) re-stamps
+# old-schema files under the current schema id, sailing past the
+# manifest-level fast path the previous leg proved. Fixture: fragment a
+# table, evolve the schema over REST the DANGEROUS way (drop column v and
+# re-add v — same name, same position, same type, NEW field id: the exact
+# dropped-column-resurrection shape), then re-stamp the head's manifests
+# in place exactly as a foreign rewrite_manifests would (patch the Avro
+# OCF header's schema/schema-id metadata; the entries — and the Parquet
+# bytes they point at — stay byte-identical). compact must STILL refuse,
+# via the per-file Parquet field-id guard (compact.rs
+# ensure_file_schema_current), in dry-run AND --execute, mutating nothing.
+q 'drop table if exists demo.e2e_evo2' >/dev/null 2>&1 || true
+q 'create table demo.e2e_evo2 (id bigint, v text)' >/dev/null
+for i in 1 2 3; do
+  q "insert into demo.e2e_evo2 (id, v) values ($i, 'r$i')" >/dev/null
+done
+evo2_meta=$(curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_evo2") \
+  || fail "could not load demo.e2e_evo2's metadata over REST"
+evo2_loc=$(jq -r '.metadata.location' <<<"$evo2_meta")
+[[ "$evo2_loc" == s3://lakehouse/* ]] || fail "unexpected table location for demo.e2e_evo2: $evo2_loc"
+evo2_key=${evo2_loc#s3://lakehouse/}
+# Schema 1 = drop v, re-add v: name/position/type unchanged, NEW field id.
+evo2_new_schema=$(jq -c '.metadata as $m
+  | ($m.schemas[] | select(."schema-id" == $m."current-schema-id"))
+  | ."schema-id" += 1
+  | .fields |= map(if .name == "v" then .id = ($m."last-column-id" + 1) else . end)' <<<"$evo2_meta")
+evo2_last_col=$(jq '.metadata."last-column-id" + 1' <<<"$evo2_meta")
+curl -sf -X POST "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_evo2" \
+  -H 'Content-Type: application/json' -d "{
+  \"requirements\": [],
+  \"updates\": [
+    {\"action\":\"add-schema\",\"schema\": $evo2_new_schema,
+     \"last-column-id\": $evo2_last_col},
+    {\"action\":\"set-current-schema\",\"schema-id\": -1}
+  ]
+}" >/dev/null || fail "could not evolve demo.e2e_evo2's schema over REST"
+# Launder: re-stamp every data manifest in place to the (new) current
+# schema, leaving entries and data files byte-identical — the metadata
+# state a foreign rewrite_manifests produces.
+mkdir -p "$E2E_DIR/evo2-manifests"
+evo2_manifest_keys=$(aws --endpoint-url "$S3_ENDPOINT" s3 ls --recursive \
+    "s3://lakehouse/$evo2_key/metadata/" | awk '{print $4}' | grep -E -- '-m[0-9]+\.avro$') \
+  || fail "no data manifests found under demo.e2e_evo2's metadata dir"
+evo2_stamped=0
+while read -r mkey; do
+  [[ -n "$mkey" ]] || continue
+  mbase=$(basename "$mkey")
+  aws --endpoint-url "$S3_ENDPOINT" s3 cp "s3://lakehouse/$mkey" \
+    "$E2E_DIR/evo2-manifests/$mbase" >/dev/null \
+    || fail "could not download manifest $mkey"
+  python3 - "$E2E_DIR/evo2-manifests/$mbase" "$evo2_new_schema" 1 <<'PYEOF' \
+    || fail "could not re-stamp manifest $mkey"
+import sys
+path, schema_json, new_id = sys.argv[1], sys.argv[2], sys.argv[3]
+raw = open(path, "rb").read()
+assert raw[:4] == b"Obj\x01", "not an Avro OCF"
+pos = 4
+def rvlong():  # Avro zigzag varint decode
+    global pos
+    shift = n = 0
+    while True:
+        b = raw[pos]; pos += 1
+        n |= (b & 0x7F) << shift
+        shift += 7
+        if not b & 0x80:
+            break
+    return (n >> 1) ^ -(n & 1)
+def vlong(n):  # Avro zigzag varint encode
+    n = (n << 1) ^ (n >> 63)
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+meta = {}
+while True:  # the OCF header metadata map
+    count = rvlong()
+    if count == 0:
+        break
+    assert count > 0, "unsupported negative map block count"
+    for _ in range(count):
+        klen = rvlong(); k = raw[pos:pos + klen].decode(); pos += klen
+        vlen = rvlong(); v = raw[pos:pos + vlen]; pos += vlen
+        meta[k] = v
+assert "schema" in meta and "schema-id" in meta, sorted(meta)
+meta["schema"] = schema_json.encode()
+meta["schema-id"] = new_id.encode()
+out = b"Obj\x01" + vlong(len(meta))
+for k, v in meta.items():
+    out += vlong(len(k.encode())) + k.encode() + vlong(len(v)) + v
+out += vlong(0) + raw[pos:]  # sync marker + data blocks, untouched
+open(path, "wb").write(out)
+PYEOF
+  aws --endpoint-url "$S3_ENDPOINT" s3 cp "$E2E_DIR/evo2-manifests/$mbase" \
+    "s3://lakehouse/$mkey" >/dev/null || fail "could not upload re-stamped manifest $mkey"
+  evo2_stamped=$((evo2_stamped + 1))
+done <<<"$evo2_manifest_keys"
+[[ "$evo2_stamped" -ge 3 ]] \
+  || fail "laundering fixture re-stamped only $evo2_stamped manifest(s), expected >= 3"
+evo2_snaps_before=$(count_snaps e2e_evo2)
+# Dry run: the per-file pre-pass runs before the plan is printed, so even
+# a plan-only invocation surfaces the refusal (matching the other rails).
+if "$BIN" maintain compact --table demo.e2e_evo2 >"$E2E_DIR/compact-evo2-dry.log" 2>&1; then
+  cat "$E2E_DIR/compact-evo2-dry.log" >&2
+  fail "dry-run compact on laundered old-schema files must be refused"
+fi
+if grep -q 'was written under schema' "$E2E_DIR/compact-evo2-dry.log"; then
+  cat "$E2E_DIR/compact-evo2-dry.log" >&2
+  fail "refusal came from the manifest fast path — the laundering fixture failed to re-stamp"
+fi
+grep -q 'Parquet field id' "$E2E_DIR/compact-evo2-dry.log" \
+  || { cat "$E2E_DIR/compact-evo2-dry.log" >&2; fail "dry-run refusal did not come from the per-file field-id guard"; }
+pass "compact dry run refuses laundered old-schema files via the per-file field-id guard"
+if "$BIN" maintain compact --table demo.e2e_evo2 --execute \
+    >"$E2E_DIR/compact-evo2.log" 2>&1; then
+  cat "$E2E_DIR/compact-evo2.log" >&2
+  fail "compact --execute on laundered old-schema files must be refused"
+fi
+if grep -q 'was written under schema' "$E2E_DIR/compact-evo2.log"; then
+  cat "$E2E_DIR/compact-evo2.log" >&2
+  fail "refusal came from the manifest fast path — the laundering fixture failed to re-stamp"
+fi
+grep -Eq 'data file s3://[^ ]+\.parquet column "v"' "$E2E_DIR/compact-evo2.log" \
+  || { cat "$E2E_DIR/compact-evo2.log" >&2; fail "refusal did not name the data file and column"; }
+grep -q 'written with Parquet field id 2' "$E2E_DIR/compact-evo2.log" \
+  || { cat "$E2E_DIR/compact-evo2.log" >&2; fail "refusal did not name the file's stale field id"; }
+grep -q 'assigns field id 3' "$E2E_DIR/compact-evo2.log" \
+  || { cat "$E2E_DIR/compact-evo2.log" >&2; fail "refusal did not name the current schema's field id"; }
+grep -q 'nothing was rewritten' "$E2E_DIR/compact-evo2.log" \
+  || { cat "$E2E_DIR/compact-evo2.log" >&2; fail "refusal did not assert nothing was rewritten"; }
+assert_eq "laundered-file refusal committed nothing (snapshot count unchanged)" \
+  "$evo2_snaps_before" "$(count_snaps e2e_evo2)"
+pass "compact --execute refuses laundered old-schema files (per-file Parquet field-id guard)"
+curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_evo2?purgeRequested=true" >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
 log "all assertions passed ($PASS_COUNT)"

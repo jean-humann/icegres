@@ -271,9 +271,13 @@ any concurrent writer — a foreign engine, a serving endpoint's DML or
 buffered flush — makes the compact abort cleanly with nothing changed
 (first-committer-wins; just re-run it in a quieter window). It refuses loudly
 on tables bearing foreign merge-on-read delete manifests (icegres cannot
-apply those deletes), on partitioned tables, and on schema-divergent tables —
-manifests carrying a schema id other than the current one (a foreign engine
-evolved the schema); rewrite those files under the current schema first.
+apply those deletes), on partitioned tables, and on schema-divergent files —
+every candidate input's Parquet footer is verified against the current
+schema's field ids before anything is staged (a non-current manifest schema
+id refuses earlier as a fast path), so files physically written under an
+older schema version (a foreign engine evolved the schema) are refused even
+when later manifest rewrites re-stamped them; rewrite those files under the
+current schema first.
 Schedule it per hot
 fragmented table BEFORE the expiry + GC pair — compact, then expire, then GC
 reclaims the replaced files one cycle later. Buffered/tail mode already keeps
