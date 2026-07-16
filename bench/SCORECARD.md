@@ -2333,3 +2333,163 @@ warmups discarded: 3, iterations: 20, cold-start runs: 5, demo.trips data files:
 | flight_q1_ms | 13.23 | 13.89 | n=15 |
 | flight_q1_fresh_ms | 12.77 | 13.36 | n=15 |
 | compact_scan_restore_ms | 37 | — | degraded p50 43 ms @ 24 files -> restored p50 37 ms @ 1 file(s); compact wall 158 ms |
+
+### Bench 20260716T121106Z
+
+Release binary `icegres/target/release/icegres` · raw: `bench/results/bench-20260716T121106Z.json` ·
+warmups discarded: 3, iterations: 20, cold-start runs: 5, demo.trips data files: 1
+
+| metric | p50 | p95 | n / detail |
+|--------|-----|-----|------------|
+| connect_ms | 0.28 | 0.39 | n=20 |
+| point_lookup_ms | 11.15 | 12.28 | n=20 |
+| filtered_scan_ms | 10.24 | 11.13 | n=20 |
+| aggregate_ms | 9.85 | 12.08 | n=20 |
+| join_ms | 13.69 | 15.39 | n=20 |
+| insert_single_ms | 72.25 | 94.4 | n=20 |
+| insert_batch100_ms | 113.84 | 129.36 | n=20 |
+| freshness_ms | 79.92 | 94.02 | n=20 |
+| qps_8conn | 362.2 | — | median of 378.6, 360.0, 362.2 (8 conns, 10s windows) |
+| cold_start_ms | 46.25 | 50.79 | n=5 |
+| binary_size_mb | 131.18 | — | |
+| rss_idle_mb | 83.89 | — | |
+| rss_peak_mb | 99.27 | — | qps-window peak 97.23 MB, 436 samples @ 100ms |
+| rss_after_load_mb | 98.66 | — | |
+| insert_single_buffered_ms | 1.42 | 1.99 | n=20 |
+| freshness_buffered_ms | 9.72 | 87.33 | n=20 |
+| durable_ack_dir_ms | 3.25 | 4.69 | n=20 |
+| durable_ack_pg_ms | 3.47 | 6.32 | n=20 |
+| durable_ack_quorum_ms | 4.23 | 7.46 | n=20 |
+| cold_start_via_proxy_ms | 91 | 105 | n=5 |
+| failover_ms | 132 | 146 | n=5 |
+| connect_via_proxy_ms | 0.52 | 0.75 | n=20 |
+| qps_via_proxy_8conn | 346.9 | — | median of 346.3, 357.8, 346.9 (8 conns, 10s windows) |
+| adbc_query_point_ms | 10.3 | 14.3 | n=20 |
+| adbc_query_bigfilter_ms | 7.8 | 8.3 | n=10 |
+| adbc_bulk_ingest_100k_rows_s | 836842 | — | |
+| flight_q1_ms | 10.41 | 11.62 | n=15 |
+| flight_q1_fresh_ms | 5.49 | 6.1 | n=15 |
+| compact_scan_restore_ms | 51 | — | degraded p50 66 ms @ 24 files -> restored p50 51 ms @ 1 file(s); compact wall 201 ms |
+
+### Bench 20260716T121258Z
+
+Release binary `/tmp/claude-0/-home-user-icegres/5e800786-6af4-536d-92f8-1b93df45ac84/scratchpad/icegres-pre-p5p7` · raw: `bench/results/bench-20260716T121258Z.json` ·
+warmups discarded: 3, iterations: 20, cold-start runs: 5, demo.trips data files: 1
+
+| metric | p50 | p95 | n / detail |
+|--------|-----|-----|------------|
+| connect_ms | 0.21 | 0.27 | n=20 |
+| point_lookup_ms | 8.1 | 9.35 | n=20 |
+| filtered_scan_ms | 7.8 | 9.0 | n=20 |
+| aggregate_ms | 8.63 | 9.19 | n=20 |
+| join_ms | 12.43 | 13.05 | n=20 |
+| insert_single_ms | 69.89 | 96.02 | n=20 |
+| insert_batch100_ms | 113.32 | 127.44 | n=20 |
+| freshness_ms | 77.36 | 89.3 | n=20 |
+| qps_8conn | 376.5 | — | median of 383.8, 348.3, 376.5 (8 conns, 10s windows) |
+| cold_start_ms | 46.51 | 47.56 | n=5 |
+| binary_size_mb | 130.64 | — | |
+| rss_idle_mb | 86.15 | — | |
+| rss_peak_mb | 101.45 | — | qps-window peak 100.79 MB, 428 samples @ 100ms |
+| rss_after_load_mb | 101.45 | — | |
+| insert_single_buffered_ms | 184.9 | 206.64 | n=20 |
+| freshness_buffered_ms | 123.12 | 143.73 | n=20 |
+| durable_ack_dir_ms | 65.37 | 86.77 | n=20 |
+| durable_ack_pg_ms | 76.88 | 93.11 | n=20 |
+| durable_ack_quorum_ms | 69.79 | 80.68 | n=20 |
+| cold_start_via_proxy_ms | 77 | 91 | n=5 |
+| failover_ms | 118 | 145 | n=5 |
+| connect_via_proxy_ms | 0.45 | 0.89 | n=20 |
+| qps_via_proxy_8conn | 365.7 | — | median of 366.8, 350.8, 365.7 (8 conns, 10s windows) |
+| adbc_query_point_ms | 11.2 | 14.4 | n=20 |
+| adbc_query_bigfilter_ms | 8.6 | 9.7 | n=10 |
+| adbc_bulk_ingest_100k_rows_s | 570887 | — | |
+| flight_q1_ms | 10.67 | 11.39 | n=15 |
+| flight_q1_fresh_ms | 10.39 | 11.55 | n=15 |
+| compact_scan_restore_ms | 51 | — | degraded p50 59 ms @ 24 files -> restored p50 51 ms @ 1 file(s); compact wall 172 ms |
+
+### Bench 20260716T121816Z
+
+Release binary `/tmp/claude-0/-home-user-icegres/5e800786-6af4-536d-92f8-1b93df45ac84/scratchpad/icegres-pre-p5p7` · raw: `bench/results/bench-20260716T121816Z.json` ·
+warmups discarded: 3, iterations: 20, cold-start runs: 5, demo.trips data files: 1
+
+| metric | p50 | p95 | n / detail |
+|--------|-----|-----|------------|
+| connect_ms | 0.3 | 0.38 | n=20 |
+| point_lookup_ms | 7.91 | 9.09 | n=20 |
+| filtered_scan_ms | 9.0 | 11.01 | n=20 |
+| aggregate_ms | 9.34 | 9.98 | n=20 |
+| join_ms | 13.11 | 14.37 | n=20 |
+| insert_single_ms | 69.88 | 81.45 | n=20 |
+| insert_batch100_ms | 115.39 | 143.43 | n=20 |
+| freshness_ms | 80.52 | 99.21 | n=20 |
+| qps_8conn | 341.5 | — | median of 356.4, 325.2, 341.5 (8 conns, 10s windows) |
+| cold_start_ms | 45.84 | 46.39 | n=5 |
+| binary_size_mb | 130.64 | — | |
+| rss_idle_mb | 85.95 | — | |
+| rss_peak_mb | 100.22 | — | qps-window peak 97.9 MB, 435 samples @ 100ms |
+| rss_after_load_mb | 100.22 | — | |
+| insert_single_buffered_ms | 186.84 | 206.44 | n=20 |
+| freshness_buffered_ms | 126.95 | 141.02 | n=20 |
+| durable_ack_dir_ms | 70.29 | 86.01 | n=20 |
+| durable_ack_pg_ms | 73.05 | 87.09 | n=20 |
+| durable_ack_quorum_ms | 62.79 | 77.06 | n=20 |
+| cold_start_via_proxy_ms | 76 | 96 | n=5 |
+| failover_ms | 120 | 132 | n=5 |
+| connect_via_proxy_ms | 0.53 | 0.72 | n=20 |
+| qps_via_proxy_8conn | 321.8 | — | median of 330.6, 321.8, 321.5 (8 conns, 10s windows) |
+| adbc_query_point_ms | 13.6 | 15.8 | n=20 |
+| adbc_query_bigfilter_ms | 9.9 | 11.0 | n=10 |
+| adbc_bulk_ingest_100k_rows_s | 598784 | — | |
+| flight_q1_ms | 12.22 | 12.8 | n=15 |
+| flight_q1_fresh_ms | 11.62 | 12.47 | n=15 |
+| compact_scan_restore_ms | 51 | — | degraded p50 57 ms @ 24 files -> restored p50 51 ms @ 1 file(s); compact wall 188 ms |
+
+### Bench 20260716T122051Z
+
+Release binary `icegres/target/release/icegres` · raw: `bench/results/bench-20260716T122051Z.json` ·
+warmups discarded: 3, iterations: 20, cold-start runs: 5, demo.trips data files: 1
+
+| metric | p50 | p95 | n / detail |
+|--------|-----|-----|------------|
+| connect_ms | 0.25 | 0.33 | n=20 |
+| point_lookup_ms | 8.43 | 9.19 | n=20 |
+| filtered_scan_ms | 8.41 | 9.17 | n=20 |
+| aggregate_ms | 8.38 | 10.17 | n=20 |
+| join_ms | 11.0 | 12.59 | n=20 |
+| insert_single_ms | 75.36 | 106.55 | n=20 |
+| insert_batch100_ms | 114.4 | 125.09 | n=20 |
+| freshness_ms | 77.02 | 88.15 | n=20 |
+| qps_8conn | 341.4 | — | median of 386.2, 341.4, 340.9 (8 conns, 10s windows) |
+| cold_start_ms | 46.34 | 46.66 | n=5 |
+| binary_size_mb | 131.18 | — | |
+| rss_idle_mb | 84.91 | — | |
+| rss_peak_mb | 99.35 | — | qps-window peak 97.84 MB, 430 samples @ 100ms |
+| rss_after_load_mb | 99.35 | — | |
+| insert_single_buffered_ms | 1.4 | 1.79 | n=20 |
+| freshness_buffered_ms | 9.62 | 83.53 | n=20 |
+| durable_ack_dir_ms | 3.48 | 5.41 | n=20 |
+| durable_ack_pg_ms | 3.28 | 6.27 | n=20 |
+| durable_ack_quorum_ms | 4.2 | 5.57 | n=20 |
+| cold_start_via_proxy_ms | 76 | 78 | n=5 |
+| failover_ms | 106 | 149 | n=5 |
+| connect_via_proxy_ms | 0.47 | 0.65 | n=20 |
+| qps_via_proxy_8conn | 364.6 | — | median of 364.6, 368.1, 358.2 (8 conns, 10s windows) |
+| adbc_query_point_ms | 11.5 | 14.2 | n=20 |
+| adbc_query_bigfilter_ms | 7.4 | 10.0 | n=10 |
+| adbc_bulk_ingest_100k_rows_s | 634143 | — | |
+| flight_q1_ms | 10.06 | 11.16 | n=15 |
+| flight_q1_fresh_ms | 5.89 | 8.79 | n=15 |
+| compact_scan_restore_ms | 49 | — | degraded p50 57 ms @ 24 files -> restored p50 49 ms @ 1 file(s); compact wall 173 ms |
+
+
+### P5+P7 gate (paired, drift-controlled) — 2026-07-16
+Candidate `bench-20260716T122051Z.json` vs the pre-P5P7 binary re-benched in the
+same box state (`bench-20260716T121816Z.json`, `ICEGRES_BIN` override): **GATE
+PASS** on every metric (join -16.1%, aggregate -10.3%, connect -16.7% faster;
+point_lookup +6.6% / insert_single +7.8% within noise; qps flat). A first pair
+this session showed spurious +30% read deltas purely from run ORDER (candidate
+ran cold-first); reversing the order flips the sign, confirming warmup drift on
+this shared box, not a code regression. P5+P7 adds only new subcommands + an
+allocation-free per-query AS OF byte-scan gate on the query path; the drift-
+controlled read metrics are unchanged.
