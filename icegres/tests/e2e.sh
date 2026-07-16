@@ -190,6 +190,7 @@ cleanup() {
   stop_pidfile_generic "$PK_PID_FILE"
   stop_pidfile_generic "$E2E_DIR/serve-buffered.pid"
   stop_pidfile_generic "$E2E_DIR/serve-branch.pid"
+  stop_pidfile_generic "$E2E_DIR/serve-p5branch.pid"
   stop_pidfile_generic "$E2E_DIR/flight.pid"
   stop_pidfile_generic "$E2E_DIR/flight-secure.pid"
   stop_pidfile_generic "$E2E_DIR/flight-authz.pid"
@@ -214,6 +215,11 @@ cleanup() {
     # `|| continue`, not `&&`: after a clean run no pidfile matches, and a
     # false-status last command in the EXIT trap would (set -e) override
     # the suite's exit code with 1.
+    [[ -f "$kp" ]] || continue
+    stop_keeper_at "$kp"
+  done
+  # (p7) verify-section acceptors, same guard as above.
+  for kp in "$E2E_DIR"/vk-*.pid; do
     [[ -f "$kp" ]] || continue
     stop_keeper_at "$kp"
   done
@@ -1094,6 +1100,313 @@ fi
 pass "branch drop removed the ref"
 assert_eq "main state fully intact after the branch lifecycle (dev row|main row|seeded)" "0|1|280" \
   "$(q "select count(*) from demo.trips where trip_id = $DEV_ID")|$(q "select count(*) from demo.trips where trip_id = $MAIN_ID")|$(q 'select count(*) from demo.trips where trip_id between 1 and 280')"
+
+# ---------------------------------------------------------------------------
+# (p5) branch diff / merge (fast-forward only) + AS OF time-travel sugar
+#      (roadmap-v2 P5). Metadata-only diff: fork points via snapshot-lineage
+#      walks, statuses across the created/dropped/advanced/diverged matrix,
+#      summary-reported row deltas. Merge: dry-run by default, whole eligible
+#      set in ONE atomic multi-table commit with the observed to/from heads
+#      pinned (a real injected 409 aborts it with NOTHING applied), diverged
+#      tables refuse the whole run. AS OF: raw-SQL rewrite to table@snapshot
+#      on both wire protocols, loud error before a table's history begins.
+# ---------------------------------------------------------------------------
+P5BR=e2e_p5dev
+P5BR_PORT=5470
+P5BR_PID_FILE="$E2E_DIR/serve-p5branch.pid"
+P5BR_LOG="$E2E_DIR/serve-p5branch.log"
+log "(p5) branch diff/merge + AS OF: branch '$P5BR' on :$P5BR_PORT"
+stop_pidfile_generic "$P5BR_PID_FILE"
+
+# Fixtures: four branched tables + one created only on main AFTER branching.
+# a: advances on the branch; b: diverges (writes on BOTH sides); d, e: the
+# atomic multi-table fast-forward pair; c: exists on main only.
+for t in a b c d e; do
+  q "drop table if exists demo.e2e_p5_$t" >/dev/null 2>&1 || true
+done
+"$BIN" branch drop-all "$P5BR" >/dev/null 2>&1 || true # crashed-run cleanup
+for t in a b d e; do
+  q "create table demo.e2e_p5_$t (id bigint, note varchar)" >/dev/null
+  q "insert into demo.e2e_p5_$t values (1, 'seed')" >/dev/null
+  "$BIN" branch create "demo.e2e_p5_$t" "$P5BR" >/dev/null 2>&1 \
+    || fail "branch create $P5BR on demo.e2e_p5_$t failed"
+done
+q 'create table demo.e2e_p5_c (id bigint, note varchar)' >/dev/null
+q "insert into demo.e2e_p5_c values (1, 'main-only')" >/dev/null
+p5_fork_a=$("$BIN" branch list demo.e2e_p5_a | awk -F'\t' '$1=="main"{print $2}')
+[[ -n "$p5_fork_a" ]] || fail "could not read demo.e2e_p5_a's fork head"
+
+: >"$P5BR_LOG"
+"$BIN" serve --host "$PG_HOST" --port "$P5BR_PORT" --branch "$P5BR" >>"$P5BR_LOG" 2>&1 &
+echo $! >"$P5BR_PID_FILE"
+p5_ready=0
+for _ in $(seq 1 60); do
+  if psql -h "$PG_HOST" -p "$P5BR_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+    p5_ready=1; break
+  fi
+  sleep 0.5
+done
+[[ "$p5_ready" == 1 ]] || { tail -n 20 "$P5BR_LOG" >&2; fail "$P5BR server not ready on :$P5BR_PORT"; }
+P5Q=(psql -h "$PG_HOST" -p "$P5BR_PORT" -U postgres -d icegres -tA)
+
+# Mutations: a advances by 2 rows on the branch; b gets one write on EACH
+# side (diverged); d and e advance by 1 on the branch.
+"${P5Q[@]}" -c "insert into demo.e2e_p5_a values (2, 'branch')" >/dev/null
+"${P5Q[@]}" -c "insert into demo.e2e_p5_a values (3, 'branch')" >/dev/null
+"${P5Q[@]}" -c "insert into demo.e2e_p5_b values (2, 'branch-side')" >/dev/null
+q "insert into demo.e2e_p5_b values (3, 'main-side')" >/dev/null
+"${P5Q[@]}" -c "insert into demo.e2e_p5_d values (2, 'branch')" >/dev/null
+"${P5Q[@]}" -c "insert into demo.e2e_p5_e values (2, 'branch')" >/dev/null
+
+# p5-1: the diff status matrix, one metadata read per table.
+"$BIN" branch diff "$P5BR" main >"$E2E_DIR/p5-diff.out" 2>&1 \
+  || { cat "$E2E_DIR/p5-diff.out" >&2; fail "branch diff failed"; }
+grep -q "^demo.e2e_p5_a	advanced-a" "$E2E_DIR/p5-diff.out" || fail "diff: a not advanced-a"
+grep -q "^demo.e2e_p5_b	diverged" "$E2E_DIR/p5-diff.out" || fail "diff: b not diverged"
+grep -q "^demo.e2e_p5_c	dropped" "$E2E_DIR/p5-diff.out" || fail "diff: c (main-only) not dropped"
+grep -q "^demo.e2e_p5_d	advanced-a" "$E2E_DIR/p5-diff.out" || fail "diff: d not advanced-a"
+grep -Eq "^demo.e2e_p5_a	advanced-a	fork $p5_fork_a \| a [0-9]+: \+2 snapshots, rows \+2/-0" \
+  "$E2E_DIR/p5-diff.out" || fail "diff: a's fork/row-delta line wrong: $(grep e2e_p5_a "$E2E_DIR/p5-diff.out")"
+pass "branch diff: created/dropped/advanced/diverged matrix + fork + summary-reported deltas"
+
+# p5-2: --json for tooling (statuses, deltas, fork, honesty label).
+"$BIN" branch diff "$P5BR" main --json >"$E2E_DIR/p5-diff.json" 2>/dev/null \
+  || fail "branch diff --json failed"
+assert_eq "diff --json: statuses + a-side delta + fork + rows_source" \
+  "advanced-a|2|$p5_fork_a|summary-reported|diverged|dropped" \
+  "$(jq -r '[(.tables[]|select(.table=="demo.e2e_p5_a")|.status, (.a.rows_added|tostring), (.fork_snapshot_id|tostring), .a.rows_source), (.tables[]|select(.table=="demo.e2e_p5_b")|.status), (.tables[]|select(.table=="demo.e2e_p5_c")|.status)] | join("|")' "$E2E_DIR/p5-diff.json")"
+
+# p5-3: --table narrows with per-snapshot lineage detail.
+"$BIN" branch diff "$P5BR" main --table demo.e2e_p5_a >"$E2E_DIR/p5-diff-table.out" 2>&1 \
+  || fail "branch diff --table failed"
+assert_eq "diff --table: per-snapshot lineage lines for a's two branch commits" "2" \
+  "$(grep -c '^  a snapshot .* (append, +1/-0 rows)$' "$E2E_DIR/p5-diff-table.out")"
+
+# p5-4: merge dry run with a diverged table refuses the WHOLE run (per-table
+# conflict report; three-way merges are never attempted) and mutates nothing.
+set +e
+"$BIN" branch merge "$P5BR" main >"$E2E_DIR/p5-merge-refuse.out" 2>&1
+p5_rc=$?
+set -e
+[[ $p5_rc -ne 0 ]] || fail "merge with a diverged table was ACCEPTED"
+grep -q "^demo.e2e_p5_b: CONFLICT — diverged" "$E2E_DIR/p5-merge-refuse.out" \
+  || fail "merge refusal lacks b's conflict report: $(cat "$E2E_DIR/p5-merge-refuse.out")"
+grep -q "refusing the merge" "$E2E_DIR/p5-merge-refuse.out" \
+  || fail "merge refusal message missing"
+grep -q "^demo.e2e_p5_a: fast-forward main" "$E2E_DIR/p5-merge-refuse.out" \
+  || fail "merge plan does not list a's fast-forward"
+assert_eq "refused merge moved NO ref (a still at the fork on main)" "$p5_fork_a" \
+  "$("$BIN" branch list demo.e2e_p5_a | awk -F'\t' '$1=="main"{print $2}')"
+pass "diverged table => per-table conflict report + whole-run refusal, nothing applied"
+
+# p5-5: dry-run purity — a clean single-table plan commits nothing.
+"$BIN" branch merge "$P5BR" main --table demo.e2e_p5_a >"$E2E_DIR/p5-merge-dry.out" 2>&1 \
+  || { cat "$E2E_DIR/p5-merge-dry.out" >&2; fail "single-table dry-run merge failed"; }
+grep -q "dry run: 1 table(s) would fast-forward" "$E2E_DIR/p5-merge-dry.out" \
+  || fail "dry-run footer missing: $(cat "$E2E_DIR/p5-merge-dry.out")"
+assert_eq "dry run moved nothing (main head of a unchanged)" "$p5_fork_a" \
+  "$("$BIN" branch list demo.e2e_p5_a | awk -F'\t' '$1=="main"{print $2}')"
+
+# p5-6: injected race — the commit pins the observed to/from heads, so a
+# REAL server-side 409 (requirement corrupted via the test-only env, same
+# pattern as ICEGRES_DML_INJECT_CONFLICT) aborts cleanly with nothing moved.
+set +e
+ICEGRES_MERGE_INJECT_CONFLICT=1 "$BIN" branch merge "$P5BR" main \
+  --table demo.e2e_p5_a --execute >"$E2E_DIR/p5-merge-race.out" 2>&1
+p5_rc=$?
+set -e
+[[ $p5_rc -ne 0 ]] || fail "raced merge was ACCEPTED (pinned heads must 409)"
+grep -q "NOTHING was applied" "$E2E_DIR/p5-merge-race.out" \
+  || fail "raced merge error does not state nothing was applied: $(cat "$E2E_DIR/p5-merge-race.out")"
+assert_eq "raced merge moved NO ref" "$p5_fork_a" \
+  "$("$BIN" branch list demo.e2e_p5_a | awk -F'\t' '$1=="main"{print $2}')"
+pass "injected foreign commit (real 409) aborts the merge cleanly, first-committer-wins"
+
+# p5-7: single-table fast-forward for real: main's ref moves to the branch
+# head (zero-copy) and the rows appear on the main endpoint.
+p5_branch_head_a=$("$BIN" branch list demo.e2e_p5_a | awk -F'\t' -v b="$P5BR" '$1==b{print $2}')
+"$BIN" branch merge "$P5BR" main --table demo.e2e_p5_a --execute >"$E2E_DIR/p5-merge-a.out" 2>&1 \
+  || { cat "$E2E_DIR/p5-merge-a.out" >&2; fail "single-table merge --execute failed"; }
+assert_eq "main fast-forwarded to the branch head on a" "$p5_branch_head_a" \
+  "$("$BIN" branch list demo.e2e_p5_a | awk -F'\t' '$1=="main"{print $2}')"
+assert_eq "branch rows now readable on the MAIN endpoint" "3" \
+  "$(q 'select count(*) from demo.e2e_p5_a')"
+
+# p5-8: the atomic multi-table cut. b's branch ref is dropped (the operator
+# "rebases by re-branching"), leaving d + e the eligible set. First the
+# injected race: the ONE transactions/commit request 409s and NEITHER head
+# moves (all-or-nothing). Then for real: both to-heads move TOGETHER.
+"$BIN" branch drop demo.e2e_p5_b "$P5BR" >/dev/null 2>&1 || fail "branch drop on b failed"
+p5_main_d=$("$BIN" branch list demo.e2e_p5_d | awk -F'\t' '$1=="main"{print $2}')
+p5_main_e=$("$BIN" branch list demo.e2e_p5_e | awk -F'\t' '$1=="main"{print $2}')
+p5_br_d=$("$BIN" branch list demo.e2e_p5_d | awk -F'\t' -v b="$P5BR" '$1==b{print $2}')
+p5_br_e=$("$BIN" branch list demo.e2e_p5_e | awk -F'\t' -v b="$P5BR" '$1==b{print $2}')
+set +e
+ICEGRES_MERGE_INJECT_CONFLICT=1 "$BIN" branch merge "$P5BR" main --execute \
+  >"$E2E_DIR/p5-merge-race2.out" 2>&1
+p5_rc=$?
+set -e
+[[ $p5_rc -ne 0 ]] || fail "raced multi-table merge was ACCEPTED"
+assert_eq "raced multi-table merge moved NEITHER head (atomic, nothing applied)" \
+  "$p5_main_d|$p5_main_e" \
+  "$("$BIN" branch list demo.e2e_p5_d | awk -F'\t' '$1=="main"{print $2}')|$("$BIN" branch list demo.e2e_p5_e | awk -F'\t' '$1=="main"{print $2}')"
+"$BIN" branch merge "$P5BR" main --execute >"$E2E_DIR/p5-merge-all.out" 2>&1 \
+  || { cat "$E2E_DIR/p5-merge-all.out" >&2; fail "multi-table merge --execute failed"; }
+grep -q "2 table(s) fast-forwarded in ONE atomic commit" "$E2E_DIR/p5-merge-all.out" \
+  || fail "multi-table merge did not report the atomic cut: $(cat "$E2E_DIR/p5-merge-all.out")"
+assert_eq "BOTH to-heads moved together to their branch heads" "$p5_br_d|$p5_br_e" \
+  "$("$BIN" branch list demo.e2e_p5_d | awk -F'\t' '$1=="main"{print $2}')|$("$BIN" branch list demo.e2e_p5_e | awk -F'\t' '$1=="main"{print $2}')"
+assert_eq "both tables' branch rows readable on main after the cut" "2|2" \
+  "$(q 'select count(*) from demo.e2e_p5_d')|$(q 'select count(*) from demo.e2e_p5_e')"
+pass "atomic multi-table fast-forward: to-heads move together or not at all"
+
+# p5-9: AS OF sugar — pinned reads vs now, on BOTH wire protocols.
+assert_eq "AS OF <snapshot_id> reads the pinned fork state (1 row) vs now (3)" "1|3" \
+  "$(q "select count(*) from demo.e2e_p5_a AS OF $p5_fork_a")|$(q 'select count(*) from demo.e2e_p5_a')"
+assert_eq "AS OF <head snapshot id> equals now" "3" \
+  "$(q "select count(*) from demo.e2e_p5_a AS OF $p5_branch_head_a")"
+# Timestamp form: 1 ms after the fork snapshot's commit -> resolves
+# at/just-before to the fork snapshot.
+p5_fork_ts=$(curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_p5_a" \
+  | jq -r ".metadata.snapshots[] | select(.\"snapshot-id\" == $p5_fork_a) | .\"timestamp-ms\"")
+[[ -n "$p5_fork_ts" && "$p5_fork_ts" != null ]] || fail "could not read the fork snapshot's timestamp"
+p5_ms=$((p5_fork_ts + 1))
+p5_iso="$(date -u -d "@$((p5_ms / 1000))" +'%F %T').$(printf '%03d' $((p5_ms % 1000)))"
+assert_eq "AS OF TIMESTAMP (1 ms after the fork commit) resolves just-before" "1" \
+  "$(q "select count(*) from demo.e2e_p5_a AS OF TIMESTAMP '$p5_iso'")"
+# Extended protocol (psql \bind): the AsOfParser path.
+assert_eq "AS OF over the EXTENDED protocol (psql \\bind)" "1" \
+  "$(printf 'select count(*) from demo.e2e_p5_a AS OF %s \\bind \\g\n' "$p5_fork_a" | "${PSQL[@]}" -tA)"
+# Before the first snapshot: a loud error, never an empty result.
+set +e
+p5_early=$(q "select count(*) from demo.e2e_p5_a AS OF TIMESTAMP '2001-01-01 00:00:00'" 2>&1)
+p5_rc=$?
+set -e
+[[ $p5_rc -ne 0 ]] || fail "AS OF before the first snapshot was ACCEPTED: $p5_early"
+grep -q "AS OF cannot read before a table's history begins" <<<"$p5_early" \
+  || fail "unexpected before-first error: $p5_early"
+pass "AS OF before the table's first snapshot fails loudly"
+# Gating: 'AS OF' inside a string literal is data, not sugar.
+assert_eq "'AS OF' inside a string literal is untouched" "0" \
+  "$(q "select count(*) from demo.e2e_p5_a where note = 'x AS OF 5'")"
+
+# p5 cleanup: branch server down, refs + scratch tables dropped.
+stop_pidfile_generic "$P5BR_PID_FILE"
+"$BIN" branch drop-all "$P5BR" >/dev/null 2>&1 || true
+for t in a b c d e; do
+  q "drop table if exists demo.e2e_p5_$t" >/dev/null 2>&1 || true
+done
+pass "p5 cleanup (branch server stopped, scratch refs/tables dropped)"
+
+# ---------------------------------------------------------------------------
+# (p7) icegres verify — the durability harness productized (roadmap-v2 P7):
+#      re-proves the durability/exactly-once/fencing/freshness/failover
+#      claims against the configured deployment from a dedicated scratch
+#      namespace, spawning its OWN scratch servers. Green end to end for the
+#      dir, pg, and quorum backends here — and proven to FAIL (nonzero exit,
+#      durability marked FAIL in the report) when the tail LIES (a wiper
+#      deletes the tail's segments out from under it mid-test).
+# ---------------------------------------------------------------------------
+log "(p7) icegres verify: dir + pg + quorum green, sabotaged tail caught"
+VF_TAIL="$E2E_DIR/verify-tail"
+rm -rf "$VF_TAIL"; mkdir -p "$VF_TAIL"
+
+# p7-1: dir backend — durability/exactly-once/freshness run (4 checks),
+# fencing/failover SKIP loudly (no cross-writer identity on a local WAL).
+"$BIN" verify --tail-dir "$VF_TAIL" --json >"$E2E_DIR/p7-dir.json" 2>"$E2E_DIR/p7-dir.err" \
+  || { cat "$E2E_DIR/p7-dir.err" >&2; fail "verify --tail-dir failed (see $E2E_DIR/p7-dir.json)"; }
+assert_eq "verify dir: 4 passed, 0 failed, 2 loud skips (fencing+failover)" "4|0|2" \
+  "$(jq -r '[.passed, .failed, .skipped] | map(tostring) | join("|")' "$E2E_DIR/p7-dir.json")"
+assert_eq "verify dir: every check names its claim + doc section" "0" \
+  "$(jq -r '[.checks[] | select(.claim == "" or .doc == "")] | length' "$E2E_DIR/p7-dir.json")"
+assert_eq "verify dir: scratch namespace is run-scoped" "icegres_verify_" \
+  "$(jq -r '.namespace' "$E2E_DIR/p7-dir.json" | cut -c1-15)"
+[[ -z "$(ls "$VF_TAIL" 2>/dev/null)" ]] \
+  || fail "verify left scratch state in the tail dir: $(ls "$VF_TAIL")"
+pass "verify --tail-dir: green, skips loud, scratch tail dir cleaned up"
+
+# p7-2: pg backend on a DEDICATED database (the stack's Postgres, superuser
+# creates it): fencing joins in via the one-writer advisory lock (5 checks).
+VF_PG_ADMIN="postgresql://postgres@127.0.0.1:5433/postgres"
+VF_PG_URL="postgresql://lakekeeper:lakekeeper@127.0.0.1:5433/e2e_verify_tail"
+psql "$VF_PG_ADMIN" -q -c 'DROP DATABASE IF EXISTS e2e_verify_tail' \
+  -c 'CREATE DATABASE e2e_verify_tail OWNER lakekeeper' \
+  || fail "could not create the dedicated verify tail database"
+"$BIN" verify --tail-url "$VF_PG_URL" --json >"$E2E_DIR/p7-pg.json" 2>"$E2E_DIR/p7-pg.err" \
+  || { cat "$E2E_DIR/p7-pg.err" >&2; fail "verify --tail-url failed (see $E2E_DIR/p7-pg.json)"; }
+assert_eq "verify pg: 5 passed (fencing included), 0 failed, failover skipped" "5|0|1|PASS" \
+  "$(jq -r '[(.passed|tostring), (.failed|tostring), (.skipped|tostring), (.checks[] | select(.suite=="fencing") | .status)] | join("|")' "$E2E_DIR/p7-pg.json")"
+assert_eq "verify pg: dropped its scratch icegres_tail schema on exit" "f" \
+  "$(psql "$VF_PG_URL" -tA -c "select exists (select 1 from information_schema.schemata where schema_name = 'icegres_tail')")"
+# Honesty rail: a tail database that ALREADY carries an icegres_tail schema
+# (someone's live tail) is refused before anything is written.
+psql "$VF_PG_URL" -q -c 'CREATE SCHEMA icegres_tail' || fail "could not plant the schema"
+set +e
+"$BIN" verify --tail-url "$VF_PG_URL" >"$E2E_DIR/p7-pg-refuse.out" 2>&1
+p7_rc=$?
+set -e
+[[ $p7_rc -ne 0 ]] || fail "verify against a tail database with an existing icegres_tail schema was ACCEPTED"
+grep -q "already carries an icegres_tail schema" "$E2E_DIR/p7-pg-refuse.out" \
+  || fail "unexpected pg-tail refusal: $(cat "$E2E_DIR/p7-pg-refuse.out")"
+pass "verify pg: green incl. advisory-lock fencing; occupied tail database refused"
+psql "$VF_PG_ADMIN" -q -c 'DROP DATABASE e2e_verify_tail' || true
+
+# p7-3: quorum backend on three dedicated icekeeperd acceptors — the full
+# matrix runs: 6 checks, failover included, zero skips.
+VF_KEEPER_PORTS=(5474 5475 5476)
+for kp in "${VF_KEEPER_PORTS[@]}"; do
+  if (exec 3<>"/dev/tcp/127.0.0.1/$kp") 2>/dev/null; then
+    exec 3>&- 3<&-
+    fail "something is already listening on :$kp — stop it first"
+  fi
+done
+KBIN="$ICEGRES_DIR/target/debug/icekeeperd"
+[[ -x "$KBIN" ]] || fail "icekeeperd binary not found at $KBIN"
+for n in 1 2 3; do
+  rm -rf "$E2E_DIR/vk-$n"
+  "$KBIN" serve --host 127.0.0.1 --port "${VF_KEEPER_PORTS[$((n - 1))]}" \
+    --data-dir "$E2E_DIR/vk-$n" --node-id "$n" >"$E2E_DIR/vk-$n.log" 2>&1 &
+  echo $! >"$E2E_DIR/vk-$n.pid"
+done
+for n in 1 2 3; do
+  vk_ok=0
+  for _ in $(seq 1 40); do
+    if (exec 3<>"/dev/tcp/127.0.0.1/${VF_KEEPER_PORTS[$((n - 1))]}") 2>/dev/null; then
+      exec 3>&- 3<&-; vk_ok=1; break
+    fi
+    sleep 0.25
+  done
+  [[ "$vk_ok" == 1 ]] || { tail -n 20 "$E2E_DIR/vk-$n.log" >&2; fail "verify icekeeperd $n not ready"; }
+done
+"$BIN" verify --tail-quorum "127.0.0.1:5474,127.0.0.1:5475,127.0.0.1:5476" --json \
+  >"$E2E_DIR/p7-quorum.json" 2>"$E2E_DIR/p7-quorum.err" \
+  || { cat "$E2E_DIR/p7-quorum.err" >&2; fail "verify --tail-quorum failed (see $E2E_DIR/p7-quorum.json)"; }
+assert_eq "verify quorum: full matrix green (6 passed, failover PASS, 0 skips)" "6|0|0|PASS" \
+  "$(jq -r '[(.passed|tostring), (.failed|tostring), (.skipped|tostring), (.checks[] | select(.suite=="failover") | .status)] | join("|")' "$E2E_DIR/p7-quorum.json")"
+pass "verify --tail-quorum: durability/exactly-once/fencing/freshness/failover all re-proven"
+for n in 1 2 3; do stop_keeper_at "$E2E_DIR/vk-$n.pid"; done
+rm -rf "$E2E_DIR"/vk-*
+
+# p7-4: the negative proof — verify must CATCH a lying tail. A wiper loop
+# deletes the scratch tail's segment directories out from under the run;
+# the durability re-proof cannot hold and the run must exit NONZERO with
+# the durability suite marked FAIL (never a silent pass).
+VF_SAB="$E2E_DIR/verify-sabotage"
+rm -rf "$VF_SAB"; mkdir -p "$VF_SAB"
+( while :; do rm -rf "$VF_SAB"/icegres_verify_*/ 2>/dev/null; sleep 0.05; done ) &
+VF_WIPER=$!
+set +e
+"$BIN" verify --suite durability --tail-dir "$VF_SAB" --json \
+  >"$E2E_DIR/p7-sabotage.json" 2>"$E2E_DIR/p7-sabotage.err"
+p7_rc=$?
+set -e
+kill "$VF_WIPER" 2>/dev/null || true
+wait "$VF_WIPER" 2>/dev/null || true
+[[ $p7_rc -ne 0 ]] || fail "verify PASSED against a sabotaged tail (the report told a lie)"
+assert_eq "sabotaged tail: the durability suite is marked FAIL in the report" "FAIL" \
+  "$(jq -r '[.checks[] | select(.suite=="durability") | .status] | unique | join("|")' "$E2E_DIR/p7-sabotage.json")"
+pass "verify FAILS against a sabotaged tail (exit $p7_rc — the lie is caught, not reported green)"
+rm -rf "$VF_SAB" "$VF_TAIL"
 
 # ---------------------------------------------------------------------------
 # (n) icegresd control plane (SPEC D5/D7): wake-on-connect scale-to-zero,
