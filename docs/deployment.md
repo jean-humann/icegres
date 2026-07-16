@@ -627,6 +627,20 @@ icegres verify --tail-quorum k1:5471,k2:5471,k3:5471
 icegres verify --suite exactly-once --json --keep-evidence /tmp/evidence
 ```
 
+Unlike `icegres serve`, verify takes its tail backend **only from the
+command line**: the `ICEGRES_TAIL_DIR` / `ICEGRES_TAIL_URL` /
+`ICEGRES_TAIL_QUORUM` environment variables are **ignored**. Production
+writer hosts carry exactly those variables (the Helm writer pod sets
+them), and running verify on a writer host must never silently target the
+production tail — a bare `icegres verify` that adopted them would fence
+the live quorum writer with its first scratch server's election. Without
+a tail flag, the tail-backed suites SKIP loudly instead. Runbook rule:
+**always name the dedicated verify backend explicitly** with `--tail-dir`
+/ `--tail-url` / `--tail-quorum`, as in the examples above. (The catalog
+flags keep their env bindings: the catalog is read-mostly and shared by
+design — verify only creates, tests, and drops its own scratch
+namespace in it.)
+
 What it does, mechanically: creates a dedicated scratch namespace
 `icegres_verify_<nonce>` (refused if it pre-exists; dropped — with its
 tables purged — on every exit path, including Ctrl-C), spawns its own

@@ -23,7 +23,12 @@
 //!   `icegres_verify_<nonce>` subdirectory (refused if it pre-exists);
 //!   `--tail-url` is refused when the database already carries an
 //!   `icegres_tail` schema (a live or prior server's tail — replaying it
-//!   would commit FOREIGN rows); `--tail-quorum` is refused — before any
+//!   would commit FOREIGN rows), and its cleanup re-proves ownership at
+//!   drop time: the schema is dropped only if it still carries the
+//!   identity the run's first scratch server minted AND no live session
+//!   holds its one-writer advisory lock — otherwise the drop is skipped
+//!   loudly (never delete state the run cannot prove is its own);
+//!   `--tail-quorum` is refused — before any
 //!   write, kill, or flush — if the first scratch server's boot replays
 //!   foreign frames from the quorum log. A live production writer on the
 //!   same quorum would additionally be FENCED by the verify run: point
@@ -328,6 +333,11 @@ struct Harness {
     prefix: String,
     /// The quorum confinement guard runs on the FIRST tail-backed boot.
     first_tail_boot_done: bool,
+    /// Ownership token for pg cleanup: the `icegres_tail.meta` identity
+    /// minted by the run's first scratch server (read right after that
+    /// boot). Cleanup drops the schema only while this identity still
+    /// matches — see [`pg_drop_decision`].
+    pg_tail_identity: Option<String>,
 }
 
 impl Harness {
@@ -445,6 +455,32 @@ impl Harness {
                      DEDICATED, empty verify resource.",
                     self.backend.label()
                 );
+            }
+            // Ownership token: this boot just minted the pg tail schema
+            // (verified free of foreign frames above). Remember its
+            // identity so cleanup can prove the schema is still OURS
+            // before dropping it — the start-of-run absence pre-flight
+            // alone does not license a drop minutes later.
+            let pg_url = match &self.backend {
+                Backend::Pg(url) => Some(url.clone()),
+                _ => None,
+            };
+            if let Some(url) = pg_url {
+                let (client, conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+                    .await
+                    .context("cannot connect to the tail database to record the tail identity")?;
+                let handle = tokio::spawn(conn);
+                let identity: String = client
+                    .query_one("SELECT identity FROM icegres_tail.meta", &[])
+                    .await
+                    .context(
+                        "cannot read the tail identity the first scratch server minted \
+                         into icegres_tail.meta",
+                    )?
+                    .get(0);
+                drop(client);
+                handle.abort();
+                self.pg_tail_identity = Some(identity);
             }
         }
         Ok(proc)
@@ -1013,16 +1049,45 @@ impl Harness {
                 }
             }
             Backend::Pg(url) => {
-                // The schema was verified ABSENT before the run, so it is
-                // ours to drop.
+                // DROP ... CASCADE destroys every acked frame in the
+                // schema, and "absent at pre-flight" does not mean "ours
+                // at cleanup": the run lasts minutes with lock-free
+                // windows in which a concurrent verify or a misconfigured
+                // server can adopt the database. Re-prove ownership at
+                // drop time (identity match + no live lock holder) and
+                // otherwise skip loudly — never delete state the run
+                // cannot prove is its own (the scratch-namespace rail).
                 match tokio_postgres::connect(url, tokio_postgres::NoTls).await {
                     Ok((client, conn)) => {
                         let handle = tokio::spawn(conn);
-                        if let Err(e) = client
-                            .simple_query("DROP SCHEMA IF EXISTS icegres_tail CASCADE")
-                            .await
-                        {
-                            problems.push(format!("could not drop the scratch tail schema: {e}"));
+                        let decision = match pg_cleanup_probe(&client).await {
+                            Ok((current, holder)) => pg_drop_decision(
+                                self.pg_tail_identity.as_deref(),
+                                current.as_deref(),
+                                holder.as_deref(),
+                            ),
+                            Err(e) => {
+                                PgDrop::Skip(format!("the ownership re-check failed ({e:#})"))
+                            }
+                        };
+                        match decision {
+                            PgDrop::Drop => {
+                                if let Err(e) = client
+                                    .simple_query("DROP SCHEMA IF EXISTS icegres_tail CASCADE")
+                                    .await
+                                {
+                                    problems.push(format!(
+                                        "could not drop the scratch tail schema: {e}"
+                                    ));
+                                }
+                            }
+                            PgDrop::Skip(why) => problems.push(format!(
+                                "NOT dropping the icegres_tail schema on the tail \
+                                 database: {why}. Dropping it could destroy another \
+                                 writer's acked-but-unflushed frames — inspect and \
+                                 remove it manually."
+                            )),
+                            PgDrop::Nothing => {}
                         }
                         drop(client);
                         handle.abort();
@@ -1044,6 +1109,113 @@ impl Harness {
             format!("/{}", self.prefix)
         }
     }
+}
+
+/// What pg cleanup decided to do with the `icegres_tail` schema.
+#[derive(Debug, PartialEq, Eq)]
+enum PgDrop {
+    /// Provably still ours (identity match, no live holder): drop it.
+    Drop,
+    /// Not provably ours — leave it and say what was found.
+    Skip(String),
+    /// No schema on the database: nothing to drop.
+    Nothing,
+}
+
+/// The pg-cleanup ownership rule, pure so it is unit-testable: `ours` is
+/// the identity recorded after the run's first scratch server minted the
+/// schema, `current` the identity on the database at drop time (None =
+/// schema absent), `live_holder` a session holding the schema's one-writer
+/// advisory lock right now. The identity is minted ONCE (`ON CONFLICT DO
+/// NOTHING`), so a foreign writer that adopts our schema keeps our
+/// identity — the live-holder veto covers exactly that case.
+fn pg_drop_decision(
+    ours: Option<&str>,
+    current: Option<&str>,
+    live_holder: Option<&str>,
+) -> PgDrop {
+    match (ours, current) {
+        (_, None) => PgDrop::Nothing,
+        (None, Some(found)) => PgDrop::Skip(format!(
+            "the schema (identity {found}) is not one this run created — it appeared \
+             after the start-of-run absence pre-flight, so another writer owns it"
+        )),
+        (Some(mine), Some(found)) if mine != found => PgDrop::Skip(format!(
+            "the tail identity changed under the run (ours: {mine}, found: {found}) — \
+             another writer re-minted the schema"
+        )),
+        (Some(_), Some(_)) => match live_holder {
+            Some(holder) => PgDrop::Skip(format!(
+                "a live session ({holder}) holds the schema's one-writer advisory lock \
+                 — a foreign writer adopted the tail mid-run"
+            )),
+            None => PgDrop::Drop,
+        },
+    }
+}
+
+/// Cleanup-time ownership probe for [`pg_drop_decision`]: the
+/// `icegres_tail.meta` identity now on the database (None = schema absent;
+/// a present schema whose meta row is unreadable yields a marker string
+/// that can never match ours, so the comparison fails safe) and any LIVE
+/// session holding the schema's one-writer advisory lock. The holder check
+/// retries briefly: postgres releases our own SIGKILLed children's locks
+/// as it reaps their dead connections, so only a genuinely foreign session
+/// persists past the retries.
+async fn pg_cleanup_probe(
+    client: &tokio_postgres::Client,
+) -> Result<(Option<String>, Option<String>)> {
+    let exists: bool = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.schemata \
+             WHERE schema_name = 'icegres_tail')",
+            &[],
+        )
+        .await
+        .context("cannot check the tail database for the icegres_tail schema")?
+        .get(0);
+    if !exists {
+        return Ok((None, None));
+    }
+    let identity = match client
+        .query_opt("SELECT identity FROM icegres_tail.meta", &[])
+        .await
+    {
+        Ok(Some(row)) => row.get::<_, String>(0),
+        Ok(None) => "<no identity row in icegres_tail.meta>".to_string(),
+        Err(e) => format!("<unreadable icegres_tail.meta: {e}>"),
+    };
+    let lock_key = crate::tail_pg::schema_lock_key(crate::tail_pg::DEFAULT_SCHEMA);
+    let mut holder = None;
+    for _ in 0..20 {
+        let row = client
+            .query_opt(
+                "SELECT l.pid, coalesce(a.application_name, '') \
+                 FROM pg_locks l LEFT JOIN pg_stat_activity a ON a.pid = l.pid \
+                 WHERE l.locktype = 'advisory' AND l.granted \
+                   AND l.classid::int4 = $1 AND l.objid::int4 = $2 AND l.objsubid = 2",
+                &[&crate::tail_pg::LOCK_CLASS, &lock_key],
+            )
+            .await
+            .context("cannot check pg_locks for a live tail-lock holder")?;
+        match row {
+            None => {
+                holder = None;
+                break;
+            }
+            Some(row) => {
+                let pid: i32 = row.get(0);
+                let app: String = row.get(1);
+                holder = Some(if app.is_empty() {
+                    format!("pid {pid}")
+                } else {
+                    format!("pid {pid}, application {app:?}")
+                });
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
+    Ok((Some(identity), holder))
 }
 
 fn skip(
@@ -1212,6 +1384,7 @@ pub async fn run(catalog_opts: &CatalogOpts, opts: VerifyOpts) -> Result<()> {
         http,
         prefix,
         first_tail_boot_done: false,
+        pg_tail_identity: None,
     };
 
     // Run the suites with guaranteed cleanup on EVERY exit path: normal
@@ -1374,6 +1547,51 @@ mod tests {
             "durable tail is empty; nothing to replay"
         ));
         assert!(!log_reports_replay(""));
+    }
+
+    /// The pg-cleanup drop must be ownership-checked at DROP time: match
+    /// => drop, mismatch => skip, absent => nothing, and a live lock
+    /// holder vetoes even an identity match (mint-once identity: a
+    /// foreign adopter of our schema keeps our identity).
+    #[test]
+    fn pg_drop_ownership_decision() {
+        // Identity match, no live holder: ours to drop.
+        assert_eq!(pg_drop_decision(Some("a"), Some("a"), None), PgDrop::Drop);
+        // Identity mismatch: another writer re-minted the schema — skip,
+        // naming both identities.
+        match pg_drop_decision(Some("mine-id"), Some("theirs-id"), None) {
+            PgDrop::Skip(why) => {
+                assert!(why.contains("mine-id"), "skip names our identity: {why}");
+                assert!(
+                    why.contains("theirs-id"),
+                    "skip names the found identity: {why}"
+                );
+            }
+            other => panic!("mismatch must skip, got {other:?}"),
+        }
+        // Schema absent at cleanup: nothing to drop, whatever we remember.
+        assert_eq!(pg_drop_decision(Some("a"), None, None), PgDrop::Nothing);
+        assert_eq!(pg_drop_decision(None, None, None), PgDrop::Nothing);
+        assert_eq!(pg_drop_decision(None, None, Some("pid 1")), PgDrop::Nothing);
+        // A schema exists but this run never created one: foreign — skip.
+        assert!(matches!(
+            pg_drop_decision(None, Some("foreign-id"), None),
+            PgDrop::Skip(why) if why.contains("foreign-id")
+        ));
+        // A live advisory-lock holder vetoes even an identity match.
+        match pg_drop_decision(Some("a"), Some("a"), Some("pid 42, application \"srv\"")) {
+            PgDrop::Skip(why) => assert!(why.contains("pid 42"), "skip names the holder: {why}"),
+            other => panic!("a live holder must skip, got {other:?}"),
+        }
+        // The unreadable-meta marker can never match a UUID identity.
+        assert!(matches!(
+            pg_drop_decision(
+                Some("a"),
+                Some("<unreadable icegres_tail.meta: boom>"),
+                None
+            ),
+            PgDrop::Skip(_)
+        ));
     }
 
     #[test]

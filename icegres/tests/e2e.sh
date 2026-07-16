@@ -1305,11 +1305,38 @@ pass "p5 cleanup (branch server stopped, scratch refs/tables dropped)"
 #      namespace, spawning its OWN scratch servers. Green end to end for the
 #      dir, pg, and quorum backends here — and proven to FAIL (nonzero exit,
 #      durability marked FAIL in the report) when the tail LIES (a wiper
-#      deletes the tail's segments out from under it mid-test).
+#      deletes the tail's segments out from under it mid-test). Also proves
+#      verify IGNORES the serve tail env vars (ICEGRES_TAIL_DIR/URL/QUORUM):
+#      a bare run on a writer host must never target the production tail.
 # ---------------------------------------------------------------------------
 log "(p7) icegres verify: dir + pg + quorum green, sabotaged tail caught"
 VF_TAIL="$E2E_DIR/verify-tail"
 rm -rf "$VF_TAIL"; mkdir -p "$VF_TAIL"
+
+# p7-0: tail env-var immunity — production writer hosts export
+# ICEGRES_TAIL_DIR/URL/QUORUM for `serve` (the Helm writer pod sets them);
+# a bare `icegres verify` there must NOT adopt them, because its first
+# scratch server's quorum election would fence the LIVE production writer.
+# All three are set to poisoned values here: had verify consumed any of
+# them it would either error on the clap tail-flag conflict, fail booting
+# against the dead endpoints (nonzero exit, backend != "none"), or create
+# a scratch dir under the poisoned ICEGRES_TAIL_DIR. Exit 0 + backend
+# "none" + a loud SKIP + no dir created proves the env vars were ignored
+# and no tail connection was even attempted.
+VF_ENV_DIR="$E2E_DIR/verify-env-poison"
+rm -rf "$VF_ENV_DIR"
+env ICEGRES_TAIL_DIR="$VF_ENV_DIR" \
+    ICEGRES_TAIL_URL="postgresql://nobody@127.0.0.1:1/poison" \
+    ICEGRES_TAIL_QUORUM="127.0.0.1:1,127.0.0.1:1,127.0.0.1:1" \
+    "$BIN" verify --suite durability --json >"$E2E_DIR/p7-env.json" 2>"$E2E_DIR/p7-env.err" \
+  || { cat "$E2E_DIR/p7-env.err" >&2; fail "bare verify with ICEGRES_TAIL_* set did not exit 0 — a tail env var was adopted"; }
+assert_eq "verify ignores ICEGRES_TAIL_*: backend none, durability SKIPs (0 pass/0 fail/1 skip)" "none|0|0|1|SKIP" \
+  "$(jq -r '[.backend, (.passed|tostring), (.failed|tostring), (.skipped|tostring), .checks[0].status] | join("|")' "$E2E_DIR/p7-env.json")"
+jq -r '.checks[0].detail' "$E2E_DIR/p7-env.json" | grep -q "no durable tail configured" \
+  || fail "the durability skip is not loud about the missing tail: $(jq -r '.checks[0].detail' "$E2E_DIR/p7-env.json")"
+[[ ! -e "$VF_ENV_DIR" ]] \
+  || fail "verify created scratch state under the env-named tail dir — ICEGRES_TAIL_DIR was adopted"
+pass "bare verify ignores the serve tail env vars (backend none, loud SKIP, no tail touched)"
 
 # p7-1: dir backend — durability/exactly-once/freshness run (4 checks),
 # fencing/failover SKIP loudly (no cross-writer identity on a local WAL).

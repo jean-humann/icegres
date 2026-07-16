@@ -112,15 +112,17 @@ use crate::tail::{
 };
 
 /// Schema every production tail lives in (tests pass their own throwaway
-/// schema through [`PgTail::open_with_schema`]).
-const DEFAULT_SCHEMA: &str = "icegres_tail";
+/// schema through [`PgTail::open_with_schema`]). `pub(crate)`: verify's
+/// ownership-checked cleanup names the same schema.
+pub(crate) const DEFAULT_SCHEMA: &str = "icegres_tail";
 
 /// First key of the two-int advisory lock (the second is derived from the
 /// schema name) — a constant tag so icegres tail locks can never collide
 /// with another application's advisory locks in a shared database. Kept
 /// within i32/oid range so the holder-diagnosis query can compare it
-/// against `pg_locks.classid` directly.
-const LOCK_CLASS: i32 = 0x1CE9_7A11;
+/// against `pg_locks.classid` directly. `pub(crate)`: verify's cleanup
+/// checks pg_locks for a live holder before dropping the schema.
+pub(crate) const LOCK_CLASS: i32 = 0x1CE9_7A11;
 
 /// One request to the worker thread; every variant carries its own reply
 /// channel (a std channel — the caller blocks on it for the round trip).
@@ -757,7 +759,7 @@ async fn open_connection(url: &str, schema: &str) -> Result<(Client, Sql, InitSt
 /// code (a wider key would break the pg_locks-diagnosable two-int shape);
 /// the refusal message already tells the operator to give each server its
 /// own schema or database.
-fn schema_lock_key(schema: &str) -> i32 {
+pub(crate) fn schema_lock_key(schema: &str) -> i32 {
     (crc32fast::hash(schema.as_bytes()) & 0x7fff_ffff) as i32
 }
 

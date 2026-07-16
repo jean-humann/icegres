@@ -412,21 +412,39 @@ enum Command {
     /// It never touches a running production server — but point it at
     /// DEDICATED tail resources (an unused tail dir/database/quorum): a
     /// second writer on a production tail is refused (pg) or would fence
-    /// the production writer (quorum). Runbook: docs/deployment.md.
+    /// the production writer (quorum). The tail backend is taken ONLY
+    /// from the flags below: the serve env vars (ICEGRES_TAIL_DIR /
+    /// ICEGRES_TAIL_URL / ICEGRES_TAIL_QUORUM) are deliberately IGNORED,
+    /// because on a writer host they name the LIVE production tail. With
+    /// no tail flag, the tail-backed suites SKIP loudly. Runbook:
+    /// docs/deployment.md §12.
     Verify {
+        // The catalog args (flattened below) keep their env bindings: the
+        // catalog is read-mostly and shared by design — verify only
+        // creates, tests, and drops its own icegres_verify_<nonce>
+        // namespace in it. The tail args deliberately carry NO env
+        // bindings: ICEGRES_TAIL_DIR/URL/QUORUM are exactly the variables
+        // a production writer host (e.g. the Helm writer pod) is
+        // configured with, and a bare `icegres verify` there must never
+        // silently adopt the live production tail — the first scratch
+        // server's quorum election would fence the production writer
+        // before any guard could run. Dedicated tail resources must be
+        // named explicitly on the command line.
         #[command(flatten)]
         catalog: CatalogOpts,
 
         /// Verify the local-WAL tail backend against this directory (a
         /// scratch subdirectory is created under it; the directory should
         /// be on the same filesystem/mount your production tail uses).
-        #[arg(long, env = "ICEGRES_TAIL_DIR")]
+        /// Flag only — ICEGRES_TAIL_DIR is ignored (see above).
+        #[arg(long)]
         tail_dir: Option<PathBuf>,
 
         /// Verify the Postgres tail backend against this database. It must
         /// NOT already carry an icegres_tail schema (i.e. use a dedicated
         /// verify database on the same instance, not the live tail).
-        #[arg(long, env = "ICEGRES_TAIL_URL", conflicts_with = "tail_dir")]
+        /// Flag only — ICEGRES_TAIL_URL is ignored (see above).
+        #[arg(long, conflicts_with = "tail_dir")]
         tail_url: Option<String>,
 
         /// Verify the quorum tail backend against these three icekeeperd
@@ -434,11 +452,8 @@ enum Command {
         /// EMPTY/dedicated: verify refuses (before writing anything) if its
         /// first scratch server replays foreign frames, and a live writer
         /// on this quorum WOULD be fenced by the verify run.
-        #[arg(
-            long,
-            env = "ICEGRES_TAIL_QUORUM",
-            conflicts_with_all = ["tail_dir", "tail_url"]
-        )]
+        /// Flag only — ICEGRES_TAIL_QUORUM is ignored (see above).
+        #[arg(long, conflicts_with_all = ["tail_dir", "tail_url"])]
         tail_quorum: Option<String>,
 
         /// Which suite to run: all, durability, exactly-once, fencing,
