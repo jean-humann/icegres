@@ -2336,7 +2336,7 @@ warmups discarded: 3, iterations: 20, cold-start runs: 5, demo.trips data files:
 
 ### Bench 20260716T121106Z
 
-Release binary `icegres/target/release/icegres` · raw: `bench/results/bench-20260716T121106Z.json` ·
+Release binary `icegres/target/release/icegres` · raw: withheld (ordering-confounded first pair, invalidated — see the P5+P7 drift note; superseded by the 121816/122051 paired run) ·
 warmups discarded: 3, iterations: 20, cold-start runs: 5, demo.trips data files: 1
 
 | metric | p50 | p95 | n / detail |
@@ -2373,7 +2373,7 @@ warmups discarded: 3, iterations: 20, cold-start runs: 5, demo.trips data files:
 
 ### Bench 20260716T121258Z
 
-Release binary `/tmp/claude-0/-home-user-icegres/5e800786-6af4-536d-92f8-1b93df45ac84/scratchpad/icegres-pre-p5p7` · raw: `bench/results/bench-20260716T121258Z.json` ·
+Release binary `/tmp/claude-0/-home-user-icegres/5e800786-6af4-536d-92f8-1b93df45ac84/scratchpad/icegres-pre-p5p7` · raw: withheld (ordering-confounded first pair, invalidated — see the P5+P7 drift note; superseded by the 121816/122051 paired run) ·
 warmups discarded: 3, iterations: 20, cold-start runs: 5, demo.trips data files: 1
 
 | metric | p50 | p95 | n / detail |
