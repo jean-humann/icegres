@@ -4,6 +4,9 @@
 //! and tables through DataFusion, and serves them over the Postgres wire
 //! protocol via datafusion-postgres.
 
+/// `AS OF` time-travel SQL sugar — raw-statement rewrite to the
+/// `table@snapshot` path (roadmap-v2 P5; see the module's dialect note).
+mod asof;
 mod authz;
 mod branch;
 mod buffer;
@@ -42,6 +45,10 @@ mod tailapi;
 mod timing;
 mod traced;
 mod txn;
+/// `icegres verify` — the operator-facing durability re-prover (roadmap-v2
+/// P7): re-runs the durability/exactly-once/fencing/freshness/failover
+/// proofs against the operator's OWN catalog/store/tail backend.
+mod verify;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -394,6 +401,81 @@ enum Command {
         #[command(subcommand)]
         cmd: MaintainCmd,
     },
+    /// Re-prove the durability claims against YOUR deployment (the harness,
+    /// productized): spawns its OWN scratch icegres servers against the
+    /// configured catalog + object store + tail backend, runs the kill -9 /
+    /// exactly-once / fencing / freshness / failover proofs inside a
+    /// dedicated scratch namespace (icegres_verify_<nonce>: created, tested,
+    /// dropped — refused if it pre-exists), and reports pass/fail per claim
+    /// with the doc section that makes the claim. Exit 0 iff every selected
+    /// check passes; checks whose backend is not configured SKIP loudly.
+    /// It never touches a running production server — but point it at
+    /// DEDICATED tail resources (an unused tail dir/database/quorum): a
+    /// second writer on a production tail is refused (pg) or would fence
+    /// the production writer (quorum). The tail backend is taken ONLY
+    /// from the flags below: the serve env vars (ICEGRES_TAIL_DIR /
+    /// ICEGRES_TAIL_URL / ICEGRES_TAIL_QUORUM) are deliberately IGNORED,
+    /// because on a writer host they name the LIVE production tail. With
+    /// no tail flag, the tail-backed suites SKIP loudly. Runbook:
+    /// docs/deployment.md §12.
+    Verify {
+        // The catalog args (flattened below) keep their env bindings: the
+        // catalog is read-mostly and shared by design — verify only
+        // creates, tests, and drops its own icegres_verify_<nonce>
+        // namespace in it. The tail args deliberately carry NO env
+        // bindings: ICEGRES_TAIL_DIR/URL/QUORUM are exactly the variables
+        // a production writer host (e.g. the Helm writer pod) is
+        // configured with, and a bare `icegres verify` there must never
+        // silently adopt the live production tail — the first scratch
+        // server's quorum election would fence the production writer
+        // before any guard could run. Dedicated tail resources must be
+        // named explicitly on the command line.
+        #[command(flatten)]
+        catalog: CatalogOpts,
+
+        /// Verify the local-WAL tail backend against this directory (a
+        /// scratch subdirectory is created under it; the directory should
+        /// be on the same filesystem/mount your production tail uses).
+        /// Flag only — ICEGRES_TAIL_DIR is ignored (see above).
+        #[arg(long)]
+        tail_dir: Option<PathBuf>,
+
+        /// Verify the Postgres tail backend against this database. It must
+        /// NOT already carry an icegres_tail schema (i.e. use a dedicated
+        /// verify database on the same instance, not the live tail).
+        /// Flag only — ICEGRES_TAIL_URL is ignored (see above).
+        #[arg(long, conflicts_with = "tail_dir")]
+        tail_url: Option<String>,
+
+        /// Verify the quorum tail backend against these three icekeeperd
+        /// acceptors (comma-separated host:port). The quorum log must be
+        /// EMPTY/dedicated: verify refuses (before writing anything) if its
+        /// first scratch server replays foreign frames, and a live writer
+        /// on this quorum WOULD be fenced by the verify run.
+        /// Flag only — ICEGRES_TAIL_QUORUM is ignored (see above).
+        #[arg(long, conflicts_with_all = ["tail_dir", "tail_url"])]
+        tail_quorum: Option<String>,
+
+        /// Which suite to run: all, durability, exactly-once, fencing,
+        /// freshness, or failover.
+        #[arg(long, default_value = "all")]
+        suite: String,
+
+        /// Bound (ms) the freshness suite verifies foreign-commit
+        /// visibility against (the scratch reader runs --freshness-ms with
+        /// this value).
+        #[arg(long, default_value_t = 500)]
+        freshness_ms: u64,
+
+        /// Keep the evidence directory (scratch-server logs, the JSON
+        /// report) at this path instead of deleting it on exit.
+        #[arg(long)]
+        keep_evidence: Option<PathBuf>,
+
+        /// Machine-readable JSON report on stdout instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Execute a single SQL statement locally (no server) and print results.
     Sql {
         #[command(flatten)]
@@ -472,6 +554,48 @@ enum BranchCmd {
         catalog: CatalogOpts,
         /// Branch name to drop everywhere (`main` is refused).
         name: String,
+    },
+    /// Compare two refs per table, metadata-only: fork point (snapshot-
+    /// lineage common ancestor), status (unchanged / advanced-a /
+    /// advanced-b / diverged / created / dropped), snapshot counts and
+    /// summary-reported row deltas per side, schema changes. Cheap: no
+    /// data is scanned.
+    Diff {
+        #[command(flatten)]
+        catalog: CatalogOpts,
+        /// First ref to compare (branch name or `main`).
+        a: String,
+        /// Second ref to compare (branch name or `main`).
+        b: String,
+        /// Narrow to one table (<table> or <namespace>.<table>) with
+        /// per-snapshot lineage detail.
+        #[arg(long)]
+        table: Option<String>,
+        /// Machine-readable JSON instead of the human report.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fast-forward-only merge of <from> into <to>: a table is eligible iff
+    /// <to> has NOT moved since the fork point, and the whole eligible set
+    /// commits as ONE atomic multi-table transaction with the observed
+    /// to/from heads pinned as requirements (a racing foreign commit aborts
+    /// the merge cleanly — nothing applied). Diverged tables refuse the
+    /// whole run with a per-table conflict report (icegres never three-way-
+    /// merges rows; rebase by re-branching, or narrow with --table).
+    /// Dry-run by default: prints the plan, commits nothing.
+    Merge {
+        #[command(flatten)]
+        catalog: CatalogOpts,
+        /// Merge source ref (branch name or `main`).
+        from: String,
+        /// Merge target ref (branch name or `main`).
+        to: String,
+        /// Narrow to one table (<table> or <namespace>.<table>).
+        #[arg(long)]
+        table: Option<String>,
+        /// Actually commit the fast-forwards (default: dry run).
+        #[arg(long)]
+        execute: bool,
     },
 }
 
@@ -559,24 +683,47 @@ enum MaintainCmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
     // Log format: ICEGRES_LOG_FORMAT=json emits structured JSON lines (for log
     // shippers/aggregators); anything else keeps the human-readable format.
+    // Commands whose stdout is a machine-readable document (verify's report,
+    // branch diff/merge --json) route logs to stderr — a stray INFO line
+    // (e.g. a tokio_postgres NOTICE) must never corrupt the JSON a consumer
+    // pipes into jq. Server/maintenance commands keep stdout logging.
+    let logs_to_stderr = matches!(
+        &cli.command,
+        Command::Verify { .. }
+            | Command::Branch {
+                cmd: BranchCmd::Diff { json: true, .. },
+                ..
+            }
+    );
     let env_filter = || {
         tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
     };
-    if std::env::var("ICEGRES_LOG_FORMAT").as_deref() == Ok("json") {
-        tracing_subscriber::fmt()
+    match (
+        std::env::var("ICEGRES_LOG_FORMAT").as_deref() == Ok("json"),
+        logs_to_stderr,
+    ) {
+        (true, true) => tracing_subscriber::fmt()
             .json()
             .with_env_filter(env_filter())
-            .init();
-    } else {
-        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .init(),
+        (true, false) => tracing_subscriber::fmt()
+            .json()
             .with_env_filter(env_filter())
-            .init();
+            .init(),
+        (false, true) => tracing_subscriber::fmt()
+            .with_env_filter(env_filter())
+            .with_writer(std::io::stderr)
+            .init(),
+        (false, false) => tracing_subscriber::fmt()
+            .with_env_filter(env_filter())
+            .init(),
     }
-
-    let cli = Cli::parse();
     match cli.command {
         Command::Serve {
             catalog,
@@ -670,6 +817,20 @@ async fn main() -> Result<()> {
             } => branch::drop(&catalog, &table, &name).await,
             BranchCmd::CreateAll { catalog, name } => branch::create_all(&catalog, &name).await,
             BranchCmd::DropAll { catalog, name } => branch::drop_all(&catalog, &name).await,
+            BranchCmd::Diff {
+                catalog,
+                a,
+                b,
+                table,
+                json,
+            } => branch::diff(&catalog, &a, &b, table.as_deref(), json).await,
+            BranchCmd::Merge {
+                catalog,
+                from,
+                to,
+                table,
+                execute,
+            } => branch::merge(&catalog, &from, &to, table.as_deref(), execute).await,
         },
         Command::Maintain { cmd } => match cmd {
             MaintainCmd::ExpireSnapshots {
@@ -695,6 +856,30 @@ async fn main() -> Result<()> {
                 execute,
             } => compact::run(&catalog, &table, target_file_mb, min_input_files, execute).await,
         },
+        Command::Verify {
+            catalog,
+            tail_dir,
+            tail_url,
+            tail_quorum,
+            suite,
+            freshness_ms,
+            keep_evidence,
+            json,
+        } => {
+            verify::run(
+                &catalog,
+                verify::VerifyOpts {
+                    tail_dir,
+                    tail_url,
+                    tail_quorum,
+                    suite,
+                    freshness_ms,
+                    keep_evidence,
+                    json,
+                },
+            )
+            .await
+        }
         Command::Sql {
             catalog,
             query,
@@ -1155,7 +1340,7 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
     let hooks = query_hooks(
         engine,
         txn_registry.clone(),
-        catalog,
+        catalog.clone(),
         write_buffer,
         serve_opts.enforce_pk,
         authorizer,
@@ -1170,6 +1355,7 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
     // transaction buffers would leak).
     ops::serve_custom(
         ctx,
+        catalog,
         host,
         port,
         serve_opts.idle_shutdown_secs,
@@ -1274,6 +1460,10 @@ fn query_hooks(
 
 async fn run_sql(opts: &CatalogOpts, query: &str, enforce_pk: bool) -> Result<()> {
     let catalog = context::connect_catalog(opts).await?;
+    // AS OF sugar (asof.rs): same raw-text rewrite the pgwire listener
+    // applies; statements without the exact syntax pass through untouched.
+    let rewritten = asof::rewrite_as_of(catalog.as_ref(), query).await?;
+    let query = rewritten.as_deref().unwrap_or(query);
     // UPDATE/DELETE take the same copy-on-write path as the server's wire
     // handler; everything else goes through DataFusion unchanged.
     if let Some(dml_stmt) = dml::parse_single_dml(query)? {

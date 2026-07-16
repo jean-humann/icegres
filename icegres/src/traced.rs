@@ -162,20 +162,39 @@ fn kind_of(sql: &str) -> &'static str {
 }
 
 /// Timing wrapper around `DfSessionService`. Same query behavior — it only
-/// delegates and measures. Placed in the handler factory in `ops.rs`.
+/// delegates and measures — plus the raw-SQL `AS OF` pre-rewrite (asof.rs):
+/// hooks only ever see PARSED statements, and `AS OF` is not part of the
+/// parser's grammar, so the rewrite has to happen here, on the raw text,
+/// before delegation. Statements without the exact sugar are untouched
+/// (one allocation-free scan). Placed in the handler factory in `ops.rs`.
 pub struct TracedService {
     inner: Arc<DfSessionService>,
+    /// `AS OF` sugar for the simple protocol; the extended protocol gets it
+    /// through [`crate::asof::AsOfParser`] below.
+    asof: Arc<crate::asof::AsOfRewriter>,
+    /// The extended-protocol parser with the same pre-rewrite, built once.
+    asof_parser: Arc<crate::asof::AsOfParser>,
     slow_ms: u64,
 }
 
 impl TracedService {
-    pub fn new(inner: Arc<DfSessionService>) -> Self {
+    pub fn new(inner: Arc<DfSessionService>, catalog: Arc<dyn iceberg::Catalog>) -> Self {
         // Slow-query threshold in ms; default 1000, `0` disables the WARN.
         let slow_ms = std::env::var("ICEGRES_SLOW_QUERY_MS")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(1000);
-        Self { inner, slow_ms }
+        let asof = Arc::new(crate::asof::AsOfRewriter::new(catalog));
+        let asof_parser = Arc::new(crate::asof::AsOfParser::new(
+            inner.query_parser(),
+            asof.clone(),
+        ));
+        Self {
+            inner,
+            asof,
+            asof_parser,
+            slow_ms,
+        }
     }
 }
 
@@ -188,6 +207,11 @@ impl SimpleQueryHandler for TracedService {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let _guard = QueryGuard::begin(kind_of(query), self.slow_ms);
+        // AS OF sugar (asof.rs): rewrite the raw text to table@snapshot when
+        // (and only when) the exact gated syntax is present.
+        if let Some(rewritten) = self.asof.rewrite(query).await? {
+            return SimpleQueryHandler::do_query(self.inner.as_ref(), client, &rewritten).await;
+        }
         SimpleQueryHandler::do_query(self.inner.as_ref(), client, query).await
     }
 }
@@ -197,10 +221,10 @@ impl ExtendedQueryHandler for TracedService {
     // Project the associated types through the public trait so the wrapper is
     // interchangeable with the inner service without naming private types.
     type Statement = <DfSessionService as ExtendedQueryHandler>::Statement;
-    type QueryParser = <DfSessionService as ExtendedQueryHandler>::QueryParser;
+    type QueryParser = crate::asof::AsOfParser;
 
     fn query_parser(&self) -> Arc<Self::QueryParser> {
-        self.inner.query_parser()
+        self.asof_parser.clone()
     }
 
     async fn do_query<C>(

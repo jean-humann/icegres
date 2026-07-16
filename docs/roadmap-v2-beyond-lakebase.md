@@ -114,6 +114,22 @@ The pitch — branch the lakehouse per PR, query it, diff it, merge or
 discard — is a workflow neither Lakebase (per-database, closed engine)
 nor bare Iceberg (no serving endpoint) delivers end to end.
 
+**Status (2026-07): SHIPPED** (scope: docs/p5p7-scope.md, one PR with P7).
+`icegres branch diff <a> <b> [--table] [--json]`: metadata-only per-table
+comparison — fork point by walking parent-snapshot-id chains to the common
+ancestor, unchanged/advanced/diverged/created/dropped statuses,
+summary-reported row deltas, field-id-matched schema add/drop/rename.
+`icegres branch merge <from> <to> [--table] [--execute]`: fast-forward
+ONLY (no three-way row merge, ever — documented in limitations.md); dry
+run by default; the whole eligible set commits as ONE atomic multi-table
+transaction with the observed to/from heads pinned as requirements, so an
+injected foreign commit 409s with nothing applied (e2e-proven); any
+diverged table refuses the whole run with a per-table conflict report.
+`AS OF TIMESTAMP '...'` / `AS OF <snapshot_id>` sugar rewrites — on the
+raw statement text, gated to that exact syntax — to the existing
+`table@snapshot` path on both pgwire protocols and `icegres sql`
+(dialect note in limitations.md; before-first-snapshot errors loudly).
+
 ### P6 — Prove it at 100×: the scale bench + serve-any-catalog
 1. **Scale bench**: extend `bench/compare` to ~500M rows on the dev box
    (still honest about single-node), publish where the interactive-band
@@ -130,6 +146,21 @@ exactly-once replay, freshness-bound checks — a pass/fail report of the
 claims that matter. No database vendor lets users re-prove the marketing
 locally; the harness already exists, this is packaging. Cheap, loud
 differentiation aligned with I4.
+
+**Status (2026-07): SHIPPED** (scope: docs/p5p7-scope.md, one PR with P5).
+`icegres verify [--tail-dir|--tail-url|--tail-quorum] [--suite ...]
+[--json] [--keep-evidence DIR]` spawns its OWN scratch servers (the
+current executable) against the operator's real catalog/store/tail,
+inside a dedicated `icegres_verify_<nonce>` namespace (refused if it
+pre-exists; created, tested, dropped on every exit path), and re-runs the
+tail_durability suites as library code: durable-ack kill -9 recovery,
+exactly-once watermark replay + sequence floor, stale-writer fencing
+(pg advisory lock / quorum term), the freshness bound, and quorum
+failover replay. Unconfigured backends SKIP loudly; each check names the
+claim and the doc section that makes it; exit 0 iff all selected pass.
+e2e-proven green for dir+pg+quorum AND proven to FAIL (nonzero, durability
+marked FAIL) against a sabotaged tail. Runbook: deployment.md §12;
+non-coverage (object-store durability itself, catalog HA): limitations.md.
 
 ## 2. Explicitly still refused (unchanged non-goals)
 Postgres extensions/full fidelity; an authoritative row tier; arbitrary-

@@ -610,6 +610,67 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
   tables, and non-immutable expressions (`now()`, `random()`, …) are never
   cached.
 
+## Branch diff / merge and `AS OF` (P5)
+
+- **`branch merge` is fast-forward ONLY — there is no three-way row merge,
+  ever, by design.** A table is merge-eligible iff the target ref has not
+  moved since the fork point; anything else is a per-table conflict report
+  and a refusal of the whole run (narrow with `--table` to merge the clean
+  tables). Merging rows that changed on both sides of a fork needs
+  application-level semantics an engine cannot invent; the honest workflow
+  is to rebase — drop the branch and re-branch from the target. The commit
+  pins the observed to/from heads as requirements, so a foreign commit
+  racing the merge aborts it with nothing applied (first-committer-wins);
+  a multi-table set additionally requires a catalog with
+  `transactions/commit` (Lakekeeper) — without it, merge one table at a
+  time. Operational rule, as with any Iceberg ref surgery: quiesce writers
+  committing to the target ref before merging into it (a buffering server
+  on the target will fail its next flush's ref assertion and retry —
+  nothing is lost, but do not make it race on purpose).
+- **`branch diff` is metadata-honest, which has three edges.** Row deltas
+  come from snapshot SUMMARY properties (`added-records`/`deleted-records`)
+  and are labeled *summary-reported* — they are what the committing engines
+  recorded, not a recount (snapshots missing the properties are counted and
+  surfaced, not guessed). The fork point is found by walking
+  parent-snapshot-id chains; if snapshot expiry removed the fork from
+  metadata the pair is reported *diverged* with the fork unknown, never
+  guessed. And Iceberg table **properties are table-scoped, not
+  branch-scoped** — both sides of a diff share them, so the PK/keyed-tail
+  properties shown in `--table` detail are context, not a delta.
+- **`AS OF` is dialect sugar, not Postgres syntax.** Stock Postgres (and
+  psql's parser) has no `FROM t AS OF ...`; the DuckDB/Databricks-style
+  form is rewritten on the RAW statement text — gated to exactly
+  `FROM/JOIN/, <table-or-ns.table> AS OF (TIMESTAMP '<literal>' |
+  <snapshot_id>)` — into the existing `"table@snapshot"` path, on both
+  pgwire protocols and `icegres sql` (NOT on Flight SQL: pass
+  `"t@<snapshot_id>"` there). Naive timestamps are read as UTC; the
+  timestamp resolves to the snapshot-log entry at/just-before the instant
+  (the log tracks the MAIN ref, so it answers "what did main serve at T");
+  a time before the table's first snapshot — or a snapshot expired out of
+  metadata — errors loudly. Three-part relation names (`cat.ns.t AS OF`)
+  are refused.
+
+## `icegres verify` (P7)
+
+- **verify re-proves the documented durability claims on the operator's
+  deployment; it does not prove everything.** Out of its reach by
+  construction: the object store's own durability (verify exercises the
+  catalog-commit path, not S3's replication), catalog HA, Kubernetes
+  scheduling/failover (deployment.md §11 covers that), multi-node network
+  partitions, and any timing as a *reference* number — the report's
+  timings are the box it ran on. Skipped checks are loud, never silent
+  passes: fencing needs a tail with a cross-process identity
+  (`--tail-url`/`--tail-quorum`), failover needs `--tail-quorum`.
+- **The tail resources handed to verify must be dedicated to the run.**
+  Enforced where possible: `--tail-dir` writes only a run-scoped
+  subdirectory; `--tail-url` refuses a database that already carries an
+  `icegres_tail` schema; `--tail-quorum` refuses — before writing
+  anything — if the first scratch server replays foreign frames from the
+  quorum log. Not detectable: a live production writer on the same quorum
+  that has no un-flushed frames at probe time — it WOULD be fenced by the
+  verify run, so point verify at dedicated or quiesced acceptors
+  (deployment.md §12).
+
 ## Transport / security
 
 - **Arrow Flight SQL TLS is in-process** (`flight-serve --tls-cert/--tls-key`),

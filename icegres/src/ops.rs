@@ -339,6 +339,9 @@ const IDLE_POLL: Duration = Duration::from_millis(250);
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_custom(
     ctx: Arc<SessionContext>,
+    // For the AS OF raw-SQL rewrite (asof.rs): snapshot resolution needs
+    // catalog metadata before the statement is parsed.
+    catalog: Arc<dyn iceberg::Catalog>,
     host: &str,
     port: u16,
     idle_secs: Option<u64>,
@@ -364,9 +367,10 @@ pub async fn serve_custom(
     );
 
     let factory = Arc::new(IcegresHandlerFactory {
-        service: Arc::new(crate::traced::TracedService::new(Arc::new(
-            DfSessionService::new_with_hooks(ctx, hooks),
-        ))),
+        service: Arc::new(crate::traced::TracedService::new(
+            Arc::new(DfSessionService::new_with_hooks(ctx, hooks)),
+            catalog,
+        )),
         auth,
         throttle: Arc::new(AuthThrottle::default()),
     });

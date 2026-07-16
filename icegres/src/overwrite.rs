@@ -314,6 +314,12 @@ impl OverwriteEngine {
         self.enforce_pk
     }
 
+    /// The connected catalog (metadata-only callers — branch diff/merge —
+    /// load tables through the same client the engine commits with).
+    pub fn catalog(&self) -> &Arc<dyn Catalog> {
+        &self.catalog
+    }
+
     /// The snapshot ref this engine commits to (`main` by default).
     pub fn branch(&self) -> &str {
         &self.branch
@@ -947,6 +953,79 @@ impl OverwriteEngine {
         }
     }
 
+    /// `icegres branch merge --execute`: fast-forward ref `to` to ref
+    /// `from`'s head on every planned table in ONE atomic multi-table
+    /// transaction. Each table's request pins BOTH observed heads —
+    /// `assert-ref-snapshot-id <to>=<to_head>` (the fast-forward
+    /// eligibility itself: `to` must still sit at the fork point) and
+    /// `assert-ref-snapshot-id <from>=<from_head>` (the merged state is
+    /// exactly the one the plan reported) — so a foreign commit racing the
+    /// merge on EITHER ref makes the whole transaction a clean 409 with
+    /// NOTHING applied (first-committer-wins; re-plan and retry). A single
+    /// planned table posts the identical request through the plain
+    /// per-table commit endpoint instead, so `--table` merges work against
+    /// catalogs without `transactions/commit`; multi-table sets require the
+    /// endpoint and error cleanly otherwise (never a partial fast-forward).
+    pub async fn merge_fast_forward_all(
+        &self,
+        from: &str,
+        to: &str,
+        moves: &[FastForwardMove],
+    ) -> Result<()> {
+        anyhow::ensure!(!moves.is_empty(), "no tables to merge");
+        let mut requests: Vec<CommitTableRequest> = Vec::with_capacity(moves.len());
+        for mv in moves {
+            requests.push(fast_forward_request(mv, from, to));
+        }
+        // Test-only race injection (same pattern as ICEGRES_DML_INJECT_CONFLICT):
+        // corrupt the pinned heads so the catalog's requirement check answers a
+        // REAL server-side 409 — proving the whole merge aborts cleanly when a
+        // foreign commit lands between plan and commit.
+        if std::env::var_os("ICEGRES_MERGE_INJECT_CONFLICT").is_some() {
+            for request in &mut requests {
+                corrupt_ref_requirement(request);
+            }
+            tracing::warn!(
+                "ICEGRES_MERGE_INJECT_CONFLICT set (test-only): sabotaging the merge's \
+                 pinned to/from heads to force a 409"
+            );
+        }
+        if let [request] = requests.as_slice() {
+            // One table: the plain requirement-checked commit endpoint carries
+            // the identical request (works on any REST catalog).
+            let ident = request
+                .identifier
+                .clone()
+                .expect("fast_forward_request always sets the identifier");
+            return match self
+                .post_commit(&ident.namespace().to_url_string(), ident.name(), request)
+                .await?
+            {
+                CommitOutcome::Committed => Ok(()),
+                CommitOutcome::Conflict(msg) => bail!(
+                    "branch {to:?} or {from:?} on {ident} moved between plan and commit \
+                     (a foreign commit won the race) — NOTHING was applied; re-run the \
+                     merge: {msg}"
+                ),
+            };
+        }
+        let refs: Vec<&CommitTableRequest> = requests.iter().collect();
+        match self.post_transaction(&refs).await? {
+            TxnCommitOutcome::Committed => Ok(()),
+            TxnCommitOutcome::Conflict(msg) => bail!(
+                "branch {to:?} or {from:?} moved on at least one table between plan and \
+                 commit (a foreign commit won the race) — the merge is all-or-nothing \
+                 and NOTHING was applied; re-run the merge: {msg}"
+            ),
+            TxnCommitOutcome::Unsupported => bail!(
+                "the catalog does not implement the multi-table transaction endpoint \
+                 ({TXN_COMMIT_ENDPOINT:?}), so a multi-table merge cannot commit \
+                 atomically; NOTHING was applied. Merge one table at a time instead: \
+                 icegres branch merge {from} {to} --table <ns.table> --execute"
+            ),
+        }
+    }
+
     /// Expire old snapshots of `ident`, keeping the newest `keep_last` by
     /// commit timestamp plus every snapshot that is still reachable from a
     /// branch/tag ref (so time-travel over live refs and the current head
@@ -1380,6 +1459,49 @@ fn remove_branch_ref_request(
         ],
         updates: vec![TableUpdate::RemoveSnapshotRef {
             ref_name: name.to_string(),
+        }],
+    }
+}
+
+/// One planned fast-forward ref move for `icegres branch merge` (branch.rs):
+/// point ref `to` at `from`'s observed head on this table, anchored at both
+/// observed heads so a racing foreign commit aborts the whole merge cleanly.
+#[derive(Debug, Clone)]
+pub struct FastForwardMove {
+    pub ident: TableIdent,
+    pub uuid: Uuid,
+    /// Head of the merge source (`from`) at plan time — the snapshot `to`
+    /// fast-forwards to.
+    pub from_head: i64,
+    /// Head of the merge target (`to`) at plan time. Eligibility means this
+    /// IS the fork point, and the commit asserts it is still current.
+    pub to_head: i64,
+}
+
+/// The fast-forward commit for one table of a merge: `set-snapshot-ref
+/// <to>=<from_head>`, guarded by `assert-table-uuid` plus BOTH observed
+/// heads (see [`OverwriteEngine::merge_fast_forward_all`]). Zero-copy: like
+/// every branch operation this moves a ref — no data file is touched.
+fn fast_forward_request(mv: &FastForwardMove, from: &str, to: &str) -> CommitTableRequest {
+    CommitTableRequest {
+        identifier: Some(mv.ident.clone()),
+        requirements: vec![
+            TableRequirement::UuidMatch { uuid: mv.uuid },
+            TableRequirement::RefSnapshotIdMatch {
+                r#ref: to.to_string(),
+                snapshot_id: Some(mv.to_head),
+            },
+            TableRequirement::RefSnapshotIdMatch {
+                r#ref: from.to_string(),
+                snapshot_id: Some(mv.from_head),
+            },
+        ],
+        updates: vec![TableUpdate::SetSnapshotRef {
+            ref_name: to.to_string(),
+            reference: SnapshotReference::new(
+                mv.from_head,
+                SnapshotRetention::branch(None, None, None),
+            ),
         }],
     }
 }

@@ -596,3 +596,69 @@ kubectl -n icegres get statefulset icegres-writer   # replicas 0
 
 kind delete cluster --name icegres
 ```
+
+## 12. `icegres verify` — re-prove the durability claims on YOUR deployment
+
+The claims this repo makes about buffered-write durability are proven in
+CI by `icegres/tests/tail_durability.sh` — on our box. `icegres verify`
+re-proves them against *your* deployment: your catalog, your object
+store, your tail backend, your disks. Run it **after install** and
+**after any infrastructure change** that touches the durability path (new
+tail backend, moved tail database, replaced acceptors, storage-class or
+filesystem changes, kernel/fsync-behavior updates).
+
+```sh
+# local WAL tail: durability + exactly-once + freshness
+# (fencing/failover SKIP: a local WAL has no cross-writer identity)
+icegres verify --tail-dir /var/lib/icegres/verify-tail
+
+# Postgres tail: adds one-writer fencing (advisory lock).
+# Use a DEDICATED, EMPTY database on the same instance as your real tail —
+# verify REFUSES a database that already carries an icegres_tail schema.
+icegres verify --tail-url postgresql://user:pw@tail-host:5432/icegres_verify
+
+# quorum tail: the full matrix incl. failover. DEDICATED acceptors only:
+# verify refuses (before writing anything) if the quorum log already
+# carries foreign frames, and a live writer on the same quorum WOULD be
+# fenced by the run.
+icegres verify --tail-quorum k1:5471,k2:5471,k3:5471
+
+# one suite, machine-readable report, keep the evidence for support
+icegres verify --suite exactly-once --json --keep-evidence /tmp/evidence
+```
+
+Unlike `icegres serve`, verify takes its tail backend **only from the
+command line**: the `ICEGRES_TAIL_DIR` / `ICEGRES_TAIL_URL` /
+`ICEGRES_TAIL_QUORUM` environment variables are **ignored**. Production
+writer hosts carry exactly those variables (the Helm writer pod sets
+them), and running verify on a writer host must never silently target the
+production tail — a bare `icegres verify` that adopted them would fence
+the live quorum writer with its first scratch server's election. Without
+a tail flag, the tail-backed suites SKIP loudly instead. Runbook rule:
+**always name the dedicated verify backend explicitly** with `--tail-dir`
+/ `--tail-url` / `--tail-quorum`, as in the examples above. (The catalog
+flags keep their env bindings: the catalog is read-mostly and shared by
+design — verify only creates, tests, and drops its own scratch
+namespace in it.)
+
+What it does, mechanically: creates a dedicated scratch namespace
+`icegres_verify_<nonce>` (refused if it pre-exists; dropped — with its
+tables purged — on every exit path, including Ctrl-C), spawns its own
+scratch `icegres serve` processes against your catalog flags, drives them
+over pgwire, and SIGKILLs *only those children* exactly like the CI
+harness does. Suites: `durability` (acked rows survive kill -9 via tail
+replay), `exactly-once` (watermark replay + post-flush sequence floor),
+`fencing` (a second writer on the same tail identity is excluded),
+`freshness` (a foreign commit becomes visible within `--freshness-ms` +
+one refresh round trip), `failover` (a replacement writer on the quorum
+fences and replays). Every check names the claim it re-proves and the doc
+section that makes the claim; exit code 0 iff all selected checks pass;
+checks whose backend is not configured **SKIP loudly** — never a silent
+pass. Timings in the report are your box's, not a reference number.
+
+What it does NOT cover (see also `docs/limitations.md`): the object
+store's own durability, catalog HA, Kubernetes scheduling/failover (use
+the §11 runbook for that), and it never touches a running production
+server — but the tail resources you point it at must be dedicated to the
+run (that is enforced where possible, refused loudly where it can be
+detected, and documented here where it cannot: quorum).
