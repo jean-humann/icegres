@@ -11,10 +11,13 @@
 version = 2
 # A yanked crate on the graph fails the gate.
 yanked = "deny"
-# The five advisories below are KNOWN-ACCEPTED, pending a pinned-matrix bump —
-# every one is transitive through the pinned dependency matrix (see
-# README.md "Architecture notes") with no in-pin upgrade, and the matrix is
-# out of scope to bump here. Each is ignored with a reason.
+# The five advisories below are KNOWN-ACCEPTED, pending a pinned-matrix bump.
+# None can be cleared from the graph without moving the pinned dependency
+# matrix (see README.md "Architecture notes"), and the matrix is out of scope
+# to bump here. Most arrive purely transitively; rustls-pemfile is also a
+# direct dependency (Cargo.toml) but is still pulled by datafusion-postgres,
+# so removing our direct edge would not clear it either. Each is ignored with
+# a reason (direct vs. transitive noted inline).
 ignore = [
   # Unmaintained (build-time / thin-wrapper, not a vulnerability):
   "RUSTSEC-2025-0134", # rustls-pemfile 2.2.0 unmaintained — thin wrapper over rustls-pki-types (direct dep + via datafusion-postgres)
@@ -22,7 +25,7 @@ ignore = [
   # Vulnerabilities (DoS-class, reachable only on semi-trusted paths):
   "RUSTSEC-2026-0194", # quick-xml 0.38.4 quadratic attr-check DoS — via opendal 0.55.0 S3 XML (semi-trusted object store); see docs/limitations.md
   "RUSTSEC-2026-0195", # quick-xml 0.38.4 unbounded namespace-decl alloc DoS — same opendal S3 XML path
-  "RUSTSEC-2026-0204", # crossbeam invalid-ptr deref in the Debug/fmt::Pointer impl — transitive via datafusion/tokio; not on a normal reachable path
+  "RUSTSEC-2026-0204", # crossbeam invalid-ptr deref in the Debug/fmt::Pointer impl — transitive via moka/dashmap (crossbeam-channel); not on a normal reachable path
 ]
 
 [licenses]
