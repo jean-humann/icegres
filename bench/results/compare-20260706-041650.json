@@ -1,0 +1,120 @@
+{
+  "engines": {
+    "icegres": {
+      "meta": {
+        "engine": "icegres",
+        "engine_version": "PostgreSQL 16.6 (icegres 0.1.0) on x86_64-pc-linux-gnu, Apache DataFusion 52.5.0",
+        "iterations": 15,
+        "result_row_counts": {
+          "q1_point_lookup_ms": 1,
+          "q2_filtered_scan_ms": 3,
+          "q3_aggregate_ms": 20,
+          "q4_join_ms": 15,
+          "q5_big_scan_agg_ms": 20,
+          "q6_big_filter_count_ms": 1,
+          "q7_big_selective_ms": 101
+        },
+        "table_prefix": "demo",
+        "timestamp": "2026-07-06T04:16:50+00:00",
+        "warmup": 3
+      },
+      "metrics": {
+        "connect_ms": {
+          "max": 20.23,
+          "min": 1.0,
+          "n": 10,
+          "p50": 1.11,
+          "p95": 20.23
+        },
+        "q1_point_lookup_ms": {
+          "max": 7.34,
+          "min": 6.28,
+          "n": 15,
+          "p50": 6.78,
+          "p95": 7.12
+        },
+        "q2_filtered_scan_ms": {
+          "max": 6.82,
+          "min": 6.16,
+          "n": 15,
+          "p50": 6.53,
+          "p95": 6.76
+        },
+        "q3_aggregate_ms": {
+          "max": 7.17,
+          "min": 6.2,
+          "n": 15,
+          "p50": 6.43,
+          "p95": 6.96
+        },
+        "q4_join_ms": {
+          "max": 15.61,
+          "min": 8.85,
+          "n": 15,
+          "p50": 9.06,
+          "p95": 9.32
+        },
+        "q5_big_scan_agg_ms": {
+          "max": 380.56,
+          "min": 332.22,
+          "n": 15,
+          "p50": 352.29,
+          "p95": 368.76
+        },
+        "q6_big_filter_count_ms": {
+          "max": 251.1,
+          "min": 238.01,
+          "n": 15,
+          "p50": 244.96,
+          "p95": 249.34
+        },
+        "q7_big_selective_ms": {
+          "max": 60.16,
+          "min": 46.48,
+          "n": 15,
+          "p50": 49.22,
+          "p95": 52.69
+        },
+        "qps_8way": {
+          "elapsed_s": 10.19,
+          "errors": [],
+          "qps": 52.2,
+          "threads": 8,
+          "total_queries": 532
+        },
+        "rss_peak_mb": {
+          "value": 220.7
+        },
+        "startup_ms": {
+          "value": 256
+        }
+      }
+    }
+  },
+  "meta": {
+    "connect_ms": "fresh connection + SELECT 1 round trip",
+    "cpus": 4,
+    "datasets": {
+      "demo.cities": {
+        "bytes": 1887,
+        "files": 1,
+        "rows": 20
+      },
+      "demo.trips": {
+        "bytes": 12533,
+        "files": 1,
+        "rows": 280
+      },
+      "demo.trips_big": {
+        "bytes": 71210654,
+        "files": 10,
+        "rows": 5000000
+      }
+    },
+    "host": "vm",
+    "python": "3.11.15",
+    "qps_8way": "8 threads x 10s mixed reads (q1_point_lookup_ms, q2_filtered_scan_ms, q3_aggregate_ms, q4_join_ms, q6_big_filter_count_ms, q7_big_selective_ms)",
+    "timestamp": "2026-07-06T04:16:50+00:00",
+    "timing": "perf_counter around execute + full fetchall; 3 warmup discarded, p50/p95 over timed iterations"
+  }
+}

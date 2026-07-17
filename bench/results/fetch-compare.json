@@ -1,0 +1,256 @@
+{
+  "sizes": [
+    5000,
+    50000,
+    500000,
+    5000000
+  ],
+  "reps": {
+    "5000": [
+      5,
+      2
+    ],
+    "50000": [
+      5,
+      2
+    ],
+    "500000": [
+      5,
+      1
+    ],
+    "5000000": [
+      3,
+      1
+    ]
+  },
+  "tables": {
+    "trips_big": 5,
+    "wide15": 15
+  },
+  "results": {
+    "trips_big": {
+      "pgwire (psycopg2)": {
+        "5000": {
+          "fetch_arrow_ms": 68.9,
+          "fetch_pandas_ms": 77.3,
+          "rows": 5000
+        },
+        "50000": {
+          "fetch_arrow_ms": 280.3,
+          "fetch_pandas_ms": 252.9,
+          "rows": 50000
+        },
+        "500000": {
+          "fetch_arrow_ms": 1534.3,
+          "fetch_pandas_ms": 1351.4,
+          "rows": 500000
+        },
+        "5000000": {
+          "fetch_arrow_ms": 14488.1,
+          "fetch_pandas_ms": 11519.4,
+          "rows": 5000000
+        }
+      },
+      "ODBC (psqlODBC)": {
+        "5000": {
+          "fetch_arrow_ms": 76.7,
+          "fetch_pandas_ms": 105.7,
+          "rows": 5000
+        },
+        "50000": {
+          "fetch_arrow_ms": 323.5,
+          "fetch_pandas_ms": 369.4,
+          "rows": 50000
+        },
+        "500000": {
+          "fetch_arrow_ms": 2112.3,
+          "fetch_pandas_ms": 2034.9,
+          "rows": 500000
+        },
+        "5000000": {
+          "fetch_arrow_ms": 21724.7,
+          "fetch_pandas_ms": 19042.0,
+          "rows": 5000000
+        }
+      },
+      "ADBC (Flight SQL)": {
+        "5000": {
+          "fetch_arrow_ms": 156.1,
+          "fetch_pandas_ms": 152.9,
+          "rows": 5000
+        },
+        "50000": {
+          "fetch_arrow_ms": 263.5,
+          "fetch_pandas_ms": 311.4,
+          "rows": 50000
+        },
+        "500000": {
+          "fetch_arrow_ms": 358.2,
+          "fetch_pandas_ms": 347.6,
+          "rows": 500000
+        },
+        "5000000": {
+          "fetch_arrow_ms": 997.1,
+          "fetch_pandas_ms": 959.2,
+          "rows": 5000000
+        }
+      },
+      "ADBC (postgres/COPY)": {
+        "5000": {
+          "fetch_arrow_ms": 68.6,
+          "fetch_pandas_ms": 85.0,
+          "rows": 5000
+        },
+        "50000": {
+          "fetch_arrow_ms": 168.0,
+          "fetch_pandas_ms": 196.0,
+          "rows": 50000
+        },
+        "500000": {
+          "fetch_arrow_ms": 492.5,
+          "fetch_pandas_ms": 507.3,
+          "rows": 500000
+        },
+        "5000000": {
+          "fetch_arrow_ms": 3143.3,
+          "fetch_pandas_ms": 3185.3,
+          "rows": 5000000
+        }
+      },
+      "DuckDB (iceberg parquet)": {
+        "5000": {
+          "fetch_arrow_ms": 11.3,
+          "fetch_pandas_ms": 11.9,
+          "rows": 5000
+        },
+        "50000": {
+          "fetch_arrow_ms": 19.8,
+          "fetch_pandas_ms": 24.0,
+          "rows": 50000
+        },
+        "500000": {
+          "fetch_arrow_ms": 130.5,
+          "fetch_pandas_ms": 172.4,
+          "rows": 500000
+        },
+        "5000000": {
+          "fetch_arrow_ms": 411.8,
+          "fetch_pandas_ms": 1047.3,
+          "rows": 5000000
+        }
+      }
+    },
+    "wide15": {
+      "pgwire (psycopg2)": {
+        "5000": {
+          "fetch_arrow_ms": 82.3,
+          "fetch_pandas_ms": 88.5,
+          "rows": 5000
+        },
+        "50000": {
+          "fetch_arrow_ms": 298.0,
+          "fetch_pandas_ms": 294.3,
+          "rows": 50000
+        },
+        "500000": {
+          "fetch_arrow_ms": 2974.1,
+          "fetch_pandas_ms": 2630.9,
+          "rows": 500000
+        },
+        "5000000": {
+          "fetch_arrow_ms": 30644.8,
+          "fetch_pandas_ms": 26222.4,
+          "rows": 5000000
+        }
+      },
+      "ODBC (psqlODBC)": {
+        "5000": {
+          "fetch_arrow_ms": 84.2,
+          "fetch_pandas_ms": 83.5,
+          "rows": 5000
+        },
+        "50000": {
+          "fetch_arrow_ms": 376.7,
+          "fetch_pandas_ms": 400.3,
+          "rows": 50000
+        },
+        "500000": {
+          "fetch_arrow_ms": 3570.3,
+          "fetch_pandas_ms": 3643.1,
+          "rows": 500000
+        },
+        "5000000": {
+          "fetch_arrow_ms": 38758.8,
+          "fetch_pandas_ms": 38768.7,
+          "rows": 5000000
+        }
+      },
+      "ADBC (Flight SQL)": {
+        "5000": {
+          "fetch_arrow_ms": 114.6,
+          "fetch_pandas_ms": 116.2,
+          "rows": 5000
+        },
+        "50000": {
+          "fetch_arrow_ms": 184.7,
+          "fetch_pandas_ms": 181.0,
+          "rows": 50000
+        },
+        "500000": {
+          "fetch_arrow_ms": 364.9,
+          "fetch_pandas_ms": 395.1,
+          "rows": 500000
+        },
+        "5000000": {
+          "fetch_arrow_ms": 2320.9,
+          "fetch_pandas_ms": 2367.3,
+          "rows": 5000000
+        }
+      },
+      "ADBC (postgres/COPY)": {
+        "5000": {
+          "fetch_arrow_ms": 64.2,
+          "fetch_pandas_ms": 69.0,
+          "rows": 5000
+        },
+        "50000": {
+          "fetch_arrow_ms": 144.6,
+          "fetch_pandas_ms": 150.8,
+          "rows": 50000
+        },
+        "500000": {
+          "fetch_arrow_ms": 650.7,
+          "fetch_pandas_ms": 666.9,
+          "rows": 500000
+        },
+        "5000000": {
+          "fetch_arrow_ms": 5973.7,
+          "fetch_pandas_ms": 6081.6,
+          "rows": 5000000
+        }
+      },
+      "DuckDB (iceberg parquet)": {
+        "5000": {
+          "fetch_arrow_ms": 9.2,
+          "fetch_pandas_ms": 13.3,
+          "rows": 5000
+        },
+        "50000": {
+          "fetch_arrow_ms": 19.8,
+          "fetch_pandas_ms": 32.2,
+          "rows": 50000
+        },
+        "500000": {
+          "fetch_arrow_ms": 137.3,
+          "fetch_pandas_ms": 347.3,
+          "rows": 500000
+        },
+        "5000000": {
+          "fetch_arrow_ms": 919.7,
+          "fetch_pandas_ms": 3985.7,
+          "rows": 5000000
+        }
+      }
+    }
+  }
+}

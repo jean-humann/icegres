@@ -1,0 +1,55 @@
+{
+  "meta": {
+    "counted_rows": 5000000,
+    "engine_version": "PostgreSQL 16.6 (icegres 0.1.0) on x86_64-pc-linux-gnu, Apache DataFusion 52.5.0",
+    "timestamp": "2026-07-16T14:18:06+00:00"
+  },
+  "metrics": {
+    "filtered_count_ms": {
+      "class": "scan_bound",
+      "eff_rows_per_s": 28628686,
+      "max": 192.1,
+      "min": 168.25,
+      "n": 15,
+      "p50": 174.65,
+      "p95": 182.88,
+      "result_rows": 1
+    },
+    "full_agg_ms": {
+      "class": "scan_bound",
+      "eff_rows_per_s": 24191988,
+      "max": 233.36,
+      "min": 188.94,
+      "n": 15,
+      "p50": 206.68,
+      "p95": 227.43,
+      "result_rows": 20
+    },
+    "point_lookup_ms": {
+      "class": "interactive",
+      "eff_rows_per_s": 102438025,
+      "max": 68.44,
+      "min": 45.7,
+      "n": 15,
+      "p50": 48.81,
+      "p95": 55.32,
+      "result_rows": 1
+    },
+    "rss_peak_mb": {
+      "value": 244.6
+    },
+    "selective_join_ms": {
+      "class": "interactive",
+      "eff_rows_per_s": 124937531,
+      "max": 47.53,
+      "min": 37.41,
+      "n": 15,
+      "p50": 40.02,
+      "p95": 43.89,
+      "result_rows": 14
+    }
+  },
+  "rows": 5000000,
+  "size_label": "5M",
+  "table": "demo.trips_scale"
+}

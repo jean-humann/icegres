@@ -1,0 +1,102 @@
+{
+  "cold_start_runs": 5,
+  "host": "127.0.0.1",
+  "iterations": 20,
+  "metrics": {
+    "aggregate_ms": {
+      "max": 6.69,
+      "min": 5.71,
+      "n": 20,
+      "p50": 5.94,
+      "p95": 6.25
+    },
+    "binary_size_mb": {
+      "value": 120.01
+    },
+    "cold_start_ms": {
+      "max": 45.45,
+      "min": 23.65,
+      "n": 5,
+      "p50": 44.03,
+      "p95": 45.22
+    },
+    "connect_ms": {
+      "max": 0.29,
+      "min": 0.18,
+      "n": 20,
+      "p50": 0.19,
+      "p95": 0.23
+    },
+    "filtered_scan_ms": {
+      "max": 6.42,
+      "min": 5.42,
+      "n": 20,
+      "p50": 5.6,
+      "p95": 5.79
+    },
+    "freshness_ms": {
+      "max": 65.99,
+      "min": 51.39,
+      "n": 20,
+      "p50": 59.03,
+      "p95": 64.22
+    },
+    "insert_batch100_ms": {
+      "max": 100.1,
+      "min": 71.59,
+      "n": 20,
+      "p50": 85.17,
+      "p95": 95.66
+    },
+    "insert_single_ms": {
+      "max": 78.66,
+      "min": 34.85,
+      "n": 20,
+      "p50": 48.79,
+      "p95": 59.85
+    },
+    "join_ms": {
+      "max": 9.06,
+      "min": 8.14,
+      "n": 20,
+      "p50": 8.41,
+      "p95": 9.06
+    },
+    "point_lookup_ms": {
+      "max": 6.25,
+      "min": 5.63,
+      "n": 20,
+      "p50": 5.79,
+      "p95": 6.2
+    },
+    "qps_8conn": {
+      "aggregation": "median of 3 consecutive windows",
+      "connections": 8,
+      "value": 448.9,
+      "window_s": 10,
+      "windows": [
+        457.0,
+        445.8,
+        448.9
+      ]
+    },
+    "rss_after_load_mb": {
+      "value": 92.36
+    },
+    "rss_idle_mb": {
+      "value": 76.15
+    },
+    "rss_peak_mb": {
+      "interval_ms": 100,
+      "qps_window_peak_mb": 90.3,
+      "samples": 400,
+      "value": 92.36
+    }
+  },
+  "port": 5439,
+  "schema": "icegres-bench-v1",
+  "server_bin": "/home/user/jean-humann/icegres/target/release/icegres",
+  "unix_ts": 1783281479,
+  "warmup_discarded": 3,
+  "trips_data_files": 1
+}

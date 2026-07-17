@@ -1,0 +1,194 @@
+{
+  "schema": "icegres-parity-v1",
+  "ts": "20260706T005652Z",
+  "binary": "/home/user/jean-humann/icegres/target/release/icegres",
+  "summary": {
+    "PASS": 25,
+    "GAP": 0,
+    "NA_BY_DESIGN": 1
+  },
+  "probes": [
+    {
+      "id": "A1",
+      "area": "wire",
+      "behavior": "psql connects, simple query protocol",
+      "verdict": "PASS",
+      "evidence": "psql -c 'select 1' over a fresh connection returned: 1"
+    },
+    {
+      "id": "A2",
+      "area": "wire",
+      "behavior": "extended protocol / parameterized statements",
+      "verdict": "PASS",
+      "evidence": "psql \\bind 42 + 'where trip_id = $1' (extended query protocol) returned: 42|Brussels"
+    },
+    {
+      "id": "A3",
+      "area": "wire",
+      "behavior": "\\dt / pg_catalog introspection",
+      "verdict": "PASS",
+      "evidence": "\\dt demo.* lists trips and cities (plus $snapshots/$manifests metadata tables): demo|cities|table|postgres demo|cities$manifests|table|postgres demo|cities$snapshots|table|postgres demo|trips|table|postgres demo|trips$manifests|table|postgres demo|trips$snapshots|table|postgres"
+    },
+    {
+      "id": "A4",
+      "area": "wire",
+      "behavior": "information_schema",
+      "verdict": "PASS",
+      "evidence": "information_schema.tables for schema demo returned: cities cities$manifests cities$snapshots trips trips$manifests trips$snapshots"
+    },
+    {
+      "id": "A5",
+      "area": "wire",
+      "behavior": "multiple concurrent connections",
+      "verdict": "PASS",
+      "evidence": "8 parallel psql SELECT count(*) connections all succeeded (8/8 identical results: 343)"
+    },
+    {
+      "id": "A6",
+      "area": "wire",
+      "behavior": "server-side auth",
+      "verdict": "PASS",
+      "evidence": "--auth-file (SCRAM-SHA-256, hashed-at-rest): right password accepted (select 1 -> 1); wrong password rejected (psql: error: connection to server at \"127.0.0.1\", port 5447 failed: FATAL: Password authentication failed for user \"\" connection to server at \"127.0.0.1\", port 5447 failed: FATAL: Password authentication failed for user \"\"); unknown user rejected (psql: error: connection to server at \"127.0.0.1\", port 5447 failed: FATAL: password authentication failed for user \"not_a_real_user\" connection to server at \"127.0.0.1\", port 5447 failed: FATAL: password authentication failed for user \"not_a_real_user\"). Servers without --auth-file stay permissive and log a startup WARN."
+    },
+    {
+      "id": "A7",
+      "area": "wire",
+      "behavior": "TLS",
+      "verdict": "PASS",
+      "evidence": "--tls-cert/--tls-key (rustls; boot fails hard on bad cert/key, no plaintext fallback): sslmode=require -> 1; openssl s_client -starttls postgres handshake: TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384; sslmode=verify-full against the pinned dev cert -> 1. Plaintext startup is still accepted on the same listener (upstream/stock-Postgres behavior) — clients enforce encryption via sslmode."
+    },
+    {
+      "id": "B1",
+      "area": "oltp",
+      "behavior": "INSERT via wire, durable",
+      "verdict": "PASS",
+      "evidence": "INSERT trip_id=900271 returned tag 'INSERT 0 1'; row read back over a NEW connection: 900271|Parity B1"
+    },
+    {
+      "id": "B2",
+      "area": "oltp",
+      "behavior": "UPDATE",
+      "verdict": "PASS",
+      "evidence": "UPDATE trip_id=900271 returned tag 'UPDATE 1'; new fare read back over a NEW connection: 99.9 (copy-on-write: only the Parquet file holding the row is rewritten, all other files are reused in the new Iceberg snapshot)"
+    },
+    {
+      "id": "B3",
+      "area": "oltp",
+      "behavior": "DELETE",
+      "verdict": "PASS",
+      "evidence": "DELETE trip_id=900272 returned tag 'DELETE 1'; count over a NEW connection afterwards: 0; time travel intact: pre-delete snapshot 523065517279976011 still serves the row (count=1)"
+    },
+    {
+      "id": "B4",
+      "area": "oltp",
+      "behavior": "explicit transactions BEGIN/COMMIT/ROLLBACK",
+      "verdict": "PASS",
+      "evidence": "real transactions: ROLLBACK undid the INSERT (row 900273 absent afterwards; the row WAS visible inside the txn: 'BEGIN INSERT 0 1 count(*) ---------- 1 (1 row) ROLLBACK'); a 2-statement txn (INSERT + UPDATE) COMMITted atomically as one Iceberg snapshot (row 900274|fare=77.0 from a new connection: 'BEGIN INSERT 0 1 UPDATE 1 COMMIT'). Reads inside a txn are snapshot-pinned per table (snapshot isolation, first-committer-wins 40001 on conflict — proven in e2e (j))."
+    },
+    {
+      "id": "B5",
+      "area": "oltp",
+      "behavior": "PK/constraint enforcement",
+      "verdict": "PASS",
+      "evidence": "--enforce-pk + table property icegres.primary-key=id: first insert accepted ('INSERT 0 1'); duplicate rejected with 23505 (ERROR: duplicate key value violates unique constraint \"parity_pk_pkey\": key (id) = (1) is not unique); NULL key rejected with 23502 (ERROR: null value in column(s) (id) of relation \"parity_pk\" violates not-null constraint (primary key, 1 row(s))); table holds 1 row. Checks run against the snapshot each commit anchors to (409 retry re-validates), so racing duplicates cannot both land. Default is OFF (documented cost: reads key columns of every live file per write)."
+    },
+    {
+      "id": "C1",
+      "area": "lakehouse",
+      "behavior": "data in open format, other engines can read",
+      "verdict": "PASS",
+      "evidence": "independent reader pyiceberg 0.11.1 read demo.trips via the REST catalog + S3: 345 rows == server's count(345)"
+    },
+    {
+      "id": "C2",
+      "area": "lakehouse",
+      "behavior": "catalog registration (REST)",
+      "verdict": "PASS",
+      "evidence": "Lakekeeper GET /v1/563d3f92-7884-11f1-ab2a-cba89bbcc662/namespaces/demo/tables lists: [\"cities\",\"trips\"]"
+    },
+    {
+      "id": "C3",
+      "area": "lakehouse",
+      "behavior": "CDC Postgres->Iceberg",
+      "verdict": "NA_BY_DESIGN",
+      "evidence": "Moonlink exists to replicate Postgres heap data into Iceberg; icegres data is born in Iceberg (INSERT via wire commits an Iceberg snapshot directly, verified by B1+C1) — there is no second copy to synchronize."
+    },
+    {
+      "id": "C4",
+      "area": "lakehouse",
+      "behavior": "write freshness (commit -> readable elsewhere)",
+      "verdict": "PASS",
+      "evidence": "row committed via conn A was readable from a new connection ~69ms after commit (coarse; includes psql startup — precise p50/p95 is bench freshness_ms). Moonlink bar: sub-second. Additionally: buffered mode (--write-buffer-ms 100, opt-in; default 0 = synchronous): INSERT acked from the in-memory buffer was readable from a NEW connection on the same server after ~73ms (union read — no wait for the Iceberg commit; precise p50/p95 is bench insert_single_buffered_ms/freshness_buffered_ms; cross-server freshness = flush cadence, unclean-kill loss window <= 100ms, WARNed at startup)."
+    },
+    {
+      "id": "C5",
+      "area": "lakehouse",
+      "behavior": "Iceberg metadata surfaces",
+      "verdict": "PASS",
+      "evidence": "demo.\"trips$snapshots\" queryable (43 snapshots listed; $manifests also works). Caveats: 'select *' fails on the Map-typed summary column (ERROR: Unsupported Datatype Map(\"key_value\": non-null Struct(\"key\": non-null Utf8, metadata: {\"PARQUET:field_id\": \"7\"}, \"value\": Utf8, metadata: {\"PARQUET:field_id\": \"8\"}), unsorted)) and count(*) hits a DataFusion logical/physical schema mismatch — column projections work."
+    },
+    {
+      "id": "D1",
+      "area": "elasticity",
+      "behavior": "stateless compute: restart durability",
+      "verdict": "PASS",
+      "evidence": "killed and restarted the :5440 compute: row count identical before/after (346), wire-inserted row trip_id=900271 intact — all state lives in Iceberg/RustFS, none in the process."
+    },
+    {
+      "id": "D2",
+      "area": "elasticity",
+      "behavior": "multiple stateless computes on shared storage",
+      "verdict": "PASS",
+      "evidence": "second 'icegres serve' on :5440 (same catalog, started before the write) returned identical count (346) and served row trip_id=900271 committed via :5439 after both computes started (visible on first poll, 51ms; each query reloads table metadata from the REST catalog, so no staleness window was observed)."
+    },
+    {
+      "id": "D3",
+      "area": "elasticity",
+      "behavior": "cold start",
+      "verdict": "PASS",
+      "evidence": "serve spawn -> first successful 'select 1': 39ms (single run, 50ms poll; p50/p95 over >=5 runs is bench cold_start_ms). Neon bar: ~500ms-few s."
+    },
+    {
+      "id": "D4",
+      "area": "elasticity",
+      "behavior": "time-travel read (branching/PITR analogue)",
+      "verdict": "PASS",
+      "evidence": "snapshot-pinned read works: demo.\"trips@7928055737845185364\" (oldest snapshot from \"trips$snapshots\") returned count=280 vs current count=346 (rows appended this run are invisible in the pinned view; WHERE on the pinned table -> 280). Read-only; timestamp syntax FOR SYSTEM_TIME AS OF is not supported by datafusion 52."
+    },
+    {
+      "id": "D5",
+      "area": "elasticity",
+      "behavior": "scale-to-zero",
+      "verdict": "PASS",
+      "evidence": "--idle-shutdown-secs 5: server answered queries (demo.cities count=20), then exited on its own 5050ms after the last connection with code 0 (clean); health pings on :5446 do not reset the idle clock. Scale-from-zero: fresh spawn answered 'select 1' after 44ms (supervisor pattern documented in icegres/src/ops.rs + README)."
+    },
+    {
+      "id": "D6",
+      "area": "elasticity",
+      "behavior": "writable zero-copy branches",
+      "verdict": "PASS",
+      "evidence": "Neon branch-per-endpoint over Iceberg snapshot refs: 'icegres branch create demo.trips parity_dev' forked main's head with zero data copied; a second server (icegres serve --branch parity_dev on :5450) took INSERT trip_id=99027260 + UPDATE (fare -> 123.0) committed to the branch ref with assert-ref-snapshot-id; main endpoint on :5439 stayed untouched (row count for the id 0 -> 0, total 346 -> 346); 'branch drop' removed only the ref."
+    },
+    {
+      "id": "E1",
+      "area": "ops",
+      "behavior": "structured startup logs",
+      "verdict": "PASS",
+      "evidence": "serve log contains structured fields catalog_uri/warehouse/s3_endpoint/listen_addr: 2026-07-06T00:56:53.232467Z INFO icegres: connecting to Iceberg REST catalog catalog_uri=http://127.0.0.1:8181/catalog warehouse=lakehouse s3_endpoint=http://127.0.0.1:9000 2026-07-06T00:56:53.268931Z INFO icegres: starting pgwire server listen_addr=127.0.0.1:5440"
+    },
+    {
+      "id": "E2",
+      "area": "ops",
+      "behavior": "health-checkable",
+      "verdict": "PASS",
+      "evidence": "two probes work: (1) pgwire connect + 'select 1' as the readiness check (what the harnesses use; plain TCP connect works for tcpSocket-style checks); (2) dedicated HTTP liveness endpoint via --health-port — curl http://127.0.0.1:5446/health during the D5 probe returned 200 'ok'."
+    },
+    {
+      "id": "E3",
+      "area": "ops",
+      "behavior": "full config via env vars",
+      "verdict": "PASS",
+      "evidence": "'icegres serve' booted with ZERO flags — all config from ICEGRES_* env vars (host/port/catalog/warehouse/S3) — and answered on :5444 (demo.cities count=20)"
+    }
+  ]
+}

@@ -1,0 +1,219 @@
+{
+  "cold_start_runs": 5,
+  "host": "127.0.0.1",
+  "iterations": 20,
+  "metrics": {
+    "aggregate_ms": {
+      "max": 12.35,
+      "min": 6.69,
+      "n": 20,
+      "p50": 7.32,
+      "p95": 8.34
+    },
+    "binary_size_mb": {
+      "value": 131.18
+    },
+    "cold_start_ms": {
+      "max": 69.52,
+      "min": 45.42,
+      "n": 5,
+      "p50": 46.06,
+      "p95": 65.16
+    },
+    "connect_ms": {
+      "max": 0.44,
+      "min": 0.18,
+      "n": 20,
+      "p50": 0.24,
+      "p95": 0.44
+    },
+    "filtered_scan_ms": {
+      "max": 8.61,
+      "min": 6.41,
+      "n": 20,
+      "p50": 7.16,
+      "p95": 8.23
+    },
+    "freshness_ms": {
+      "max": 82.02,
+      "min": 52.26,
+      "n": 20,
+      "p50": 63.74,
+      "p95": 76.99
+    },
+    "insert_batch100_ms": {
+      "max": 219.29,
+      "min": 78.07,
+      "n": 20,
+      "p50": 94.74,
+      "p95": 186.87
+    },
+    "insert_single_ms": {
+      "max": 183.72,
+      "min": 42.01,
+      "n": 20,
+      "p50": 59.9,
+      "p95": 81.52
+    },
+    "join_ms": {
+      "max": 57.05,
+      "min": 9.44,
+      "n": 20,
+      "p50": 11.91,
+      "p95": 18.41
+    },
+    "point_lookup_ms": {
+      "max": 11.73,
+      "min": 6.33,
+      "n": 20,
+      "p50": 6.82,
+      "p95": 8.54
+    },
+    "qps_8conn": {
+      "aggregation": "median of 3 consecutive windows",
+      "connections": 8,
+      "value": 437.5,
+      "window_s": 10,
+      "windows": [
+        405.8,
+        437.5,
+        469.3
+      ]
+    },
+    "rss_after_load_mb": {
+      "value": 97.61
+    },
+    "rss_idle_mb": {
+      "value": 83.43
+    },
+    "rss_peak_mb": {
+      "interval_ms": 100,
+      "qps_window_peak_mb": 96.16,
+      "samples": 422,
+      "value": 98.92
+    },
+    "freshness_buffered_ms": {
+      "max": 110.93,
+      "min": 92.35,
+      "n": 20,
+      "p50": 100.52,
+      "p95": 105.28
+    },
+    "insert_single_buffered_ms": {
+      "max": 283.87,
+      "min": 133.97,
+      "n": 20,
+      "p50": 157.37,
+      "p95": 262.23
+    },
+    "durable_ack_dir_ms": {
+      "max": 79.51,
+      "min": 46.77,
+      "n": 20,
+      "p50": 63.0,
+      "p95": 76.07
+    },
+    "durable_ack_pg_ms": {
+      "max": 91.84,
+      "min": 48.41,
+      "n": 20,
+      "p50": 64.45,
+      "p95": 87.28
+    },
+    "durable_ack_quorum_ms": {
+      "max": 83.12,
+      "min": 51.49,
+      "n": 20,
+      "p50": 64.13,
+      "p95": 78.87
+    },
+    "cold_start_via_proxy_ms": {
+      "p50": 73,
+      "p95": 91,
+      "n": 5,
+      "runs": [
+        70,
+        91,
+        83,
+        73,
+        72
+      ]
+    },
+    "connect_via_proxy_ms": {
+      "max": 0.86,
+      "min": 0.24,
+      "n": 20,
+      "p50": 0.53,
+      "p95": 0.77
+    },
+    "qps_via_proxy_8conn": {
+      "aggregation": "median of 3 consecutive windows",
+      "connections": 8,
+      "value": 431.1,
+      "window_s": 10,
+      "windows": [
+        396.8,
+        431.1,
+        443.4
+      ]
+    },
+    "flight_q1_ms": {
+      "p50": 9.37,
+      "p95": 10.25,
+      "n": 15
+    },
+    "adbc_query_point_ms": {
+      "p50": 9.2,
+      "p95": 12.1,
+      "n": 20
+    },
+    "adbc_query_bigfilter_ms": {
+      "p50": 96.3,
+      "p95": 142.1,
+      "n": 10
+    },
+    "adbc_bulk_ingest_100k_rows_s": {
+      "value": 750916,
+      "runs": [
+        750916,
+        712396,
+        794014
+      ],
+      "rows_per_run": 100000,
+      "commits_per_run": 1
+    },
+    "flight_q1_fresh_ms": {
+      "p50": 8.8,
+      "p95": 9.77,
+      "n": 15
+    },
+    "compact_scan_restore_ms": {
+      "degraded_p50": 48,
+      "restored_p50": 40,
+      "compact_wall_ms": 171,
+      "files_before": 24,
+      "files_after": 1,
+      "n": 15
+    },
+    "failover_ms": {
+      "p50": 106,
+      "p95": 124,
+      "n": 5,
+      "runs": [
+        97,
+        106,
+        98,
+        123,
+        124
+      ]
+    }
+  },
+  "port": 5439,
+  "schema": "icegres-bench-v1",
+  "server_bin": "/tmp/claude-0/-home-user-icegres/5e800786-6af4-536d-92f8-1b93df45ac84/scratchpad/icegres-pre-p6",
+  "unix_ts": 1784285369,
+  "warmup_discarded": 3,
+  "trips_data_files": 1,
+  "write_buffer_ms_buffered_run": 100,
+  "proxy_pooled_sessions": 55
+}

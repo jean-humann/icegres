@@ -1,0 +1,406 @@
+{
+  "engines": {
+    "flightsql": {
+      "meta": {
+        "engine": "flightsql",
+        "engine_version": "adbc-flightsql 1.11.0",
+        "footprint": "110M",
+        "iterations": 15,
+        "result_row_counts": {
+          "q1_point_lookup_ms": 1,
+          "q2_filtered_scan_ms": 3,
+          "q3_aggregate_ms": 20,
+          "q4_join_ms": 15,
+          "q5_big_scan_agg_ms": 20,
+          "q6_big_filter_count_ms": 1,
+          "q7_big_selective_ms": 101
+        },
+        "table_prefix": "demo",
+        "timestamp": "2026-07-06T04:27:32+00:00",
+        "warmup": 3
+      },
+      "metrics": {
+        "connect_ms": {
+          "max": 443.87,
+          "min": 45.49,
+          "n": 10,
+          "p50": 48.94,
+          "p95": 443.87
+        },
+        "q1_point_lookup_ms": {
+          "max": 48.5,
+          "min": 47.23,
+          "n": 15,
+          "p50": 48.0,
+          "p95": 48.4
+        },
+        "q2_filtered_scan_ms": {
+          "max": 48.79,
+          "min": 44.14,
+          "n": 15,
+          "p50": 47.96,
+          "p95": 48.26
+        },
+        "q3_aggregate_ms": {
+          "max": 52.39,
+          "min": 43.99,
+          "n": 15,
+          "p50": 48.04,
+          "p95": 51.97
+        },
+        "q4_join_ms": {
+          "max": 56.33,
+          "min": 47.45,
+          "n": 15,
+          "p50": 48.13,
+          "p95": 51.8
+        },
+        "q5_big_scan_agg_ms": {
+          "max": 430.25,
+          "min": 340.83,
+          "n": 15,
+          "p50": 390.29,
+          "p95": 413.45
+        },
+        "q6_big_filter_count_ms": {
+          "max": 275.34,
+          "min": 254.61,
+          "n": 15,
+          "p50": 261.87,
+          "p95": 274.45
+        },
+        "q7_big_selective_ms": {
+          "max": 135.7,
+          "min": 63.96,
+          "n": 15,
+          "p50": 91.97,
+          "p95": 95.99
+        },
+        "qps_8way": {
+          "elapsed_s": 10.2,
+          "errors": [],
+          "qps": 38.2,
+          "threads": 8,
+          "total_queries": 390
+        },
+        "rss_idle_mb": {
+          "value": 47.9
+        },
+        "rss_peak_mb": {
+          "value": 164.9
+        },
+        "startup_ms": {
+          "value": 643
+        }
+      }
+    },
+    "icegres": {
+      "meta": {
+        "engine": "icegres",
+        "engine_version": "PostgreSQL 16.6 (icegres 0.1.0) on x86_64-pc-linux-gnu, Apache DataFusion 52.5.0",
+        "footprint": "123M",
+        "iterations": 15,
+        "result_row_counts": {
+          "q1_point_lookup_ms": 1,
+          "q2_filtered_scan_ms": 3,
+          "q3_aggregate_ms": 20,
+          "q4_join_ms": 15,
+          "q5_big_scan_agg_ms": 20,
+          "q6_big_filter_count_ms": 1,
+          "q7_big_selective_ms": 101
+        },
+        "table_prefix": "demo",
+        "timestamp": "2026-07-06T04:24:42+00:00",
+        "warmup": 3
+      },
+      "metrics": {
+        "connect_ms": {
+          "max": 18.59,
+          "min": 1.0,
+          "n": 10,
+          "p50": 1.14,
+          "p95": 18.59
+        },
+        "q1_point_lookup_ms": {
+          "max": 7.96,
+          "min": 6.75,
+          "n": 15,
+          "p50": 7.24,
+          "p95": 7.67
+        },
+        "q2_filtered_scan_ms": {
+          "max": 7.39,
+          "min": 6.41,
+          "n": 15,
+          "p50": 7.06,
+          "p95": 7.3
+        },
+        "q3_aggregate_ms": {
+          "max": 7.93,
+          "min": 6.9,
+          "n": 15,
+          "p50": 7.51,
+          "p95": 7.83
+        },
+        "q4_join_ms": {
+          "max": 10.75,
+          "min": 9.71,
+          "n": 15,
+          "p50": 10.16,
+          "p95": 10.61
+        },
+        "q5_big_scan_agg_ms": {
+          "max": 434.77,
+          "min": 364.0,
+          "n": 15,
+          "p50": 404.22,
+          "p95": 427.04
+        },
+        "q6_big_filter_count_ms": {
+          "max": 255.52,
+          "min": 230.95,
+          "n": 15,
+          "p50": 238.02,
+          "p95": 242.88
+        },
+        "q7_big_selective_ms": {
+          "max": 50.65,
+          "min": 47.22,
+          "n": 15,
+          "p50": 49.02,
+          "p95": 50.5
+        },
+        "qps_8way": {
+          "elapsed_s": 10.27,
+          "errors": [],
+          "qps": 51.7,
+          "threads": 8,
+          "total_queries": 531
+        },
+        "rss_idle_mb": {
+          "value": 63.2
+        },
+        "rss_peak_mb": {
+          "value": 225.9
+        },
+        "startup_ms": {
+          "value": 329
+        }
+      }
+    },
+    "spark": {
+      "meta": {
+        "engine": "spark",
+        "engine_version": "spark 3.5.8 5a48a37b2dbd7b51e3640cd1d947438459556cc6",
+        "footprint": "536M",
+        "iterations": 15,
+        "result_row_counts": {
+          "q1_point_lookup_ms": 1,
+          "q2_filtered_scan_ms": 3,
+          "q3_aggregate_ms": 20,
+          "q4_join_ms": 15,
+          "q5_big_scan_agg_ms": 20,
+          "q6_big_filter_count_ms": 1,
+          "q7_big_selective_ms": 101
+        },
+        "table_prefix": "lake.demo",
+        "timestamp": "2026-07-06T04:27:02+00:00",
+        "warmup": 3
+      },
+      "metrics": {
+        "connect_ms": {
+          "max": 219.86,
+          "min": 88.62,
+          "n": 10,
+          "p50": 110.4,
+          "p95": 219.86
+        },
+        "q1_point_lookup_ms": {
+          "max": 335.92,
+          "min": 131.41,
+          "n": 15,
+          "p50": 157.99,
+          "p95": 291.91
+        },
+        "q2_filtered_scan_ms": {
+          "max": 252.79,
+          "min": 117.32,
+          "n": 15,
+          "p50": 127.12,
+          "p95": 187.51
+        },
+        "q3_aggregate_ms": {
+          "max": 490.0,
+          "min": 207.28,
+          "n": 15,
+          "p50": 259.9,
+          "p95": 427.19
+        },
+        "q4_join_ms": {
+          "max": 671.83,
+          "min": 287.72,
+          "n": 15,
+          "p50": 436.16,
+          "p95": 539.56
+        },
+        "q5_big_scan_agg_ms": {
+          "max": 816.4,
+          "min": 692.82,
+          "n": 15,
+          "p50": 732.66,
+          "p95": 787.79
+        },
+        "q6_big_filter_count_ms": {
+          "max": 711.01,
+          "min": 407.4,
+          "n": 15,
+          "p50": 542.36,
+          "p95": 621.18
+        },
+        "q7_big_selective_ms": {
+          "max": 334.62,
+          "min": 292.18,
+          "n": 15,
+          "p50": 318.69,
+          "p95": 330.92
+        },
+        "qps_8way": {
+          "elapsed_s": 10.6,
+          "errors": [],
+          "qps": 7.9,
+          "threads": 8,
+          "total_queries": 84
+        },
+        "rss_idle_mb": {
+          "value": 478.1
+        },
+        "rss_peak_mb": {
+          "value": 1802.6
+        },
+        "startup_ms": {
+          "value": 9944
+        }
+      }
+    },
+    "trino": {
+      "meta": {
+        "engine": "trino",
+        "engine_version": "trino 446",
+        "footprint": "443M",
+        "iterations": 15,
+        "result_row_counts": {
+          "q1_point_lookup_ms": 1,
+          "q2_filtered_scan_ms": 3,
+          "q3_aggregate_ms": 20,
+          "q4_join_ms": 15,
+          "q5_big_scan_agg_ms": 20,
+          "q6_big_filter_count_ms": 1,
+          "q7_big_selective_ms": 101
+        },
+        "table_prefix": "iceberg.demo",
+        "timestamp": "2026-07-06T04:25:39+00:00",
+        "warmup": 3
+      },
+      "metrics": {
+        "connect_ms": {
+          "max": 238.81,
+          "min": 73.61,
+          "n": 10,
+          "p50": 91.8,
+          "p95": 238.81
+        },
+        "q1_point_lookup_ms": {
+          "max": 197.79,
+          "min": 110.16,
+          "n": 15,
+          "p50": 138.05,
+          "p95": 188.16
+        },
+        "q2_filtered_scan_ms": {
+          "max": 157.73,
+          "min": 98.93,
+          "n": 15,
+          "p50": 115.48,
+          "p95": 151.65
+        },
+        "q3_aggregate_ms": {
+          "max": 231.07,
+          "min": 155.81,
+          "n": 15,
+          "p50": 184.59,
+          "p95": 198.64
+        },
+        "q4_join_ms": {
+          "max": 440.57,
+          "min": 185.56,
+          "n": 15,
+          "p50": 210.86,
+          "p95": 342.01
+        },
+        "q5_big_scan_agg_ms": {
+          "max": 359.51,
+          "min": 279.46,
+          "n": 15,
+          "p50": 335.87,
+          "p95": 359.5
+        },
+        "q6_big_filter_count_ms": {
+          "max": 382.57,
+          "min": 246.07,
+          "n": 15,
+          "p50": 315.25,
+          "p95": 352.49
+        },
+        "q7_big_selective_ms": {
+          "max": 135.67,
+          "min": 107.48,
+          "n": 15,
+          "p50": 120.53,
+          "p95": 132.67
+        },
+        "qps_8way": {
+          "elapsed_s": 10.46,
+          "errors": [],
+          "qps": 12.2,
+          "threads": 8,
+          "total_queries": 128
+        },
+        "rss_idle_mb": {
+          "value": 824.4
+        },
+        "rss_peak_mb": {
+          "value": 2162.3
+        },
+        "startup_ms": {
+          "value": 14116
+        }
+      }
+    }
+  },
+  "meta": {
+    "connect_ms": "fresh connection + SELECT 1 round trip",
+    "cpus": 4,
+    "datasets": {
+      "demo.cities": {
+        "bytes": 1887,
+        "files": 1,
+        "rows": 20
+      },
+      "demo.trips": {
+        "bytes": 12533,
+        "files": 1,
+        "rows": 280
+      },
+      "demo.trips_big": {
+        "bytes": 71210654,
+        "files": 10,
+        "rows": 5000000
+      }
+    },
+    "host": "vm",
+    "python": "3.11.15",
+    "qps_8way": "8 threads x 10s mixed reads (q1_point_lookup_ms, q2_filtered_scan_ms, q3_aggregate_ms, q4_join_ms, q6_big_filter_count_ms, q7_big_selective_ms)",
+    "timestamp": "2026-07-06T04:27:33+00:00",
+    "timing": "perf_counter around execute + full fetchall; 3 warmup discarded, p50/p95 over timed iterations"
+  }
+}
