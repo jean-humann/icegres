@@ -1,0 +1,67 @@
+# Supply-chain governance for icegres (SOTA deliverable #2).
+#
+# cargo-deny is a DEV tool, never a runtime dependency. Run `cargo deny check`
+# as a gate (advisories, licenses, bans, sources). If a pinned/offline CI
+# cannot install cargo-deny, skip the gate with a documented posture (as
+# tests/helm.sh does for helm) — this file is the durable artifact.
+#
+# See docs/rust-quality.md §6.
+
+[advisories]
+version = 2
+# A yanked crate on the graph fails the gate.
+yanked = "deny"
+# The five advisories below are KNOWN-ACCEPTED, pending a pinned-matrix bump.
+# None can be cleared from the graph without moving the pinned dependency
+# matrix (see README.md "Architecture notes"), and the matrix is out of scope
+# to bump here. Most arrive purely transitively; rustls-pemfile is also a
+# direct dependency (Cargo.toml) but is still pulled by datafusion-postgres,
+# so removing our direct edge would not clear it either. Each is ignored with
+# a reason (direct vs. transitive noted inline).
+ignore = [
+  # Unmaintained (build-time / thin-wrapper, not a vulnerability):
+  "RUSTSEC-2025-0134", # rustls-pemfile 2.2.0 unmaintained — thin wrapper over rustls-pki-types (direct dep + via datafusion-postgres)
+  "RUSTSEC-2024-0436", # paste unmaintained — proc-macro, build-time only (via datafusion/arrow)
+  # Vulnerabilities (DoS-class, reachable only on semi-trusted paths):
+  "RUSTSEC-2026-0194", # quick-xml 0.38.4 quadratic attr-check DoS — via opendal 0.55.0 S3 XML (semi-trusted object store); see docs/limitations.md
+  "RUSTSEC-2026-0195", # quick-xml 0.38.4 unbounded namespace-decl alloc DoS — same opendal S3 XML path
+  "RUSTSEC-2026-0204", # crossbeam invalid-ptr deref in the Debug/fmt::Pointer impl — transitive via moka/dashmap (crossbeam-channel); not on a normal reachable path
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+# The complete set of SPDX identifiers appearing across the 529-package graph.
+# A new dependency under any license NOT listed here fails the gate.
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "MIT",
+  "MIT-0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",          # 18 icu-* crates
+  "Unlicense",
+  "BSL-1.0",
+  "0BSD",
+  "CC0-1.0",              # tiny-keccak (public domain)
+  "MPL-2.0",              # x509-certificate (weak file-level copyleft, permissive enough)
+  "CDLA-Permissive-2.0",  # webpki-roots (Mozilla CA data license)
+  "bzip2-1.0.6",          # libbz2-rs-sys (BSD-like)
+]
+
+[bans]
+# The datafusion/arrow/opendal/tonic transitive stack legitimately pulls in
+# multiple versions of ~26 crates. These are EXPECTED, not pretended absent:
+#   block-buffer, const-oid, cpufeatures, crypto-common, darling(_core/_macro),
+#   digest, foldhash, getrandom (x3), hashbrown (x4), hmac, itertools, md-5,
+#   ordered-float, phf, phf_shared, quick-xml, r-efi, rand (x3), rand_chacha,
+#   rand_core (x3), sha2, wasi, windows-sys.
+# Deduplicating them would require moving the pinned matrix (out of scope).
+multiple-versions = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
