@@ -703,6 +703,20 @@ caveats:
   that has no un-flushed frames at probe time — it WOULD be fenced by the
   verify run, so point verify at dedicated or quiesced acceptors
   (deployment.md §12).
+- **Against an auth-guarded catalog, verify carries the full `serve`
+  catalog-auth surface** — the `--catalog-token` / `--catalog-credential`
+  / `--catalog-oauth2-uri` / `--catalog-scope` flags are forwarded to its
+  scratch servers, and the create-test-**drop** cleanup runs through the
+  authenticated catalog client (a raw unauthenticated REST DELETE would 401
+  and strand the scratch namespace). Two consequences carry over from the
+  write plane (`docs/catalog-support.md`): (1) under a **pure**
+  `--catalog-credential` deployment (OAuth2 client-credentials, no static
+  `--catalog-token`), the copy-on-write commit client cannot authenticate,
+  so verify's write-based suites **SKIP loudly** — supply `--catalog-token`
+  to re-prove them; (2) the catalog client's `drop_table` requests no
+  object-store purge, so verify's dropped scratch tables leave their data
+  files to the object store's own lifecycle (object-store cleanup is out of
+  verify's reach, as above).
 
 ## Transport / security
 

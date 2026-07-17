@@ -93,13 +93,27 @@ new compute taking over a quorum tail IS a safe failover. Ship:
 Claim afterward: the only self-hostable lakehouse-Postgres with automated
 HA — a sentence Lakebase's OSS story cannot say.
 
-### P4 — Local NVMe cache tier (the PageServer idea that translates, minus its hardest problem)
-Foyer-style read cache for Parquet footers + column chunks keyed by
-(path, byte-range). Immutable files make invalidation trivial — the
-problem that makes PageServer's cache hard (LSN-addressed pages) simply
-does not exist here. Gate on evidence at scale: build the 100× bench
-first (P6), cache second if it shows object-store latency dominating.
-Pairs with the deferred key index tier (sota-roadmap §7 bar unchanged).
+### P4 — Local NVMe cache tier — DROPPED (P6 evidence: the premise is false)
+Original idea: a Foyer-style read cache for Parquet footers + column
+chunks keyed by (path, byte-range), gated on P6's 100× bench showing
+object-store latency dominating the interactive path.
+
+**Verdict (2026-07-17, from P6's measured scale curve): NOT justified —
+dropped.** P6 measured point/filtered/join/aggregation across 5M → 500M
+rows (`bench/SCORECARD.md` P6 scale curve). Point lookups and selective
+joins stay **flat** (~49→59 ms / ~40→56 ms) across the 100× jump — their
+cost is planning-bound, not object-store-latency-bound, so a byte-range
+page cache has nothing to shave on the interactive path. The only cost
+that grows with data is **full-scan compute** (filtered_count/full_agg
+scale linearly to ~20 s), which a footer/column-chunk cache does not
+help — that is DataFusion CPU over decompressed batches, not repeated
+object-store fetches, and those are the queries we explicitly concede to
+Trino/Spark. The cache's own premise ("object-store latency dominating")
+is falsified by the data. Re-open only if a future workload profile
+(e.g. a high-QPS repeated-footer hot set, or remote/high-latency object
+storage rather than the local RustFS bench) shows footer/range fetches
+actually dominating a served query's wall time — that is the concrete
+re-check trigger, and it would be a new scope, not this one.
 
 ### P5 — Branch diff/merge: the lakehouse preview-environment DX
 We have whole-lakehouse branches + dbname routing. Complete the loop:
@@ -133,8 +147,9 @@ raw statement text, gated to that exact syntax — to the existing
 ### P6 — Prove it at 100×: the scale bench + serve-any-catalog
 1. **Scale bench**: extend `bench/compare` to ~500M rows on the dev box
    (still honest about single-node), publish where the interactive-band
-   advantage holds vs Trino/Spark and where it ends; this drives P4's
-   go/no-go and updates the README's honest-fit line with data.
+   advantage holds vs Trino/Spark and where it ends; this drove P4's
+   go/no-go (verdict: dropped — see P4) and updates the README's
+   honest-fit line with data.
 2. **Catalog breadth**: verify + document against Polaris and AWS Glue
    REST (capability probes exist; auth flows differ). Every catalog
    icegres serves is a market Lakebase's write-closed tier cannot enter.
@@ -190,12 +205,14 @@ execution; transaction pooling. The moment any of these tempt, reread
 invariant I1.
 
 ## 3. Sequencing & dependencies
-P1 and P3 are independent and can interleave; P2 (matrix bump) should land
-early because P2.1 changes hot-row economics that P6's bench should
-measure; P4 waits for P6's evidence; P5 and P7 are low-risk fillers
-between heavy increments. Every increment: scope doc → ultracode workflow
-(recon → implement → adversarial review ×2 → fix rounds) → full gate
-ladder (unit + durability + e2e + drift-controlled bench A/B) → commit.
+**All of P1, P2, P3, P5, P6, P7 have shipped** (merged PRs #4–#8; P2 and
+P6 each turned up an evidence-first recon/scale verdict that trimmed the
+scope honestly). P4 was gated on P6's evidence and is now **dropped** —
+P6's scale curve falsified its premise (see P4). That closes roadmap v2:
+no open increments remain. Every increment followed: scope doc →
+ultracode workflow (recon → implement → adversarial review ×2 → fix
+rounds) → full gate ladder (unit + durability + e2e + drift-controlled
+bench A/B) → commit.
 
 ## 4. The scoreboard "better" will be judged on
 | axis | Lakebase today | icegres after v2 |

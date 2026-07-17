@@ -39,6 +39,12 @@
 //! * A check whose backend is not configured SKIPS loudly — it never
 //!   silently passes (e.g. fencing needs a shared-identity tail: pg or
 //!   quorum; failover needs quorum).
+//! * Against a catalog reached by the OAuth2 client-credentials grant with
+//!   no static `--catalog-token`, every write-based suite SKIPS loudly: the
+//!   copy-on-write commit client authenticates only with a static bearer, so
+//!   the write plane cannot re-prove its claims (the same documented limit as
+//!   the main write path — docs/catalog-support.md). Supply `--catalog-token`
+//!   to run them.
 //! * The report states that timings are the operator's box, not ours.
 //! * What verify does NOT cover is documented in docs/limitations.md: the
 //!   object store's own durability, catalog HA, and multi-node scheduling
@@ -327,10 +333,6 @@ struct Harness {
     backend: Backend,
     evidence: PathBuf,
     freshness_ms: u64,
-    http: reqwest::Client,
-    /// Catalog path prefix from `GET /v1/config` (for the purge deletes the
-    /// iceberg-rust client does not expose).
-    prefix: String,
     /// The quorum confinement guard runs on the FIRST tail-backed boot.
     first_tail_boot_done: bool,
     /// Ownership token for pg cleanup: the `icegres_tail.meta` identity
@@ -366,6 +368,51 @@ impl Harness {
         Ok(format!("{}.{name}", self.ns_name))
     }
 
+    /// The catalog connection flags every scratch `serve` child needs: the
+    /// base connection (uri/warehouse/s3) plus the four `--catalog-*` auth
+    /// flags for each auth opt the operator actually set (only-when-set,
+    /// mirroring [`crate::context::apply_catalog_auth`]). Without the auth
+    /// flags the scratch children would connect UNAUTHENTICATED and fail to
+    /// boot against an auth-guarded catalog when auth was supplied as a FLAG.
+    /// (The `ICEGRES_CATALOG_*` env vars are not scrubbed, so the env-var
+    /// form is inherited either way — forwarding the flags makes both forms
+    /// behave identically.) Absent every auth opt the vector is byte-identical
+    /// to the pre-auth base connection flags (invariant I3).
+    fn catalog_serve_args(&self) -> Vec<String> {
+        let o = &self.catalog_opts;
+        let mut args = vec![
+            "--catalog-uri".into(),
+            o.catalog_uri.clone(),
+            "--warehouse".into(),
+            o.warehouse.clone(),
+            "--s3-endpoint".into(),
+            o.s3_endpoint.clone(),
+            "--s3-access-key".into(),
+            o.s3_access_key.clone(),
+            "--s3-secret-key".into(),
+            o.s3_secret_key.clone(),
+            "--s3-region".into(),
+            o.s3_region.clone(),
+        ];
+        if let Some(token) = &o.catalog_token {
+            args.push("--catalog-token".into());
+            args.push(token.clone());
+        }
+        if let Some(credential) = &o.catalog_credential {
+            args.push("--catalog-credential".into());
+            args.push(credential.clone());
+        }
+        if let Some(uri) = &o.catalog_oauth2_uri {
+            args.push("--catalog-oauth2-uri".into());
+            args.push(uri.clone());
+        }
+        if let Some(scope) = &o.catalog_scope {
+            args.push("--catalog-scope".into());
+            args.push(scope.clone());
+        }
+        args
+    }
+
     /// Spawn a scratch `icegres serve` (the current executable) with the
     /// harness catalog flags plus `extra`, wait for readiness, and — on the
     /// first tail-backed boot — enforce the confinement guard: a replay at
@@ -380,24 +427,14 @@ impl Harness {
             .open(&log)
             .with_context(|| format!("cannot open scratch server log {}", log.display()))?;
         let exe = std::env::current_exe().context("cannot resolve the icegres executable")?;
+        let catalog_args = self.catalog_serve_args();
         let mut cmd = Command::new(exe);
         cmd.arg("serve")
             .arg("--host")
             .arg("127.0.0.1")
             .arg("--port")
             .arg(port.to_string())
-            .arg("--catalog-uri")
-            .arg(&self.catalog_opts.catalog_uri)
-            .arg("--warehouse")
-            .arg(&self.catalog_opts.warehouse)
-            .arg("--s3-endpoint")
-            .arg(&self.catalog_opts.s3_endpoint)
-            .arg("--s3-access-key")
-            .arg(&self.catalog_opts.s3_access_key)
-            .arg("--s3-secret-key")
-            .arg(&self.catalog_opts.s3_secret_key)
-            .arg("--s3-region")
-            .arg(&self.catalog_opts.s3_region)
+            .args(&catalog_args)
             .args(extra)
             .env("RUST_LOG", "info")
             .stdout(std::process::Stdio::from(log_file.try_clone()?))
@@ -496,24 +533,14 @@ impl Harness {
             .append(true)
             .open(&log)?;
         let exe = std::env::current_exe()?;
+        let catalog_args = self.catalog_serve_args();
         let mut cmd = Command::new(exe);
         cmd.arg("serve")
             .arg("--host")
             .arg("127.0.0.1")
             .arg("--port")
             .arg(port.to_string())
-            .arg("--catalog-uri")
-            .arg(&self.catalog_opts.catalog_uri)
-            .arg("--warehouse")
-            .arg(&self.catalog_opts.warehouse)
-            .arg("--s3-endpoint")
-            .arg(&self.catalog_opts.s3_endpoint)
-            .arg("--s3-access-key")
-            .arg(&self.catalog_opts.s3_access_key)
-            .arg("--s3-secret-key")
-            .arg(&self.catalog_opts.s3_secret_key)
-            .arg("--s3-region")
-            .arg(&self.catalog_opts.s3_region)
+            .args(&catalog_args)
             .args(extra)
             .env("RUST_LOG", "info")
             .stdout(std::process::Stdio::from(log_file.try_clone()?))
@@ -988,29 +1015,29 @@ impl Harness {
     // Cleanup (every exit path)
     // ------------------------------------------------------------------
 
-    /// Drop everything the run created: scratch tables (purged), the
-    /// scratch namespace, the scratch tail subdirectory / pg schema.
-    /// Children die via kill_on_drop when their suite scope ends (or the
-    /// run future is cancelled).
+    /// Drop everything the run created: scratch tables, the scratch
+    /// namespace, the scratch tail subdirectory / pg schema. Children die via
+    /// kill_on_drop when their suite scope ends (or the run future is
+    /// cancelled).
+    ///
+    /// Tables and the namespace are dropped through the AUTHENTICATED catalog
+    /// client (`context::connect_catalog` threaded the operator's auth props),
+    /// so cleanup authenticates uniformly under BOTH `--catalog-token` and the
+    /// `--catalog-credential` OAuth2 grant. A raw unauthenticated REST DELETE
+    /// (what this used to issue) would 401 against an auth-guarded catalog and
+    /// STRAND the scratch namespace + tables, breaking verify's
+    /// create-test-drop contract. The catalog client's `drop_table` does not
+    /// request an object-store purge (iceberg-rust 0.9.1 exposes none), so the
+    /// dropped tables' data files are left to the store's own lifecycle — like
+    /// all object-store cleanup, which is out of verify's reach by
+    /// construction (docs/limitations.md).
     async fn cleanup(&self) -> Vec<String> {
         let mut problems = Vec::new();
         match self.catalog.list_tables(&self.ns).await {
             Ok(tables) => {
                 for ident in tables {
-                    let url = format!(
-                        "{}/v1{}/namespaces/{}/tables/{}?purgeRequested=true",
-                        self.catalog_opts.catalog_uri.trim_end_matches('/'),
-                        self.prefix_segment(),
-                        self.ns_name,
-                        ident.name()
-                    );
-                    match self.http.delete(&url).send().await {
-                        Ok(resp) if resp.status().is_success() => {}
-                        Ok(resp) => problems.push(format!(
-                            "could not purge {ident}: catalog answered {}",
-                            resp.status()
-                        )),
-                        Err(e) => problems.push(format!("could not purge {ident}: {e}")),
+                    if let Err(e) = self.catalog.drop_table(&ident).await {
+                        problems.push(format!("could not drop scratch table {ident}: {e}"));
                     }
                 }
             }
@@ -1019,23 +1046,11 @@ impl Harness {
                 self.ns_name
             )),
         }
-        let ns_url = format!(
-            "{}/v1{}/namespaces/{}",
-            self.catalog_opts.catalog_uri.trim_end_matches('/'),
-            self.prefix_segment(),
-            self.ns_name
-        );
-        match self.http.delete(&ns_url).send().await {
-            Ok(resp) if resp.status().is_success() => {}
-            Ok(resp) => problems.push(format!(
-                "could not drop scratch namespace {}: catalog answered {}",
-                self.ns_name,
-                resp.status()
-            )),
-            Err(e) => problems.push(format!(
+        if let Err(e) = self.catalog.drop_namespace(&self.ns).await {
+            problems.push(format!(
                 "could not drop scratch namespace {}: {e}",
                 self.ns_name
-            )),
+            ));
         }
         match &self.backend {
             Backend::Dir(dir) => {
@@ -1100,14 +1115,6 @@ impl Harness {
             Backend::Quorum(_) | Backend::None => {}
         }
         problems
-    }
-
-    fn prefix_segment(&self) -> String {
-        if self.prefix.is_empty() {
-            String::new()
-        } else {
-            format!("/{}", self.prefix)
-        }
     }
 }
 
@@ -1236,32 +1243,6 @@ fn skip(
     }
 }
 
-/// Resolve the catalog's REST path prefix (`GET /v1/config`), like the
-/// engine and the shell harness do.
-async fn catalog_prefix(http: &reqwest::Client, opts: &CatalogOpts) -> Result<String> {
-    let url = format!(
-        "{}/v1/config?warehouse={}",
-        opts.catalog_uri.trim_end_matches('/'),
-        opts.warehouse
-    );
-    let config: serde_json::Value = http
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("failed to fetch catalog config from {url}"))?
-        .error_for_status()
-        .with_context(|| format!("catalog config request rejected ({url})"))?
-        .json()
-        .await
-        .context("catalog config response is not JSON")?;
-    Ok(config
-        .pointer("/overrides/prefix")
-        .or_else(|| config.pointer("/defaults/prefix"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string())
-}
-
 /// Entry point: `icegres verify` (main.rs).
 pub async fn run(catalog_opts: &CatalogOpts, opts: VerifyOpts) -> Result<()> {
     let suites = select_suites(&opts.suite)?;
@@ -1280,8 +1261,6 @@ pub async fn run(catalog_opts: &CatalogOpts, opts: VerifyOpts) -> Result<()> {
         bail!("--tail-dir, --tail-url, and --tail-quorum are mutually exclusive");
     }
     let catalog = context::connect_catalog(catalog_opts).await?;
-    let http = reqwest::Client::new();
-    let prefix = catalog_prefix(&http, catalog_opts).await?;
 
     // Scratch namespace: refuse if it pre-exists (never adopt state the run
     // did not create — a nonce collision or a crashed run's leftovers are a
@@ -1381,8 +1360,6 @@ pub async fn run(catalog_opts: &CatalogOpts, opts: VerifyOpts) -> Result<()> {
         backend,
         evidence: evidence.clone(),
         freshness_ms: opts.freshness_ms,
-        http,
-        prefix,
         first_tail_boot_done: false,
         pg_tail_identity: None,
     };
@@ -1489,8 +1466,34 @@ pub async fn run(catalog_opts: &CatalogOpts, opts: VerifyOpts) -> Result<()> {
 }
 
 async fn run_suites(harness: &mut Harness, suites: &[Suite]) -> Result<Vec<Check>> {
+    // Every suite INSERTs rows, and the copy-on-write commit client (see
+    // overwrite.rs) authenticates only with a STATIC `--catalog-token` bearer,
+    // not the OAuth2 client-credentials grant. Under credential-only auth the
+    // scratch servers' READ plane authenticates (the OAuth2-minted bearer) but
+    // their WRITE plane would 401, so the write-based claims cannot be re-proven
+    // here — the SAME documented limitation as the main write path
+    // (docs/catalog-support.md). Rather than let those suites FAIL confusingly,
+    // SKIP them loudly and name the fix (supply --catalog-token). Both auth
+    // props set means the static token drives writes, so suites run normally.
+    let credential_only = harness.catalog_opts.catalog_credential.is_some()
+        && harness.catalog_opts.catalog_token.is_none();
     let mut checks = Vec::new();
     for suite in suites {
+        if credential_only {
+            checks.push(skip(
+                suite.name(),
+                "write-based check (OAuth2 credential auth)",
+                "the suite's INSERT-driven claims require an authenticated write path",
+                "docs/catalog-support.md (write plane under OAuth2 client-credentials)",
+                "this catalog is reached via the OAuth2 client-credentials grant \
+                 (--catalog-credential) with no --catalog-token: verify's suites INSERT \
+                 rows, and the copy-on-write commit client authenticates only with a \
+                 static --catalog-token bearer, not an OAuth2-minted one. Re-run with \
+                 --catalog-token to re-prove the write-based claims against this catalog \
+                 (docs/catalog-support.md).",
+            ));
+            continue;
+        }
         let result = match suite {
             Suite::Durability => harness.suite_durability().await,
             Suite::ExactlyOnce => harness.suite_exactly_once().await,

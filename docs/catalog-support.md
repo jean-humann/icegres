@@ -98,6 +98,33 @@ bumped pin lets the commit client share the read client's session), thread it
 into `overwrite.rs` so client-credentials authenticates writes too. Record the
 version that first exposes it.
 
+### `icegres verify` under an auth-guarded catalog
+`icegres verify` (`src/verify.rs`) is wired for the same auth surface as `serve`:
+
+- **Scratch-server spawning.** Each scratch `icegres serve` child verify
+  launches is given the four `--catalog-token` / `--catalog-credential` /
+  `--catalog-oauth2-uri` / `--catalog-scope` flags for every auth opt the
+  operator set (only-when-set), so the children authenticate against a guarded
+  catalog. This holds whether auth was supplied as a **flag** or as an
+  `ICEGRES_CATALOG_*` **env var** (env vars are inherited by the children;
+  before this fix only the env-var form worked).
+- **Cleanup.** The scratch namespace + tables are dropped through the
+  **authenticated catalog client**, not a raw REST DELETE, so cleanup succeeds
+  under both `--catalog-token` and `--catalog-credential` — the run keeps its
+  create-test-**drop** contract against a guarded catalog (a raw unauthenticated
+  DELETE would 401 and strand the scratch namespace). The catalog client's
+  `drop_table` does not request an object-store purge, so the dropped tables'
+  data files are left to the object store's own lifecycle (out of verify's reach
+  — `docs/limitations.md`).
+- **Write-based suites under *pure* credential auth.** verify's suites INSERT
+  rows, so they hit the **same** write-plane caveat above: with
+  `--catalog-credential` and **no** `--catalog-token`, every write-based suite
+  **SKIPs loudly** (naming the fix) rather than failing confusingly. Supply
+  `--catalog-token` to re-prove the durability/exactly-once/fencing/freshness/
+  failover claims against such a catalog. The config-open discovery handshake
+  (`GET /v1/config`) stays reachable per Iceberg-REST convention, so this is not
+  treated as a startup failure.
+
 ---
 
 ## 3. Auth flows — blocked at the pin

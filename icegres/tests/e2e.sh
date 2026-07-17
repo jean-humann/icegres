@@ -3517,6 +3517,53 @@ else
   fi
   pass "no catalog secret leaked into the server logs (bearer/client-secret redacted)"
 
+  # --- verify (P7) against the auth-guarded catalog: token form, --tail-dir.
+  #     Proves icegres verify carries the same catalog-auth surface as serve:
+  #     (1) it forwards --catalog-token to its OWN scratch servers, so their
+  #     read AND copy-on-write write planes authenticate through the gateway
+  #     (durability inserts, SIGKILLs, replays — a full write round trip); and
+  #     (2) it drops its scratch namespace through the AUTHENTICATED catalog
+  #     client, so nothing is stranded. A raw unauthenticated REST DELETE (the
+  #     pre-fix cleanup) would 401 against this guarded gateway and strand the
+  #     namespace — here an AUTHENTICATED GET for it must 404 after the run.
+  CATGW_VF_TAIL="$E2E_DIR/catgw-verify-tail"
+  rm -rf "$CATGW_VF_TAIL"; mkdir -p "$CATGW_VF_TAIL"
+  "$BIN" verify --suite durability --tail-dir "$CATGW_VF_TAIL" \
+    --catalog-uri "$CATGW_URI" --catalog-token "$CATGW_PREMINT" \
+    --json >"$E2E_DIR/catgw-verify.json" 2>"$E2E_DIR/catgw-verify.err" \
+    || { cat "$E2E_DIR/catgw-verify.err" >&2; catgw_cleanup; fail "icegres verify failed against the auth-guarded gateway (token form)"; }
+  assert_eq "verify (auth catalog): durability re-proven through the token-authenticated catalog (1 pass/0 fail/0 skip, PASS)" "1|0|0|PASS" \
+    "$(jq -r '[(.passed|tostring), (.failed|tostring), (.skipped|tostring), (.checks[] | select(.suite=="durability") | .status)] | join("|")' "$E2E_DIR/catgw-verify.json")"
+  catgw_vf_ns=$(jq -r '.namespace' "$E2E_DIR/catgw-verify.json")
+  assert_eq "verify (auth catalog): scratch namespace is run-scoped" "icegres_verify_" \
+    "$(printf '%s' "$catgw_vf_ns" | cut -c1-15)"
+  # DROPPED on exit through the authenticated catalog client: an AUTHENTICATED
+  # GET for the scratch namespace now 404s (created, tested, dropped — nothing
+  # stranded). The bearer is required: unauthenticated the gateway answers 401.
+  assert_eq "verify (auth catalog): scratch namespace DROPPED via the authenticated client (404, not stranded)" "404" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $CATGW_PREMINT" "$CATGW_URI/v1/$prefix/namespaces/$catgw_vf_ns")"
+  [[ -z "$(ls "$CATGW_VF_TAIL" 2>/dev/null)" ]] \
+    || { catgw_cleanup; fail "verify left scratch state in the tail dir: $(ls "$CATGW_VF_TAIL")"; }
+  pass "verify (P7): green against the OAuth2-guarded catalog; scratch namespace dropped through the authenticated client"
+
+  # --- verify honesty under PURE OAuth2 client-credentials (no --catalog-token):
+  #     the copy-on-write commit client carries no OAuth2-minted bearer, so the
+  #     write-based suites SKIP loudly (naming the fix) rather than FAIL — and
+  #     the scratch namespace is still created and dropped via the OAuth2 read
+  #     plane (exit 0, nothing stranded).
+  "$BIN" verify --suite durability --tail-dir "$CATGW_VF_TAIL" \
+    --catalog-uri "$CATGW_URI" \
+    --catalog-credential "$CATGW_CLIENT" \
+    --catalog-oauth2-uri "$CATGW_TOKEP" \
+    --catalog-scope catalog \
+    --json >"$E2E_DIR/catgw-verify-cred.json" 2>"$E2E_DIR/catgw-verify-cred.err" \
+    || { cat "$E2E_DIR/catgw-verify-cred.err" >&2; catgw_cleanup; fail "verify under credential-only auth did not exit 0 (it should SKIP loudly, not fail)"; }
+  assert_eq "verify (credential-only): write-based durability SKIPs loudly (0 pass/0 fail/1 skip, SKIP)" "0|0|1|SKIP" \
+    "$(jq -r '[(.passed|tostring), (.failed|tostring), (.skipped|tostring), (.checks[] | select(.suite=="durability") | .status)] | join("|")' "$E2E_DIR/catgw-verify-cred.json")"
+  jq -r '.checks[] | select(.suite=="durability") | .detail' "$E2E_DIR/catgw-verify-cred.json" | grep -q -- "--catalog-token" \
+    || { catgw_cleanup; fail "the credential-only skip does not name the --catalog-token fix"; }
+  pass "verify (credential-only): write-based suites SKIP loudly and name the --catalog-token fix"
+
   catgw_cleanup
   pass "(cat) cleanup: gateway + serves stopped, scratch namespace dropped"
 fi
