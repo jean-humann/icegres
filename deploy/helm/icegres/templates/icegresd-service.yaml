@@ -1,0 +1,24 @@
+{{- include "icegres.validate" . -}}
+# The client endpoint (pgwire). With ha.enabled the leadership readiness
+# probe keeps standbys out of the endpoints, so this Service always
+# points at the lease holder.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "icegres.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegres.labels" . | nindent 4 }}
+    app.kubernetes.io/component: icegresd
+  {{- with .Values.icegresd.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.icegresd.service.type }}
+  selector:
+    {{- include "icegres.selectorLabels" (dict "ctx" $ "component" "icegresd") | nindent 4 }}
+  ports:
+    - name: pgwire
+      port: {{ int .Values.icegresd.service.port }}
+      targetPort: pgwire

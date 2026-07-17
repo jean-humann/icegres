@@ -1,0 +1,15 @@
+{{- include "icegres.validate" . -}}
+# Lakehouse wiring shared by every compute (writer + read replicas):
+# non-secret, envFrom'd as ICEGRES_* variables.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "icegres.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegres.labels" . | nindent 4 }}
+data:
+  ICEGRES_CATALOG_URI: {{ .Values.catalog.uri | quote }}
+  ICEGRES_WAREHOUSE: {{ .Values.catalog.warehouse | quote }}
+  ICEGRES_S3_ENDPOINT: {{ .Values.s3.endpoint | quote }}
+  ICEGRES_S3_REGION: {{ .Values.s3.region | quote }}

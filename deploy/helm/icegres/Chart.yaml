@@ -1,0 +1,18 @@
+apiVersion: v2
+name: icegres
+description: >-
+  Postgres wire endpoint over an Iceberg lakehouse, with optional
+  consensus-fenced HA: icegresd control plane (wake-on-connect,
+  leader-lease redundancy), a single buffered writer compute, stateless
+  read replicas over the same single copy of the data, and the
+  icekeeperd quorum-tail acceptor trio.
+type: application
+# Chart version (packaging); appVersion tracks the icegres crate version
+# and is the default image tag.
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - postgres
+  - iceberg
+  - lakehouse
+  - datafusion

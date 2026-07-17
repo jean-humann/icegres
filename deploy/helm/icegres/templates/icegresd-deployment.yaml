@@ -1,0 +1,161 @@
+{{- include "icegres.validate" . -}}
+{{/*
+icegresd — the single client endpoint: wake-on-connect router + warm
+session pool in k8s mode (it never forks; the writer is a pod it dials,
+and optionally scales, at {{ include "icegres.fullname" . }}-writer).
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "icegres.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegres.labels" . | nindent 4 }}
+    app.kubernetes.io/component: icegresd
+spec:
+  {{- if .Values.ha.enabled }}
+  # ha.enabled: at least two instances; the leader lease (below) makes
+  # exactly one of them serve at a time.
+  replicas: {{ max 2 (int .Values.icegresd.replicas) }}
+  {{- else }}
+  replicas: {{ int .Values.icegresd.replicas }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "icegres.selectorLabels" (dict "ctx" $ "component" "icegresd") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "icegres.labels" . | nindent 8 }}
+        app.kubernetes.io/component: icegresd
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "icegres.serviceAccountName" . }}
+      # The token exists solely for the scale-subresource PATCH.
+      automountServiceAccountToken: {{ .Values.k8sScaling.enabled }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- if .Values.ha.enabled }}
+      # Spread the redundant instances; soft — a one-node dev cluster
+      # still schedules, the lease just protects less.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "icegres.selectorLabels" (dict "ctx" $ "component" "icegresd") | nindent 20 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: icegresd
+          image: {{ include "icegres.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/bin/tini", "--", "/usr/local/bin/icegresd"]
+          args: ["serve"]
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          env:
+            - name: ICEGRESD_HOST
+              value: "0.0.0.0"
+            - name: ICEGRESD_PORT
+              value: {{ .Values.icegresd.port | quote }}
+            # k8s mode: the main compute is the writer Service, never a
+            # forked child (see `icegresd serve --help`).
+            - name: ICEGRESD_K8S_COMPUTE
+              value: "true"
+            - name: ICEGRESD_COMPUTE_HOST
+              value: {{ printf "%s-writer" (include "icegres.fullname" .) | quote }}
+            - name: ICEGRESD_MAIN_PORT
+              value: {{ .Values.writer.port | quote }}
+            - name: ICEGRESD_WAKE_TIMEOUT_MS
+              value: {{ .Values.icegresd.wakeTimeoutMs | quote }}
+            - name: ICEGRESD_STATUS_FILE
+              value: /tmp/icegresd-status.json
+            {{- if .Values.k8sScaling.enabled }}
+            - name: ICEGRESD_K8S_SCALE
+              value: {{ printf "statefulsets/%s-writer" (include "icegres.fullname" .) | quote }}
+            - name: ICEGRESD_IDLE_SHUTDOWN_SECS
+              value: {{ .Values.icegresd.idleShutdownSecs | quote }}
+            {{- end }}
+            {{- if .Values.auth.enabled }}
+            # SCRAM computes cannot be pre-handshaked by the proxy: keep
+            # the pool off instead of letting every warm attempt fail.
+            - name: ICEGRESD_POOL_SIZE
+              value: "0"
+            {{- else }}
+            - name: ICEGRESD_POOL_SIZE
+              value: {{ .Values.icegresd.poolSize | quote }}
+            - name: ICEGRESD_POOL_USER
+              value: {{ .Values.icegresd.poolUser | quote }}
+            {{- end }}
+            {{- if .Values.ha.enabled }}
+            - name: ICEGRESD_LEASE_QUORUM
+              value: {{ include "icegres.trioAddrs" (dict "ctx" $ "suffix" "lease" "port" .Values.lease.port) | quote }}
+            - name: ICEGRESD_LEASE_TTL_MS
+              value: {{ .Values.ha.leaseTtlMs | quote }}
+            {{- end }}
+            {{- with .Values.icegresd.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: pgwire
+              containerPort: {{ int .Values.icegresd.port }}
+          livenessProbe:
+            tcpSocket:
+              port: pgwire
+            periodSeconds: 10
+          {{- if .Values.ha.enabled }}
+          # Leadership readiness: standbys answer 57P03, so they must be
+          # OUT of the Service until they hold the lease. The status file
+          # is atomically replaced on every leadership flip.
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - "grep -q '\"leader\": true' /tmp/icegresd-status.json"
+            periodSeconds: 2
+            failureThreshold: 2
+          {{- else }}
+          readinessProbe:
+            tcpSocket:
+              port: pgwire
+            periodSeconds: 5
+          {{- end }}
+          {{- if .Values.ha.enabled }}
+          # Drain/eviction of the leader (the PDB deliberately allows it —
+          # see icegresd-pdb.yaml): deletion pulls the pod from the Service
+          # endpoints at Terminating; the brief preStop keeps the process
+          # serving while that propagates (a connection routed here in the
+          # same instant still lands on a live leader), then SIGTERM stops
+          # lease renewal IMMEDIATELY and the standby takes over within
+          # ~1-2x ha.leaseTtlMs. icegresd exits in well under the default
+          # 30 s terminationGracePeriodSeconds (k8s mode has no child
+          # computes to reap).
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 2"]
+          {{- end }}
+          resources:
+            {{- toYaml .Values.icegresd.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # readOnlyRootFilesystem: the status file needs a writable /tmp.
+        - name: tmp
+          emptyDir: {}

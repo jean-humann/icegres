@@ -1,0 +1,8 @@
+{{- include "icegres.validate" . -}}
+{{- if .Values.ha.enabled }}
+{{- include "icegres.trio" (dict
+      "ctx" $
+      "suffix" "lease"
+      "cfg" .Values.lease
+      "purpose" "icegresd leader-lease trio (ha.enabled): a DEDICATED log — icegresd refuses a lease quorum that shares an address with the data trio, because electing on the data log would fence the tail writer.") }}
+{{- end }}

@@ -1,0 +1,6 @@
+# Profile: single-node durable tail — buffered writes WAL'd to the writer
+# PVC. No automated failover (dir is single-node by nature).
+tail:
+  mode: dir
+writer:
+  writeBufferMs: 200

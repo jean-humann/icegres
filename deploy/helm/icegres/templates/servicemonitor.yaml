@@ -1,0 +1,27 @@
+{{- include "icegres.validate" . -}}
+{{- if .Values.metrics.serviceMonitor.enabled }}
+# Prometheus Operator scrape config for the compute /metrics endpoints
+# (writer + read replicas expose Prometheus text on their health port;
+# icegresd has no metrics endpoint — its state is the status file).
+# Requires the monitoring.coreos.com CRDs; gated off by default.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "icegres.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegres.labels" . | nindent 4 }}
+    {{- with .Values.metrics.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "icegres.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      icegres.io/metrics: "true"
+  endpoints:
+    - port: health
+      path: /metrics
+      interval: {{ .Values.metrics.serviceMonitor.interval }}
+{{- end }}

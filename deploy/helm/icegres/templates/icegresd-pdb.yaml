@@ -1,0 +1,22 @@
+{{- include "icegres.validate" . -}}
+{{- if .Values.ha.enabled }}
+# Leadership readiness pins the icegresd Ready count at exactly 1 (the
+# leader), so ANY availability-demanding budget computes
+# disruptionsAllowed = 0 forever and DEADLOCKS every voluntary eviction
+# of the leader (drains hang until a human force-deletes the pod).
+# Evictions are instead always allowed, on purpose: SIGTERM demote +
+# lease takeover recovers in ~1-2x ha.leaseTtlMs (deployment.md §11).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "icegres.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegres.labels" . | nindent 4 }}
+    app.kubernetes.io/component: icegresd
+spec:
+  maxUnavailable: 100%
+  selector:
+    matchLabels:
+      {{- include "icegres.selectorLabels" (dict "ctx" $ "component" "icegresd") | nindent 6 }}
+{{- end }}
