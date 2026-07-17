@@ -581,7 +581,8 @@ impl QueryHook for AuthzHook {
     }
 }
 
-#[cfg(all(test, feature = "managed"))]
+#[cfg(test)]
+#[cfg(feature = "managed")]
 mod tests {
     use super::*;
     use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;

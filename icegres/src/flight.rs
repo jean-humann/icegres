@@ -1933,6 +1933,23 @@ mod tests {
         assert_eq!(sql, "select 1");
     }
 
+    // Malformed client-supplied ticket bytes must never panic (SOTA fuzz
+    // deliverable). `decode_plan_ticket` is private to this module, so its
+    // fuzz target lives here, driven by the shared harness in `crate::fuzz`.
+    #[test]
+    fn fuzz_decode_plan_ticket_never_panics() {
+        let corpus = crate::fuzz::plan_ticket_corpus();
+        crate::fuzz::run(
+            "decode_plan_ticket",
+            0x0DEC_0DE0_0000_0007,
+            16_000,
+            &corpus,
+            |b| {
+                let _ = decode_plan_ticket(b);
+            },
+        );
+    }
+
     #[test]
     fn stashed_plan_version_mismatch_forces_replan() {
         use datafusion::physical_plan::empty::EmptyExec;

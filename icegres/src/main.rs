@@ -17,6 +17,9 @@ mod context;
 mod dml;
 mod flight;
 mod freshness;
+/// Malformed-input-never-panics fuzz harness (test-only; see the module docs).
+#[cfg(test)]
+mod fuzz;
 mod keyed;
 mod maintain;
 mod metrics;

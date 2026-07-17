@@ -268,7 +268,7 @@ fn split_conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
 }
 
 /// `<column> = <literal>` (either order), else `None`.
-fn eq_pair(expr: &Expr, scope: &QualScope) -> Option<(KeyCol, ScalarLit)> {
+fn eq_pair(expr: &Expr, scope: &QualScope<'_>) -> Option<(KeyCol, ScalarLit)> {
     let Expr::BinaryOp {
         left,
         op: BinaryOperator::Eq,
@@ -293,7 +293,7 @@ fn eq_pair(expr: &Expr, scope: &QualScope) -> Option<(KeyCol, ScalarLit)> {
 /// foreign qualifier (`x.id` on `demo.t`) returns `None`, so the statement
 /// falls back to the synchronous path, which resolves or errors
 /// authoritatively instead of the keyed path silently map-hitting.
-fn column_ref(expr: &Expr, scope: &QualScope) -> Option<KeyCol> {
+fn column_ref(expr: &Expr, scope: &QualScope<'_>) -> Option<KeyCol> {
     match expr {
         Expr::Identifier(id) => Some(KeyCol {
             name: normalize_ident(id),
@@ -606,7 +606,7 @@ impl KeySuppressExec {
 }
 
 impl DisplayAs for KeySuppressExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "KeySuppressExec keys={}", self.keys.len())
     }
 }

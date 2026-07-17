@@ -163,6 +163,8 @@ pub(crate) fn lock_dir_exclusive(
         .write(true)
         .open(&path)
         .with_context(|| format!("cannot open {log_kind} lock file {}", path.display()))?;
+    // The one audited FFI site in the crate: an advisory flock on an owned fd.
+    #[allow(unsafe_code)]
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
         let err = std::io::Error::last_os_error();

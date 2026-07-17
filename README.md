@@ -158,6 +158,7 @@ docker run --rm -p 5439:5439 -p 8080:8080 \
 
 - **Pinned dependency matrix** (do not bump independently — see `icegres/Cargo.toml`): iceberg-rust 0.9.1, DataFusion 52.5.0, arrow 57.3.1, datafusion-postgres 0.15.0 (pgwire 0.38.3), tonic 0.14, sqlparser 0.62.0, toolchain 1.96.1.
 - **Open-core split:** the SQL server, the authorization *seam*, and all wire/driver support are open source and always compiled; the auth/authz *backends* live behind the default `managed` cargo feature (`--no-default-features` builds a pure open-source distribution).
+- **Safe-Rust posture (enforced):** package-wide `deny(unsafe_code)` (one audited `flock` FFI exception) + `deny(clippy::unwrap_used)`, a std-only malformed-input-never-panics fuzz harness over every untrusted-byte decoder, `cargo-deny` supply-chain governance, and a deliberate fail-fast lock-poisoning policy — see [`docs/rust-quality.md`](docs/rust-quality.md).
 
 ## License
 

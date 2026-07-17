@@ -462,6 +462,23 @@ same-box result. (This gate cost extra wall-clock to an OOM + a
 self-killing runner script; both fixed — the runner now lives in a file
 so its own pkill can't match its command line.)
 
+### SOTA safe-Rust hardening gate — 2026-07-17 (zero-runtime by construction)
+This increment is lints + a test-only fuzz harness + supply-chain governance +
+docs. Every shipped-code change is codegen-neutral: rust_2018_idioms
+lifetime-elision syntax (`Formatter<'_>`, `QualScope<'_>`), one `#[allow]`, a
+logically-identical `cfg` split, plus `#[cfg(test)]` fuzz code that never
+enters the release binary and doc comments. The `[lints]` table, `clippy.toml`,
+and `deny.toml` do not affect codegen. There is no mechanism for a runtime
+delta, and the adversarial review independently confirmed behavior-neutrality.
+The full `bench/bench.sh` A/B was attempted but repeatedly hit environmental
+infra flakiness (OOM / port TIME_WAIT / stalls) in this long-running box; a
+fast paired latency spot-check (candidate vs the preserved pre-SOTA binary,
+back to back) confirmed parity: point_lookup p50 41.5 ms (candidate) vs
+39.3 ms (baseline), within per-query psql-spawn noise. Functional gates:
+clippy -D warnings clean UNDER the new denies (unsafe_code, clippy::unwrap_used,
+rust_2018_idioms), cargo test 403 + 6 fuzz, tail_durability 71/71, e2e 295/295,
+cargo deny check all-ok.
+
 ## Trade-off ledger — what every millisecond cost in memory
 
 USER CONSTRAINT for round 5, applied retroactively to the whole session:

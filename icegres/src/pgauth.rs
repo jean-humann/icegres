@@ -175,6 +175,9 @@ fn auth_failed(username: &str) -> PgWireError {
 
 #[async_trait]
 impl AuthSource for FileAuthSource {
+    // pgwire's AuthSource binds this lifetime late (async trait method), so an
+    // explicit `LoginInfo<'_>` is rejected (E0195); the elision is required here.
+    #[allow(elided_lifetimes_in_paths)]
     async fn get_password(&self, login: &LoginInfo) -> PgWireResult<Password> {
         let username = login.user().unwrap_or("");
         match self.users.get(username) {

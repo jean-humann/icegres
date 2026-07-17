@@ -755,10 +755,50 @@ an operational edge:
 - **Validation-only record walk**: quorum-tail replay decodes every
   surviving record's Arrow payload eagerly; a cheap validation-only walk
   would bound boot memory on very large recovered suffixes.
+- **Arrow IPC reader is not adversarial-input-safe** (found by the fuzz
+  harness, `src/fuzz.rs`): the tail/quorum payload path decodes Arrow IPC
+  bytes that can originate from a crafted-but-crc-valid local WAL frame
+  (needs write access to the flock-guarded data dir) or a malicious quorum
+  peer body. Arrow's `StreamReader` reads a metadata length (any positive
+  `i32`) and a batch `bodyLength` (`i64`) from the stream and allocates from
+  them *before* bounds-checking against the available bytes, so a crafted
+  stream forces an unbounded allocation → allocation-failure `abort()` (the
+  harness reproduced a ~2.3 EB allocation attempt). No in-process guard
+  (`catch_unwind` included) can catch an allocation abort. This is reachable
+  only from OUTSIDE the documented trust model (see "Transport / security");
+  hardening it needs a hardened Arrow (the dependency matrix is pinned) or an
+  out-of-process / bounded-allocator decode. The fuzz harness covers the
+  icegres-owned framing layers up to this boundary; see `docs/rust-quality.md`
+  §4.
 - **Plan-cache miss-counter noise in buffered+freshness mode**: overlay-
   bearing tables are (correctly) never cached, but each of their SELECTs
   still counts as a plan-cache miss, skewing the hit-ratio metric on mixed
   workloads.
+
+## Lock-poisoning is fail-fast by design
+
+icegres holds most `std::sync` locks with `.expect("…poisoned")`, so a thread
+that panics while holding a lock guarding **durability, tail, quorum, txn,
+slot, or compiled-plan** state propagates the poison and crashes the process
+rather than continuing on maybe-torn state. This is a deliberate choice, not an
+oversight: a panic under those locks is already a bug, and serving corrupt
+invariant state would be worse than a restart-and-replay from the durable log.
+Non-invariant sites (metrics gauges, the generation-guarded read cache) instead
+recover the guard via `freshness::recover`. The full two-tier policy — and why
+`parking_lot` (no poisoning) stays rejected — is in
+[`docs/rust-quality.md`](rust-quality.md) §5.
+
+## Accepted dependency advisories
+
+`cargo deny check` is a gate, but five RUSTSEC advisories on the graph are
+**known-accepted, pending a pinned-matrix bump** (`icegres/deny.toml`
+`[advisories].ignore`): two unmaintained build-time/wrapper crates
+(`rustls-pemfile`, `paste`), one `crossbeam` Debug-`fmt::Pointer` deref not on
+a reachable path, and — the two worth watching — a `quick-xml` 0.38.4 DoS pair
+(quadratic attribute check + unbounded namespace-declaration allocation),
+reachable via `opendal`'s S3 XML parsing. That surface is only exercised on
+responses from the configured object store (semi-trusted); the fix is a matrix
+bump, tracked with the rest of the pinned-matrix re-check.
 
 ## Build / dependency matrix
 

@@ -1413,6 +1413,18 @@ fn encode_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>> {
 
 /// Undo [`encode_ipc`]: every batch of one statement, in order. An empty
 /// stream is an error — a tail frame is never rowless.
+///
+/// SAFETY/TRUST NOTE: the Arrow IPC `StreamReader` is built for TRUSTED
+/// internal data and is NOT hardened against adversarial input — a crafted
+/// stream can drive an unbounded allocation from an attacker-controlled buffer
+/// length (→ allocation-failure `abort`, which no in-process guard can catch)
+/// or trip an `arrow-buffer` bounds assert. This is only reachable from
+/// OUTSIDE icegres's documented trust model: a crc-valid but crafted local WAL
+/// frame (needs write access to the flock-guarded data dir) or a malicious
+/// quorum peer body (semi-trusted network). The fuzz harness (`src/fuzz.rs`)
+/// covers icegres's own decode layers up to this boundary; hardening the Arrow
+/// body decode (structural pre-validation or out-of-process decode) is tracked
+/// in `docs/limitations.md`. See `docs/rust-quality.md` §4.
 fn decode_ipc(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
     let reader = StreamReader::try_new(std::io::Cursor::new(bytes), None)
         .map_err(|e| anyhow!("tail frame IPC header invalid: {e}"))?;
@@ -1935,6 +1947,29 @@ mod tests {
         let wal2 = LocalWal::open(&root).unwrap();
         let frames = replay_frames(&wal2);
         assert_eq!(frames.iter().map(|f| f.1).collect::<Vec<_>>(), vec![1]);
+    }
+
+    // Malformed frame payloads (foreign/attacker WAL bytes) must never panic
+    // (SOTA fuzz deliverable). `decode_payload` is private to this module, so
+    // its fuzz target lives here, driven by the shared harness in `crate::fuzz`.
+    // Only the icegres-owned layers are fuzzed: the 8-byte seq-header guard and
+    // the delegation to `decode_op_payload`. The Arrow IPC body decode is NOT
+    // fed adversarial bytes (it OOM-aborts on crafted content lengths — see
+    // `crate::fuzz`'s "Arrow IPC boundary" note), so inputs are bounded to keep
+    // the Arrow-visible body under 4 bytes (EOF before any allocation).
+    #[test]
+    fn fuzz_decode_payload_never_panics() {
+        let seed = 0x0DEC_0DE0_0000_0008;
+        let mut rng = crate::fuzz::Rng::new(seed);
+        for i in 0..16_000 {
+            // seq header (0..=8 bytes) + a short op payload (0..=5 bytes: at
+            // most a [fmt][op] plus <4 Arrow-visible body bytes).
+            let mut input = rng.bounded_bytes(8);
+            input.extend(rng.bounded_bytes(5));
+            crate::fuzz::guard("decode_payload(shallow)", seed, i, &input, || {
+                let _ = decode_payload(&input);
+            });
+        }
     }
 
     // Rotation + truncation: only segments fully covered by the watermark
