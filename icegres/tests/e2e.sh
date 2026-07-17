@@ -1,0 +1,3984 @@
+#!/usr/bin/env bash
+# End-to-end test for icegres against the local lakehouse stack
+# (Postgres + RustFS + Lakekeeper). Self-contained and idempotent:
+#
+#   bash icegres/tests/e2e.sh
+#
+# Design notes:
+#   - The harness is NON-DESTRUCTIVE: it never drops catalog tables. The
+#     seeded dataset is deterministic (LCG seed 42) and occupies
+#     trip_id 1..280 in demo.trips, so all "exact value" assertions filter
+#     on that id range. The write-path tests append/update/delete only rows
+#     with fresh unique trip_id >= 900000 (sections (e) and (i)), which the
+#     range filter keeps out of the deterministic assertions.
+#   - Every psql invocation is a NEW connection (psql -c opens/closes one),
+#     so read-your-writes checks always cross connection boundaries.
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Paths / config
+# ---------------------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ICEGRES_DIR="$(dirname "$SCRIPT_DIR")"
+REPO_DIR="$(dirname "$ICEGRES_DIR")"
+E2E_DIR="$ICEGRES_DIR/.e2e"
+BIN="$ICEGRES_DIR/target/debug/icegres"
+
+PG_HOST=127.0.0.1
+PG_PORT=5439
+SECURE_PORT=5443 # auth+TLS server for section (h)
+PK_PORT=5448     # --enforce-pk server for section (k)
+STRICT_PORT=5450 # ICEGRES_TXN_STRICT server for section (u)
+VBUF_PORT=5451   # buffered durability server for section (v)
+PSQL=(psql -h "$PG_HOST" -p "$PG_PORT" -U postgres -d icegres -v ON_ERROR_STOP=1)
+export PGCONNECT_TIMEOUT=5
+
+# Harness-owned servers are permissive/plaintext by design (except the
+# dedicated auth+TLS server in section (h), configured explicitly): a stray
+# ICEGRES_AUTH_FILE/ICEGRES_TLS_* in the caller's environment must not flip
+# them. Clients still pass credentials when configured: psql reads PGPASSWORD
+# from the (inherited) environment on every invocation below.
+unset ICEGRES_AUTH_FILE ICEGRES_TLS_CERT ICEGRES_TLS_KEY
+# Same for buffered-write mode: only section (l)'s dedicated server enables it.
+unset ICEGRES_WRITE_BUFFER_MS ICEGRES_WRITE_BUFFER_MAX_ROWS
+# And for strict transaction mode: only section (u)'s dedicated server enables it.
+unset ICEGRES_TXN_STRICT
+# And for the P1 tail-API/peer-overlay surfaces: only section (p3)'s
+# dedicated servers enable them.
+unset ICEGRES_TAIL_API_PORT ICEGRES_PEER_TAILS ICEGRES_FRESHNESS_MS
+
+CATALOG_URI="http://127.0.0.1:8181/catalog"
+WAREHOUSE=lakehouse
+S3_ENDPOINT="http://127.0.0.1:9000"
+export AWS_ACCESS_KEY_ID=rustfsadmin
+export AWS_SECRET_ACCESS_KEY=rustfssecret
+export AWS_DEFAULT_REGION=us-east-1
+
+SERVE_PID_FILE="$E2E_DIR/serve.pid"
+SERVE_LOG="$E2E_DIR/serve.log"
+
+mkdir -p "$E2E_DIR"
+
+PASS_COUNT=0
+
+log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+pass() { PASS_COUNT=$((PASS_COUNT + 1)); printf '\033[1;32mPASS\033[0m %s\n' "$*"; }
+fail() { printf '\033[1;31mFAIL\033[0m %s\n' "$*" >&2; exit 1; }
+
+# assert_eq <name> <expected> <actual>
+assert_eq() {
+  local name=$1 expected=$2 actual=$3
+  if [[ "$actual" == "$expected" ]]; then
+    pass "$name (== $expected)"
+  else
+    fail "$name: expected [$expected], got [$actual]"
+  fi
+}
+
+# q <sql> -> unaligned tuples-only result over a fresh psql connection
+q() { "${PSQL[@]}" -tA -c "$1"; }
+
+# ---------------------------------------------------------------------------
+# Server lifecycle
+# ---------------------------------------------------------------------------
+stop_server() {
+  if [[ -f "$SERVE_PID_FILE" ]]; then
+    local pid
+    pid=$(cat "$SERVE_PID_FILE")
+    # Only signal the PID if it is actually an icegres process: a pidfile left
+    # behind by a crashed run may name a PID recycled by an unrelated process.
+    if kill -0 "$pid" 2>/dev/null \
+        && [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == icegres ]]; then
+      kill "$pid" 2>/dev/null || true
+      for _ in $(seq 1 20); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.25
+      done
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$SERVE_PID_FILE"
+  fi
+}
+
+start_server() {
+  "$BIN" serve --host 127.0.0.1 --port "$PG_PORT" >>"$SERVE_LOG" 2>&1 &
+  echo $! >"$SERVE_PID_FILE"
+  for _ in $(seq 1 60); do
+    if q "select 1" >/dev/null 2>&1; then
+      return 0
+    fi
+    if ! kill -0 "$(cat "$SERVE_PID_FILE")" 2>/dev/null; then
+      tail -n 30 "$SERVE_LOG" >&2
+      fail "icegres serve exited during startup (log tail above: $SERVE_LOG)"
+    fi
+    sleep 0.5
+  done
+  tail -n 30 "$SERVE_LOG" >&2
+  fail "icegres serve did not become ready on port $PG_PORT within 30s"
+}
+
+SECURE_PID_FILE="$E2E_DIR/serve-secure.pid"
+SECURE_LOG="$E2E_DIR/serve-secure.log"
+PK_PID_FILE="$E2E_DIR/serve-pk.pid"
+PK_LOG="$E2E_DIR/serve-pk.log"
+
+stop_secure_server() {
+  if [[ -f "$SECURE_PID_FILE" ]]; then
+    local pid
+    pid=$(cat "$SECURE_PID_FILE")
+    if kill -0 "$pid" 2>/dev/null \
+        && [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == icegres ]]; then
+      kill "$pid" 2>/dev/null || true
+      for _ in $(seq 1 20); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.25
+      done
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$SECURE_PID_FILE"
+  fi
+}
+
+stop_pidfile_generic() { # pidfile — identity-checked kill
+  local pidfile=$1 pid
+  if [[ -f "$pidfile" ]]; then
+    pid=$(cat "$pidfile")
+    if kill -0 "$pid" 2>/dev/null \
+        && [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == icegres ]]; then
+      kill "$pid" 2>/dev/null || true
+      for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.25; done
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$pidfile"
+  fi
+}
+
+stop_icegresd_at() { # pidfile — identity-checked kill of a control plane (comm=icegresd)
+  local pidfile=$1 pid
+  if [[ -f "$pidfile" ]]; then
+    pid=$(cat "$pidfile")
+    if kill -0 "$pid" 2>/dev/null \
+        && [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == icegresd ]]; then
+      kill "$pid" 2>/dev/null || true # SIGTERM: icegresd terminates its computes
+      for _ in $(seq 1 40); do kill -0 "$pid" 2>/dev/null || break; sleep 0.25; done
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$pidfile"
+  fi
+}
+
+stop_icegresd() { stop_icegresd_at "$E2E_DIR/icegresd.pid"; }
+
+stop_keeper_at() { # pidfile — identity-checked kill of an acceptor (comm=icekeeperd)
+  local pidfile=$1 pid
+  if [[ -f "$pidfile" ]]; then
+    pid=$(cat "$pidfile")
+    if kill -0 "$pid" 2>/dev/null \
+        && [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == icekeeperd ]]; then
+      kill "$pid" 2>/dev/null || true
+      for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.25; done
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$pidfile"
+  fi
+}
+
+cleanup() {
+  stop_server
+  stop_secure_server
+  stop_pidfile_generic "$PK_PID_FILE"
+  stop_pidfile_generic "$E2E_DIR/serve-buffered.pid"
+  stop_pidfile_generic "$E2E_DIR/serve-branch.pid"
+  stop_pidfile_generic "$E2E_DIR/serve-p5branch.pid"
+  stop_pidfile_generic "$E2E_DIR/flight.pid"
+  stop_pidfile_generic "$E2E_DIR/flight-secure.pid"
+  stop_pidfile_generic "$E2E_DIR/flight-authz.pid"
+  stop_pidfile_generic "$E2E_DIR/serve-strict.pid"
+  stop_pidfile_generic "$E2E_DIR/serve-vbuf.pid"
+  stop_pidfile_generic "$E2E_DIR/serve-obs.pid"
+  stop_pidfile_generic "$E2E_DIR/serve-thr.pid"
+  stop_pidfile_generic "$E2E_DIR/flight-tls.pid"
+  stop_pidfile_generic "$E2E_DIR/serve-fresh.pid"
+  stop_pidfile_generic "$E2E_DIR/serve-freshbuf.pid"
+  stop_pidfile_generic "$E2E_DIR/serve-p1a.pid"
+  stop_pidfile_generic "$E2E_DIR/serve-p1b.pid"
+  stop_icegresd
+  # (ha) section leftovers: HA icegresd instances, fence pair, keepers.
+  stop_icegresd_at "$E2E_DIR/icegresd-ha.pid"
+  stop_icegresd_at "$E2E_DIR/icegresd-lease-a.pid"
+  stop_icegresd_at "$E2E_DIR/icegresd-lease-b.pid"
+  stop_icegresd_at "$E2E_DIR/icegresd-scale.pid"
+  stop_pidfile_generic "$E2E_DIR/serve-ha-z.pid"
+  stop_pidfile_generic "$E2E_DIR/serve-ha-w.pid"
+  for kp in "$E2E_DIR"/ha-keeper-*.pid; do
+    # `|| continue`, not `&&`: after a clean run no pidfile matches, and a
+    # false-status last command in the EXIT trap would (set -e) override
+    # the suite's exit code with 1.
+    [[ -f "$kp" ]] || continue
+    stop_keeper_at "$kp"
+  done
+  # (p7) verify-section acceptors, same guard as above.
+  for kp in "$E2E_DIR"/vk-*.pid; do
+    [[ -f "$kp" ]] || continue
+    stop_keeper_at "$kp"
+  done
+}
+trap cleanup EXIT
+
+# ---------------------------------------------------------------------------
+# 0. Stack up
+# ---------------------------------------------------------------------------
+log "starting lakehouse stack (infra/scripts/up.sh)"
+bash "$REPO_DIR/infra/scripts/up.sh" >"$E2E_DIR/up.log" 2>&1 \
+  || { tail -n 30 "$E2E_DIR/up.log" >&2; fail "infra/scripts/up.sh failed (log: $E2E_DIR/up.log)"; }
+pass "lakehouse stack healthy"
+
+# ---------------------------------------------------------------------------
+# 1. Build (cargo skips work when the binary is fresh)
+# ---------------------------------------------------------------------------
+log "building icegres"
+(cd "$ICEGRES_DIR" && cargo build --quiet) \
+  || fail "cargo build failed"
+[[ -x "$BIN" ]] || fail "binary not found at $BIN"
+pass "cargo build"
+
+# ---------------------------------------------------------------------------
+# 2. Port must be ours to use
+# ---------------------------------------------------------------------------
+stop_server # kill any server left over from a previous (crashed) run
+if q "select 1" >/dev/null 2>&1; then
+  fail "something is already listening on $PG_HOST:$PG_PORT — stop it first (not started by this harness)"
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Seed (idempotent)
+# ---------------------------------------------------------------------------
+log "seeding demo data"
+"$BIN" seed >"$E2E_DIR/seed.log" 2>&1 \
+  || { tail -n 30 "$E2E_DIR/seed.log" >&2; fail "icegres seed failed (log: $E2E_DIR/seed.log)"; }
+pass "icegres seed"
+
+# ---------------------------------------------------------------------------
+# 4. Serve
+# ---------------------------------------------------------------------------
+log "starting icegres serve on port $PG_PORT"
+: >"$SERVE_LOG"
+start_server
+pass "server ready on port $PG_PORT"
+
+# ---------------------------------------------------------------------------
+# (a) Row counts match the seeded dataset
+# ---------------------------------------------------------------------------
+log "(a) seeded row counts"
+assert_eq "demo.cities count" 20 "$(q 'select count(*) from demo.cities')"
+assert_eq "demo.trips seeded rows (trip_id 1..280)" 280 \
+  "$(q 'select count(*) from demo.trips where trip_id between 1 and 280')"
+
+# ---------------------------------------------------------------------------
+# (b) WHERE filter with exact expected count (deterministic: LCG seed 42)
+# ---------------------------------------------------------------------------
+log "(b) WHERE filter"
+assert_eq "seeded trips with distance_km > 20" 104 \
+  "$(q 'select count(*) from demo.trips where trip_id between 1 and 280 and distance_km > 20')"
+
+# ---------------------------------------------------------------------------
+# (c) Aggregate GROUP BY with exact expected first row
+# ---------------------------------------------------------------------------
+log "(c) aggregate GROUP BY"
+assert_eq "top city by trips (city|trips|avg_fare)" "Berlin|21|25.42" \
+  "$(q "select city, count(*) as trips, round(avg(fare), 2) as avg_fare
+        from demo.trips where trip_id between 1 and 280
+        group by city order by trips desc, city asc limit 1")"
+
+# ---------------------------------------------------------------------------
+# (d) JOIN trips x cities with exact expected value
+# ---------------------------------------------------------------------------
+log "(d) JOIN"
+assert_eq "top country by trips via join (country|trips)" "United Kingdom|33" \
+  "$(q "select c.country, count(*) as trips
+        from demo.trips t join demo.cities c on t.city = c.city
+        where t.trip_id between 1 and 280
+        group by c.country order by trips desc, c.country asc limit 1")"
+
+# ---------------------------------------------------------------------------
+# (e) Write path over the wire: INSERT via psql, verify from new connections
+# ---------------------------------------------------------------------------
+log "(e) INSERT over pgwire"
+total_before=$(q 'select count(*) from demo.trips')
+max_id=$(q 'select coalesce(max(trip_id), 0) from demo.trips')
+new_id=$((max_id >= 900000 ? max_id + 1 : 900000))
+
+insert_tag=$("${PSQL[@]}" -c "insert into demo.trips (trip_id, city, distance_km, fare, ts)
+  values ($new_id, 'E2E City', 1.23, 4.56, TIMESTAMP '2026-07-05 12:34:56')" | tail -n 1)
+assert_eq "INSERT command tag" "INSERT 0 1" "$insert_tag"
+
+# Both checks below run on NEW psql connections.
+total_after=$(q 'select count(*) from demo.trips')
+assert_eq "demo.trips count after INSERT" "$((total_before + 1))" "$total_after"
+assert_eq "inserted row readable from a new connection" \
+  "$new_id|E2E City|1.23|4.56|2026-07-05 12:34:56.000000" \
+  "$(q "select trip_id, city, distance_km, fare, ts from demo.trips where trip_id = $new_id")"
+
+# ---------------------------------------------------------------------------
+# (f) Data really lives in the lakehouse (catalog registration + S3 Parquet)
+# ---------------------------------------------------------------------------
+log "(f) lakehouse storage and catalog registration"
+prefix=$(curl -sf "$CATALOG_URI/v1/config?warehouse=$WAREHOUSE" | jq -r '.overrides.prefix // .defaults.prefix') \
+  || fail "could not fetch catalog config from $CATALOG_URI"
+[[ -n "$prefix" && "$prefix" != "null" ]] || fail "no prefix in catalog config response"
+
+tables_json=$(curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables") \
+  || fail "could not list tables in namespace demo via the REST catalog"
+for t in trips cities; do
+  echo "$tables_json" | jq -e --arg t "$t" '.identifiers[] | select(.name == $t)' >/dev/null \
+    || fail "table demo.$t not registered in the REST catalog: $tables_json"
+  pass "demo.$t registered in Lakekeeper catalog"
+
+  location=$(curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/$t" | jq -r '.metadata.location')
+  [[ "$location" == s3://lakehouse/* ]] || fail "unexpected table location for demo.$t: $location"
+  key_prefix=${location#s3://lakehouse/}
+  parquet_count=$(aws --endpoint-url "$S3_ENDPOINT" s3 ls --recursive "s3://lakehouse/$key_prefix/data/" \
+    | grep -c '\.parquet$' || true)
+  [[ "$parquet_count" -gt 0 ]] \
+    || fail "no Parquet data files on RustFS under $location/data/ for demo.$t"
+  pass "demo.$t has $parquet_count Parquet data file(s) on RustFS under $location/data/"
+done
+
+# ---------------------------------------------------------------------------
+# (g) Restart durability: data lives in Iceberg, not the server
+# ---------------------------------------------------------------------------
+log "(g) restart durability"
+stop_server
+if q "select 1" >/dev/null 2>&1; then
+  fail "server still answering after kill"
+fi
+start_server
+assert_eq "demo.trips count after server restart" "$total_after" \
+  "$(q 'select count(*) from demo.trips')"
+assert_eq "seeded rows intact after restart" 280 \
+  "$(q 'select count(*) from demo.trips where trip_id between 1 and 280')"
+assert_eq "wire-inserted row survived restart" "$new_id" \
+  "$(q "select trip_id from demo.trips where trip_id = $new_id")"
+
+# ---------------------------------------------------------------------------
+# (h) Auth (--auth-file, SCRAM-SHA-256) + TLS (--tls-cert/--tls-key)
+# ---------------------------------------------------------------------------
+log "(h) auth + TLS on :$SECURE_PORT"
+stop_secure_server
+if psql -h "$PG_HOST" -p "$SECURE_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+  fail "something is already listening on :$SECURE_PORT — stop it first"
+fi
+
+bash "$REPO_DIR/infra/scripts/gen-dev-cert.sh" >/dev/null \
+  || fail "gen-dev-cert.sh failed"
+TLS_CRT="$REPO_DIR/infra/.data/tls/dev.crt"
+TLS_KEY="$REPO_DIR/infra/.data/tls/dev.key"
+AUTH_FILE="$E2E_DIR/auth.conf"
+printf '# e2e credentials\ne2e_user:e2e-secret-pw\n' >"$AUTH_FILE"
+chmod 600 "$AUTH_FILE"
+
+: >"$SECURE_LOG"
+"$BIN" serve --host "$PG_HOST" --port "$SECURE_PORT" \
+  --auth-file "$AUTH_FILE" --tls-cert "$TLS_CRT" --tls-key "$TLS_KEY" \
+  >>"$SECURE_LOG" 2>&1 &
+echo $! >"$SECURE_PID_FILE"
+secure_ready=0
+for _ in $(seq 1 60); do
+  if PGPASSWORD=e2e-secret-pw psql "host=$PG_HOST port=$SECURE_PORT user=e2e_user dbname=icegres sslmode=require" \
+       -tA -c 'select 1' >/dev/null 2>&1; then
+    secure_ready=1; break
+  fi
+  if ! kill -0 "$(cat "$SECURE_PID_FILE")" 2>/dev/null; then
+    tail -n 30 "$SECURE_LOG" >&2
+    fail "auth+TLS server exited during startup (log: $SECURE_LOG)"
+  fi
+  sleep 0.5
+done
+[[ "$secure_ready" == 1 ]] || { tail -n 30 "$SECURE_LOG" >&2; fail "auth+TLS server not ready on :$SECURE_PORT"; }
+pass "auth+TLS server ready on :$SECURE_PORT"
+
+assert_eq "right password over sslmode=require" 1 \
+  "$(PGPASSWORD=e2e-secret-pw psql "host=$PG_HOST port=$SECURE_PORT user=e2e_user dbname=icegres sslmode=require" -tA -c 'select 1' 2>&1)"
+
+assert_eq "right password + sslmode=verify-full (pinned dev cert)" 1 \
+  "$(PGPASSWORD=e2e-secret-pw psql "host=localhost port=$SECURE_PORT user=e2e_user dbname=icegres sslmode=verify-full sslrootcert=$TLS_CRT" -tA -c 'select 1' 2>&1)"
+
+if PGPASSWORD=totally-wrong psql "host=$PG_HOST port=$SECURE_PORT user=e2e_user dbname=icegres" \
+     -tA -c 'select 1' >/dev/null 2>&1; then
+  fail "wrong password was ACCEPTED on the auth-enabled server"
+fi
+pass "wrong password rejected"
+
+if PGPASSWORD=e2e-secret-pw psql "host=$PG_HOST port=$SECURE_PORT user=no_such_user dbname=icegres" \
+     -tA -c 'select 1' >/dev/null 2>&1; then
+  fail "unknown user was ACCEPTED on the auth-enabled server"
+fi
+pass "unknown user rejected"
+
+tls_line=$(echo | openssl s_client -starttls postgres -connect "$PG_HOST:$SECURE_PORT" 2>/dev/null \
+  | grep -Eo 'TLSv1\.[23], Cipher is [A-Z0-9_]+' | head -n 1)
+[[ -n "$tls_line" ]] || fail "openssl s_client -starttls postgres saw no TLS handshake on :$SECURE_PORT"
+pass "TLS handshake proven by openssl s_client ($tls_line)"
+
+# The data path works authenticated + encrypted end to end.
+assert_eq "authenticated+encrypted query result" 20 \
+  "$(PGPASSWORD=e2e-secret-pw psql "host=$PG_HOST port=$SECURE_PORT user=e2e_user dbname=icegres sslmode=require" -tA -c 'select count(*) from demo.cities' 2>&1)"
+
+stop_secure_server
+
+# ---------------------------------------------------------------------------
+# (i) UPDATE/DELETE: copy-on-write DML over the wire (SPEC B2/B3)
+# ---------------------------------------------------------------------------
+log "(i) UPDATE/DELETE copy-on-write DML"
+U_ID=$((new_id + 1))
+D_ID=$((new_id + 2))
+"${PSQL[@]}" -q -c "insert into demo.trips (trip_id, city, distance_km, fare, ts) values
+  ($U_ID, 'DML Update', 1.0, 10.0, TIMESTAMP '2026-07-05 00:00:00'),
+  ($D_ID, 'DML Delete', 2.0, 20.0, TIMESTAMP '2026-07-05 00:00:00')" \
+  || fail "seeding DML test rows failed"
+
+pre_dml_snap=$(q 'select snapshot_id from demo."trips$snapshots" order by committed_at desc limit 1')
+[[ "$pre_dml_snap" =~ ^[0-9]+$ ]] || fail "could not read the pre-DML snapshot id"
+
+update_tag=$("${PSQL[@]}" -c "update demo.trips set fare = 123.45 where trip_id = $U_ID" | tail -n 1)
+assert_eq "UPDATE command tag" "UPDATE 1" "$update_tag"
+assert_eq "updated row readable from a new connection" "$U_ID|DML Update|123.45" \
+  "$(q "select trip_id, city, fare from demo.trips where trip_id = $U_ID")"
+
+delete_tag=$("${PSQL[@]}" -c "delete from demo.trips where trip_id = $D_ID" | tail -n 1)
+assert_eq "DELETE command tag" "DELETE 1" "$delete_tag"
+assert_eq "deleted row gone from a new connection" 0 \
+  "$(q "select count(*) from demo.trips where trip_id = $D_ID")"
+assert_eq "sibling row survived the DELETE" "$U_ID" \
+  "$(q "select trip_id from demo.trips where trip_id = $U_ID")"
+assert_eq "seeded rows untouched by DML" 280 \
+  "$(q 'select count(*) from demo.trips where trip_id between 1 and 280')"
+
+# Time travel is intact after DML: the pre-DML snapshot still serves the
+# deleted row and the pre-update fare (copy-on-write never mutates history).
+assert_eq "pre-DML snapshot still serves the deleted row" 1 \
+  "$(q "select count(*) from demo.\"trips@$pre_dml_snap\" where trip_id = $D_ID")"
+assert_eq "pre-DML snapshot still serves the pre-update fare" "10.0" \
+  "$(q "select fare from demo.\"trips@$pre_dml_snap\" where trip_id = $U_ID")"
+
+# Optimistic-concurrency retry, proven against the real catalog:
+# ICEGRES_DML_INJECT_CONFLICT sabotages attempt 1's assert-ref-snapshot-id,
+# Lakekeeper answers 409, and the engine recomputes+retries successfully.
+ICEGRES_DML_INJECT_CONFLICT=1 "$BIN" sql -e "delete from demo.trips where trip_id = $U_ID" \
+  >"$E2E_DIR/dml-conflict.log" 2>&1 \
+  || { tail -n 20 "$E2E_DIR/dml-conflict.log" >&2; fail "conflict-injected DELETE failed"; }
+grep -q "commit conflict (409)" "$E2E_DIR/dml-conflict.log" \
+  || fail "conflict injection did not produce a 409 (log: $E2E_DIR/dml-conflict.log)"
+grep -q "DELETE 1" "$E2E_DIR/dml-conflict.log" \
+  || fail "conflict-injected DELETE did not commit on retry (log: $E2E_DIR/dml-conflict.log)"
+pass "DML conflict retry: 409 from Lakekeeper on attempt 1, committed on attempt 2"
+assert_eq "conflict-retried DELETE took effect" 0 \
+  "$(q "select count(*) from demo.trips where trip_id = $U_ID")"
+
+# ---------------------------------------------------------------------------
+# (j) Explicit transactions (SPEC B4): ROLLBACK undoes, COMMIT is one atomic
+#     snapshot across statements, errors abort, concurrent writers conflict.
+# ---------------------------------------------------------------------------
+log "(j) explicit transactions BEGIN/COMMIT/ROLLBACK"
+TX_A=$((new_id + 3))
+TX_B=$((new_id + 4))
+TX_C=$((new_id + 5))
+
+# The trips snapshot count is read via the REST catalog (the $snapshots
+# metadata table has a pre-existing upstream projection bug on count()).
+trips_snap_count() {
+  curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/trips" \
+    | jq '[.metadata.snapshots[]?] | length'
+}
+
+# j1: ROLLBACK undoes the INSERT; the row was visible INSIDE the txn (RYOW).
+txn_out=$("${PSQL[@]}" 2>&1 <<EOF
+BEGIN;
+insert into demo.trips (trip_id, city, distance_km, fare, ts) values ($TX_A, 'E2E Txn', 1.0, 1.0, TIMESTAMP '2026-07-05 00:00:00');
+select count(*) from demo.trips where trip_id = $TX_A;
+ROLLBACK;
+EOF
+)
+echo "$txn_out" | grep -q "INSERT 0 1" || fail "txn INSERT tag missing: $txn_out"
+echo "$txn_out" | grep -qE '^\s*1$' || fail "read-your-own-writes inside txn failed: $txn_out"
+echo "$txn_out" | grep -q "ROLLBACK" || fail "ROLLBACK tag missing: $txn_out"
+pass "txn INSERT visible inside the transaction (read-your-own-writes)"
+assert_eq "ROLLBACK undid the INSERT (new connection)" 0 \
+  "$(q "select count(*) from demo.trips where trip_id = $TX_A")"
+
+# j2: multi-statement txn (2 INSERTs + UPDATE + DELETE) commits as ONE
+#     Iceberg snapshot; final state correct from new connections.
+snaps_before=$(trips_snap_count)
+"${PSQL[@]}" -q 2>"$E2E_DIR/txn-commit.err" <<EOF || { cat "$E2E_DIR/txn-commit.err" >&2; fail "multi-statement txn failed"; }
+BEGIN;
+insert into demo.trips (trip_id, city, distance_km, fare, ts) values ($TX_A, 'E2E Txn', 1.0, 10.0, TIMESTAMP '2026-07-05 00:00:00');
+insert into demo.trips (trip_id, city, distance_km, fare, ts) values ($TX_B, 'E2E Txn', 2.0, 20.0, TIMESTAMP '2026-07-05 00:00:00');
+update demo.trips set fare = 99.0 where trip_id = $TX_A;
+delete from demo.trips where trip_id = $TX_B;
+COMMIT;
+EOF
+snaps_after=$(trips_snap_count)
+assert_eq "COMMIT produced exactly ONE new snapshot for 4 statements" \
+  "$((snaps_before + 1))" "$snaps_after"
+assert_eq "post-commit state (INSERT+UPDATE composed)" "$TX_A|99.0" \
+  "$(q "select trip_id, fare from demo.trips where trip_id = $TX_A")"
+assert_eq "post-commit state (INSERT+DELETE composed away)" 0 \
+  "$(q "select count(*) from demo.trips where trip_id = $TX_B")"
+
+# j3: a failed statement aborts the transaction: subsequent statements are
+#     rejected (25P02) and COMMIT answers ROLLBACK; nothing landed. This
+#     probe must keep the session running past the error, so it uses psql
+#     WITHOUT ON_ERROR_STOP.
+txn_out=$(psql -h "$PG_HOST" -p "$PG_PORT" -U postgres -d icegres 2>&1 <<EOF
+BEGIN;
+select 1/0;
+insert into demo.trips (trip_id, city, distance_km, fare, ts) values ($TX_C, 'E2E Abort', 1.0, 1.0, TIMESTAMP '2026-07-05 00:00:00');
+COMMIT;
+EOF
+) || true
+echo "$txn_out" | grep -q "current transaction is aborted" \
+  || fail "aborted txn did not block the follow-up statement: $txn_out"
+echo "$txn_out" | grep -q "ROLLBACK" \
+  || fail "COMMIT after a failed statement did not roll back: $txn_out"
+pass "failed statement aborts the txn; COMMIT rolls back"
+assert_eq "nothing from the aborted txn landed" 0 \
+  "$(q "select count(*) from demo.trips where trip_id = $TX_C")"
+
+# j4: snapshot isolation is first-committer-wins: a writer that commits
+#     between BEGIN and COMMIT makes the txn's COMMIT fail with 40001.
+( echo "BEGIN;"
+  echo "insert into demo.trips (trip_id, city, distance_km, fare, ts) values ($TX_A + 100, 'E2E Conflict', 1.0, 1.0, TIMESTAMP '2026-07-05 00:00:00');"
+  sleep 3
+  echo "COMMIT;" ) | "${PSQL[@]}" >"$E2E_DIR/txn-conflict.out" 2>&1 &
+TXN_PID=$!
+sleep 1.5
+"${PSQL[@]}" -q -c "insert into demo.trips (trip_id, city, distance_km, fare, ts) values ($TX_C, 'E2E Winner', 1.0, 1.0, TIMESTAMP '2026-07-05 00:00:00')" \
+  || fail "concurrent autocommit INSERT failed"
+wait "$TXN_PID" || true
+grep -q "could not serialize access due to concurrent update" "$E2E_DIR/txn-conflict.out" \
+  || { cat "$E2E_DIR/txn-conflict.out" >&2; fail "txn COMMIT did not fail with a serialization error"; }
+pass "concurrent writer -> COMMIT fails with serialization_failure (first-committer-wins)"
+assert_eq "loser txn's row absent, winner's row present" "0|1" \
+  "$(q "select count(*) from demo.trips where trip_id = $TX_A + 100")|$(q "select count(*) from demo.trips where trip_id = $TX_C")"
+
+# ---------------------------------------------------------------------------
+# (j2) Atomic multi-table transactions (roadmap Phase 3): a COMMIT touching
+#      N tables is ONE all-or-nothing catalog request against Lakekeeper's
+#      POST /v1/{prefix}/transactions/commit. Both tables commit together
+#      (exactly one new snapshot each), and a staged conflict is a clean
+#      40001 with NEITHER table changed — the 40003 partial-apply outcome is
+#      unreachable on this path. Whole-lakehouse branches ride the same
+#      endpoint: create-all/drop-all set/remove the ref on EVERY table —
+#      tables in NESTED namespaces included, each request pinning main to
+#      the head captured at load (consistent-or-nothing cut) — in one
+#      atomic transaction.
+# ---------------------------------------------------------------------------
+log "(j2) atomic multi-table transactions + whole-lakehouse branches"
+
+# snap_count <table>: snapshot count of demo.<table> via the REST catalog.
+snap_count() {
+  curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/$1" \
+    | jq '[.metadata.snapshots[]?] | length'
+}
+
+q 'drop table if exists demo.e2e_mt_a' >/dev/null 2>&1 || true
+q 'drop table if exists demo.e2e_mt_b' >/dev/null 2>&1 || true
+q 'create table demo.e2e_mt_a (id bigint, v double)' >/dev/null
+q 'create table demo.e2e_mt_b (id bigint, v double)' >/dev/null
+
+# j2-1: a two-table COMMIT lands atomically: both rows visible from new
+# connections, exactly ONE new snapshot per table, and the server used the
+# multi-table transaction endpoint (not N ordered per-table commits).
+mt_atomic_before=$(grep -c 'transaction committed atomically via transactions/commit' "$SERVE_LOG" || true)
+snaps_a_before=$(snap_count e2e_mt_a)
+snaps_b_before=$(snap_count e2e_mt_b)
+"${PSQL[@]}" -q 2>"$E2E_DIR/mt-commit.err" <<EOF || { cat "$E2E_DIR/mt-commit.err" >&2; fail "multi-table txn COMMIT failed"; }
+BEGIN;
+insert into demo.e2e_mt_a values (1, 1.0);
+insert into demo.e2e_mt_b values (2, 2.0);
+COMMIT;
+EOF
+assert_eq "both tables visible from new connections after ONE COMMIT" "1|1" \
+  "$(q 'select count(*) from demo.e2e_mt_a')|$(q 'select count(*) from demo.e2e_mt_b')"
+assert_eq "exactly one new snapshot per table" \
+  "$((snaps_a_before + 1))|$((snaps_b_before + 1))" \
+  "$(snap_count e2e_mt_a)|$(snap_count e2e_mt_b)"
+mt_atomic_after=$(grep -c 'transaction committed atomically via transactions/commit' "$SERVE_LOG" || true)
+assert_eq "COMMIT went through the atomic transactions/commit endpoint" \
+  "$((mt_atomic_before + 1))" "$mt_atomic_after"
+
+# j2-2: staged conflict — a second writer commits to ONE touched table while
+# the transaction is open. COMMIT fails with 40001 (serialization_failure,
+# retryable) and NEITHER table changed: no partial apply, no 40003.
+snaps_a_before=$(snap_count e2e_mt_a)
+snaps_b_before=$(snap_count e2e_mt_b)
+( echo "BEGIN;"
+  echo "insert into demo.e2e_mt_a values (10, 10.0);"
+  echo "insert into demo.e2e_mt_b values (11, 11.0);"
+  sleep 3
+  echo "COMMIT;" ) | "${PSQL[@]}" -v VERBOSITY=verbose >"$E2E_DIR/mt-conflict.out" 2>&1 &
+MT_PID=$!
+sleep 1.5
+"${PSQL[@]}" -q -c 'insert into demo.e2e_mt_b values (777, 7.0)' \
+  || fail "concurrent autocommit INSERT failed"
+wait "$MT_PID" || true
+grep -q 'could not serialize access due to concurrent update' "$E2E_DIR/mt-conflict.out" \
+  || { cat "$E2E_DIR/mt-conflict.out" >&2; fail "multi-table conflict did not report a serialization failure"; }
+grep -q '40001' "$E2E_DIR/mt-conflict.out" \
+  || { cat "$E2E_DIR/mt-conflict.out" >&2; fail "multi-table conflict sqlstate is not 40001"; }
+grep -q 'no changes were applied' "$E2E_DIR/mt-conflict.out" \
+  || { cat "$E2E_DIR/mt-conflict.out" >&2; fail "conflict error does not state that nothing was applied"; }
+pass "staged conflict -> 40001 serialization_failure (all-or-nothing, retryable)"
+assert_eq "NEITHER table has the loser txn's rows; the winner's row landed" "0|0|1" \
+  "$(q 'select count(*) from demo.e2e_mt_a where id = 10')|$(q 'select count(*) from demo.e2e_mt_b where id = 11')|$(q 'select count(*) from demo.e2e_mt_b where id = 777')"
+assert_eq "conflicted COMMIT wrote no snapshot (only the winner's on table b)" \
+  "$snaps_a_before|$((snaps_b_before + 1))" \
+  "$(snap_count e2e_mt_a)|$(snap_count e2e_mt_b)"
+
+# j2-3: whole-lakehouse branches: create-all sets the ref on EVERY table in
+# ONE atomic transaction (per-table assert-ref-snapshot-id=null guard, plus
+# a main=<captured head> anchor per table so the cut is consistent-or-
+# nothing); drop-all removes it everywhere the same way. Tables in NESTED
+# namespaces are part of "every table": list_all_tables walks the namespace
+# tree (the REST list_namespaces answers one level per call), so a table in
+# demo_nested.child must get the ref too — before that fix it was silently
+# excluded from the cut.
+ALL_BR=e2e_all
+
+# Nested-namespace fixture: demo_nested.child.nested_t with ONE honest EMPTY
+# snapshot (an Iceberg branch ref must point at a snapshot; a real
+# zero-manifest manifest list is uploaded to the table's metadata dir and
+# committed via the REST API — no SQL surface reaches nested namespaces).
+NESTED_NS_URL="demo_nested%1Fchild" # %1F = REST spec namespace level separator
+NESTED_SNAP=424242424242
+nested_table_url() { echo "$CATALOG_URI/v1/$prefix/namespaces/$NESTED_NS_URL/tables/nested_t"; }
+# crashed-run cleanup, then (re)create parent + child namespaces and table
+curl -sf -X DELETE "$(nested_table_url)?purgeRequested=true" >/dev/null 2>&1 || true
+curl -sf -X POST "$CATALOG_URI/v1/$prefix/namespaces" -H 'Content-Type: application/json' \
+  -d '{"namespace":["demo_nested"]}' >/dev/null 2>&1 || true # may already exist
+curl -sf -X POST "$CATALOG_URI/v1/$prefix/namespaces" -H 'Content-Type: application/json' \
+  -d '{"namespace":["demo_nested","child"]}' >/dev/null 2>&1 || true
+curl -sf -X POST "$CATALOG_URI/v1/$prefix/namespaces/$NESTED_NS_URL/tables" \
+  -H 'Content-Type: application/json' -d '{
+  "name": "nested_t",
+  "schema": {"type":"struct","schema-id":0,"fields":[
+    {"id":1,"name":"id","required":false,"type":"long"}]}
+}' >/dev/null || fail "could not create demo_nested.child.nested_t via the REST catalog"
+nested_loc=$(curl -sf "$(nested_table_url)" | jq -r '.metadata.location')
+[[ "$nested_loc" == s3://lakehouse/* ]] || fail "unexpected nested table location: $nested_loc"
+# A valid EMPTY manifest list is an Avro OCF with a header (magic + writer
+# schema + null codec + sync marker) and zero data blocks.
+python3 - "$E2E_DIR/nested-empty-manifest-list.avro" <<'PYEOF' \
+  || fail "could not generate the empty manifest list"
+import json, os, sys
+schema = {"type": "record", "name": "manifest_file", "fields": [
+    {"name": "manifest_path", "type": "string", "field-id": 500},
+    {"name": "manifest_length", "type": "long", "field-id": 501},
+    {"name": "partition_spec_id", "type": "int", "field-id": 502},
+    {"name": "content", "type": "int", "field-id": 517},
+    {"name": "sequence_number", "type": "long", "field-id": 515},
+    {"name": "min_sequence_number", "type": "long", "field-id": 516},
+    {"name": "added_snapshot_id", "type": "long", "field-id": 503},
+    {"name": "added_files_count", "type": "int", "field-id": 504},
+    {"name": "existing_files_count", "type": "int", "field-id": 505},
+    {"name": "deleted_files_count", "type": "int", "field-id": 506},
+    {"name": "added_rows_count", "type": "long", "field-id": 512},
+    {"name": "existing_rows_count", "type": "long", "field-id": 513},
+    {"name": "deleted_rows_count", "type": "long", "field-id": 514},
+    {"name": "partitions", "field-id": 507, "type": ["null", {
+        "type": "array", "element-id": 508, "items": {
+            "type": "record", "name": "r508", "fields": [
+                {"name": "contains_null", "type": "boolean", "field-id": 509},
+                {"name": "contains_nan", "type": ["null", "boolean"], "field-id": 518},
+                {"name": "lower_bound", "type": ["null", "bytes"], "field-id": 510},
+                {"name": "upper_bound", "type": ["null", "bytes"], "field-id": 511}]},
+    }]},
+]}
+def vlong(n):  # Avro zigzag varint
+    n = (n << 1) ^ (n >> 63)
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+meta = {"avro.schema": json.dumps(schema).encode(),
+        "avro.codec": b"null", "format-version": b"2"}
+buf = b"Obj\x01" + vlong(len(meta))
+for k, v in meta.items():
+    buf += vlong(len(k.encode())) + k.encode() + vlong(len(v)) + v
+buf += vlong(0)        # end of the header metadata map
+buf += os.urandom(16)  # sync marker; zero data blocks follow
+open(sys.argv[1], "wb").write(buf)
+PYEOF
+aws --endpoint-url "$S3_ENDPOINT" s3 cp "$E2E_DIR/nested-empty-manifest-list.avro" \
+  "$nested_loc/metadata/snap-$NESTED_SNAP-0-e2e-empty.avro" >/dev/null \
+  || fail "could not upload the empty manifest list for demo_nested.child.nested_t"
+curl -sf -X POST "$(nested_table_url)" -H 'Content-Type: application/json' -d "{
+  \"requirements\": [{\"type\":\"assert-ref-snapshot-id\",\"ref\":\"main\",\"snapshot-id\":null}],
+  \"updates\": [
+    {\"action\":\"add-snapshot\",\"snapshot\":{
+      \"snapshot-id\": $NESTED_SNAP,
+      \"sequence-number\": 1,
+      \"timestamp-ms\": $(date +%s%3N),
+      \"manifest-list\": \"$nested_loc/metadata/snap-$NESTED_SNAP-0-e2e-empty.avro\",
+      \"summary\": {\"operation\":\"append\"},
+      \"schema-id\": 0
+    }},
+    {\"action\":\"set-snapshot-ref\",\"ref-name\":\"main\",
+     \"type\":\"branch\",\"snapshot-id\": $NESTED_SNAP}
+  ]
+}" >/dev/null || fail "could not commit the empty snapshot to demo_nested.child.nested_t"
+pass "nested-namespace fixture: demo_nested.child.nested_t with one (empty) snapshot"
+# The branch ref of the nested table, read via the REST catalog (the branch
+# CLI addresses <namespace>.<table> only; nested tables are asserted here).
+nested_ref() {
+  curl -sf "$(nested_table_url)" \
+    | jq -r ".metadata.refs.\"$ALL_BR\".\"snapshot-id\" // \"absent\""
+}
+
+"$BIN" branch drop-all "$ALL_BR" >/dev/null 2>&1 || true # crashed-run cleanup
+"$BIN" branch create-all "$ALL_BR" >"$E2E_DIR/branch-create-all.log" 2>&1 \
+  || { cat "$E2E_DIR/branch-create-all.log" >&2; fail "branch create-all failed"; }
+grep -q "ONE atomic transaction" "$E2E_DIR/branch-create-all.log" \
+  || fail "create-all output unexpected: $(cat "$E2E_DIR/branch-create-all.log")"
+for t in trips cities e2e_mt_a e2e_mt_b; do
+  "$BIN" branch list "demo.$t" 2>/dev/null | grep -q "^$ALL_BR	" \
+    || fail "branch $ALL_BR missing on demo.$t after create-all"
+done
+pass "branch create-all: ref present on every table (trips, cities, e2e_mt_a, e2e_mt_b)"
+grep -q "created branch $ALL_BR on demo_nested.child.nested_t at snapshot $NESTED_SNAP" \
+  "$E2E_DIR/branch-create-all.log" \
+  || fail "create-all output does not mention the nested table: $(cat "$E2E_DIR/branch-create-all.log")"
+assert_eq "create-all reached the NESTED namespace (ref on demo_nested.child.nested_t)" \
+  "$NESTED_SNAP" "$(nested_ref)"
+if "$BIN" branch create-all "$ALL_BR" >/dev/null 2>&1; then
+  fail "duplicate create-all was ACCEPTED (per-table assert-ref-snapshot-id=null must reject it)"
+fi
+pass "duplicate create-all rejected (all-or-nothing, nothing applied)"
+"$BIN" branch drop-all "$ALL_BR" >"$E2E_DIR/branch-drop-all.log" 2>&1 \
+  || { cat "$E2E_DIR/branch-drop-all.log" >&2; fail "branch drop-all failed"; }
+for t in trips cities e2e_mt_a e2e_mt_b; do
+  if "$BIN" branch list "demo.$t" 2>/dev/null | grep -q "^$ALL_BR	"; then
+    fail "branch $ALL_BR still on demo.$t after drop-all"
+  fi
+done
+pass "branch drop-all: ref removed from every table"
+assert_eq "drop-all removed the ref from the NESTED table too" \
+  "absent" "$(nested_ref)"
+if "$BIN" branch drop-all "$ALL_BR" >/dev/null 2>&1; then
+  fail "drop-all of a nonexistent branch was ACCEPTED (must error when no table has it)"
+fi
+pass "drop-all errors when no table has the branch"
+q 'drop table demo.e2e_mt_a' >/dev/null 2>&1 || true
+q 'drop table demo.e2e_mt_b' >/dev/null 2>&1 || true
+# Nested fixture cleanup: table (with purge — the empty manifest list is a
+# real file under its location), then child + parent namespaces.
+curl -sf -X DELETE "$(nested_table_url)?purgeRequested=true" >/dev/null 2>&1 || true
+curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/$NESTED_NS_URL" >/dev/null 2>&1 || true
+curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/demo_nested" >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
+# (k) Opt-in PK enforcement (SPEC B5): --enforce-pk + icegres.primary-key
+# ---------------------------------------------------------------------------
+log "(k) PK enforcement (--enforce-pk) on :$PK_PORT"
+stop_pk_server() { stop_pidfile_generic "$PK_PID_FILE"; }
+drop_pk_table() {
+  curl -sf -X DELETE \
+    "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_pk?purgeRequested=true" \
+    >/dev/null 2>&1 || true
+}
+stop_pk_server
+drop_pk_table
+curl -sf -X POST "$CATALOG_URI/v1/$prefix/namespaces/demo/tables" \
+  -H 'Content-Type: application/json' -d '{
+  "name": "e2e_pk",
+  "schema": {"type":"struct","schema-id":0,"fields":[
+    {"id":1,"name":"id","required":false,"type":"long"},
+    {"id":2,"name":"val","required":false,"type":"string"}]},
+  "properties": {"icegres.primary-key": "id"}
+}' >/dev/null || fail "could not create demo.e2e_pk via REST catalog"
+
+: >"$PK_LOG"
+"$BIN" serve --host "$PG_HOST" --port "$PK_PORT" --enforce-pk >>"$PK_LOG" 2>&1 &
+echo $! >"$PK_PID_FILE"
+pk_ready=0
+for _ in $(seq 1 60); do
+  if psql -h "$PG_HOST" -p "$PK_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+    pk_ready=1; break
+  fi
+  sleep 0.5
+done
+[[ "$pk_ready" == 1 ]] || { tail -n 20 "$PK_LOG" >&2; fail "--enforce-pk server not ready on :$PK_PORT"; }
+PKQ=(psql -h "$PG_HOST" -p "$PK_PORT" -U postgres -d icegres)
+
+assert_eq "first insert accepted" "INSERT 0 1" \
+  "$("${PKQ[@]}" -c "insert into demo.e2e_pk (id, val) values (1, 'a')" 2>&1 | tail -n 1)"
+dup_out=$("${PKQ[@]}" -c "insert into demo.e2e_pk (id, val) values (1, 'dup')" 2>&1) || true
+echo "$dup_out" | grep -q 'duplicate key value violates unique constraint "e2e_pk_pkey"' \
+  || fail "duplicate insert not rejected: $dup_out"
+pass "duplicate key rejected (23505 unique violation)"
+null_out=$("${PKQ[@]}" -c "insert into demo.e2e_pk (id, val) values (NULL, 'n')" 2>&1) || true
+echo "$null_out" | grep -q "violates not-null constraint" \
+  || fail "NULL key not rejected: $null_out"
+pass "NULL key rejected (23502 not-null violation)"
+# Enforcement also applies to rows buffered in a transaction (RYOW check).
+txn_pk_out=$("${PKQ[@]}" 2>&1 <<'EOF'
+BEGIN;
+insert into demo.e2e_pk (id, val) values (2, 'b');
+insert into demo.e2e_pk (id, val) values (2, 'dup-in-txn');
+COMMIT;
+EOF
+) || true
+echo "$txn_pk_out" | grep -q "duplicate key value" \
+  || fail "in-txn duplicate not rejected: $txn_pk_out"
+pass "duplicate against the txn's own buffered rows rejected"
+assert_eq "table holds exactly the accepted rows" "1|a" \
+  "$(psql -h "$PG_HOST" -p "$PK_PORT" -U postgres -d icegres -tA -c 'select id, val from demo.e2e_pk order by id')"
+
+stop_pk_server
+drop_pk_table
+
+# ---------------------------------------------------------------------------
+# (l) Buffered write mode (--write-buffer-ms, Moonlink-style union reads):
+#     insert burst acked from the buffer, instantly readable on NEW
+#     connections BEFORE any Iceberg commit (union read proven by the
+#     unchanged snapshot count), group-committed as ONE snapshot at the
+#     flush cadence, and durable across an UNCLEAN kill once flushed.
+# ---------------------------------------------------------------------------
+BUF_PORT=5449
+BUF_PID_FILE="$E2E_DIR/serve-buffered.pid"
+BUF_LOG="$E2E_DIR/serve-buffered.log"
+BUF_MS=1500 # long cadence so the "readable before commit" check is deterministic
+log "(l) buffered write mode (--write-buffer-ms $BUF_MS) on :$BUF_PORT"
+stop_pidfile_generic "$BUF_PID_FILE"
+if psql -h "$PG_HOST" -p "$BUF_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+  fail "something is already listening on :$BUF_PORT — stop it first"
+fi
+: >"$BUF_LOG"
+"$BIN" serve --host "$PG_HOST" --port "$BUF_PORT" --write-buffer-ms "$BUF_MS" \
+  >>"$BUF_LOG" 2>&1 &
+echo $! >"$BUF_PID_FILE"
+buf_ready=0
+for _ in $(seq 1 60); do
+  if psql -h "$PG_HOST" -p "$BUF_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+    buf_ready=1; break
+  fi
+  sleep 0.5
+done
+[[ "$buf_ready" == 1 ]] || { tail -n 20 "$BUF_LOG" >&2; fail "buffered server not ready on :$BUF_PORT"; }
+BQ=(psql -h "$PG_HOST" -p "$BUF_PORT" -U postgres -d icegres -tA)
+
+# The enabled mode must announce its durability trade loudly.
+grep -q "write buffering is ENABLED" "$BUF_LOG" \
+  || fail "buffered server did not log the durability WARN (log: $BUF_LOG)"
+pass "startup WARN present (acked-write loss window documented)"
+
+# Burst: 25 rows in 5 INSERT statements over one connection, all acked from
+# the buffer, then read back from NEW connections. The instant-visibility
+# assertion (count == 25) is timing-independent — the union view is correct
+# whether or not a flush has happened. The stronger "served from the buffer,
+# NOT the lake" proof (snapshot count unchanged across the burst) races the
+# background flush tick by construction, so it retries with fresh ids until
+# an attempt completes inside one flush window (3 attempts, each ~0.5 s in a
+# ${BUF_MS} ms window — a systematic failure means the union read is broken).
+buf_base=$(( $("${BQ[@]}" -c 'select coalesce(max(trip_id), 0) from demo.trips') + 1 ))
+(( buf_base >= 900000 )) || buf_base=950000
+snaps_start=$(trips_snap_count)
+burst_stmts=""
+attempts=0
+union_proven=0
+for attempt in 1 2 3; do
+  attempts=$attempt
+  base=$((buf_base + (attempt - 1) * 25))
+  snaps_pre=$(trips_snap_count)
+  burst_stmts=""
+  for k in 0 1 2 3 4; do
+    vals=""
+    for j in 0 1 2 3 4; do
+      id=$((base + k * 5 + j))
+      vals+="${vals:+, }($id, 'E2E Buffered', 1.0, 2.0, TIMESTAMP '2026-07-06 00:00:00')"
+    done
+    burst_stmts+="insert into demo.trips (trip_id, city, distance_km, fare, ts) values $vals;"$'\n'
+  done
+  burst_out=$(psql -h "$PG_HOST" -p "$BUF_PORT" -U postgres -d icegres -v ON_ERROR_STOP=1 2>&1 <<<"$burst_stmts") \
+    || fail "buffered INSERT burst failed: $burst_out"
+  [[ "$(grep -c '^INSERT 0 5$' <<<"$burst_out")" == 5 ]] || fail "burst tags wrong: $burst_out"
+  # Union read: all 25 rows visible IMMEDIATELY on a NEW connection.
+  burst_count=$("${BQ[@]}" -c "select count(*) from demo.trips where trip_id between $base and $((base + 24))")
+  [[ "$burst_count" == 25 ]] || fail "burst not instantly readable on a new connection (union read broken): got $burst_count/25"
+  # Aggregates also see the buffered rows (whole-scan union, no special case).
+  agg=$("${BQ[@]}" -c "select city, count(*) from demo.trips where trip_id between $base and $((base + 24)) group by city")
+  [[ "$agg" == "E2E Buffered|25" ]] || fail "aggregate over the union view wrong: $agg"
+  snaps_post=$(trips_snap_count)
+  if [[ "$snaps_post" == "$snaps_pre" ]]; then
+    union_proven=1
+    break
+  fi
+  log "  flush tick landed inside attempt $attempt's burst window (snapshots $snaps_pre -> $snaps_post); retrying with fresh ids"
+done
+[[ "$union_proven" == 1 ]] || fail "no burst attempt completed with an unchanged snapshot count — rows are not being served from the buffer"
+pass "burst of 25 rows readable instantly on new connections with ZERO new Iceberg snapshots (union read, acked from the buffer)"
+total_rows=$((attempts * 25))
+
+# Wait one flush cadence: the buffered statements group-commit. 5 INSERT
+# statements per attempt would be 5 snapshots each in synchronous mode; the
+# buffer coalesces each attempt's burst into one flush (2 max if a tick
+# split an earlier retried attempt).
+sleep $(( BUF_MS / 1000 + 2 ))
+snaps_settled=$(trips_snap_count)
+new_snaps=$((snaps_settled - snaps_start))
+if (( new_snaps >= 1 && new_snaps <= attempts + 1 )); then
+  pass "group commit: $((attempts * 5)) INSERT statements ($total_rows rows) produced $new_snaps snapshot(s) (sync mode would produce $((attempts * 5)))"
+else
+  fail "unexpected snapshot count after flush: $new_snaps new snapshots for $attempts burst attempt(s)"
+fi
+assert_eq "all burst rows committed after the flush cadence" "$total_rows" \
+  "$("${BQ[@]}" -c "select count(*) from demo.trips where trip_id between $buf_base and $((buf_base + total_rows - 1))")"
+
+# UNCLEAN kill (SIGKILL — no graceful shutdown), then restart: the flushed
+# rows are in Iceberg, so they survive the loss of the process.
+buf_pid=$(cat "$BUF_PID_FILE")
+kill -9 "$buf_pid" 2>/dev/null || fail "could not SIGKILL buffered server"
+for _ in $(seq 1 20); do kill -0 "$buf_pid" 2>/dev/null || break; sleep 0.25; done
+kill -0 "$buf_pid" 2>/dev/null && fail "buffered server survived SIGKILL"
+rm -f "$BUF_PID_FILE"
+"$BIN" serve --host "$PG_HOST" --port "$BUF_PORT" --write-buffer-ms "$BUF_MS" \
+  >>"$BUF_LOG" 2>&1 &
+echo $! >"$BUF_PID_FILE"
+buf_ready=0
+for _ in $(seq 1 60); do
+  if psql -h "$PG_HOST" -p "$BUF_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+    buf_ready=1; break
+  fi
+  sleep 0.5
+done
+[[ "$buf_ready" == 1 ]] || { tail -n 20 "$BUF_LOG" >&2; fail "buffered server not ready after unclean restart"; }
+assert_eq "committed burst survived the unclean kill + restart" "$total_rows" \
+  "$("${BQ[@]}" -c "select count(*) from demo.trips where trip_id between $buf_base and $((buf_base + total_rows - 1))")"
+# The main (synchronous, :$PG_PORT) server sees them too — cross-server
+# freshness after the flush cadence.
+assert_eq "burst visible on the default-mode server (cross-server = commit cadence)" "$total_rows" \
+  "$(q "select count(*) from demo.trips where trip_id between $buf_base and $((buf_base + total_rows - 1))")"
+
+# Ordering fence: with rows pending in the buffer, an UPDATE must see them
+# (buffered INSERT then immediate UPDATE behaves exactly like sync mode).
+fence_id=$((buf_base + total_rows))
+psql -h "$PG_HOST" -p "$BUF_PORT" -U postgres -d icegres -q -c \
+  "insert into demo.trips (trip_id, city, distance_km, fare, ts) values ($fence_id, 'E2E Fence', 1.0, 1.0, TIMESTAMP '2026-07-06 00:00:00')" \
+  || fail "fence INSERT failed"
+fence_tag=$(psql -h "$PG_HOST" -p "$BUF_PORT" -U postgres -d icegres -c \
+  "update demo.trips set fare = 42.0 where trip_id = $fence_id" | tail -n 1)
+assert_eq "UPDATE right after a buffered INSERT (flush fence)" "UPDATE 1" "$fence_tag"
+assert_eq "fenced row readable with the updated value" "$fence_id|42.0" \
+  "$("${BQ[@]}" -c "select trip_id, fare from demo.trips where trip_id = $fence_id")"
+
+stop_pidfile_generic "$BUF_PID_FILE"
+
+# ---------------------------------------------------------------------------
+# (m) Zero-copy branches (SPEC D6, Neon branch-per-endpoint model): a branch
+#     is a named Iceberg snapshot ref — creating one copies NO data. Two
+#     servers, one per branch, write to their own ref with full isolation:
+#     writes on dev never appear on main and vice versa, single copy of the
+#     shared history in the lake.
+# ---------------------------------------------------------------------------
+BR_PORT=5440
+BR_PID_FILE="$E2E_DIR/serve-branch.pid"
+BR_LOG="$E2E_DIR/serve-branch.log"
+BR_NAME=e2e_dev
+log "(m) zero-copy branches: main on :$PG_PORT, branch '$BR_NAME' on :$BR_PORT"
+stop_pidfile_generic "$BR_PID_FILE"
+if psql -h "$PG_HOST" -p "$BR_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+  fail "something is already listening on :$BR_PORT — stop it first"
+fi
+# Idempotency: a crashed earlier run may have left the ref behind.
+"$BIN" branch drop demo.trips "$BR_NAME" >/dev/null 2>&1 || true
+
+# m1: create = one metadata commit, zero data copied; both refs at one head.
+"$BIN" branch create demo.trips "$BR_NAME" >"$E2E_DIR/branch-create.log" 2>&1 \
+  || { cat "$E2E_DIR/branch-create.log" >&2; fail "branch create failed"; }
+grep -q "created branch $BR_NAME" "$E2E_DIR/branch-create.log" \
+  || fail "branch create output unexpected: $(cat "$E2E_DIR/branch-create.log")"
+pass "branch create $BR_NAME (zero-copy snapshot ref)"
+branch_list=$("$BIN" branch list demo.trips 2>&1)
+main_head=$(awk -F'\t' '$1=="main"{print $2}' <<<"$branch_list")
+dev_head=$(awk -F'\t' -v b="$BR_NAME" '$1==b{print $2}' <<<"$branch_list")
+[[ -n "$main_head" && "$main_head" == "$dev_head" ]] \
+  || fail "freshly created branch does not share main's head: main=$main_head dev=$dev_head ($branch_list)"
+pass "branch list shows $BR_NAME at main's head ($main_head)"
+if "$BIN" branch create demo.trips "$BR_NAME" >/dev/null 2>&1; then
+  fail "duplicate branch create was ACCEPTED (assert-ref-snapshot-id null must reject it)"
+fi
+pass "duplicate branch create rejected (atomic create via assert-ref-snapshot-id=null)"
+
+# m2: serve the branch on its own port (Neon: one endpoint per branch).
+: >"$BR_LOG"
+"$BIN" serve --host "$PG_HOST" --port "$BR_PORT" --branch "$BR_NAME" >>"$BR_LOG" 2>&1 &
+echo $! >"$BR_PID_FILE"
+br_ready=0
+for _ in $(seq 1 60); do
+  if psql -h "$PG_HOST" -p "$BR_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+    br_ready=1; break
+  fi
+  sleep 0.5
+done
+[[ "$br_ready" == 1 ]] || { tail -n 20 "$BR_LOG" >&2; fail "--branch server not ready on :$BR_PORT"; }
+BRQ=(psql -h "$PG_HOST" -p "$BR_PORT" -U postgres -d icegres -tA)
+assert_eq "both endpoints serve the shared history (same count)" \
+  "$(q 'select count(*) from demo.trips')" \
+  "$("${BRQ[@]}" -c 'select count(*) from demo.trips')"
+
+# m3: write to dev -> main unchanged (zero-copy isolation, direction 1).
+br_base=$(( $(q 'select coalesce(max(trip_id), 0) from demo.trips') + 100 ))
+(( br_base >= 900000 )) || br_base=970000
+DEV_ID=$br_base
+MAIN_ID=$((br_base + 1))
+main_total_before=$(q 'select count(*) from demo.trips')
+dev_ins=$("${BRQ[@]}" -c "insert into demo.trips (trip_id, city, distance_km, fare, ts)
+  values ($DEV_ID, 'E2E DevBranch', 1.0, 10.0, TIMESTAMP '2026-07-06 00:00:00')" 2>&1 | tail -n 1)
+assert_eq "INSERT on the dev endpoint" "INSERT 0 1" "$dev_ins"
+assert_eq "dev endpoint sees its row (new connection)" 1 \
+  "$("${BRQ[@]}" -c "select count(*) from demo.trips where trip_id = $DEV_ID")"
+assert_eq "main endpoint does NOT see the dev row" 0 \
+  "$(q "select count(*) from demo.trips where trip_id = $DEV_ID")"
+assert_eq "main total unchanged by the dev write" "$main_total_before" \
+  "$(q 'select count(*) from demo.trips')"
+
+# m4: write to main -> dev unchanged (direction 2).
+"${PSQL[@]}" -q -c "insert into demo.trips (trip_id, city, distance_km, fare, ts)
+  values ($MAIN_ID, 'E2E MainSide', 1.0, 20.0, TIMESTAMP '2026-07-06 00:00:00')" \
+  || fail "INSERT on the main endpoint failed"
+assert_eq "main endpoint sees its row" 1 \
+  "$(q "select count(*) from demo.trips where trip_id = $MAIN_ID")"
+assert_eq "dev endpoint does NOT see the main row" 0 \
+  "$("${BRQ[@]}" -c "select count(*) from demo.trips where trip_id = $MAIN_ID")"
+
+# m5: the full write engine works ON the branch (UPDATE + txn), still isolated.
+dev_upd=$("${BRQ[@]}" -c "update demo.trips set fare = 99.5 where trip_id = $DEV_ID" 2>&1 | tail -n 1)
+assert_eq "UPDATE on the dev endpoint" "UPDATE 1" "$dev_upd"
+assert_eq "updated fare visible on dev" "99.5" \
+  "$("${BRQ[@]}" -c "select fare from demo.trips where trip_id = $DEV_ID")"
+txn_out=$(psql -h "$PG_HOST" -p "$BR_PORT" -U postgres -d icegres -v ON_ERROR_STOP=1 2>&1 <<EOF
+BEGIN;
+insert into demo.trips (trip_id, city, distance_km, fare, ts) values ($((DEV_ID + 2)), 'E2E DevTxn', 1.0, 1.0, TIMESTAMP '2026-07-06 00:00:00');
+COMMIT;
+EOF
+) || fail "transaction on the dev endpoint failed: $txn_out"
+assert_eq "txn row committed to the branch, invisible on main" "1|0" \
+  "$("${BRQ[@]}" -c "select count(*) from demo.trips where trip_id = $((DEV_ID + 2))")|$(q "select count(*) from demo.trips where trip_id = $((DEV_ID + 2))")"
+assert_eq "seeded rows intact on BOTH endpoints" "280|280" \
+  "$(q 'select count(*) from demo.trips where trip_id between 1 and 280')|$("${BRQ[@]}" -c 'select count(*) from demo.trips where trip_id between 1 and 280')"
+
+# m6: heads have diverged; reading a table without the ref fails loudly.
+branch_list=$("$BIN" branch list demo.trips 2>&1)
+main_head2=$(awk -F'\t' '$1=="main"{print $2}' <<<"$branch_list")
+dev_head2=$(awk -F'\t' -v b="$BR_NAME" '$1==b{print $2}' <<<"$branch_list")
+[[ -n "$main_head2" && -n "$dev_head2" && "$main_head2" != "$dev_head2" ]] \
+  || fail "branch heads did not diverge after writes: main=$main_head2 dev=$dev_head2"
+pass "branch heads diverged (main=$main_head2, $BR_NAME=$dev_head2) with shared history below the fork"
+no_ref_out=$("${BRQ[@]}" -c 'select count(*) from demo.cities' 2>&1) || true
+echo "$no_ref_out" | grep -q "does not exist on this table" \
+  || fail "reading a table without the branch ref did not fail loudly: $no_ref_out"
+pass "table without the branch ref fails loudly (no silent fallback to main)"
+
+# m7: drop the branch — ref-only removal; main untouched; 'main' is protected.
+stop_pidfile_generic "$BR_PID_FILE"
+if "$BIN" branch drop demo.trips main >/dev/null 2>&1; then
+  fail "'branch drop main' was ACCEPTED — main must be protected"
+fi
+pass "dropping 'main' is refused"
+"$BIN" branch drop demo.trips "$BR_NAME" >"$E2E_DIR/branch-drop.log" 2>&1 \
+  || { cat "$E2E_DIR/branch-drop.log" >&2; fail "branch drop failed"; }
+branch_list=$("$BIN" branch list demo.trips 2>&1)
+if grep -q "^$BR_NAME	" <<<"$branch_list"; then
+  fail "branch $BR_NAME still listed after drop: $branch_list"
+fi
+pass "branch drop removed the ref"
+assert_eq "main state fully intact after the branch lifecycle (dev row|main row|seeded)" "0|1|280" \
+  "$(q "select count(*) from demo.trips where trip_id = $DEV_ID")|$(q "select count(*) from demo.trips where trip_id = $MAIN_ID")|$(q 'select count(*) from demo.trips where trip_id between 1 and 280')"
+
+# ---------------------------------------------------------------------------
+# (p5) branch diff / merge (fast-forward only) + AS OF time-travel sugar
+#      (roadmap-v2 P5). Metadata-only diff: fork points via snapshot-lineage
+#      walks, statuses across the created/dropped/advanced/diverged matrix,
+#      summary-reported row deltas. Merge: dry-run by default, whole eligible
+#      set in ONE atomic multi-table commit with the observed to/from heads
+#      pinned (a real injected 409 aborts it with NOTHING applied), diverged
+#      tables refuse the whole run. AS OF: raw-SQL rewrite to table@snapshot
+#      on both wire protocols, loud error before a table's history begins.
+# ---------------------------------------------------------------------------
+P5BR=e2e_p5dev
+P5BR_PORT=5470
+P5BR_PID_FILE="$E2E_DIR/serve-p5branch.pid"
+P5BR_LOG="$E2E_DIR/serve-p5branch.log"
+log "(p5) branch diff/merge + AS OF: branch '$P5BR' on :$P5BR_PORT"
+stop_pidfile_generic "$P5BR_PID_FILE"
+
+# Fixtures: four branched tables + one created only on main AFTER branching.
+# a: advances on the branch; b: diverges (writes on BOTH sides); d, e: the
+# atomic multi-table fast-forward pair; c: exists on main only.
+for t in a b c d e; do
+  q "drop table if exists demo.e2e_p5_$t" >/dev/null 2>&1 || true
+done
+"$BIN" branch drop-all "$P5BR" >/dev/null 2>&1 || true # crashed-run cleanup
+for t in a b d e; do
+  q "create table demo.e2e_p5_$t (id bigint, note varchar)" >/dev/null
+  q "insert into demo.e2e_p5_$t values (1, 'seed')" >/dev/null
+  "$BIN" branch create "demo.e2e_p5_$t" "$P5BR" >/dev/null 2>&1 \
+    || fail "branch create $P5BR on demo.e2e_p5_$t failed"
+done
+q 'create table demo.e2e_p5_c (id bigint, note varchar)' >/dev/null
+q "insert into demo.e2e_p5_c values (1, 'main-only')" >/dev/null
+p5_fork_a=$("$BIN" branch list demo.e2e_p5_a | awk -F'\t' '$1=="main"{print $2}')
+[[ -n "$p5_fork_a" ]] || fail "could not read demo.e2e_p5_a's fork head"
+
+: >"$P5BR_LOG"
+"$BIN" serve --host "$PG_HOST" --port "$P5BR_PORT" --branch "$P5BR" >>"$P5BR_LOG" 2>&1 &
+echo $! >"$P5BR_PID_FILE"
+p5_ready=0
+for _ in $(seq 1 60); do
+  if psql -h "$PG_HOST" -p "$P5BR_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+    p5_ready=1; break
+  fi
+  sleep 0.5
+done
+[[ "$p5_ready" == 1 ]] || { tail -n 20 "$P5BR_LOG" >&2; fail "$P5BR server not ready on :$P5BR_PORT"; }
+P5Q=(psql -h "$PG_HOST" -p "$P5BR_PORT" -U postgres -d icegres -tA)
+
+# Mutations: a advances by 2 rows on the branch; b gets one write on EACH
+# side (diverged); d and e advance by 1 on the branch.
+"${P5Q[@]}" -c "insert into demo.e2e_p5_a values (2, 'branch')" >/dev/null
+"${P5Q[@]}" -c "insert into demo.e2e_p5_a values (3, 'branch')" >/dev/null
+"${P5Q[@]}" -c "insert into demo.e2e_p5_b values (2, 'branch-side')" >/dev/null
+q "insert into demo.e2e_p5_b values (3, 'main-side')" >/dev/null
+"${P5Q[@]}" -c "insert into demo.e2e_p5_d values (2, 'branch')" >/dev/null
+"${P5Q[@]}" -c "insert into demo.e2e_p5_e values (2, 'branch')" >/dev/null
+
+# p5-1: the diff status matrix, one metadata read per table.
+"$BIN" branch diff "$P5BR" main >"$E2E_DIR/p5-diff.out" 2>&1 \
+  || { cat "$E2E_DIR/p5-diff.out" >&2; fail "branch diff failed"; }
+grep -q "^demo.e2e_p5_a	advanced-a" "$E2E_DIR/p5-diff.out" || fail "diff: a not advanced-a"
+grep -q "^demo.e2e_p5_b	diverged" "$E2E_DIR/p5-diff.out" || fail "diff: b not diverged"
+grep -q "^demo.e2e_p5_c	dropped" "$E2E_DIR/p5-diff.out" || fail "diff: c (main-only) not dropped"
+grep -q "^demo.e2e_p5_d	advanced-a" "$E2E_DIR/p5-diff.out" || fail "diff: d not advanced-a"
+grep -Eq "^demo.e2e_p5_a	advanced-a	fork $p5_fork_a \| a [0-9]+: \+2 snapshots, rows \+2/-0" \
+  "$E2E_DIR/p5-diff.out" || fail "diff: a's fork/row-delta line wrong: $(grep e2e_p5_a "$E2E_DIR/p5-diff.out")"
+pass "branch diff: created/dropped/advanced/diverged matrix + fork + summary-reported deltas"
+
+# p5-2: --json for tooling (statuses, deltas, fork, honesty label).
+"$BIN" branch diff "$P5BR" main --json >"$E2E_DIR/p5-diff.json" 2>/dev/null \
+  || fail "branch diff --json failed"
+assert_eq "diff --json: statuses + a-side delta + fork + rows_source" \
+  "advanced-a|2|$p5_fork_a|summary-reported|diverged|dropped" \
+  "$(jq -r '[(.tables[]|select(.table=="demo.e2e_p5_a")|.status, (.a.rows_added|tostring), (.fork_snapshot_id|tostring), .a.rows_source), (.tables[]|select(.table=="demo.e2e_p5_b")|.status), (.tables[]|select(.table=="demo.e2e_p5_c")|.status)] | join("|")' "$E2E_DIR/p5-diff.json")"
+
+# p5-3: --table narrows with per-snapshot lineage detail.
+"$BIN" branch diff "$P5BR" main --table demo.e2e_p5_a >"$E2E_DIR/p5-diff-table.out" 2>&1 \
+  || fail "branch diff --table failed"
+assert_eq "diff --table: per-snapshot lineage lines for a's two branch commits" "2" \
+  "$(grep -c '^  a snapshot .* (append, +1/-0 rows)$' "$E2E_DIR/p5-diff-table.out")"
+
+# p5-4: merge dry run with a diverged table refuses the WHOLE run (per-table
+# conflict report; three-way merges are never attempted) and mutates nothing.
+set +e
+"$BIN" branch merge "$P5BR" main >"$E2E_DIR/p5-merge-refuse.out" 2>&1
+p5_rc=$?
+set -e
+[[ $p5_rc -ne 0 ]] || fail "merge with a diverged table was ACCEPTED"
+grep -q "^demo.e2e_p5_b: CONFLICT — diverged" "$E2E_DIR/p5-merge-refuse.out" \
+  || fail "merge refusal lacks b's conflict report: $(cat "$E2E_DIR/p5-merge-refuse.out")"
+grep -q "refusing the merge" "$E2E_DIR/p5-merge-refuse.out" \
+  || fail "merge refusal message missing"
+grep -q "^demo.e2e_p5_a: fast-forward main" "$E2E_DIR/p5-merge-refuse.out" \
+  || fail "merge plan does not list a's fast-forward"
+assert_eq "refused merge moved NO ref (a still at the fork on main)" "$p5_fork_a" \
+  "$("$BIN" branch list demo.e2e_p5_a | awk -F'\t' '$1=="main"{print $2}')"
+pass "diverged table => per-table conflict report + whole-run refusal, nothing applied"
+
+# p5-5: dry-run purity — a clean single-table plan commits nothing.
+"$BIN" branch merge "$P5BR" main --table demo.e2e_p5_a >"$E2E_DIR/p5-merge-dry.out" 2>&1 \
+  || { cat "$E2E_DIR/p5-merge-dry.out" >&2; fail "single-table dry-run merge failed"; }
+grep -q "dry run: 1 table(s) would fast-forward" "$E2E_DIR/p5-merge-dry.out" \
+  || fail "dry-run footer missing: $(cat "$E2E_DIR/p5-merge-dry.out")"
+assert_eq "dry run moved nothing (main head of a unchanged)" "$p5_fork_a" \
+  "$("$BIN" branch list demo.e2e_p5_a | awk -F'\t' '$1=="main"{print $2}')"
+
+# p5-6: injected race — the commit pins the observed to/from heads, so a
+# REAL server-side 409 (requirement corrupted via the test-only env, same
+# pattern as ICEGRES_DML_INJECT_CONFLICT) aborts cleanly with nothing moved.
+set +e
+ICEGRES_MERGE_INJECT_CONFLICT=1 "$BIN" branch merge "$P5BR" main \
+  --table demo.e2e_p5_a --execute >"$E2E_DIR/p5-merge-race.out" 2>&1
+p5_rc=$?
+set -e
+[[ $p5_rc -ne 0 ]] || fail "raced merge was ACCEPTED (pinned heads must 409)"
+grep -q "NOTHING was applied" "$E2E_DIR/p5-merge-race.out" \
+  || fail "raced merge error does not state nothing was applied: $(cat "$E2E_DIR/p5-merge-race.out")"
+assert_eq "raced merge moved NO ref" "$p5_fork_a" \
+  "$("$BIN" branch list demo.e2e_p5_a | awk -F'\t' '$1=="main"{print $2}')"
+pass "injected foreign commit (real 409) aborts the merge cleanly, first-committer-wins"
+
+# p5-7: single-table fast-forward for real: main's ref moves to the branch
+# head (zero-copy) and the rows appear on the main endpoint.
+p5_branch_head_a=$("$BIN" branch list demo.e2e_p5_a | awk -F'\t' -v b="$P5BR" '$1==b{print $2}')
+"$BIN" branch merge "$P5BR" main --table demo.e2e_p5_a --execute >"$E2E_DIR/p5-merge-a.out" 2>&1 \
+  || { cat "$E2E_DIR/p5-merge-a.out" >&2; fail "single-table merge --execute failed"; }
+assert_eq "main fast-forwarded to the branch head on a" "$p5_branch_head_a" \
+  "$("$BIN" branch list demo.e2e_p5_a | awk -F'\t' '$1=="main"{print $2}')"
+assert_eq "branch rows now readable on the MAIN endpoint" "3" \
+  "$(q 'select count(*) from demo.e2e_p5_a')"
+
+# p5-8: the atomic multi-table cut. b's branch ref is dropped (the operator
+# "rebases by re-branching"), leaving d + e the eligible set. First the
+# injected race: the ONE transactions/commit request 409s and NEITHER head
+# moves (all-or-nothing). Then for real: both to-heads move TOGETHER.
+"$BIN" branch drop demo.e2e_p5_b "$P5BR" >/dev/null 2>&1 || fail "branch drop on b failed"
+p5_main_d=$("$BIN" branch list demo.e2e_p5_d | awk -F'\t' '$1=="main"{print $2}')
+p5_main_e=$("$BIN" branch list demo.e2e_p5_e | awk -F'\t' '$1=="main"{print $2}')
+p5_br_d=$("$BIN" branch list demo.e2e_p5_d | awk -F'\t' -v b="$P5BR" '$1==b{print $2}')
+p5_br_e=$("$BIN" branch list demo.e2e_p5_e | awk -F'\t' -v b="$P5BR" '$1==b{print $2}')
+set +e
+ICEGRES_MERGE_INJECT_CONFLICT=1 "$BIN" branch merge "$P5BR" main --execute \
+  >"$E2E_DIR/p5-merge-race2.out" 2>&1
+p5_rc=$?
+set -e
+[[ $p5_rc -ne 0 ]] || fail "raced multi-table merge was ACCEPTED"
+assert_eq "raced multi-table merge moved NEITHER head (atomic, nothing applied)" \
+  "$p5_main_d|$p5_main_e" \
+  "$("$BIN" branch list demo.e2e_p5_d | awk -F'\t' '$1=="main"{print $2}')|$("$BIN" branch list demo.e2e_p5_e | awk -F'\t' '$1=="main"{print $2}')"
+"$BIN" branch merge "$P5BR" main --execute >"$E2E_DIR/p5-merge-all.out" 2>&1 \
+  || { cat "$E2E_DIR/p5-merge-all.out" >&2; fail "multi-table merge --execute failed"; }
+grep -q "2 table(s) fast-forwarded in ONE atomic commit" "$E2E_DIR/p5-merge-all.out" \
+  || fail "multi-table merge did not report the atomic cut: $(cat "$E2E_DIR/p5-merge-all.out")"
+assert_eq "BOTH to-heads moved together to their branch heads" "$p5_br_d|$p5_br_e" \
+  "$("$BIN" branch list demo.e2e_p5_d | awk -F'\t' '$1=="main"{print $2}')|$("$BIN" branch list demo.e2e_p5_e | awk -F'\t' '$1=="main"{print $2}')"
+assert_eq "both tables' branch rows readable on main after the cut" "2|2" \
+  "$(q 'select count(*) from demo.e2e_p5_d')|$(q 'select count(*) from demo.e2e_p5_e')"
+pass "atomic multi-table fast-forward: to-heads move together or not at all"
+
+# p5-9: AS OF sugar — pinned reads vs now, on BOTH wire protocols.
+assert_eq "AS OF <snapshot_id> reads the pinned fork state (1 row) vs now (3)" "1|3" \
+  "$(q "select count(*) from demo.e2e_p5_a AS OF $p5_fork_a")|$(q 'select count(*) from demo.e2e_p5_a')"
+assert_eq "AS OF <head snapshot id> equals now" "3" \
+  "$(q "select count(*) from demo.e2e_p5_a AS OF $p5_branch_head_a")"
+# Timestamp form: 1 ms after the fork snapshot's commit -> resolves
+# at/just-before to the fork snapshot.
+p5_fork_ts=$(curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_p5_a" \
+  | jq -r ".metadata.snapshots[] | select(.\"snapshot-id\" == $p5_fork_a) | .\"timestamp-ms\"")
+[[ -n "$p5_fork_ts" && "$p5_fork_ts" != null ]] || fail "could not read the fork snapshot's timestamp"
+p5_ms=$((p5_fork_ts + 1))
+p5_iso="$(date -u -d "@$((p5_ms / 1000))" +'%F %T').$(printf '%03d' $((p5_ms % 1000)))"
+assert_eq "AS OF TIMESTAMP (1 ms after the fork commit) resolves just-before" "1" \
+  "$(q "select count(*) from demo.e2e_p5_a AS OF TIMESTAMP '$p5_iso'")"
+# Extended protocol (psql \bind): the AsOfParser path.
+assert_eq "AS OF over the EXTENDED protocol (psql \\bind)" "1" \
+  "$(printf 'select count(*) from demo.e2e_p5_a AS OF %s \\bind \\g\n' "$p5_fork_a" | "${PSQL[@]}" -tA)"
+# Before the first snapshot: a loud error, never an empty result.
+set +e
+p5_early=$(q "select count(*) from demo.e2e_p5_a AS OF TIMESTAMP '2001-01-01 00:00:00'" 2>&1)
+p5_rc=$?
+set -e
+[[ $p5_rc -ne 0 ]] || fail "AS OF before the first snapshot was ACCEPTED: $p5_early"
+grep -q "AS OF cannot read before a table's history begins" <<<"$p5_early" \
+  || fail "unexpected before-first error: $p5_early"
+pass "AS OF before the table's first snapshot fails loudly"
+# Gating: 'AS OF' inside a string literal is data, not sugar.
+assert_eq "'AS OF' inside a string literal is untouched" "0" \
+  "$(q "select count(*) from demo.e2e_p5_a where note = 'x AS OF 5'")"
+
+# p5 cleanup: branch server down, refs + scratch tables dropped.
+stop_pidfile_generic "$P5BR_PID_FILE"
+"$BIN" branch drop-all "$P5BR" >/dev/null 2>&1 || true
+for t in a b c d e; do
+  q "drop table if exists demo.e2e_p5_$t" >/dev/null 2>&1 || true
+done
+pass "p5 cleanup (branch server stopped, scratch refs/tables dropped)"
+
+# ---------------------------------------------------------------------------
+# (p7) icegres verify — the durability harness productized (roadmap-v2 P7):
+#      re-proves the durability/exactly-once/fencing/freshness/failover
+#      claims against the configured deployment from a dedicated scratch
+#      namespace, spawning its OWN scratch servers. Green end to end for the
+#      dir, pg, and quorum backends here — and proven to FAIL (nonzero exit,
+#      durability marked FAIL in the report) when the tail LIES (a wiper
+#      deletes the tail's segments out from under it mid-test). Also proves
+#      verify IGNORES the serve tail env vars (ICEGRES_TAIL_DIR/URL/QUORUM):
+#      a bare run on a writer host must never target the production tail.
+# ---------------------------------------------------------------------------
+log "(p7) icegres verify: dir + pg + quorum green, sabotaged tail caught"
+VF_TAIL="$E2E_DIR/verify-tail"
+rm -rf "$VF_TAIL"; mkdir -p "$VF_TAIL"
+
+# p7-0: tail env-var immunity — production writer hosts export
+# ICEGRES_TAIL_DIR/URL/QUORUM for `serve` (the Helm writer pod sets them);
+# a bare `icegres verify` there must NOT adopt them, because its first
+# scratch server's quorum election would fence the LIVE production writer.
+# All three are set to poisoned values here: had verify consumed any of
+# them it would either error on the clap tail-flag conflict, fail booting
+# against the dead endpoints (nonzero exit, backend != "none"), or create
+# a scratch dir under the poisoned ICEGRES_TAIL_DIR. Exit 0 + backend
+# "none" + a loud SKIP + no dir created proves the env vars were ignored
+# and no tail connection was even attempted.
+VF_ENV_DIR="$E2E_DIR/verify-env-poison"
+rm -rf "$VF_ENV_DIR"
+env ICEGRES_TAIL_DIR="$VF_ENV_DIR" \
+    ICEGRES_TAIL_URL="postgresql://nobody@127.0.0.1:1/poison" \
+    ICEGRES_TAIL_QUORUM="127.0.0.1:1,127.0.0.1:1,127.0.0.1:1" \
+    "$BIN" verify --suite durability --json >"$E2E_DIR/p7-env.json" 2>"$E2E_DIR/p7-env.err" \
+  || { cat "$E2E_DIR/p7-env.err" >&2; fail "bare verify with ICEGRES_TAIL_* set did not exit 0 — a tail env var was adopted"; }
+assert_eq "verify ignores ICEGRES_TAIL_*: backend none, durability SKIPs (0 pass/0 fail/1 skip)" "none|0|0|1|SKIP" \
+  "$(jq -r '[.backend, (.passed|tostring), (.failed|tostring), (.skipped|tostring), .checks[0].status] | join("|")' "$E2E_DIR/p7-env.json")"
+jq -r '.checks[0].detail' "$E2E_DIR/p7-env.json" | grep -q "no durable tail configured" \
+  || fail "the durability skip is not loud about the missing tail: $(jq -r '.checks[0].detail' "$E2E_DIR/p7-env.json")"
+[[ ! -e "$VF_ENV_DIR" ]] \
+  || fail "verify created scratch state under the env-named tail dir — ICEGRES_TAIL_DIR was adopted"
+pass "bare verify ignores the serve tail env vars (backend none, loud SKIP, no tail touched)"
+
+# p7-1: dir backend — durability/exactly-once/freshness run (4 checks),
+# fencing/failover SKIP loudly (no cross-writer identity on a local WAL).
+"$BIN" verify --tail-dir "$VF_TAIL" --json >"$E2E_DIR/p7-dir.json" 2>"$E2E_DIR/p7-dir.err" \
+  || { cat "$E2E_DIR/p7-dir.err" >&2; fail "verify --tail-dir failed (see $E2E_DIR/p7-dir.json)"; }
+assert_eq "verify dir: 4 passed, 0 failed, 2 loud skips (fencing+failover)" "4|0|2" \
+  "$(jq -r '[.passed, .failed, .skipped] | map(tostring) | join("|")' "$E2E_DIR/p7-dir.json")"
+assert_eq "verify dir: every check names its claim + doc section" "0" \
+  "$(jq -r '[.checks[] | select(.claim == "" or .doc == "")] | length' "$E2E_DIR/p7-dir.json")"
+assert_eq "verify dir: scratch namespace is run-scoped" "icegres_verify_" \
+  "$(jq -r '.namespace' "$E2E_DIR/p7-dir.json" | cut -c1-15)"
+[[ -z "$(ls "$VF_TAIL" 2>/dev/null)" ]] \
+  || fail "verify left scratch state in the tail dir: $(ls "$VF_TAIL")"
+pass "verify --tail-dir: green, skips loud, scratch tail dir cleaned up"
+
+# p7-2: pg backend on a DEDICATED database (the stack's Postgres, superuser
+# creates it): fencing joins in via the one-writer advisory lock (5 checks).
+VF_PG_ADMIN="postgresql://postgres@127.0.0.1:5433/postgres"
+VF_PG_URL="postgresql://lakekeeper:lakekeeper@127.0.0.1:5433/e2e_verify_tail"
+psql "$VF_PG_ADMIN" -q -c 'DROP DATABASE IF EXISTS e2e_verify_tail' \
+  -c 'CREATE DATABASE e2e_verify_tail OWNER lakekeeper' \
+  || fail "could not create the dedicated verify tail database"
+"$BIN" verify --tail-url "$VF_PG_URL" --json >"$E2E_DIR/p7-pg.json" 2>"$E2E_DIR/p7-pg.err" \
+  || { cat "$E2E_DIR/p7-pg.err" >&2; fail "verify --tail-url failed (see $E2E_DIR/p7-pg.json)"; }
+assert_eq "verify pg: 5 passed (fencing included), 0 failed, failover skipped" "5|0|1|PASS" \
+  "$(jq -r '[(.passed|tostring), (.failed|tostring), (.skipped|tostring), (.checks[] | select(.suite=="fencing") | .status)] | join("|")' "$E2E_DIR/p7-pg.json")"
+assert_eq "verify pg: dropped its scratch icegres_tail schema on exit" "f" \
+  "$(psql "$VF_PG_URL" -tA -c "select exists (select 1 from information_schema.schemata where schema_name = 'icegres_tail')")"
+# Honesty rail: a tail database that ALREADY carries an icegres_tail schema
+# (someone's live tail) is refused before anything is written.
+psql "$VF_PG_URL" -q -c 'CREATE SCHEMA icegres_tail' || fail "could not plant the schema"
+set +e
+"$BIN" verify --tail-url "$VF_PG_URL" >"$E2E_DIR/p7-pg-refuse.out" 2>&1
+p7_rc=$?
+set -e
+[[ $p7_rc -ne 0 ]] || fail "verify against a tail database with an existing icegres_tail schema was ACCEPTED"
+grep -q "already carries an icegres_tail schema" "$E2E_DIR/p7-pg-refuse.out" \
+  || fail "unexpected pg-tail refusal: $(cat "$E2E_DIR/p7-pg-refuse.out")"
+pass "verify pg: green incl. advisory-lock fencing; occupied tail database refused"
+psql "$VF_PG_ADMIN" -q -c 'DROP DATABASE e2e_verify_tail' || true
+
+# p7-3: quorum backend on three dedicated icekeeperd acceptors — the full
+# matrix runs: 6 checks, failover included, zero skips.
+VF_KEEPER_PORTS=(5474 5475 5476)
+for kp in "${VF_KEEPER_PORTS[@]}"; do
+  if (exec 3<>"/dev/tcp/127.0.0.1/$kp") 2>/dev/null; then
+    exec 3>&- 3<&-
+    fail "something is already listening on :$kp — stop it first"
+  fi
+done
+KBIN="$ICEGRES_DIR/target/debug/icekeeperd"
+[[ -x "$KBIN" ]] || fail "icekeeperd binary not found at $KBIN"
+for n in 1 2 3; do
+  rm -rf "$E2E_DIR/vk-$n"
+  "$KBIN" serve --host 127.0.0.1 --port "${VF_KEEPER_PORTS[$((n - 1))]}" \
+    --data-dir "$E2E_DIR/vk-$n" --node-id "$n" >"$E2E_DIR/vk-$n.log" 2>&1 &
+  echo $! >"$E2E_DIR/vk-$n.pid"
+done
+for n in 1 2 3; do
+  vk_ok=0
+  for _ in $(seq 1 40); do
+    if (exec 3<>"/dev/tcp/127.0.0.1/${VF_KEEPER_PORTS[$((n - 1))]}") 2>/dev/null; then
+      exec 3>&- 3<&-; vk_ok=1; break
+    fi
+    sleep 0.25
+  done
+  [[ "$vk_ok" == 1 ]] || { tail -n 20 "$E2E_DIR/vk-$n.log" >&2; fail "verify icekeeperd $n not ready"; }
+done
+"$BIN" verify --tail-quorum "127.0.0.1:5474,127.0.0.1:5475,127.0.0.1:5476" --json \
+  >"$E2E_DIR/p7-quorum.json" 2>"$E2E_DIR/p7-quorum.err" \
+  || { cat "$E2E_DIR/p7-quorum.err" >&2; fail "verify --tail-quorum failed (see $E2E_DIR/p7-quorum.json)"; }
+assert_eq "verify quorum: full matrix green (6 passed, failover PASS, 0 skips)" "6|0|0|PASS" \
+  "$(jq -r '[(.passed|tostring), (.failed|tostring), (.skipped|tostring), (.checks[] | select(.suite=="failover") | .status)] | join("|")' "$E2E_DIR/p7-quorum.json")"
+pass "verify --tail-quorum: durability/exactly-once/fencing/freshness/failover all re-proven"
+for n in 1 2 3; do stop_keeper_at "$E2E_DIR/vk-$n.pid"; done
+rm -rf "$E2E_DIR"/vk-*
+
+# p7-4: the negative proof — verify must CATCH a lying tail. A wiper loop
+# deletes the scratch tail's segment directories out from under the run;
+# the durability re-proof cannot hold and the run must exit NONZERO with
+# the durability suite marked FAIL (never a silent pass).
+VF_SAB="$E2E_DIR/verify-sabotage"
+rm -rf "$VF_SAB"; mkdir -p "$VF_SAB"
+( while :; do rm -rf "$VF_SAB"/icegres_verify_*/ 2>/dev/null; sleep 0.05; done ) &
+VF_WIPER=$!
+set +e
+"$BIN" verify --suite durability --tail-dir "$VF_SAB" --json \
+  >"$E2E_DIR/p7-sabotage.json" 2>"$E2E_DIR/p7-sabotage.err"
+p7_rc=$?
+set -e
+kill "$VF_WIPER" 2>/dev/null || true
+wait "$VF_WIPER" 2>/dev/null || true
+[[ $p7_rc -ne 0 ]] || fail "verify PASSED against a sabotaged tail (the report told a lie)"
+assert_eq "sabotaged tail: the durability suite is marked FAIL in the report" "FAIL" \
+  "$(jq -r '[.checks[] | select(.suite=="durability") | .status] | unique | join("|")' "$E2E_DIR/p7-sabotage.json")"
+pass "verify FAILS against a sabotaged tail (exit $p7_rc — the lie is caught, not reported green)"
+rm -rf "$VF_SAB" "$VF_TAIL"
+
+# ---------------------------------------------------------------------------
+# (n) icegresd control plane (SPEC D5/D7): wake-on-connect scale-to-zero,
+#     branch-endpoint routing by pgwire database name, supervised computes.
+#     icegresd listens on :$PXY_PORT; the main compute lives on :$PXY_MAIN
+#     (spawned on demand, --idle-shutdown-secs 2), branch computes on
+#     ephemeral localhost ports.
+# ---------------------------------------------------------------------------
+PXY_PORT=5444
+PXY_MAIN=5445
+DBIN="$ICEGRES_DIR/target/debug/icegresd"
+PXY_LOG="$E2E_DIR/icegresd.log"
+PXY_STATUS="$E2E_DIR/icegresd-status.json"
+PXY_BRANCH=e2e_pxy
+log "(n) icegresd control plane on :$PXY_PORT (main compute :$PXY_MAIN, idle 2s)"
+[[ -x "$DBIN" ]] || fail "icegresd binary not found at $DBIN (cargo build builds both bins)"
+stop_icegresd
+for p in "$PXY_PORT" "$PXY_MAIN"; do
+  if psql -h "$PG_HOST" -p "$p" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+    fail "something is already listening on :$p — stop it first"
+  fi
+done
+"$BIN" branch drop demo.trips "$PXY_BRANCH" >/dev/null 2>&1 || true
+
+: >"$PXY_LOG"
+rm -f "$PXY_STATUS"
+# --pool-size 0: n1-n6 test the BARE wake/splice/supervision path (a warm
+# pool would hold sessions on the compute and mask the idle exits n2/n3
+# assert on); the session pool gets its own section n7 below.
+"$DBIN" serve --host "$PG_HOST" --port "$PXY_PORT" --main-port "$PXY_MAIN" \
+  --icegres-bin "$BIN" --idle-shutdown-secs 2 --pool-size 0 --status-file "$PXY_STATUS" \
+  >>"$PXY_LOG" 2>&1 &
+echo $! >"$E2E_DIR/icegresd.pid"
+pxy_up=0
+for _ in $(seq 1 40); do
+  if (exec 3<>"/dev/tcp/$PG_HOST/$PXY_PORT") 2>/dev/null; then exec 3>&- 3<&-; pxy_up=1; break; fi
+  sleep 0.25
+done
+[[ "$pxy_up" == 1 ]] || { tail -n 20 "$PXY_LOG" >&2; fail "icegresd not listening on :$PXY_PORT"; }
+pass "icegresd listening on :$PXY_PORT"
+PXQ=(psql -h "$PG_HOST" -p "$PXY_PORT" -U postgres -d icegres -tA)
+
+# helper: read a field of one compute from the status file
+pxy_status() { # key jq-expr
+  jq -r --arg k "$1" ".computes[] | select(.key == \$k) | $2" "$PXY_STATUS" 2>/dev/null
+}
+
+# n1: wake-on-connect from cold — the compute does not exist yet; the FIRST
+#     client connection spawns it, waits for readiness, and splices.
+assert_eq "first connection through icegresd wakes the compute and answers" 20 \
+  "$("${PXQ[@]}" -c 'select count(*) from demo.cities')"
+main_cpid=$(pxy_status main .pid)
+[[ "$main_cpid" =~ ^[0-9]+$ ]] || fail "status file has no main compute pid: $(cat "$PXY_STATUS" 2>/dev/null)"
+[[ "$(ps -o comm= -p "$main_cpid" 2>/dev/null)" == icegres ]] \
+  || fail "status pid $main_cpid is not a live icegres process"
+pass "status file reports the main compute (pid $main_cpid on :$(pxy_status main .port))"
+
+# n2: scale-to-zero — with --idle-shutdown-secs 2 the compute exits on its
+#     own; icegresd reaps it and marks the slot stopped.
+compute_gone=0
+for _ in $(seq 1 40); do
+  if ! kill -0 "$main_cpid" 2>/dev/null && [[ "$(pxy_status main .state)" == "stopped" ]]; then
+    compute_gone=1; break
+  fi
+  sleep 0.25
+done
+[[ "$compute_gone" == 1 ]] || fail "compute did not idle-exit (pid $main_cpid state=$(pxy_status main .state))"
+if psql -h "$PG_HOST" -p "$PXY_MAIN" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+  fail "compute port :$PXY_MAIN still answering after idle exit"
+fi
+pass "compute idle-exited (scale-to-zero): process gone, slot marked stopped"
+
+# n3: wake-after-idle — the next connection through icegresd re-spawns the
+#     compute transparently; measure the first-connection-after-idle latency.
+t0=$(($(date +%s%N) / 1000000))
+wake_out=$("${PXQ[@]}" -c 'select 1' 2>&1)
+wake_after_idle_ms=$(( $(date +%s%N) / 1000000 - t0 ))
+assert_eq "reconnect after idle auto-wakes the compute" 1 "$wake_out"
+(( wake_after_idle_ms < 10000 )) || fail "wake-after-idle took ${wake_after_idle_ms}ms (>10s)"
+pass "wake-after-idle latency: ${wake_after_idle_ms}ms (cold start + splice setup, incl. psql overhead)"
+
+# n4: branch-endpoint routing — dbname 'icegres@<branch>' routes to a
+#     per-branch compute spawned on demand with --branch <branch>.
+"$BIN" branch create demo.trips "$PXY_BRANCH" >/dev/null 2>&1 \
+  || fail "branch create $PXY_BRANCH failed"
+PXB=(psql -h "$PG_HOST" -p "$PXY_PORT" -U postgres -d "icegres@$PXY_BRANCH" -tA)
+pxb_base=$(( $(q 'select coalesce(max(trip_id), 0) from demo.trips') + 200 ))
+(( pxb_base >= 900000 )) || pxb_base=980000
+assert_eq "branch endpoint INSERT via icegresd" "INSERT 0 1" \
+  "$(psql -h "$PG_HOST" -p "$PXY_PORT" -U postgres -d "icegres@$PXY_BRANCH" -c \
+     "insert into demo.trips (trip_id, city, distance_km, fare, ts)
+      values ($pxb_base, 'E2E ProxyBranch', 1.0, 5.0, TIMESTAMP '2026-07-06 00:00:00')" 2>&1 | tail -n 1)"
+assert_eq "branch endpoint sees its row (new connection via icegresd)" 1 \
+  "$("${PXB[@]}" -c "select count(*) from demo.trips where trip_id = $pxb_base")"
+assert_eq "main endpoint (dbname icegres) does NOT see the branch row" 0 \
+  "$("${PXQ[@]}" -c "select count(*) from demo.trips where trip_id = $pxb_base")"
+br_state=$(pxy_status "branch:$PXY_BRANCH" .state)
+br_port=$(pxy_status "branch:$PXY_BRANCH" .port)
+[[ "$br_state" == "running" || "$br_state" == "stopped" ]] \
+  || fail "branch compute missing from status: state='$br_state'"
+pass "per-branch compute spawned on demand (branch:$PXY_BRANCH on ephemeral :$br_port, state $br_state)"
+
+# n5: supervision — kill -9 the main compute while a session is open; the
+#     supervisor must restart it (capped backoff) WITHOUT a new connection.
+"${PXQ[@]}" -c 'select 1' >/dev/null 2>&1 || fail "pre-kill wake failed"
+( sleep 30 | psql -h "$PG_HOST" -p "$PXY_PORT" -U postgres -d icegres >/dev/null 2>&1 ) &
+HOLD_PID=$!
+held=0
+for _ in $(seq 1 40); do
+  if [[ "$(pxy_status main .active_connections)" == 1 ]]; then held=1; break; fi
+  sleep 0.1
+done
+[[ "$held" == 1 ]] || fail "held session never showed up in active_connections"
+main_cpid=$(pxy_status main .pid)
+restarts_before=$(pxy_status main .restarts)
+kill -9 "$main_cpid" 2>/dev/null || fail "could not SIGKILL compute pid $main_cpid"
+recovered=0
+for _ in $(seq 1 100); do
+  if [[ "$(pxy_status main .restarts)" -gt "$restarts_before" ]] \
+      && [[ "$(pxy_status main .state)" == "running" ]]; then
+    recovered=1; break
+  fi
+  sleep 0.1
+done
+kill "$HOLD_PID" 2>/dev/null || true
+[[ "$recovered" == 1 ]] || { tail -n 20 "$PXY_LOG" >&2; fail "supervisor did not restart the killed compute (restarts=$(pxy_status main .restarts), state=$(pxy_status main .state))"; }
+pass "kill -9 mid-session: supervisor restarted the compute (restarts $restarts_before -> $(pxy_status main .restarts))"
+assert_eq "next connection after the crash answers" 20 \
+  "$("${PXQ[@]}" -c 'select count(*) from demo.cities')"
+grep -q "exited UNCLEANLY" "$PXY_LOG" || fail "unclean exit was not logged loudly"
+pass "unclean exit logged loudly by the supervisor"
+
+# n6: shutdown — SIGTERM to icegresd terminates its computes; ports free.
+main_cpid=$(pxy_status main .pid)
+stop_icegresd
+sleep 0.5
+if [[ "$main_cpid" =~ ^[0-9]+$ ]] && kill -0 "$main_cpid" 2>/dev/null; then
+  fail "compute pid $main_cpid survived icegresd shutdown"
+fi
+if psql -h "$PG_HOST" -p "$PXY_MAIN" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+  fail "compute port :$PXY_MAIN still answering after icegresd shutdown"
+fi
+pass "icegresd shutdown terminated its computes (no leftovers)"
+"$BIN" branch drop demo.trips "$PXY_BRANCH" >/dev/null 2>&1 || true
+
+# n7: SESSION POOLING — a fresh icegresd with a warm pool (--pool-size 4,
+#     --pool-idle-secs 3). Contract under test:
+#       * many short-lived sequential client connections (the API pattern)
+#         are all served, most from WARM pooled conns (no compute-side
+#         handshake);
+#       * session state does NOT leak between clients — every warm conn
+#         serves exactly ONE client session and dies with it (SET and an
+#         abandoned transaction from one session are invisible to the next);
+#       * overflow: identity-mismatched clients (different user) go DIRECT
+#         and still work;
+#       * scale-to-zero survives pooling: with no clients the pool
+#         idle-drains, the compute idle-exits, and the next connection
+#         re-wakes AND re-warms.
+log "(n7) icegresd session pooling on :$PXY_PORT (pool 4, pool-idle 3s, compute idle 2s)"
+: >"$PXY_LOG"
+rm -f "$PXY_STATUS"
+"$DBIN" serve --host "$PG_HOST" --port "$PXY_PORT" --main-port "$PXY_MAIN" \
+  --icegres-bin "$BIN" --idle-shutdown-secs 2 --pool-size 4 --pool-idle-secs 3 \
+  --status-file "$PXY_STATUS" >>"$PXY_LOG" 2>&1 &
+echo $! >"$E2E_DIR/icegresd.pid"
+pxy_up=0
+for _ in $(seq 1 40); do
+  if (exec 3<>"/dev/tcp/$PG_HOST/$PXY_PORT") 2>/dev/null; then exec 3>&- 3<&-; pxy_up=1; break; fi
+  sleep 0.25
+done
+[[ "$pxy_up" == 1 ]] || { tail -n 20 "$PXY_LOG" >&2; fail "pooled icegresd not listening on :$PXY_PORT"; }
+
+# n7a: the first connection wakes the compute (direct — pool still empty)
+#      and triggers background warming to --pool-size.
+assert_eq "first pooled-proxy connection wakes the compute and answers" 1 \
+  "$("${PXQ[@]}" -c 'select 1')"
+pool_warm=0
+for _ in $(seq 1 40); do
+  if [[ "$(pxy_status main .pool.warm)" == 4 ]]; then pool_warm=1; break; fi
+  sleep 0.25
+done
+[[ "$pool_warm" == 1 ]] || { tail -n 20 "$PXY_LOG" >&2; fail "pool did not warm to 4 (warm=$(pxy_status main .pool.warm))"; }
+pass "pool warmed to 4 spare backend conns after the wake"
+
+# n7b: API pattern — 15 short-lived sequential client connections, all
+#      served; the bulk must have come from warm pooled handouts.
+pooled_before=$(pxy_status main .pool.pooled_sessions)
+for i in $(seq 1 15); do
+  r=$("${PXQ[@]}" -c 'select 1' 2>&1)
+  [[ "$r" == 1 ]] || fail "pooled sequential connection $i failed: $r"
+done
+pooled_after=$(pxy_status main .pool.pooled_sessions)
+(( pooled_after - pooled_before >= 10 )) \
+  || fail "expected >=10 of 15 sequential sessions to be pooled handouts (got $((pooled_after - pooled_before)); status: $(cat "$PXY_STATUS"))"
+pass "15 sequential short-lived connections served ($((pooled_after - pooled_before)) from the warm pool, rest direct overflow)"
+
+# n7c: session isolation — SET in one client session is invisible to the
+#      next (a warm conn serves exactly one client; no reuse).
+assert_eq "SET applies inside its own pooled session" "5555ms" \
+  "$("${PXQ[@]}" -c 'SET statement_timeout = 5555' -c 'SHOW statement_timeout' | tail -n 1)"
+assert_eq "SET does NOT leak into the next pooled session" "0" \
+  "$("${PXQ[@]}" -c 'SHOW statement_timeout')"
+
+# n7d: session isolation — an abandoned transaction (BEGIN + INSERT, then
+#      disconnect without COMMIT) is rolled back with its session and its
+#      row is invisible to the next client.
+N7_ID=956789
+"${PXQ[@]}" -c 'BEGIN' -c "insert into demo.trips (trip_id, city, distance_km, fare, ts)
+  values ($N7_ID, 'E2E PoolIso', 1.0, 5.0, TIMESTAMP '2026-07-06 00:00:00')" >/dev/null 2>&1 \
+  || fail "BEGIN+INSERT in pooled session failed"
+assert_eq "abandoned txn from the previous pooled session is invisible (implicit rollback)" 0 \
+  "$("${PXQ[@]}" -c "select count(*) from demo.trips where trip_id = $N7_ID")"
+
+# n7e: identity mismatch overflows to a direct connection and still works.
+direct_before=$(pxy_status main .pool.direct_sessions)
+assert_eq "client with a different user bypasses the pool and answers" 1 \
+  "$(psql -h "$PG_HOST" -p "$PXY_PORT" -U pool_bypass_user -d icegres -tA -c 'select 1')"
+direct_after=$(pxy_status main .pool.direct_sessions)
+(( direct_after > direct_before )) \
+  || fail "different-user session was not counted as direct ($direct_before -> $direct_after)"
+pass "different-user client served via direct (non-pooled) connection"
+
+# n7f: scale-to-zero with pooling — no clients for --pool-idle-secs drains
+#      the warm pool, which frees the compute to idle-exit as usual.
+drained=0
+for _ in $(seq 1 60); do
+  if [[ "$(pxy_status main .pool.warm)" == 0 && "$(pxy_status main .state)" == "stopped" ]]; then
+    drained=1; break
+  fi
+  sleep 0.25
+done
+[[ "$drained" == 1 ]] \
+  || fail "pool did not drain / compute did not idle-exit (warm=$(pxy_status main .pool.warm), state=$(pxy_status main .state))"
+pass "pool idle-drained and the compute idle-exited (scale-to-zero preserved under pooling)"
+
+# n7g: the next connection re-wakes the compute and re-warms the pool.
+assert_eq "connection after drain re-wakes the compute" 1 "$("${PXQ[@]}" -c 'select 1')"
+rewarmed=0
+for _ in $(seq 1 40); do
+  if [[ "$(pxy_status main .pool.warm)" == 4 ]]; then rewarmed=1; break; fi
+  sleep 0.25
+done
+[[ "$rewarmed" == 1 ]] || fail "pool did not re-warm after the wake (warm=$(pxy_status main .pool.warm))"
+pass "wake after drain re-warmed the pool"
+
+stop_icegresd
+sleep 0.5
+if psql -h "$PG_HOST" -p "$PXY_MAIN" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+  fail "compute port :$PXY_MAIN still answering after pooled icegresd shutdown"
+fi
+pass "pooled icegresd shutdown terminated its computes (no leftovers)"
+
+# ---------------------------------------------------------------------------
+# (o) real ORM/driver clients — SPEC A8 (bench/clients/a8_orm_probe.py)
+# ---------------------------------------------------------------------------
+# Runs the headless ORM compatibility probe (psycopg2 + pg8000 +
+# SQLAlchemy 2.x + pandas: connect, inspect(), reflection of demo.trips,
+# ORM filter/aggregate, pandas join, prepared-statement reuse,
+# BEGIN/COMMIT/ROLLBACK) against the main server. The probe's writes use
+# trip_id >= 930000 and clean up after themselves. Server-side (named)
+# cursors are a documented XFAIL inside the probe, not a failure.
+log "(o) ORM/driver compatibility probe (bench/clients/a8_orm_probe.py)"
+if ! command -v python3 >/dev/null 2>&1 \
+    || ! python3 -c 'import sqlalchemy, psycopg2, pg8000, pandas' 2>/dev/null; then
+  log "    SKIPPED: python3 with sqlalchemy/psycopg2/pg8000/pandas not available" \
+      "(pip install sqlalchemy psycopg2-binary pg8000 pandas)"
+else
+  A8_OUT=$(env ICEGRES_PROBE_HOST="$PG_HOST" ICEGRES_PROBE_PORT="$PG_PORT" \
+      python3 "$REPO_DIR/bench/clients/a8_orm_probe.py" 2>&1) \
+    || { echo "$A8_OUT" | tail -n 25 >&2; fail "A8 ORM/driver probe reported failures"; }
+  echo "$A8_OUT" | sed 's/^/    /'
+  echo "$A8_OUT" | grep -q '^A8 RESULT: .*fail=0' \
+    || fail "A8 ORM/driver probe summary is not fail=0"
+  pass "ORM/driver clients green ($(echo "$A8_OUT" | grep '^A8 RESULT:'))"
+fi
+
+# ---------------------------------------------------------------------------
+# (p) ADBC first-class — SPEC A11 (bench/clients/a11_adbc_probe.py)
+# ---------------------------------------------------------------------------
+# Two lanes: (1) `icegres flight-serve` (Arrow Flight SQL, adbc_driver_
+# flightsql): query/metadata/prepared+bind/DML counts/BULK INGEST (one
+# Iceberg commit per stream, asserted via $snapshots) + basic-auth variants
+# against a second flight server with --auth-file; (2) adbc_driver_
+# postgresql against the main pgwire server (COPY ... TO STDOUT binary
+# reads, params, get_objects, DML). The probe's writes use trip_id >=
+# 940000 / demo.adbc_ingest and clean up; two documented XFAILs inside the
+# probe (pg-lane COPY FROM ingest, in-transaction extended SELECT).
+FLIGHT_PORT=50051
+FLIGHT_SECURE_PORT=50052
+FLIGHT_PID_FILE="$E2E_DIR/flight.pid"
+FLIGHT_SECURE_PID_FILE="$E2E_DIR/flight-secure.pid"
+
+flight_port_open() { # $1 = port
+  python3 -c "import socket,sys; s=socket.socket(); s.settimeout(0.3);
+sys.exit(0 if s.connect_ex(('127.0.0.1', $1))==0 else 1)" 2>/dev/null
+}
+
+log "(p) ADBC probe: flight-serve on :$FLIGHT_PORT (+auth on :$FLIGHT_SECURE_PORT), pgwire COPY lane on :$PG_PORT"
+if ! command -v python3 >/dev/null 2>&1 \
+    || ! python3 -c 'import adbc_driver_flightsql, adbc_driver_postgresql, pyarrow' 2>/dev/null; then
+  log "    SKIPPED: python3 with ADBC drivers not available" \
+      "(pip install adbc-driver-flightsql adbc-driver-postgresql pyarrow)"
+else
+  stop_pidfile_generic "$FLIGHT_PID_FILE"
+  stop_pidfile_generic "$FLIGHT_SECURE_PID_FILE"
+  if flight_port_open "$FLIGHT_PORT"; then
+    fail "something is already listening on :$FLIGHT_PORT — stop it first (not started by this harness)"
+  fi
+  "$BIN" flight-serve --host 127.0.0.1 --port "$FLIGHT_PORT" \
+    >"$E2E_DIR/flight.log" 2>&1 &
+  echo $! >"$FLIGHT_PID_FILE"
+  printf 'e2e_flight_user:e2e-flight-pw\n' >"$E2E_DIR/flight-auth.conf"
+  "$BIN" flight-serve --host 127.0.0.1 --port "$FLIGHT_SECURE_PORT" \
+    --auth-file "$E2E_DIR/flight-auth.conf" >"$E2E_DIR/flight-secure.log" 2>&1 &
+  echo $! >"$FLIGHT_SECURE_PID_FILE"
+  for _ in $(seq 1 60); do
+    flight_port_open "$FLIGHT_PORT" && flight_port_open "$FLIGHT_SECURE_PORT" && break
+    if ! kill -0 "$(cat "$FLIGHT_PID_FILE")" 2>/dev/null \
+        || ! kill -0 "$(cat "$FLIGHT_SECURE_PID_FILE")" 2>/dev/null; then
+      tail -n 20 "$E2E_DIR/flight.log" "$E2E_DIR/flight-secure.log" >&2
+      fail "icegres flight-serve exited during startup"
+    fi
+    sleep 0.5
+  done
+  flight_port_open "$FLIGHT_PORT" || fail "flight-serve did not open :$FLIGHT_PORT in 30s"
+  flight_port_open "$FLIGHT_SECURE_PORT" || fail "flight-serve (auth) did not open :$FLIGHT_SECURE_PORT in 30s"
+  pass "flight-serve up on :$FLIGHT_PORT and :$FLIGHT_SECURE_PORT (basic auth)"
+
+  A11_OUT=$(env ICEGRES_PROBE_FLIGHT_HOST=127.0.0.1 \
+      ICEGRES_PROBE_FLIGHT_PORT="$FLIGHT_PORT" \
+      ICEGRES_PROBE_FLIGHT_SECURE_PORT="$FLIGHT_SECURE_PORT" \
+      ICEGRES_PROBE_FLIGHT_SECURE_USER=e2e_flight_user \
+      ICEGRES_PROBE_FLIGHT_SECURE_PASSWORD=e2e-flight-pw \
+      ICEGRES_PROBE_PG_HOST="$PG_HOST" ICEGRES_PROBE_PG_PORT="$PG_PORT" \
+      python3 "$REPO_DIR/bench/clients/a11_adbc_probe.py" 2>&1) \
+    || { echo "$A11_OUT" | tail -n 25 >&2; fail "A11 ADBC probe reported failures"; }
+  echo "$A11_OUT" | sed 's/^/    /'
+  echo "$A11_OUT" | grep -q '^A11 RESULT: .*fail=0' \
+    || fail "A11 ADBC probe summary is not fail=0"
+  echo "$A11_OUT" | grep -q '^PASS flight: basic auth handshake' \
+    || fail "A11 basic-auth step did not run/pass (secure server env was set)"
+  pass "ADBC first-class green ($(echo "$A11_OUT" | grep '^A11 RESULT:'))"
+
+  # (p2) Flight-NATIVE authorization (SPEC A12 on the Flight lane / production-
+  #      readiness blocker #1): the ReBAC policy that gates pgwire MUST gate the
+  #      Flight endpoint too — otherwise the Flight port is a total authz bypass.
+  #      Grant e2e_flight_user read on demo.trips ONLY; assert trips allowed but
+  #      demo.cities SELECT and any write denied.
+  FLIGHT_AUTHZ_PORT=50053
+  printf 'grant e2e_flight_user read demo.trips\n' >"$E2E_DIR/flight-authz.conf"
+  "$BIN" flight-serve --host 127.0.0.1 --port "$FLIGHT_AUTHZ_PORT" \
+    --auth-file "$E2E_DIR/flight-auth.conf" --authz-file "$E2E_DIR/flight-authz.conf" \
+    >"$E2E_DIR/flight-authz.log" 2>&1 &
+  echo $! >"$E2E_DIR/flight-authz.pid"
+  for _ in $(seq 1 60); do
+    flight_port_open "$FLIGHT_AUTHZ_PORT" && break
+    kill -0 "$(cat "$E2E_DIR/flight-authz.pid")" 2>/dev/null \
+      || { tail -n 20 "$E2E_DIR/flight-authz.log" >&2; fail "flight-serve (authz) exited during startup"; }
+    sleep 0.5
+  done
+  flight_port_open "$FLIGHT_AUTHZ_PORT" || fail "flight-serve (authz) did not open :$FLIGHT_AUTHZ_PORT in 30s"
+  AZF_OUT=$(env FA_PORT="$FLIGHT_AUTHZ_PORT" python3 - <<'PYEOF' 2>&1
+import os
+from adbc_driver_flightsql import dbapi as fl
+port = os.environ["FA_PORT"]
+cn = fl.connect(f"grpc://127.0.0.1:{port}",
+                db_kwargs={"username": "e2e_flight_user", "password": "e2e-flight-pw"})
+cur = cn.cursor()
+cur.execute("select count(*) from demo.trips")
+assert cur.fetchone()[0] >= 0
+print("OK granted read demo.trips")
+denied = False
+try:
+    cur.execute("select count(*) from demo.cities"); cur.fetchone()
+except Exception as e:
+    denied = "permission denied" in str(e) or "cannot SELECT" in str(e)
+assert denied, "ungranted demo.cities SELECT was NOT denied"
+print("OK denied read demo.cities")
+wdenied = False
+try:
+    cur.execute("insert into demo.cities (city,country,population) values ('z','z',1)")
+except Exception as e:
+    wdenied = "permission denied" in str(e) or "cannot write" in str(e)
+assert wdenied, "ungranted demo.cities write was NOT denied"
+print("OK denied write demo.cities")
+cur.close(); cn.close()
+print("FLIGHT_AUTHZ_OK")
+PYEOF
+) || { echo "$AZF_OUT" | tail -n 15 >&2; fail "Flight-native authorization probe failed"; }
+  echo "$AZF_OUT" | grep -q FLIGHT_AUTHZ_OK \
+    || { echo "$AZF_OUT" | tail -n 15 >&2; fail "Flight authz probe did not confirm all denials"; }
+  pass "Flight-native authorization enforced (granted read allowed; ungranted table SELECT + write denied 42501)"
+  stop_pidfile_generic "$E2E_DIR/flight-authz.pid"
+
+  stop_pidfile_generic "$FLIGHT_PID_FILE"
+  stop_pidfile_generic "$FLIGHT_SECURE_PID_FILE"
+  pass "flight-serve servers stopped"
+fi
+
+# ---------------------------------------------------------------------------
+# (q) JDBC client — SPEC A9 (bench/clients/a9_jdbc_probe.sh)
+# ---------------------------------------------------------------------------
+# Runs the pgjdbc compatibility probe (DriverManager connect with pgjdbc's
+# startup parameters, DatabaseMetaData getTables/getColumns of demo,
+# Statement + PreparedStatement with typed parameters, executeUpdate INSERT
+# with a proper `INSERT 0 n` tag on the extended protocol, and a
+# setAutoCommit(false) rollback/commit cycle) against the main server. The
+# probe's writes use trip_id >= 940000 and clean up after themselves. Skips
+# gracefully when no JDK is installed (exit 3 from the wrapper).
+log "(q) JDBC client probe (bench/clients/a9_jdbc_probe.sh)"
+if ! command -v java >/dev/null 2>&1 || ! command -v javac >/dev/null 2>&1; then
+  log "    SKIPPED: java/javac not available (apt install openjdk-21-jdk-headless)"
+else
+  A9_OUT=$(env ICEGRES_PROBE_HOST="$PG_HOST" ICEGRES_PROBE_PORT="$PG_PORT" \
+      bash "$REPO_DIR/bench/clients/a9_jdbc_probe.sh" 2>&1)
+  A9_RC=$?
+  if [[ $A9_RC -eq 3 ]]; then
+    log "    SKIPPED: $(echo "$A9_OUT" | tail -n 1)"
+  else
+    echo "$A9_OUT" | sed 's/^/    /'
+    [[ $A9_RC -eq 0 ]] || fail "A9 JDBC probe reported failures (exit $A9_RC)"
+    echo "$A9_OUT" | grep -q '^A9 RESULT: .*fail=0' \
+      || fail "A9 JDBC probe summary is not fail=0"
+    pass "JDBC client green ($(echo "$A9_OUT" | grep '^A9 RESULT:'))"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# (r) ODBC client — SPEC A10 (bench/clients/a10_odbc_probe.sh)
+# ---------------------------------------------------------------------------
+# Runs the psqlODBC (unixODBC) compatibility probe against the main server:
+# connect (psqlODBC's version/type probes), SQLTables/SQLColumns metadata,
+# qmark-parameterized query, INSERT/readback/DELETE with rowcount (autocommit),
+# and a read inside an explicit transaction. Writes use trip_id >= 970000 and
+# clean up after themselves. Skips gracefully when pyodbc / the psqlODBC driver
+# is not installed (exit 3; apt install unixodbc odbc-postgresql + pip pyodbc,
+# or run infra/scripts/odbc-setup.sh).
+log "(r) ODBC client probe (bench/clients/a10_odbc_probe.sh)"
+if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import pyodbc' 2>/dev/null; then
+  log "    SKIPPED: pyodbc not available (apt install unixodbc odbc-postgresql; pip install pyodbc)"
+else
+  A10_OUT=$(env ICEGRES_PROBE_HOST="$PG_HOST" ICEGRES_PROBE_PORT="$PG_PORT" \
+      bash "$REPO_DIR/bench/clients/a10_odbc_probe.sh" 2>&1)
+  A10_RC=$?
+  if [[ $A10_RC -eq 3 ]]; then
+    log "    SKIPPED: $(echo "$A10_OUT" | tail -n 1)"
+  else
+    echo "$A10_OUT" | sed 's/^/    /'
+    [[ $A10_RC -eq 0 ]] || fail "A10 ODBC probe reported failures (exit $A10_RC)"
+    echo "$A10_OUT" | grep -q '^A10 RESULT: .*fail=0' \
+      || fail "A10 ODBC probe summary is not fail=0"
+    pass "ODBC client green ($(echo "$A10_OUT" | grep '^A10 RESULT:'))"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# (s) Authorization — SPEC A12 (bench/clients/authz_probe.sh)
+# ---------------------------------------------------------------------------
+# Runs the ReBAC enforcement probe (managed add-on): it starts its own icegres
+# with --auth-file + --authz-file and verifies namespace-grant inheritance,
+# table-scoped grants, warehouse ownership, roles, per-statement 42501 denial,
+# JOIN-checks-every-table, and pg_catalog metadata staying free. Skips
+# gracefully when psql is missing or the binary lacks the `managed` feature.
+log "(s) authorization probe (bench/clients/authz_probe.sh)"
+if ! command -v psql >/dev/null 2>&1; then
+  log "    SKIPPED: psql not available"
+else
+  AZ_OUT=$(ICEGRES_BIN="$BIN" bash "$REPO_DIR/bench/clients/authz_probe.sh" 2>&1)
+  AZ_RC=$?
+  if [[ $AZ_RC -eq 3 ]]; then
+    log "    SKIPPED: $(echo "$AZ_OUT" | tail -n 1)"
+  else
+    echo "$AZ_OUT" | sed 's/^/    /'
+    [[ $AZ_RC -eq 0 ]] || fail "A12 authz probe reported failures (exit $AZ_RC)"
+    echo "$AZ_OUT" | grep -q '^A12 RESULT: .*fail=0' \
+      || fail "A12 authz probe summary is not fail=0"
+    pass "authorization enforced ($(echo "$AZ_OUT" | grep '^A12 RESULT:'))"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# (t) Snapshot expiry (SPEC lifecycle): `icegres maintain expire-snapshots`
+# ---------------------------------------------------------------------------
+# Every write to an Iceberg table adds a snapshot forever; expiry trims the
+# metadata to the newest N + everything still reachable from a ref, without
+# touching the current data. Uses the main permissive server on :$PG_PORT.
+log "(t) snapshot expiry (maintain expire-snapshots)"
+# count(*) on Iceberg metadata tables hits a DataFusion logical/physical schema
+# mismatch (documented in parity probe C5); a *bare* projection over the
+# metadata table trips the same mismatch in the pg row encoder. Selecting with
+# an ORDER BY inserts a sort that re-establishes the schema, which is the shape
+# the C5 probe uses — count snapshots that way.
+count_snaps() {
+  q "select snapshot_id, committed_at from demo.\"$1\$snapshots\" order by committed_at" \
+    | grep -c '|'
+}
+q 'drop table if exists demo.e2e_expire' >/dev/null 2>&1 || true
+q 'create table demo.e2e_expire (id bigint, v text)' >/dev/null
+for i in 1 2 3 4 5; do
+  q "insert into demo.e2e_expire (id, v) values ($i, 'r$i')" >/dev/null
+done
+snap_before=$(count_snaps e2e_expire)
+assert_eq "five writes make five snapshots" "5" "$snap_before"
+head_before=$(q 'select snapshot_id from demo."e2e_expire$snapshots" order by committed_at desc limit 1')
+"$BIN" maintain expire-snapshots demo.e2e_expire --keep 2 >"$E2E_DIR/expire.log" 2>&1 \
+  || { cat "$E2E_DIR/expire.log" >&2; fail "expire-snapshots failed"; }
+grep -q 'expired 3 snapshot' "$E2E_DIR/expire.log" \
+  || { cat "$E2E_DIR/expire.log" >&2; fail "expire-snapshots did not remove 3 snapshots"; }
+snap_after=$(count_snaps e2e_expire)
+assert_eq "expiry keeps exactly the newest two snapshots" "2" "$snap_after"
+# A WHERE filter on the metadata table trips a separate DataFusion type-inference
+# quirk, so check head survival by listing surviving ids and matching in the shell.
+survivors=$(q 'select snapshot_id, committed_at from demo."e2e_expire$snapshots" order by committed_at' | cut -d'|' -f1)
+if echo "$survivors" | grep -qx "$head_before"; then
+  pass "current head survives expiry (never expired out from under a reader)"
+else
+  fail "current head $head_before missing after expiry; survivors: $(echo "$survivors" | tr '\n' ' ')"
+fi
+assert_eq "data is intact after expiry (metadata-only op)" "5" \
+  "$(q 'select count(*) from demo.e2e_expire')"
+# Idempotent: nothing older than the kept window remains to expire.
+"$BIN" maintain expire-snapshots demo.e2e_expire --keep 2 >"$E2E_DIR/expire2.log" 2>&1 \
+  || { cat "$E2E_DIR/expire2.log" >&2; fail "second expire-snapshots failed"; }
+grep -q 'expired 0 snapshot' "$E2E_DIR/expire2.log" \
+  || { cat "$E2E_DIR/expire2.log" >&2; fail "second expire should be a no-op"; }
+pass "expire-snapshots trims to newest-N, keeps head, is idempotent"
+q 'drop table demo.e2e_expire' >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
+# (u) Strict transaction mode (SPEC B4 hardening): on a catalog WITH the
+# multi-table transaction endpoint (Lakekeeper), ICEGRES_TXN_STRICT is
+# satisfied by atomicity — a multi-table COMMIT succeeds as ONE atomic
+# request. Only when the catalog LACKS the endpoint (simulated with the
+# test-only ICEGRES_TXN_DISABLE_ATOMIC knob) does strict mode refuse up
+# front (0A000, nothing applied) instead of committing per-table.
+# ---------------------------------------------------------------------------
+log "(u) strict transaction mode (ICEGRES_TXN_STRICT) on :$STRICT_PORT"
+strict_start() { # strict_start [EXTRA_ENV=...]
+  stop_pidfile_generic "$E2E_DIR/serve-strict.pid"
+  : >"$E2E_DIR/serve-strict.log"
+  env "$@" ICEGRES_TXN_STRICT=true "$BIN" serve --host "$PG_HOST" --port "$STRICT_PORT" \
+    >>"$E2E_DIR/serve-strict.log" 2>&1 &
+  echo $! >"$E2E_DIR/serve-strict.pid"
+  local ready=0
+  for _ in $(seq 1 60); do
+    if psql -h "$PG_HOST" -p "$STRICT_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+      ready=1; break
+    fi
+    sleep 0.5
+  done
+  [[ "$ready" == 1 ]] \
+    || { tail -n 20 "$E2E_DIR/serve-strict.log" >&2; fail "strict server not ready on :$STRICT_PORT"; }
+}
+SQ=(psql -h "$PG_HOST" -p "$STRICT_PORT" -U postgres -d icegres)
+strict_start
+"${SQ[@]}" -tA -c 'drop table if exists demo.e2e_strict_a' >/dev/null 2>&1 || true
+"${SQ[@]}" -tA -c 'drop table if exists demo.e2e_strict_b' >/dev/null 2>&1 || true
+"${SQ[@]}" -tA -c 'create table demo.e2e_strict_a (id bigint)' >/dev/null
+"${SQ[@]}" -tA -c 'create table demo.e2e_strict_b (id bigint)' >/dev/null
+# u1: strict + supported catalog: the two-table COMMIT succeeds ATOMICALLY.
+strict_out=$("${SQ[@]}" -v ON_ERROR_STOP=1 2>&1 <<'EOF'
+BEGIN;
+insert into demo.e2e_strict_a values (1);
+insert into demo.e2e_strict_b values (2);
+COMMIT;
+EOF
+) || { echo "$strict_out" >&2; fail "strict multi-table COMMIT failed on a catalog WITH transactions/commit"; }
+echo "$strict_out" | grep -q "COMMIT" || fail "strict COMMIT tag missing: $strict_out"
+grep -q 'transaction committed atomically via transactions/commit' "$E2E_DIR/serve-strict.log" \
+  || fail "strict multi-table COMMIT did not use the atomic endpoint"
+assert_eq "strict mode + Lakekeeper: multi-table COMMIT applied atomically" "1|1" \
+  "$("${SQ[@]}" -tA -c 'select (select count(*) from demo.e2e_strict_a) as a, (select count(*) from demo.e2e_strict_b) as b')"
+# u2: catalog without the endpoint (simulated): strict refuses the COMMIT
+# up front and applies nothing.
+strict_start ICEGRES_TXN_DISABLE_ATOMIC=1
+strict_out=$("${SQ[@]}" -v VERBOSITY=verbose 2>&1 <<'EOF'
+BEGIN;
+insert into demo.e2e_strict_a values (3);
+insert into demo.e2e_strict_b values (4);
+COMMIT;
+EOF
+) || true
+echo "$strict_out" | grep -q '0A000' \
+  || fail "strict multi-table COMMIT not refused with 0A000 without the endpoint: $strict_out"
+pass "strict mode refuses multi-table COMMIT when the catalog lacks the endpoint (0A000)"
+assert_eq "strict refusal applied nothing to either table (atomic rollback)" "1|1" \
+  "$("${SQ[@]}" -tA -c 'select (select count(*) from demo.e2e_strict_a) as a, (select count(*) from demo.e2e_strict_b) as b')"
+# u3: single-table transaction still commits normally under strict mode.
+"${SQ[@]}" 2>&1 <<'EOF' >/dev/null
+BEGIN;
+insert into demo.e2e_strict_a values (9);
+insert into demo.e2e_strict_a values (10);
+COMMIT;
+EOF
+assert_eq "strict mode still commits single-table transactions" "3" \
+  "$("${SQ[@]}" -tA -c 'select count(*) from demo.e2e_strict_a')"
+"${SQ[@]}" -tA -c 'drop table demo.e2e_strict_a' >/dev/null 2>&1 || true
+"${SQ[@]}" -tA -c 'drop table demo.e2e_strict_b' >/dev/null 2>&1 || true
+stop_pidfile_generic "$E2E_DIR/serve-strict.pid"
+
+# ---------------------------------------------------------------------------
+# (v) Buffered-write durability contract: an acked-but-UNFLUSHED row is LOST on
+# an UNCLEAN kill (the documented trade), but SURVIVES a CLEAN SIGTERM (the
+# shutdown-flush hardening). A 10-minute cadence guarantees the background
+# flusher never auto-commits within the test, so the only commit that can
+# happen is the shutdown flush — proving the behavior end to end.
+# ---------------------------------------------------------------------------
+VBUF_PID_FILE="$E2E_DIR/serve-vbuf.pid"
+VBUF_LOG="$E2E_DIR/serve-vbuf.log"
+VBUF_MS=600000
+VBQ=(psql -h "$PG_HOST" -p "$VBUF_PORT" -U postgres -d icegres -tA)
+: >"$VBUF_LOG"
+vbuf_start() {
+  stop_pidfile_generic "$VBUF_PID_FILE"
+  "$BIN" serve --host "$PG_HOST" --port "$VBUF_PORT" --write-buffer-ms "$VBUF_MS" >>"$VBUF_LOG" 2>&1 &
+  echo $! >"$VBUF_PID_FILE"
+  for _ in $(seq 1 60); do
+    if "${VBQ[@]}" -c 'select 1' >/dev/null 2>&1; then return 0; fi
+    sleep 0.5
+  done
+  tail -n 20 "$VBUF_LOG" >&2; fail "buffered durability server not ready on :$VBUF_PORT"
+}
+log "(v) buffered durability: kill-loss vs clean-shutdown-flush on :$VBUF_PORT"
+if "${VBQ[@]}" -c 'select 1' >/dev/null 2>&1; then fail "something is already listening on :$VBUF_PORT"; fi
+vbuf_start
+
+vbase=$(( $(q 'select coalesce(max(trip_id), 0) from demo.trips') + 1 ))
+(( vbase >= 990000 )) || vbase=990000
+KL_ID=$vbase        # kill-loss sentinel (never committed -> lost)
+CS_ID=$((vbase + 1)) # clean-shutdown sentinel (flushed on SIGTERM -> survives)
+
+# --- kill-loss: an acked-but-unflushed row is lost on SIGKILL ---
+"${VBQ[@]}" -c "insert into demo.trips (trip_id, city, distance_km, fare, ts) values ($KL_ID, 'E2E KillLoss', 1.0, 1.0, TIMESTAMP '2026-07-06 00:00:00')" >/dev/null \
+  || fail "kill-loss INSERT failed"
+assert_eq "unflushed acked row readable on the buffering server (union view)" "1" \
+  "$("${VBQ[@]}" -c "select count(*) from demo.trips where trip_id = $KL_ID")"
+assert_eq "unflushed acked row NOT yet committed (invisible to the sync server)" "0" \
+  "$(q "select count(*) from demo.trips where trip_id = $KL_ID")"
+vpid=$(cat "$VBUF_PID_FILE")
+kill -9 "$vpid" 2>/dev/null || fail "could not SIGKILL buffered durability server"
+for _ in $(seq 1 20); do kill -0 "$vpid" 2>/dev/null || break; sleep 0.25; done
+kill -0 "$vpid" 2>/dev/null && fail "buffered durability server survived SIGKILL"
+rm -f "$VBUF_PID_FILE"
+vbuf_start
+assert_eq "unflushed acked row LOST after the unclean kill (durability contract is real)" "0" \
+  "$("${VBQ[@]}" -c "select count(*) from demo.trips where trip_id = $KL_ID")"
+pass "kill-loss: an acked-but-unflushed write is genuinely lost on SIGKILL"
+
+# --- clean-shutdown-flush: an acked-but-unflushed row survives a graceful stop ---
+"${VBQ[@]}" -c "insert into demo.trips (trip_id, city, distance_km, fare, ts) values ($CS_ID, 'E2E CleanFlush', 1.0, 1.0, TIMESTAMP '2026-07-06 00:00:00')" >/dev/null \
+  || fail "clean-flush INSERT failed"
+assert_eq "clean-flush row is unflushed pre-SIGTERM (invisible to the sync server)" "0" \
+  "$(q "select count(*) from demo.trips where trip_id = $CS_ID")"
+vpid=$(cat "$VBUF_PID_FILE")
+kill -TERM "$vpid" 2>/dev/null || fail "could not SIGTERM buffered durability server"
+for _ in $(seq 1 120); do kill -0 "$vpid" 2>/dev/null || break; sleep 0.25; done
+if kill -0 "$vpid" 2>/dev/null; then kill -9 "$vpid" 2>/dev/null; fail "server did not exit within 30s of SIGTERM"; fi
+rm -f "$VBUF_PID_FILE"
+grep -q "flushing write buffer before clean shutdown" "$VBUF_LOG" \
+  || fail "clean shutdown did not attempt a buffer flush (log: $VBUF_LOG)"
+grep -q "write buffer flushed on shutdown; no acked rows lost" "$VBUF_LOG" \
+  || fail "shutdown flush did not report success (log: $VBUF_LOG)"
+pass "clean SIGTERM flushed the buffer before exit (log confirms)"
+assert_eq "clean-flush row COMMITTED to the lake by the shutdown flush (sync server sees it)" "1" \
+  "$(q "select count(*) from demo.trips where trip_id = $CS_ID")"
+vbuf_start
+assert_eq "clean-flush row survives the restart (durably in Iceberg)" "1" \
+  "$("${VBQ[@]}" -c "select count(*) from demo.trips where trip_id = $CS_ID")"
+pass "clean-shutdown-flush: an acked-but-unflushed write survives a graceful stop"
+stop_pidfile_generic "$VBUF_PID_FILE"
+
+# ---------------------------------------------------------------------------
+# (w) Observability + security hardening: per-query duration metrics +
+# slow-query WARN correlated to a per-connection span (audit #9/#11), per-peer
+# failed-auth backoff (#4), and Flight SQL in-process TLS (#13).
+# ---------------------------------------------------------------------------
+log "(w) observability + hardening (#9/#11/#4/#13)"
+
+# --- w1: query metrics + slow-query WARN + correlation span ---
+OBS_PORT=5454
+OBS_HEALTH=8091
+OBS_PID="$E2E_DIR/serve-obs.pid"
+OBS_LOG="$E2E_DIR/serve-obs.log"
+stop_pidfile_generic "$OBS_PID"
+: >"$OBS_LOG"
+# ICEGRES_SLOW_QUERY_MS=1 makes any query "slow" (deterministic WARN); JSON logs
+# so the correlation span is assertable without ANSI escapes.
+ICEGRES_LOG_FORMAT=json ICEGRES_SLOW_QUERY_MS=1 \
+  "$BIN" serve --host "$PG_HOST" --port "$OBS_PORT" --health-port "$OBS_HEALTH" >>"$OBS_LOG" 2>&1 &
+echo $! >"$OBS_PID"
+obs_ready=0
+for _ in $(seq 1 60); do
+  if psql -h "$PG_HOST" -p "$OBS_PORT" -U postgres -d icegres -tAc 'select 1' >/dev/null 2>&1; then obs_ready=1; break; fi
+  sleep 0.5
+done
+[[ "$obs_ready" == 1 ]] || { tail -n 20 "$OBS_LOG" >&2; fail "observability server not ready on :$OBS_PORT"; }
+psql -h "$PG_HOST" -p "$OBS_PORT" -U postgres -d icegres -tAc 'select count(*) from demo.trips' >/dev/null
+if command -v curl >/dev/null 2>&1; then
+  OBS_M=$(curl -s "http://$PG_HOST:$OBS_HEALTH/metrics")
+  echo "$OBS_M" | grep -q '^icegres_queries_in_flight ' || fail "queries_in_flight metric missing"
+  echo "$OBS_M" | grep -q '^icegres_query_duration_ms_total ' || fail "query_duration_ms_total metric missing"
+  obs_slow=$(echo "$OBS_M" | awk '/^icegres_queries_slow_total /{print $2}')
+  [[ -n "$obs_slow" && "$obs_slow" -ge 1 ]] || fail "queries_slow_total not incremented (got ${obs_slow:-none})"
+  pass "new query metrics exposed (in_flight/slow_total=$obs_slow/duration)"
+else
+  log "    SKIPPED /metrics assertions: curl not available"
+fi
+# Correlation: the slow-query WARN line carries the per-connection span
+# (name=conn, id, peer) so concurrent-connection logs de-multiplex.
+slow_line=$(grep '"message":"slow query"' "$OBS_LOG" | head -1)
+[[ -n "$slow_line" ]] || fail "no slow-query WARN emitted"
+echo "$slow_line" | grep -q '"name":"conn"' || fail "slow-query WARN not inside a conn span: $slow_line"
+echo "$slow_line" | grep -q '"peer"' || fail "conn span missing peer: $slow_line"
+pass "query timing WARNs correlated to a per-connection span (conn id + peer)"
+stop_pidfile_generic "$OBS_PID"
+
+# --- w2: per-peer failed-auth backoff ---
+THR_PORT=5455
+THR_PID="$E2E_DIR/serve-thr.pid"
+THR_LOG="$E2E_DIR/serve-thr.log"
+THR_AUTH="$E2E_DIR/thr-auth.conf"
+printf 'thruser:right-pw\n' >"$THR_AUTH"; chmod 600 "$THR_AUTH"
+stop_pidfile_generic "$THR_PID"
+: >"$THR_LOG"
+"$BIN" serve --host "$PG_HOST" --port "$THR_PORT" --auth-file "$THR_AUTH" >>"$THR_LOG" 2>&1 &
+echo $! >"$THR_PID"
+thr_ready=0
+for _ in $(seq 1 60); do
+  if PGPASSWORD=right-pw psql "host=$PG_HOST port=$THR_PORT user=thruser dbname=icegres" -tAc 'select 1' >/dev/null 2>&1; then thr_ready=1; break; fi
+  sleep 0.5
+done
+[[ "$thr_ready" == 1 ]] || { tail -n 20 "$THR_LOG" >&2; fail "throttle server not ready on :$THR_PORT"; }
+# First wrong attempt is ~baseline (no prior failures); after a couple more the
+# escalating backoff makes a later attempt visibly slower.
+# These are expected to FAIL (wrong password) — guard against `set -e`.
+t0=$(date +%s%N)
+PGPASSWORD=nope psql "host=$PG_HOST port=$THR_PORT user=thruser dbname=icegres connect_timeout=30" -tAc 'select 1' >/dev/null 2>&1 || true
+first_ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+for _ in 1 2; do PGPASSWORD=nope psql "host=$PG_HOST port=$THR_PORT user=thruser dbname=icegres connect_timeout=30" -tAc 'select 1' >/dev/null 2>&1 || true; done
+t0=$(date +%s%N)
+PGPASSWORD=nope psql "host=$PG_HOST port=$THR_PORT user=thruser dbname=icegres connect_timeout=30" -tAc 'select 1' >/dev/null 2>&1 || true
+later_ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+grep -q 'throttling this peer' "$THR_LOG" || fail "failed-auth throttle did not fire (log: $THR_LOG)"
+(( later_ms > first_ms + 100 )) || fail "no backoff escalation: first=${first_ms}ms later=${later_ms}ms"
+pass "per-peer failed-auth backoff escalates (first=${first_ms}ms -> later=${later_ms}ms)"
+assert_eq "correct password still authenticates despite the throttle" "1" \
+  "$(PGPASSWORD=right-pw psql "host=$PG_HOST port=$THR_PORT user=thruser dbname=icegres connect_timeout=30" -tAc 'select 1')"
+stop_pidfile_generic "$THR_PID"
+
+# --- w3: Flight SQL in-process TLS ---
+FTLS_PORT=50056
+FTLS_PID="$E2E_DIR/flight-tls.pid"
+FTLS_LOG="$E2E_DIR/flight-tls.log"
+bash "$REPO_DIR/infra/scripts/gen-dev-cert.sh" >/dev/null 2>&1 || true
+FCRT="$REPO_DIR/infra/.data/tls/dev.crt"
+FKEY="$REPO_DIR/infra/.data/tls/dev.key"
+if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import adbc_driver_flightsql' >/dev/null 2>&1; then
+  log "    SKIPPED w3 Flight TLS: python3/adbc_driver_flightsql not available"
+elif [[ ! -f "$FCRT" || ! -f "$FKEY" ]]; then
+  log "    SKIPPED w3 Flight TLS: dev cert not available ($FCRT)"
+else
+  stop_pidfile_generic "$FTLS_PID"
+  : >"$FTLS_LOG"
+  "$BIN" flight-serve --host "$PG_HOST" --port "$FTLS_PORT" --tls-cert "$FCRT" --tls-key "$FKEY" >>"$FTLS_LOG" 2>&1 &
+  echo $! >"$FTLS_PID"
+  ftls_ready=0
+  for _ in $(seq 1 60); do grep -q 'flight-serve ready' "$FTLS_LOG" && { ftls_ready=1; break; }; sleep 0.5; done
+  [[ "$ftls_ready" == 1 ]] || { tail -n 20 "$FTLS_LOG" >&2; fail "Flight TLS server not ready on :$FTLS_PORT"; }
+  FT_OUT=$(FT_PORT="$FTLS_PORT" python3 - <<'PY' 2>&1
+import os
+import adbc_driver_flightsql.dbapi as f
+from adbc_driver_flightsql import DatabaseOptions
+p = os.environ["FT_PORT"]
+tls_ok = False
+plain_rejected = False
+try:
+    c = f.connect(f"grpc+tls://localhost:{p}", db_kwargs={DatabaseOptions.TLS_SKIP_VERIFY.value: "true"})
+    cur = c.cursor(); cur.execute("select count(*) from demo.trips"); cur.fetchone()
+    tls_ok = True; cur.close(); c.close()
+except Exception as e:
+    print("TLS-FAIL", type(e).__name__, str(e)[:140])
+try:
+    c = f.connect(f"grpc://localhost:{p}"); c.cursor().execute("select 1")
+except Exception:
+    plain_rejected = True
+print(f"RESULT tls_ok={tls_ok} plain_rejected={plain_rejected}")
+PY
+)
+  echo "$FT_OUT" | sed 's/^/    /'
+  echo "$FT_OUT" | grep -q 'tls_ok=True' || fail "ADBC over grpc+tls failed"
+  echo "$FT_OUT" | grep -q 'plain_rejected=True' || fail "plaintext client not rejected on the TLS Flight port"
+  pass "Flight in-process TLS: ADBC grpc+tls query works, plaintext client rejected"
+  stop_pidfile_generic "$FTLS_PID"
+fi
+
+# ---------------------------------------------------------------------------
+# (x) Keyed tail upserts (roadmap Phase 2, docs/sota-roadmap.md §4): on a
+# table with icegres.tail-upsert=true + icegres.primary-key, an exact-PK
+# UPDATE acks from the durable tail instead of a synchronous COW commit.
+# Proven here: 20 sequential UPDATEs to ONE hot row ack fast, produce ZERO
+# intermediate snapshots, and net exactly ONE composed commit at the flush;
+# a mid-window SELECT sees the newest value through the union read; time
+# travel to the pre-update snapshot still shows the old value (never
+# overlaid). Port 5457 (5456 and 5458 belong to tail_durability.sh).
+# ---------------------------------------------------------------------------
+KY_PORT=5457
+KY_PID="$E2E_DIR/serve-keyed.pid"
+KY_LOG="$E2E_DIR/serve-keyed.log"
+KY_TAIL="$E2E_DIR/keyed-tail-wal"
+KY_MS=600000 # only fences flush: every commit below is one the test forced
+KYQ=(psql -h "$PG_HOST" -p "$KY_PORT" -U postgres -d icegres -v ON_ERROR_STOP=1 -tA)
+ky_snap_count() {
+  curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_keyed"     | jq '[.metadata.snapshots[]?] | length'
+}
+# The fence: any non-keyed DML forces a synchronous flush first (this one
+# then matches nothing and commits nothing itself).
+ky_flush() { "${KYQ[@]}" -c 'delete from demo.e2e_keyed where id < -1' >/dev/null; }
+log "(x) keyed tail upserts (Phase 2) on :$KY_PORT"
+stop_pidfile_generic "$KY_PID"
+if "${KYQ[@]}" -c 'select 1' >/dev/null 2>&1; then fail "something is already listening on :$KY_PORT"; fi
+rm -rf "$KY_TAIL"
+: >"$KY_LOG"
+curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_keyed?purgeRequested=true" >/dev/null 2>&1 || true
+curl -sf -X POST "$CATALOG_URI/v1/$prefix/namespaces/demo/tables" \
+  -H 'Content-Type: application/json' -d @- <<'JSON' >/dev/null
+{
+  "name": "e2e_keyed",
+  "schema": {
+    "type": "struct",
+    "schema-id": 0,
+    "fields": [
+      {"id": 1, "name": "id", "required": false, "type": "long"},
+      {"id": 2, "name": "val", "required": false, "type": "string"}
+    ]
+  },
+  "properties": {"icegres.primary-key": "id", "icegres.tail-upsert": "true"}
+}
+JSON
+"$BIN" serve --host "$PG_HOST" --port "$KY_PORT" --write-buffer-ms "$KY_MS" \
+  --tail-dir "$KY_TAIL" >>"$KY_LOG" 2>&1 &
+echo $! >"$KY_PID"
+ky_ready=0
+for _ in $(seq 1 60); do
+  if "${KYQ[@]}" -c 'select 1' >/dev/null 2>&1; then ky_ready=1; break; fi
+  sleep 0.5
+done
+[[ "$ky_ready" == 1 ]] || { tail -n 20 "$KY_LOG" >&2; fail "keyed server not ready on :$KY_PORT"; }
+
+# Seed one committed row, note the pre-update snapshot for time travel.
+"${KYQ[@]}" -c "insert into demo.e2e_keyed values (1, 'before')" >/dev/null
+ky_flush
+assert_eq "seed flush produced the first snapshot" "1" "$(ky_snap_count)"
+KY_SNAP1=$(curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_keyed" \
+  | jq -r '.metadata."current-snapshot-id"')
+
+# 20 sequential hot-row UPDATEs: each acks UPDATE 1 without a commit.
+ky_t0=$(date +%s%N)
+for i in $(seq 1 20); do
+  ky_tag=$(psql -h "$PG_HOST" -p "$KY_PORT" -U postgres -d icegres -c \
+    "update demo.e2e_keyed set val = 'v$i' where id = 1" | tr -d '[:space:]')
+  [[ "$ky_tag" == "UPDATE1" ]] || fail "keyed UPDATE $i answered [$ky_tag], expected UPDATE 1"
+done
+ky_ms=$(( ($(date +%s%N) - ky_t0) / 1000000 ))
+pass "20 sequential keyed UPDATEs acked (total ${ky_ms} ms ≈ $((ky_ms / 20)) ms/stmt incl. psql startup)"
+assert_eq "mid-window SELECT sees the NEWEST value (union read)" "v20" \
+  "$("${KYQ[@]}" -c 'select val from demo.e2e_keyed where id = 1')"
+assert_eq "no per-statement snapshots: still only the seed commit" "1" "$(ky_snap_count)"
+
+# One flush -> ONE coalesced commit carrying the final value.
+ky_flush
+assert_eq "one flush window = ONE snapshot for 20 updates" "2" "$(ky_snap_count)"
+assert_eq "post-flush value is the last write" "v20" \
+  "$("${KYQ[@]}" -c 'select val from demo.e2e_keyed where id = 1')"
+assert_eq "exactly one row for the key (no duplicates)" "1" \
+  "$("${KYQ[@]}" -c 'select count(*) from demo.e2e_keyed')"
+
+# (L2) Ack order is the total order for a key: a keyed DELETE followed by a
+# plain INSERT of the SAME key in the SAME window leaves the row PRESENT
+# with the inserted values — the later insert becomes the key's newest
+# version instead of being folded away by the coalesced delete.
+ky_tag=$(psql -h "$PG_HOST" -p "$KY_PORT" -U postgres -d icegres -c \
+  "delete from demo.e2e_keyed where id = 1" | tr -d '[:space:]')
+[[ "$ky_tag" == "DELETE1" ]] || fail "keyed DELETE answered [$ky_tag], expected DELETE 1"
+assert_eq "keyed DELETE hides the row mid-window (union read)" "0" \
+  "$("${KYQ[@]}" -c 'select count(*) from demo.e2e_keyed where id = 1')"
+"${KYQ[@]}" -c "insert into demo.e2e_keyed values (1, 'reborn')" >/dev/null
+assert_eq "same-window re-INSERT after the keyed DELETE is visible (union)" "reborn|1" \
+  "$("${KYQ[@]}" -c 'select val from demo.e2e_keyed where id = 1')|$("${KYQ[@]}" \
+    -c 'select count(*) from demo.e2e_keyed where id = 1')"
+assert_eq "delete-then-reinsert made no mid-window snapshots" "2" "$(ky_snap_count)"
+ky_flush
+assert_eq "flush committed the delete-then-reinsert as ONE snapshot" "3" "$(ky_snap_count)"
+assert_eq "committed row survives the same-window delete-then-reinsert, exactly once" "reborn|1" \
+  "$("${KYQ[@]}" -c 'select val from demo.e2e_keyed where id = 1')|$("${KYQ[@]}" \
+    -c 'select count(*) from demo.e2e_keyed where id = 1')"
+
+# Time travel predates the updates and never sees the buffer.
+assert_eq "time travel to the pre-update snapshot shows the OLD value" "before" \
+  "$("${KYQ[@]}" -c "select val from demo.\"e2e_keyed@$KY_SNAP1\" where id = 1")"
+
+stop_pidfile_generic "$KY_PID"
+rm -rf "$KY_TAIL"
+curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_keyed?purgeRequested=true" >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
+# (y) Orphan-file GC (roadmap Phase 4, docs/sota-roadmap.md §6):
+# `icegres maintain remove-orphans` reclaims the files snapshot expiry
+# strands. Recipe: 4 one-row INSERTs make 4 small data files; TWO full-table
+# COW UPDATEs then strand them — the first rewrites all four into one file,
+# the second rewrites again AND drops the first UPDATE's DELETED manifest
+# entries (spec: DELETED entries live only in the snapshot that deleted
+# them), so after `expire-snapshots --keep 1` the four insert-era Parquet
+# files (and the expired snapshots' manifests/manifest lists) are referenced
+# by NOTHING. Live after expiry: the newest rewrite + the previous rewrite
+# (still named by a DELETED entry in the retained snapshot's manifest) = 2
+# Parquet files, plus the retained manifest list/manifests and every
+# metadata JSON in the metadata log. Proven here: dry run reports the
+# orphans and deletes NOTHING; --execute with a 0-hour grace window is
+# REFUSED (fail closed) until --unsafe-grace asserts the table is
+# quiescent; --execute --unsafe-grace deletes exactly the reported set
+# (verified via aws CLI object counts) while the table stays queryable with
+# correct rows; a rerun reports zero. Uses --older-than-hours 0 with
+# --unsafe-grace on every step (the table is quiescent, and the flag also
+# drops the 15-minute clock-skew allowance that would otherwise hide the
+# seconds-old orphans); production keeps the default 72h grace window and
+# never passes --unsafe-grace. The --execute step also exercises the
+# clock-skew probe (write/stat/delete under metadata/), which must pass
+# against the local store.
+# ---------------------------------------------------------------------------
+log "(y) orphan-file GC (maintain remove-orphans)"
+q 'drop table if exists demo.e2e_orphan' >/dev/null 2>&1 || true
+q 'create table demo.e2e_orphan (id bigint, v text)' >/dev/null
+for i in 1 2 3 4; do
+  q "insert into demo.e2e_orphan (id, v) values ($i, 'r$i')" >/dev/null
+done
+q "update demo.e2e_orphan set v = 'u1' where id >= 1" >/dev/null
+q "update demo.e2e_orphan set v = 'u2' where id >= 1" >/dev/null
+orphan_loc=$(curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_orphan" | jq -r '.metadata.location')
+[[ "$orphan_loc" == s3://lakehouse/* ]] || fail "unexpected table location for demo.e2e_orphan: $orphan_loc"
+orphan_key=${orphan_loc#s3://lakehouse/}
+count_orphan_parquet() {
+  aws --endpoint-url "$S3_ENDPOINT" s3 ls --recursive "s3://lakehouse/$orphan_key/data/" \
+    | grep -c '\.parquet$' || true
+}
+count_orphan_objects() {
+  aws --endpoint-url "$S3_ENDPOINT" s3 ls --recursive "s3://lakehouse/$orphan_key/" \
+    | grep -c . || true
+}
+"$BIN" maintain expire-snapshots demo.e2e_orphan --keep 1 >"$E2E_DIR/orphan-expire.log" 2>&1 \
+  || { cat "$E2E_DIR/orphan-expire.log" >&2; fail "expire-snapshots before GC failed"; }
+grep -q 'expired 5 snapshot' "$E2E_DIR/orphan-expire.log" \
+  || { cat "$E2E_DIR/orphan-expire.log" >&2; fail "expected 5 expired snapshots (4 inserts + 1 update)"; }
+assert_eq "stranded data files present before GC (4 inserts + 2 rewrites)" "6" "$(count_orphan_parquet)"
+orphan_obj_before=$(count_orphan_objects)
+
+# --- dry run: reports the orphans, deletes NOTHING (--unsafe-grace only
+# --- drops the skew allowance so the seconds-old orphans are visible;
+# --- dry runs never need it to be *allowed*) ---
+"$BIN" maintain remove-orphans demo.e2e_orphan --older-than-hours 0 --unsafe-grace >"$E2E_DIR/orphan-dry.log" 2>&1 \
+  || { cat "$E2E_DIR/orphan-dry.log" >&2; fail "remove-orphans dry run failed"; }
+grep -q 'DRY RUN — nothing deleted' "$E2E_DIR/orphan-dry.log" \
+  || { cat "$E2E_DIR/orphan-dry.log" >&2; fail "dry run did not announce itself"; }
+orphan_n=$(sed -n 's/^found \([0-9]\{1,\}\) orphan file(s) totaling.*/\1/p' "$E2E_DIR/orphan-dry.log")
+[[ -n "$orphan_n" && "$orphan_n" -ge 4 ]] \
+  || { cat "$E2E_DIR/orphan-dry.log" >&2; fail "dry run found [$orphan_n] orphans, expected >= 4 (the insert-era Parquet files)"; }
+orphan_dry_parquet=$(grep -c '^  s3://lakehouse/.*/data/.*\.parquet$' "$E2E_DIR/orphan-dry.log" || true)
+assert_eq "dry run names exactly the 4 insert-era Parquet files as orphans" "4" "$orphan_dry_parquet"
+assert_eq "dry run deleted NOTHING (object count unchanged)" "$orphan_obj_before" "$(count_orphan_objects)"
+assert_eq "dry run left every data file in place" "6" "$(count_orphan_parquet)"
+pass "dry run reports $orphan_n orphan(s) and deletes nothing"
+
+# --- refusal (fail closed): --execute with a sub-1h grace window must be
+# --- refused WITHOUT --unsafe-grace, deleting nothing ---
+if "$BIN" maintain remove-orphans demo.e2e_orphan --older-than-hours 0 --execute >"$E2E_DIR/orphan-refuse.log" 2>&1; then
+  cat "$E2E_DIR/orphan-refuse.log" >&2
+  fail "--execute with --older-than-hours 0 must be refused without --unsafe-grace"
+fi
+grep -q 'refusing --execute' "$E2E_DIR/orphan-refuse.log" \
+  || { cat "$E2E_DIR/orphan-refuse.log" >&2; fail "refusal did not name the grace-window guard"; }
+assert_eq "refused execute deleted NOTHING (object count unchanged)" \
+  "$orphan_obj_before" "$(count_orphan_objects)"
+
+# --- execute (+--unsafe-grace: quiescent table): deletes exactly the
+# --- reported set; live files + rows intact; clock-skew probe passes ---
+"$BIN" maintain remove-orphans demo.e2e_orphan --older-than-hours 0 --execute --unsafe-grace >"$E2E_DIR/orphan-exec.log" 2>&1 \
+  || { cat "$E2E_DIR/orphan-exec.log" >&2; fail "remove-orphans --execute failed"; }
+grep -q "deleted $orphan_n orphan file(s) totaling" "$E2E_DIR/orphan-exec.log" \
+  || { cat "$E2E_DIR/orphan-exec.log" >&2; fail "--execute did not delete the $orphan_n orphans the dry run found"; }
+assert_eq "execute removed exactly the orphan set from the object store" \
+  "$((orphan_obj_before - orphan_n))" "$(count_orphan_objects)"
+assert_eq "live data files survive the GC (newest rewrite + its DELETED-entry predecessor)" "2" \
+  "$(count_orphan_parquet)"
+assert_eq "table fully readable after GC (rows + last update intact)" "4|u2|u2" \
+  "$(q 'select count(*), min(v), max(v) from demo.e2e_orphan')"
+
+# --- rerun: idempotent, zero orphans left ---
+"$BIN" maintain remove-orphans demo.e2e_orphan --older-than-hours 0 --unsafe-grace >"$E2E_DIR/orphan-rerun.log" 2>&1 \
+  || { cat "$E2E_DIR/orphan-rerun.log" >&2; fail "remove-orphans rerun failed"; }
+grep -q 'found 0 orphan file(s)' "$E2E_DIR/orphan-rerun.log" \
+  || { cat "$E2E_DIR/orphan-rerun.log" >&2; fail "rerun should find zero orphans"; }
+pass "orphan GC: dry-run/execute/rerun contract holds ($orphan_n orphans reclaimed)"
+q 'drop table demo.e2e_orphan' >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
+# (z) bounded-staleness freshness mode (--freshness-ms) + plan cache
+#     Contract under test (icegres/src/freshness.rs, plancache.rs):
+#       - a FOREIGN commit (the default server on :$PG_PORT is a different
+#         server process committing through the catalog) becomes visible on
+#         the freshness server within a bounded window (deadline >> N);
+#       - this server's OWN writes are visible immediately (single attempt,
+#         new connection — read-your-own-writes stays exact): buffered ack,
+#         sync DML, and plain INSERT paths;
+#       - the staleness gauge + plan-cache counters are exported on /metrics,
+#         and a repeated identical SELECT hits the plan cache;
+#       - the overlay trap: on a server with BOTH --freshness-ms and
+#         --write-buffer-ms, plans over overlay-bearing tables are NEVER
+#         cached (hits stay 0) and buffered rows are visible on repeated
+#         reads;
+#       - default mode (--freshness-ms 0) is untouched — every assertion in
+#         sections (a)..(y) above ran against default-mode servers.
+# ---------------------------------------------------------------------------
+FR_PORT=5459 # 5458 belongs to tail_durability.sh (fencing second server)
+FR_HEALTH=8092
+FR_MS=25
+FR_PID="$E2E_DIR/serve-fresh.pid"
+FR_LOG="$E2E_DIR/serve-fresh.log"
+log "(z) freshness refresher (--freshness-ms $FR_MS) + plan cache on :$FR_PORT"
+stop_pidfile_generic "$FR_PID"
+if psql -h "$PG_HOST" -p "$FR_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+  fail "something is already listening on :$FR_PORT — stop it first"
+fi
+: >"$FR_LOG"
+"$BIN" serve --host "$PG_HOST" --port "$FR_PORT" --freshness-ms "$FR_MS" \
+  --health-port "$FR_HEALTH" >>"$FR_LOG" 2>&1 &
+echo $! >"$FR_PID"
+fr_ready=0
+for _ in $(seq 1 60); do
+  if psql -h "$PG_HOST" -p "$FR_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+    fr_ready=1; break
+  fi
+  sleep 0.5
+done
+[[ "$fr_ready" == 1 ]] || { tail -n 20 "$FR_LOG" >&2; fail "freshness server not ready on :$FR_PORT"; }
+FQ=(psql -h "$PG_HOST" -p "$FR_PORT" -U postgres -d icegres -tA)
+
+# The enabled mode must announce the staleness trade loudly.
+grep -q "bounded-staleness reads are ENABLED" "$FR_LOG" \
+  || fail "freshness server did not log the bounded-staleness WARN (log: $FR_LOG)"
+pass "startup WARN present (bounded-staleness contract stated)"
+
+fr_base=$(( $(q 'select coalesce(max(trip_id), 0) from demo.trips') + 1 ))
+(( fr_base >= 900000 )) || fr_base=970000
+
+# --- z1: a FOREIGN commit becomes visible within a bounded window ---
+# Warm the freshness server's cache first so the foreign write lands on an
+# already-fresh (fast-path) table, then poll with a deadline (10 s >> 25 ms).
+assert_eq "freshness server serves the seeded rows" "280" \
+  "$("${FQ[@]}" -c 'select count(*) from demo.trips where trip_id between 1 and 280')"
+q "insert into demo.trips (trip_id, city, distance_km, fare, ts)
+   values ($fr_base, 'Fresh City', 9.99, 19.99, TIMESTAMP '2026-07-10 00:00:00')" >/dev/null
+fr_seen=""
+fr_t0=$(date +%s%N)
+for _ in $(seq 1 200); do
+  if [[ "$("${FQ[@]}" -c "select count(*) from demo.trips where trip_id = $fr_base")" == "1" ]]; then
+    fr_seen=1; break
+  fi
+  sleep 0.05
+done
+fr_ms=$(( ($(date +%s%N) - fr_t0) / 1000000 ))
+[[ "$fr_seen" == 1 ]] || fail "foreign commit not visible on the freshness server within 10 s (bound is ~${FR_MS} ms)"
+pass "foreign commit visible on the freshness server within ${fr_ms} ms (deadline 10000 ms >> ${FR_MS} ms bound)"
+
+# --- z2: OWN writes visible immediately (read-your-own-writes exact) ---
+# Plain INSERT: one attempt, new connection, no polling.
+"${FQ[@]}" -c "insert into demo.trips (trip_id, city, distance_km, fare, ts)
+  values ($((fr_base + 1)), 'Fresh City', 1.0, 2.0, TIMESTAMP '2026-07-10 00:00:01')" >/dev/null
+assert_eq "own INSERT visible immediately (no refresh wait)" "1" \
+  "$("${FQ[@]}" -c "select count(*) from demo.trips where trip_id = $((fr_base + 1))")"
+# Sync copy-on-write DML: same contract.
+"${FQ[@]}" -c "update demo.trips set fare = 42.5 where trip_id = $((fr_base + 1))" >/dev/null
+assert_eq "own UPDATE visible immediately (no refresh wait)" "42.5" \
+  "$("${FQ[@]}" -c "select fare from demo.trips where trip_id = $((fr_base + 1))")"
+
+# --- z3: /metrics gauge + plan-cache hit on a repeated identical SELECT ---
+if command -v curl >/dev/null 2>&1; then
+  "${FQ[@]}" -c 'select count(*) from demo.cities' >/dev/null
+  "${FQ[@]}" -c 'select count(*) from demo.cities' >/dev/null
+  FR_M=$(curl -s "http://$PG_HOST:$FR_HEALTH/metrics")
+  echo "$FR_M" | grep -q '^icegres_freshness_age_ms ' || fail "freshness age gauge missing from /metrics"
+  fr_hits=$(echo "$FR_M" | awk '/^icegres_plan_cache_hits_total /{print $2}')
+  [[ -n "$fr_hits" && "$fr_hits" -ge 1 ]] \
+    || fail "repeated identical SELECT did not hit the plan cache (hits=${fr_hits:-none})"
+  pass "staleness gauge exported; repeated SELECT hit the plan cache (hits=$fr_hits)"
+else
+  log "    SKIPPED /metrics assertions: curl not available"
+fi
+stop_pidfile_generic "$FR_PID"
+
+# --- z4: the overlay trap — buffered tables are excluded from the cache ---
+FRB_PORT=5460
+FRB_HEALTH=8093
+FRB_PID="$E2E_DIR/serve-freshbuf.pid"
+FRB_LOG="$E2E_DIR/serve-freshbuf.log"
+stop_pidfile_generic "$FRB_PID"
+: >"$FRB_LOG"
+"$BIN" serve --host "$PG_HOST" --port "$FRB_PORT" --freshness-ms "$FR_MS" \
+  --write-buffer-ms 2000 --health-port "$FRB_HEALTH" >>"$FRB_LOG" 2>&1 &
+echo $! >"$FRB_PID"
+frb_ready=0
+for _ in $(seq 1 60); do
+  if psql -h "$PG_HOST" -p "$FRB_PORT" -U postgres -d icegres -tA -c 'select 1' >/dev/null 2>&1; then
+    frb_ready=1; break
+  fi
+  sleep 0.5
+done
+[[ "$frb_ready" == 1 ]] || { tail -n 20 "$FRB_LOG" >&2; fail "freshness+buffer server not ready on :$FRB_PORT"; }
+FRBQ=(psql -h "$PG_HOST" -p "$FRB_PORT" -U postgres -d icegres -tA)
+# A buffered INSERT acks from the overlay; two immediate identical reads
+# must BOTH see it. A cached plan baking the (pre-insert) overlay would
+# serve a stale row set on the second read — the load-bearing overlay trap.
+"${FRBQ[@]}" -c "insert into demo.trips (trip_id, city, distance_km, fare, ts)
+  values ($((fr_base + 2)), 'Fresh City', 3.0, 4.0, TIMESTAMP '2026-07-10 00:00:02')" >/dev/null
+frb_sql="select count(*) from demo.trips where trip_id = $((fr_base + 2))"
+assert_eq "buffered row visible on first read (union view)" "1" "$("${FRBQ[@]}" -c "$frb_sql")"
+assert_eq "buffered row visible on repeated identical read (no stale cached plan)" "1" \
+  "$("${FRBQ[@]}" -c "$frb_sql")"
+if command -v curl >/dev/null 2>&1; then
+  frb_hits=$(curl -s "http://$PG_HOST:$FRB_HEALTH/metrics" | awk '/^icegres_plan_cache_hits_total /{print $2}')
+  assert_eq "overlay-bearing tables never hit the plan cache" "0" "$frb_hits"
+fi
+stop_pidfile_generic "$FRB_PID"
+
+# Cleanup: remove the rows this section appended (via the default server).
+q "delete from demo.trips where trip_id in ($fr_base, $((fr_base + 1)), $((fr_base + 2)))" >/dev/null
+pass "freshness section cleanup (rows removed)"
+
+# ---------------------------------------------------------------------------
+# (p3) P1: open tail API (--tail-api-port) + fleet overlays (--peer-tail).
+#      Buffering server A exposes its tail window over Arrow Flight; reader
+#      server B mirrors it, so A's acked-but-unflushed writes are visible on
+#      B within the event bound (NOT the flush cadence). Kill A -> B falls
+#      back to commit cadence without error; rows still land via A's tail
+#      replay + flush on restart. Ports: 5464/5465 pgwire (above every
+#      existing reservation; 5461-5463 belong to bench.sh icekeeperd,
+#      5471-5473 to tail_durability.sh), 5466-5468 pgwire (the p3g auth
+#      leg), 50057 tail API, 50058 freshness flight-serve (p3f), 50059
+#      authed tail API (p3g) — 50051-50053/50056 belong to the flight
+#      sections. docs/open-tail-protocol.md.
+# ---------------------------------------------------------------------------
+log "(p3) open tail API + peer overlays (A buffering :5464 + B reader :5465)"
+P1A_PORT=5464
+P1B_PORT=5465
+P1_TAIL_API=50057
+P1A_MS=8000 # deliberately long: event-bound visibility must beat this by miles
+P1A_PID="$E2E_DIR/serve-p1a.pid"
+P1B_PID="$E2E_DIR/serve-p1b.pid"
+P1A_LOG="$E2E_DIR/serve-p1a.log"
+P1B_LOG="$E2E_DIR/serve-p1b.log"
+P1_TAIL_DIR="$E2E_DIR/tail-p1"
+P1AQ=(psql -h "$PG_HOST" -p "$P1A_PORT" -U postgres -d icegres -tA)
+P1BQ=(psql -h "$PG_HOST" -p "$P1B_PORT" -U postgres -d icegres -tA)
+stop_pidfile_generic "$P1A_PID"
+stop_pidfile_generic "$P1B_PID"
+if "${P1AQ[@]}" -c 'select 1' >/dev/null 2>&1; then fail "something is already listening on :$P1A_PORT"; fi
+if "${P1BQ[@]}" -c 'select 1' >/dev/null 2>&1; then fail "something is already listening on :$P1B_PORT"; fi
+rm -rf "$P1_TAIL_DIR"
+: >"$P1A_LOG"
+: >"$P1B_LOG"
+# Scratch keyed table (trips-shaped so the python probe can drive it too).
+curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_p1?purgeRequested=true" >/dev/null 2>&1 || true
+curl -sf -X POST "$CATALOG_URI/v1/$prefix/namespaces/demo/tables" \
+  -H 'Content-Type: application/json' -d @- <<'JSON' >/dev/null
+{
+  "name": "e2e_p1",
+  "schema": {
+    "type": "struct",
+    "schema-id": 0,
+    "fields": [
+      {"id": 1, "name": "trip_id", "required": false, "type": "long"},
+      {"id": 2, "name": "city", "required": false, "type": "string"},
+      {"id": 3, "name": "distance_km", "required": false, "type": "double"},
+      {"id": 4, "name": "fare", "required": false, "type": "double"},
+      {"id": 5, "name": "ts", "required": false, "type": "timestamp"}
+    ]
+  },
+  "properties": {"icegres.primary-key": "trip_id", "icegres.tail-upsert": "true"}
+}
+JSON
+"$BIN" serve --host "$PG_HOST" --port "$P1A_PORT" --write-buffer-ms "$P1A_MS" \
+  --tail-dir "$P1_TAIL_DIR" --tail-api-port "$P1_TAIL_API" >>"$P1A_LOG" 2>&1 &
+echo $! >"$P1A_PID"
+"$BIN" serve --host "$PG_HOST" --port "$P1B_PORT" \
+  --peer-tail "127.0.0.1:$P1_TAIL_API" >>"$P1B_LOG" 2>&1 &
+echo $! >"$P1B_PID"
+p1_ready=0
+for _ in $(seq 1 60); do
+  if "${P1AQ[@]}" -c 'select 1' >/dev/null 2>&1 && "${P1BQ[@]}" -c 'select 1' >/dev/null 2>&1; then
+    p1_ready=1; break
+  fi
+  sleep 0.5
+done
+[[ "$p1_ready" == 1 ]] || { tail -n 20 "$P1A_LOG" "$P1B_LOG" >&2; fail "P1 servers not ready on :$P1A_PORT/:$P1B_PORT"; }
+
+# --- p3a: INSERT on A visible on B within the event bound (<< flush cadence)
+"${P1AQ[@]}" -c "insert into demo.e2e_p1 (trip_id, city, distance_km, fare, ts)
+  values (980500, 'peer-a', 1.0, 2.0, TIMESTAMP '2026-07-11 00:00:00')" >/dev/null
+p1_t0=$(date +%s%N)
+p1_seen=0
+for _ in $(seq 1 120); do
+  if [[ "$("${P1BQ[@]}" -c 'select count(*) from demo.e2e_p1 where trip_id = 980500' 2>/dev/null)" == "1" ]]; then
+    p1_seen=1; break
+  fi
+  sleep 0.05
+done
+p1_ms=$(( ($(date +%s%N) - p1_t0) / 1000000 ))
+[[ "$p1_seen" == 1 ]] || { tail -n 20 "$P1B_LOG" >&2; fail "A's buffered INSERT never became visible on B"; }
+(( p1_ms < P1A_MS )) || fail "peer visibility took ${p1_ms}ms — not faster than the ${P1A_MS}ms flush cadence"
+pass "peer overlay: A's buffered INSERT visible on B in ${p1_ms}ms (flush cadence ${P1A_MS}ms)"
+
+# --- p3b: keyed UPDATE on A suppresses/replaces on B (no duplicate).
+#     Like p3a, the pass must come from the peer OVERLAY, never from A's
+#     flush cadence delivering the committed row while the poll is still
+#     running — hence the same elapsed-time bound p3a asserts.
+"${P1AQ[@]}" -c "update demo.e2e_p1 set city = 'peer-updated' where trip_id = 980500" >/dev/null
+p1_upd_t0=$(date +%s%N)
+p1_upd=0
+for _ in $(seq 1 120); do
+  if [[ "$("${P1BQ[@]}" -c "select city from demo.e2e_p1 where trip_id = 980500" 2>/dev/null)" == "peer-updated" ]]; then
+    p1_upd=1; break
+  fi
+  sleep 0.05
+done
+p1_upd_ms=$(( ($(date +%s%N) - p1_upd_t0) / 1000000 ))
+[[ "$p1_upd" == 1 ]] || fail "A's keyed UPDATE never replaced the row on B"
+(( p1_upd_ms < P1A_MS )) || fail "keyed-update peer visibility took ${p1_upd_ms}ms — not faster than the ${P1A_MS}ms flush cadence (the overlay, not the flush, must deliver it)"
+assert_eq "keyed UPDATE on A replaces (not duplicates) on B, in ${p1_upd_ms}ms" "1" \
+  "$("${P1BQ[@]}" -c 'select count(*) from demo.e2e_p1 where trip_id = 980500')"
+
+# --- p3c: the python external merged-fresh reader (open protocol demo)
+if python3 -c 'import psycopg2, pyarrow.flight' 2>/dev/null; then
+  p1_probe_out=$(ICEGRES_PROBE_PG_HOST="$PG_HOST" ICEGRES_PROBE_PG_PORT="$P1A_PORT" \
+    ICEGRES_PROBE_TAIL_HOST=127.0.0.1 ICEGRES_PROBE_TAIL_PORT="$P1_TAIL_API" \
+    ICEGRES_PROBE_TABLE=demo.e2e_p1 ICEGRES_PROBE_KEYED=1 \
+    python3 "$ICEGRES_DIR/../bench/clients/p1_tail_reader.py" 2>&1) || {
+      echo "$p1_probe_out" | sed 's/^/    /'; fail "p1_tail_reader.py failed"; }
+  echo "$p1_probe_out" | sed 's/^/    /'
+  echo "$p1_probe_out" | grep -q '^P1TAIL RESULT: .*fail=0' || fail "p1_tail_reader reported failures"
+  pass "p1_tail_reader.py: external merged-fresh read == server union read"
+else
+  log "    SKIPPED: p1_tail_reader.py (pip install psycopg2-binary pyarrow)"
+fi
+
+# --- p3s: PF1 stale-ticket probe — a Flight ticket minted BEFORE a write
+#          must serve FRESH results at DoGet (the reviewer's INSERT-then-
+#          DoGet repro; a stale pinned plan would answer count=0).
+if python3 -c 'import psycopg2, pyarrow.flight' 2>/dev/null; then
+  p1_stale_out=$(ICEGRES_PROBE_FLIGHT_HOST=127.0.0.1 ICEGRES_PROBE_FLIGHT_PORT="$P1_TAIL_API" \
+    ICEGRES_PROBE_PG_HOST="$PG_HOST" ICEGRES_PROBE_PG_PORT="$P1A_PORT" \
+    ICEGRES_PROBE_TABLE=demo.e2e_p1 \
+    python3 "$ICEGRES_DIR/../bench/clients/p1_stale_probe.py" 2>&1) || {
+      echo "$p1_stale_out" | sed 's/^/    /'; fail "p1_stale_probe.py failed"; }
+  echo "$p1_stale_out" | sed 's/^/    /'
+  echo "$p1_stale_out" | grep -q '^P1STALE RESULT: .*fail=0 status=PASS' \
+    || fail "p1_stale_probe reported failures"
+  pass "p1_stale_probe.py: pre-write Flight ticket serves FRESH results at DoGet"
+else
+  log "    SKIPPED: p1_stale_probe.py (pip install psycopg2-binary pyarrow)"
+fi
+
+# --- p3d: kill A -> B falls back to commit cadence WITHOUT error; the rows
+#          still land via A's durable-tail replay + flush on restart.
+p1a_pid=$(cat "$P1A_PID")
+"${P1AQ[@]}" -c "insert into demo.e2e_p1 (trip_id, city, distance_km, fare, ts)
+  values (980501, 'pre-crash', 1.0, 2.0, TIMESTAMP '2026-07-11 00:00:01')" >/dev/null
+kill -9 "$p1a_pid" 2>/dev/null || true
+rm -f "$P1A_PID"
+sleep 1
+p1_fallback=$("${P1BQ[@]}" -c 'select count(*) from demo.e2e_p1' 2>&1) \
+  || fail "B errored after A died (fallback must be silent): $p1_fallback"
+pass "B keeps answering after A is killed (fallback to commit cadence; count=$p1_fallback)"
+# Restart A on the same tail dir: replay + flush commits the acked row, and
+# B sees it (via the commit and/or the re-established mirror).
+"$BIN" serve --host "$PG_HOST" --port "$P1A_PORT" --write-buffer-ms 1000 \
+  --tail-dir "$P1_TAIL_DIR" --tail-api-port "$P1_TAIL_API" >>"$P1A_LOG" 2>&1 &
+echo $! >"$P1A_PID"
+p1_land=0
+for _ in $(seq 1 120); do
+  if [[ "$("${P1BQ[@]}" -c 'select count(*) from demo.e2e_p1 where trip_id = 980501' 2>/dev/null)" == "1" ]]; then
+    p1_land=1; break
+  fi
+  sleep 0.5
+done
+[[ "$p1_land" == 1 ]] || { tail -n 20 "$P1A_LOG" >&2; fail "the acked pre-crash row never landed after A's restart"; }
+pass "acked pre-crash row landed after restart (tail replay + flush; B sees it)"
+
+# --- p3e: flight small-query latency probe. Report-only HERE because e2e
+#          runs the DEBUG binary (measured p50 ~2-3x the release build, so
+#          the release target would always fail); the <=15 ms P1 target IS
+#          asserted — in bench/bench.sh section 4e, which fails the bench
+#          run when the release binary's flight_q1_ms p50 misses it, and
+#          via ICEGRES_P1_ASSERT_BOUND=1 for release runs of this probe.
+if python3 -c 'import adbc_driver_flightsql' 2>/dev/null; then
+  p1_perf_out=$(ICEGRES_PROBE_FLIGHT_HOST=127.0.0.1 ICEGRES_PROBE_FLIGHT_PORT="$P1_TAIL_API" \
+    python3 "$ICEGRES_DIR/../bench/clients/p1_flight_perf.py" 2>&1) || {
+      echo "$p1_perf_out" | sed 's/^/    /'; fail "p1_flight_perf.py failed"; }
+  echo "$p1_perf_out" | grep '^P1PERF RESULT' | sed 's/^/    /'
+  echo "$p1_perf_out" | grep -q '^P1PERF RESULT: .*status=\(REPORT\|PASS\)' || fail "p1_flight_perf reported failure"
+  pass "p1_flight_perf.py: flight q1 measured over the tail-api listener (debug build, report-only; release bound gated in bench 4e)"
+else
+  log "    SKIPPED: p1_flight_perf.py (pip install adbc-driver-flightsql pyarrow)"
+fi
+
+# --- p3f: flight plan pinning + DoGet version re-validation, END TO END.
+#          Every other e2e/bench Flight server runs default mode, where
+#          plans are never pinned (GetFlightInfo skips physical planning and
+#          DoGet re-plans) — so this leg starts `flight-serve` WITH
+#          --freshness-ms, the only mode that pins, and (a) runs the
+#          stale-ticket probe against it: mint a ticket, commit a foreign
+#          INSERT (the sync main server), wait for the freshness cache to
+#          observe the new table version, then DoGet the PRE-write ticket —
+#          take_if_valid's version mismatch must force the re-plan (a
+#          blindly-pinned plan would answer from the pre-commit file list);
+#          (b) proves the stash actually HITS in freshness mode via the
+#          deterministic ICEGRES_QUERY_TIMING counter (`flight_doget_stash_hit`
+#          stage lines in the server log).
+P1F_PORT=50058
+P1F_LOG="$E2E_DIR/flight-fresh.log"
+P1F_PID="$E2E_DIR/flight-fresh.pid"
+if python3 -c 'import psycopg2, pyarrow.flight' 2>/dev/null; then
+  : >"$P1F_LOG"
+  ICEGRES_QUERY_TIMING=1 "$BIN" flight-serve --host 127.0.0.1 --port "$P1F_PORT" \
+    --freshness-ms 200 >>"$P1F_LOG" 2>&1 &
+  echo $! >"$P1F_PID"
+  p1f_ready=0
+  for _ in $(seq 1 60); do
+    if python3 -c "import socket,sys; s=socket.socket(); s.settimeout(0.3);
+sys.exit(0 if s.connect_ex(('127.0.0.1', $P1F_PORT))==0 else 1)" 2>/dev/null; then
+      p1f_ready=1; break
+    fi
+    kill -0 "$(cat "$P1F_PID")" 2>/dev/null || { tail -n 20 "$P1F_LOG" >&2; fail "flight-serve --freshness-ms exited during startup"; }
+    sleep 0.5
+  done
+  [[ "$p1f_ready" == 1 ]] || { tail -n 20 "$P1F_LOG" >&2; fail "flight-serve --freshness-ms not ready on :$P1F_PORT"; }
+  p1f_out=$(ICEGRES_PROBE_FLIGHT_HOST=127.0.0.1 ICEGRES_PROBE_FLIGHT_PORT="$P1F_PORT" \
+    ICEGRES_PROBE_PG_HOST="$PG_HOST" ICEGRES_PROBE_PG_PORT="$PG_PORT" \
+    ICEGRES_PROBE_TABLE=demo.trips \
+    python3 "$ICEGRES_DIR/../bench/clients/p1_stale_probe.py" 2>&1) || {
+      echo "$p1f_out" | sed 's/^/    /'; tail -n 20 "$P1F_LOG" >&2; fail "p1_stale_probe.py (freshness mode) failed"; }
+  echo "$p1f_out" | sed 's/^/    /'
+  echo "$p1f_out" | grep -q '^P1STALE RESULT: .*fail=0 status=PASS' \
+    || fail "p1_stale_probe (freshness mode) reported failures"
+  pass "p1_stale_probe.py vs --freshness-ms flight-serve: pinned pre-write ticket re-plans to FRESH at DoGet"
+  # (b) The pinning machinery must have actually engaged: the repeated
+  # mint->DoGet pairs above consume stashed plans, which the server records
+  # as `flight_doget_stash_hit` timing stages (deterministic counter —
+  # default mode never pins, so this line proves freshness-mode pinning).
+  grep -q 'flight_doget_stash_hit' "$P1F_LOG" \
+    || { tail -n 30 "$P1F_LOG" >&2; fail "no flight_doget_stash_hit stage logged — plan pinning never engaged in freshness mode"; }
+  pass "flight plan stash HITS in freshness mode (flight_doget_stash_hit timing stage observed)"
+  stop_pidfile_generic "$P1F_PID"
+else
+  log "    SKIPPED: freshness-mode stale-ticket leg (pip install psycopg2-binary pyarrow)"
+fi
+
+# Stop the first-half servers before the auth leg re-uses the table with
+# its own (single) buffering writer.
+stop_pidfile_generic "$P1A_PID"
+stop_pidfile_generic "$P1B_PID"
+rm -rf "$P1_TAIL_DIR"
+
+# --- p3g: an AUTHED tail API (--auth-file) accepts the credentialed
+#          subscriber and rejects a credential-less one. A2 buffers
+#          demo.e2e_p1 behind basic auth; reader B2 authenticates via
+#          ICEGRES_PEER_TAIL_USER/ICEGRES_PEER_TAIL_PASSWORD (the Flight
+#          basic-auth handshake) and gets event-bound visibility; reader B3
+#          has no credentials — its subscriber is rejected (Unauthenticated,
+#          ONE warn, no mirror) and it stays on commit cadence.
+P1A2_PORT=5466
+P1B2_PORT=5467
+P1B3_PORT=5468
+P1_TAIL_API_AUTH=50059
+P1_TAIL_DIR_AUTH="$E2E_DIR/tail-p1-auth"
+P1A2_PID="$E2E_DIR/serve-p1a2.pid"; P1A2_LOG="$E2E_DIR/serve-p1a2.log"
+P1B2_PID="$E2E_DIR/serve-p1b2.pid"; P1B2_LOG="$E2E_DIR/serve-p1b2.log"
+P1B3_PID="$E2E_DIR/serve-p1b3.pid"; P1B3_LOG="$E2E_DIR/serve-p1b3.log"
+printf 'p1tail:p1-tail-secret\n' >"$E2E_DIR/p1-auth.conf"
+P1A2Q=(env PGPASSWORD=p1-tail-secret psql -h "$PG_HOST" -p "$P1A2_PORT" -U p1tail -d icegres -tA)
+P1B2Q=(psql -h "$PG_HOST" -p "$P1B2_PORT" -U postgres -d icegres -tA)
+P1B3Q=(psql -h "$PG_HOST" -p "$P1B3_PORT" -U postgres -d icegres -tA)
+stop_pidfile_generic "$P1A2_PID"; stop_pidfile_generic "$P1B2_PID"; stop_pidfile_generic "$P1B3_PID"
+rm -rf "$P1_TAIL_DIR_AUTH"
+: >"$P1A2_LOG"; : >"$P1B2_LOG"; : >"$P1B3_LOG"
+# Start A2 FIRST and wait for it (the tail-api listener binds before the
+# pgwire accept loop), so the readers' first subscriber attempt hits the
+# LIVE authed endpoint — B3's one-per-outage WARN then carries the
+# Unauthenticated rejection instead of a startup connection-refused.
+"$BIN" serve --host "$PG_HOST" --port "$P1A2_PORT" --write-buffer-ms "$P1A_MS" \
+  --tail-dir "$P1_TAIL_DIR_AUTH" --tail-api-port "$P1_TAIL_API_AUTH" \
+  --auth-file "$E2E_DIR/p1-auth.conf" >>"$P1A2_LOG" 2>&1 &
+echo $! >"$P1A2_PID"
+p1g_a2_ready=0
+for _ in $(seq 1 60); do
+  if "${P1A2Q[@]}" -c 'select 1' >/dev/null 2>&1; then p1g_a2_ready=1; break; fi
+  sleep 0.5
+done
+[[ "$p1g_a2_ready" == 1 ]] || { tail -n 20 "$P1A2_LOG" >&2; fail "authed buffering server A2 not ready"; }
+ICEGRES_PEER_TAIL_USER=p1tail ICEGRES_PEER_TAIL_PASSWORD=p1-tail-secret \
+  "$BIN" serve --host "$PG_HOST" --port "$P1B2_PORT" \
+  --peer-tail "127.0.0.1:$P1_TAIL_API_AUTH" >>"$P1B2_LOG" 2>&1 &
+echo $! >"$P1B2_PID"
+"$BIN" serve --host "$PG_HOST" --port "$P1B3_PORT" \
+  --peer-tail "127.0.0.1:$P1_TAIL_API_AUTH" >>"$P1B3_LOG" 2>&1 &
+echo $! >"$P1B3_PID"
+p1g_ready=0
+for _ in $(seq 1 60); do
+  if "${P1B2Q[@]}" -c 'select 1' >/dev/null 2>&1 \
+      && "${P1B3Q[@]}" -c 'select 1' >/dev/null 2>&1; then
+    p1g_ready=1; break
+  fi
+  sleep 0.5
+done
+[[ "$p1g_ready" == 1 ]] || { tail -n 20 "$P1B2_LOG" "$P1B3_LOG" >&2; fail "P1 auth-leg readers not ready"; }
+"${P1A2Q[@]}" -c "insert into demo.e2e_p1 (trip_id, city, distance_km, fare, ts)
+  values (980502, 'peer-authed', 1.0, 2.0, TIMESTAMP '2026-07-11 00:00:03')" >/dev/null
+p1g_t0=$(date +%s%N)
+p1g_seen=0
+for _ in $(seq 1 120); do
+  if [[ "$("${P1B2Q[@]}" -c 'select count(*) from demo.e2e_p1 where trip_id = 980502' 2>/dev/null)" == "1" ]]; then
+    p1g_seen=1; break
+  fi
+  sleep 0.05
+done
+p1g_ms=$(( ($(date +%s%N) - p1g_t0) / 1000000 ))
+[[ "$p1g_seen" == 1 ]] || { tail -n 20 "$P1B2_LOG" >&2; fail "authed subscriber never mirrored the row from the authed tail API"; }
+(( p1g_ms < P1A_MS )) || fail "authed peer visibility took ${p1g_ms}ms — not faster than the ${P1A_MS}ms flush cadence"
+grep -q 'peer tail mirror installed' "$P1B2_LOG" \
+  || fail "authed subscriber log carries no 'peer tail mirror installed'"
+pass "authed tail API accepts the ICEGRES_PEER_TAIL_USER subscriber (visible on B2 in ${p1g_ms}ms)"
+# The credential-less reader: rejected with Unauthenticated (one WARN per
+# outage), no mirror ever installs, reads stay on commit cadence.
+p1g_rejected=0
+for _ in $(seq 1 40); do
+  # tonic renders UNAUTHENTICATED as its long-form description.
+  if grep -qEi 'unauthenticated|authentication credentials|no authorization header' "$P1B3_LOG"; then
+    p1g_rejected=1; break
+  fi
+  sleep 0.25
+done
+[[ "$p1g_rejected" == 1 ]] || { tail -n 20 "$P1B3_LOG" >&2; fail "credential-less subscriber was not rejected with Unauthenticated"; }
+grep -q 'peer tail unavailable' "$P1B3_LOG" \
+  || fail "credential-less subscriber never logged the one-per-outage fallback WARN"
+if grep -q 'peer tail mirror installed' "$P1B3_LOG"; then
+  fail "credential-less subscriber installed a mirror against an authed tail API"
+fi
+if (( p1g_ms < 5000 )); then
+  assert_eq "credential-less reader stays on commit cadence (buffered row invisible)" "0" \
+    "$("${P1B3Q[@]}" -c 'select count(*) from demo.e2e_p1 where trip_id = 980502')"
+fi
+pass "credential-less subscriber rejected by the authed tail API (Unauthenticated; commit-cadence fallback)"
+
+# Teardown + cleanup.
+stop_pidfile_generic "$P1A2_PID"
+stop_pidfile_generic "$P1B2_PID"
+stop_pidfile_generic "$P1B3_PID"
+rm -rf "$P1_TAIL_DIR_AUTH"
+curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_p1?purgeRequested=true" >/dev/null 2>&1 || true
+pass "P1 section cleanup (servers stopped, scratch table dropped)"
+
+# ---------------------------------------------------------------------------
+# (aa) Bin-pack compaction (roadmap-v2 §P2 re-scoped, docs/
+#      p2-matrix-bump-scope.md): `icegres maintain compact` rewrites a
+#      fragmented table's under-target data files into ~target-size files
+#      as ONE `replace` snapshot, row set identical. Contract under test
+#      (icegres/src/compact.rs):
+#        - dry-run by DEFAULT: prints the plan, mutates NOTHING;
+#        - --execute commits ONE Operation::Replace snapshot: count +
+#          checksum identical, snapshot count +1, summary operation
+#          `replace`, live file count collapses to 1;
+#        - orphan-GC interplay: right after the compact the replaced files
+#          are NOT orphans (pre-compact snapshots and the retained DELETED
+#          manifest entries still reference them: remove-orphans finds 0);
+#        - time travel to the pre-compact snapshot reads the old layout
+#          with identical rows;
+#        - a foreign reader (pyiceberg via the REST catalog + S3 — the
+#          parity C1 convention) agrees with the server post-compact;
+#        - conflict abort: a racing commit (test-only knob
+#          ICEGRES_COMPACT_INJECT_CONFLICT forces a REAL server-side 409)
+#          aborts the compact cleanly with nothing changed
+#          (first-committer-wins; the same anchored-commit discipline that
+#          keeps compaction from interleaving with a buffered server's
+#          in-flight flush);
+#        - refusal on delete-manifest tables: a merge-on-read snapshot
+#          (hand-built manifest list carrying a content=deletes entry —
+#          the same Avro OCF recipe as the (j2) nested fixture) is refused
+#          loudly, since icegres cannot apply foreign deletes;
+#        - refusal on schema-divergent tables: evolving the schema over
+#          the REST catalog (add-schema + set-current-schema — what a
+#          foreign engine's ALTER leaves behind) makes the head snapshot's
+#          manifests carry an old schema id; compact --execute refuses
+#          loudly and mutates nothing (align_batch maps columns by
+#          position + name, not field id — see compact.rs's schema rail);
+#        - refusal on LAUNDERED schema-divergent files: re-stamping the
+#          head's manifests to the current schema id (what a foreign
+#          rewrite_manifests / copy-on-write commit leaves behind) sails
+#          past the manifest-level fast path, so compact must STILL
+#          refuse via the per-file Parquet field-id guard — in dry-run
+#          AND --execute, mutating nothing;
+#        - expiry-then-GC after a follow-up compact reclaims the replaced
+#          files (the GC keeps whatever the retained snapshot's DELETED
+#          entries still name — one generation back, exactly like (y)).
+#      Uses the main permissive server on :$PG_PORT + the CLI binary.
+# ---------------------------------------------------------------------------
+log "(aa) bin-pack compaction (maintain compact)"
+q 'drop table if exists demo.e2e_compact' >/dev/null 2>&1 || true
+q 'create table demo.e2e_compact (id bigint, v text)' >/dev/null
+for i in 1 2 3 4 5 6; do
+  q "insert into demo.e2e_compact (id, v) values ($i, 'r$i')" >/dev/null
+done
+cx_checksum() { # count + sum(id) + sum(length(v)): the row-set identity probe
+  q 'select count(*), coalesce(sum(id), 0), coalesce(sum(length(v)), 0) from demo.e2e_compact'
+}
+cx_before=$(cx_checksum)
+assert_eq "six single-row inserts land (count|sum(id)|sum(len))" "6|21|12" "$cx_before"
+cx_loc=$(curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_compact" | jq -r '.metadata.location')
+[[ "$cx_loc" == s3://lakehouse/* ]] || fail "unexpected table location for demo.e2e_compact: $cx_loc"
+cx_key=${cx_loc#s3://lakehouse/}
+count_cx_parquet() {
+  aws --endpoint-url "$S3_ENDPOINT" s3 ls --recursive "s3://lakehouse/$cx_key/data/" \
+    | grep -c '\.parquet$' || true
+}
+assert_eq "fragmented layout: one data file per insert" "6" "$(count_cx_parquet)"
+cx_snap_pre=$(q 'select snapshot_id from demo."e2e_compact$snapshots" order by committed_at desc limit 1')
+
+# --- dry run (the default): prints the plan, mutates NOTHING ---
+"$BIN" maintain compact --table demo.e2e_compact >"$E2E_DIR/compact-dry.log" 2>&1 \
+  || { cat "$E2E_DIR/compact-dry.log" >&2; fail "compact dry run failed"; }
+grep -q 'DRY RUN — nothing rewritten' "$E2E_DIR/compact-dry.log" \
+  || { cat "$E2E_DIR/compact-dry.log" >&2; fail "dry run did not announce itself"; }
+grep -q 'partition <unpartitioned>: 6 file(s)' "$E2E_DIR/compact-dry.log" \
+  || { cat "$E2E_DIR/compact-dry.log" >&2; fail "dry-run plan does not name the 6 candidates"; }
+assert_eq "dry run wrote no data file" "6" "$(count_cx_parquet)"
+assert_eq "dry run committed no snapshot" "6" "$(count_snaps e2e_compact)"
+
+# --- execute: ONE replace snapshot; row set identical ---
+"$BIN" maintain compact --table demo.e2e_compact --execute >"$E2E_DIR/compact-exec.log" 2>&1 \
+  || { cat "$E2E_DIR/compact-exec.log" >&2; fail "compact --execute failed"; }
+grep -q 'compacted 6 file(s)' "$E2E_DIR/compact-exec.log" \
+  || { cat "$E2E_DIR/compact-exec.log" >&2; fail "compact did not report rewriting the 6 files"; }
+assert_eq "row set identical post-compact (count|sum(id)|sum(len))" "$cx_before" "$(cx_checksum)"
+assert_eq "compact adds exactly ONE snapshot" "7" "$(count_snaps e2e_compact)"
+# The head snapshot's summary, read via the REST catalog: a `replace`
+# operation with exact file/record accounting (6 replaced by 1, rows equal).
+cx_summary=$(curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_compact" \
+  | jq -r '.metadata as $m | $m.refs.main."snapshot-id" as $h
+           | $m.snapshots[] | select(."snapshot-id" == $h)
+           | "\(.summary.operation)|\(.summary."added-data-files")|\(.summary."deleted-data-files")|\(.summary."total-data-files")|\(.summary."total-records")"')
+assert_eq "head snapshot is a replace with exact accounting (op|added|deleted|total-files|total-records)" \
+  "replace|1|6|1|6" "$cx_summary"
+assert_eq "replaced files still present in the store (snapshot lineage preserved)" "7" \
+  "$(count_cx_parquet)"
+
+# --- orphan-GC interplay: replaced files are NOT orphans ---
+"$BIN" maintain remove-orphans demo.e2e_compact --older-than-hours 0 --unsafe-grace \
+  >"$E2E_DIR/compact-orphans.log" 2>&1 \
+  || { cat "$E2E_DIR/compact-orphans.log" >&2; fail "remove-orphans after compact failed"; }
+grep -q 'found 0 orphan file(s)' "$E2E_DIR/compact-orphans.log" \
+  || { cat "$E2E_DIR/compact-orphans.log" >&2; \
+       fail "replaced files were mis-classified as orphans right after compact"; }
+pass "replaced files are NOT orphans (pre-compact snapshots still reference them)"
+
+# --- time travel to the pre-compact snapshot ---
+assert_eq "time travel to the pre-compact snapshot reads identical rows" "6|21|12" \
+  "$(q "select count(*), coalesce(sum(id), 0), coalesce(sum(length(v)), 0) from demo.\"e2e_compact@$cx_snap_pre\"")"
+
+# --- foreign reader agreement (pyiceberg over REST + S3, parity C1 style) ---
+if python3 -c 'import pyiceberg, pyarrow' 2>/dev/null; then
+  cx_ext=$(python3 - <<EOF 2>&1 | tail -n 1
+from pyiceberg.catalog import load_catalog
+import pyarrow.compute as pc
+cat = load_catalog("lakekeeper", **{
+    "type": "rest", "uri": "$CATALOG_URI", "warehouse": "$WAREHOUSE",
+    "s3.endpoint": "$S3_ENDPOINT", "s3.access-key-id": "$AWS_ACCESS_KEY_ID",
+    "s3.secret-access-key": "$AWS_SECRET_ACCESS_KEY", "s3.region": "us-east-1",
+    "s3.path-style-access": "true",
+})
+t = cat.load_table("demo.e2e_compact").scan().to_arrow()
+print(f"{len(t)}|{pc.sum(t.column('id')).as_py() or 0}|{pc.sum(pc.utf8_length(t.column('v'))).as_py() or 0}")
+EOF
+)
+  assert_eq "foreign reader (pyiceberg) agrees with the server post-compact" \
+    "$cx_before" "$cx_ext"
+else
+  log "    SKIPPED foreign-reader leg: pyiceberg/pyarrow not importable" \
+      "(pip install 'pyiceberg[pyarrow]' s3fs)"
+fi
+
+# --- conflict abort: a REAL server-side 409, aborted cleanly ---
+for i in 7 8; do
+  q "insert into demo.e2e_compact (id, v) values ($i, 'r$i')" >/dev/null
+done
+cx_snaps_before_conflict=$(count_snaps e2e_compact)
+if ICEGRES_COMPACT_INJECT_CONFLICT=1 "$BIN" maintain compact --table demo.e2e_compact --execute \
+    >"$E2E_DIR/compact-conflict.log" 2>&1; then
+  cat "$E2E_DIR/compact-conflict.log" >&2
+  fail "compact with an injected commit conflict (409) must abort"
+fi
+grep -q 'NOTHING changed' "$E2E_DIR/compact-conflict.log" \
+  || { cat "$E2E_DIR/compact-conflict.log" >&2; fail "conflict abort did not announce a clean abort"; }
+assert_eq "conflict abort committed nothing (snapshot count unchanged)" \
+  "$cx_snaps_before_conflict" "$(count_snaps e2e_compact)"
+assert_eq "conflict abort left the rows intact" "8|36|16" "$(cx_checksum)"
+pass "compact aborts cleanly on a commit conflict (first-committer-wins, nothing applied)"
+
+# --- follow-up compact, then expiry + GC reclaims the replaced files ---
+# Candidates now: the first compact's output + the two fresh insert files.
+"$BIN" maintain compact --table demo.e2e_compact --execute >"$E2E_DIR/compact-exec2.log" 2>&1 \
+  || { cat "$E2E_DIR/compact-exec2.log" >&2; fail "second compact failed"; }
+grep -q 'compacted 3 file(s)' "$E2E_DIR/compact-exec2.log" \
+  || { cat "$E2E_DIR/compact-exec2.log" >&2; fail "second compact did not rewrite the 3 live files"; }
+assert_eq "row set identical after the second compact" "8|36|16" "$(cx_checksum)"
+"$BIN" maintain expire-snapshots demo.e2e_compact --keep 1 >"$E2E_DIR/compact-expire.log" 2>&1 \
+  || { cat "$E2E_DIR/compact-expire.log" >&2; fail "expire-snapshots after compact failed"; }
+"$BIN" maintain remove-orphans demo.e2e_compact --older-than-hours 0 --execute --unsafe-grace \
+  >"$E2E_DIR/compact-gc.log" 2>&1 \
+  || { cat "$E2E_DIR/compact-gc.log" >&2; fail "remove-orphans --execute after expiry failed"; }
+grep -q 'deleted .* orphan file(s)' "$E2E_DIR/compact-gc.log" \
+  || { cat "$E2E_DIR/compact-gc.log" >&2; fail "expiry-then-GC reclaimed nothing"; }
+# Live after expiry+GC: the second compact's output + the three files its
+# DELETED entries still name (first output + the two conflict-leg inserts)
+# = 4 Parquet files; the SIX insert-era originals AND the aborted conflict
+# attempt's staged (never-committed) file are reclaimed.
+assert_eq "expiry-then-GC reclaims the replaced files (6 originals + 1 staged gone)" \
+  "4" "$(count_cx_parquet)"
+assert_eq "table fully readable after the reclaim" "8|36|16" "$(cx_checksum)"
+pass "compaction lifecycle: compact -> not-orphans -> expire+GC reclaims ($(count_cx_parquet) live files left)"
+q 'drop table demo.e2e_compact' >/dev/null 2>&1 || true
+
+# --- refusal on delete-manifest (merge-on-read) tables ---
+# Fixture: a fresh table whose head snapshot's manifest list names ONE
+# manifest with content=1 (deletes) — hand-built Avro OCF (the (j2) recipe
+# plus one record) uploaded to the table's metadata dir and committed over
+# REST, exactly what a foreign merge-on-read writer leaves behind.
+q 'drop table if exists demo.e2e_mor' >/dev/null 2>&1 || true
+q 'create table demo.e2e_mor (id bigint)' >/dev/null
+mor_loc=$(curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_mor" | jq -r '.metadata.location')
+[[ "$mor_loc" == s3://lakehouse/* ]] || fail "unexpected table location for demo.e2e_mor: $mor_loc"
+MOR_SNAP=555000111
+python3 - "$E2E_DIR/mor-manifest-list.avro" "$mor_loc/metadata/e2e-fake-deletes-m0.avro" "$MOR_SNAP" <<'PYEOF' \
+  || fail "could not generate the merge-on-read manifest list"
+import json, os, sys
+schema = {"type": "record", "name": "manifest_file", "fields": [
+    {"name": "manifest_path", "type": "string", "field-id": 500},
+    {"name": "manifest_length", "type": "long", "field-id": 501},
+    {"name": "partition_spec_id", "type": "int", "field-id": 502},
+    {"name": "content", "type": "int", "field-id": 517},
+    {"name": "sequence_number", "type": "long", "field-id": 515},
+    {"name": "min_sequence_number", "type": "long", "field-id": 516},
+    {"name": "added_snapshot_id", "type": "long", "field-id": 503},
+    {"name": "added_files_count", "type": "int", "field-id": 504},
+    {"name": "existing_files_count", "type": "int", "field-id": 505},
+    {"name": "deleted_files_count", "type": "int", "field-id": 506},
+    {"name": "added_rows_count", "type": "long", "field-id": 512},
+    {"name": "existing_rows_count", "type": "long", "field-id": 513},
+    {"name": "deleted_rows_count", "type": "long", "field-id": 514},
+    {"name": "partitions", "field-id": 507, "type": ["null", {
+        "type": "array", "element-id": 508, "items": {
+            "type": "record", "name": "r508", "fields": [
+                {"name": "contains_null", "type": "boolean", "field-id": 509},
+                {"name": "contains_nan", "type": ["null", "boolean"], "field-id": 518},
+                {"name": "lower_bound", "type": ["null", "bytes"], "field-id": 510},
+                {"name": "upper_bound", "type": ["null", "bytes"], "field-id": 511}]},
+    }]},
+]}
+def vlong(n):  # Avro zigzag varint
+    n = (n << 1) ^ (n >> 63)
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+out_path, manifest_path, snap = sys.argv[1], sys.argv[2], int(sys.argv[3])
+rec = vlong(len(manifest_path.encode())) + manifest_path.encode()
+rec += vlong(4242)  # manifest_length
+rec += vlong(0)     # partition_spec_id
+rec += vlong(1)     # content = 1 (DELETES): the refusal trigger
+rec += vlong(1) + vlong(1)             # sequence_number, min_sequence_number
+rec += vlong(snap)                     # added_snapshot_id
+rec += vlong(1) + vlong(0) + vlong(0)  # added/existing/deleted_files_count
+rec += vlong(1) + vlong(0) + vlong(0)  # added/existing/deleted_rows_count
+rec += vlong(0)                        # partitions: union branch 0 = null
+meta = {"avro.schema": json.dumps(schema).encode(),
+        "avro.codec": b"null", "format-version": b"2"}
+buf = b"Obj\x01" + vlong(len(meta))
+for k, v in meta.items():
+    buf += vlong(len(k.encode())) + k.encode() + vlong(len(v)) + v
+buf += vlong(0)  # end of the header metadata map
+sync = os.urandom(16)
+buf += sync + vlong(1) + vlong(len(rec)) + rec + sync  # one data block
+open(out_path, "wb").write(buf)
+PYEOF
+aws --endpoint-url "$S3_ENDPOINT" s3 cp "$E2E_DIR/mor-manifest-list.avro" \
+  "$mor_loc/metadata/snap-$MOR_SNAP-0-e2e-mor.avro" >/dev/null \
+  || fail "could not upload the merge-on-read manifest list for demo.e2e_mor"
+curl -sf -X POST "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_mor" \
+  -H 'Content-Type: application/json' -d "{
+  \"requirements\": [{\"type\":\"assert-ref-snapshot-id\",\"ref\":\"main\",\"snapshot-id\":null}],
+  \"updates\": [
+    {\"action\":\"add-snapshot\",\"snapshot\":{
+      \"snapshot-id\": $MOR_SNAP,
+      \"sequence-number\": 1,
+      \"timestamp-ms\": $(date +%s%3N),
+      \"manifest-list\": \"$mor_loc/metadata/snap-$MOR_SNAP-0-e2e-mor.avro\",
+      \"summary\": {\"operation\":\"append\"},
+      \"schema-id\": 0
+    }},
+    {\"action\":\"set-snapshot-ref\",\"ref-name\":\"main\",
+     \"type\":\"branch\",\"snapshot-id\": $MOR_SNAP}
+  ]
+}" >/dev/null || fail "could not commit the merge-on-read snapshot to demo.e2e_mor"
+if "$BIN" maintain compact --table demo.e2e_mor >"$E2E_DIR/compact-mor.log" 2>&1; then
+  cat "$E2E_DIR/compact-mor.log" >&2
+  fail "compact on a delete-manifest table must be refused"
+fi
+grep -q 'delete manifests' "$E2E_DIR/compact-mor.log" \
+  || { cat "$E2E_DIR/compact-mor.log" >&2; fail "refusal did not name the delete manifests"; }
+grep -q 'Nothing was rewritten' "$E2E_DIR/compact-mor.log" \
+  || { cat "$E2E_DIR/compact-mor.log" >&2; fail "refusal did not assert nothing was rewritten"; }
+pass "compact refuses delete-manifest (merge-on-read) tables loudly"
+curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_mor?purgeRequested=true" >/dev/null 2>&1 || true
+
+# --- refusal on schema-divergent tables (foreign schema evolution) ---
+# Fixture: a fresh fragmented table whose schema is then evolved over the
+# REST catalog (add-schema + set-current-schema — exactly what a foreign
+# engine's ALTER TABLE leaves behind). The head snapshot's manifests still
+# carry the OLD schema id, and compact's rewrite is not field-id-aware, so
+# it must refuse loudly BEFORE writing anything. The non-evolved happy path
+# is already proven by the demo.e2e_compact legs above.
+q 'drop table if exists demo.e2e_evo' >/dev/null 2>&1 || true
+q 'create table demo.e2e_evo (id bigint, v text)' >/dev/null
+for i in 1 2 3; do
+  q "insert into demo.e2e_evo (id, v) values ($i, 'r$i')" >/dev/null
+done
+evo_meta=$(curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_evo") \
+  || fail "could not load demo.e2e_evo's metadata over REST"
+evo_new_schema=$(jq -c '.metadata as $m
+  | ($m.schemas[] | select(."schema-id" == $m."current-schema-id"))
+  | ."schema-id" += 1
+  | .fields += [{"id": ($m."last-column-id" + 1), "name": "evo_extra",
+                 "required": false, "type": "string"}]' <<<"$evo_meta")
+evo_last_col=$(jq '.metadata."last-column-id" + 1' <<<"$evo_meta")
+curl -sf -X POST "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_evo" \
+  -H 'Content-Type: application/json' -d "{
+  \"requirements\": [],
+  \"updates\": [
+    {\"action\":\"add-schema\",\"schema\": $evo_new_schema,
+     \"last-column-id\": $evo_last_col},
+    {\"action\":\"set-current-schema\",\"schema-id\": -1}
+  ]
+}" >/dev/null || fail "could not evolve demo.e2e_evo's schema over REST"
+evo_snaps_before=$(count_snaps e2e_evo)
+if "$BIN" maintain compact --table demo.e2e_evo --execute \
+    >"$E2E_DIR/compact-evo.log" 2>&1; then
+  cat "$E2E_DIR/compact-evo.log" >&2
+  fail "compact on a schema-divergent table must be refused"
+fi
+grep -q 'was written under schema 0 (current schema is 1)' "$E2E_DIR/compact-evo.log" \
+  || { cat "$E2E_DIR/compact-evo.log" >&2; fail "refusal did not name the divergent schema ids"; }
+grep -q 'nothing was rewritten' "$E2E_DIR/compact-evo.log" \
+  || { cat "$E2E_DIR/compact-evo.log" >&2; fail "refusal did not assert nothing was rewritten"; }
+assert_eq "schema-divergence refusal committed nothing (snapshot count unchanged)" \
+  "$evo_snaps_before" "$(count_snaps e2e_evo)"
+pass "compact refuses schema-divergent tables loudly (manifests behind the current schema id)"
+curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_evo?purgeRequested=true" >/dev/null 2>&1 || true
+
+# --- refusal on LAUNDERED schema-divergent files (per-file field-id guard) ---
+# A manifest's schema id records the manifest WRITER's schema, not the
+# schema its listed data files were physically encoded under: any
+# post-evolution manifest rewrite (Spark rewrite_manifests, a foreign
+# copy-on-write commit, icegres's own m0 EXISTING carries) re-stamps
+# old-schema files under the current schema id, sailing past the
+# manifest-level fast path the previous leg proved. Fixture: fragment a
+# table, evolve the schema over REST the DANGEROUS way (drop column v and
+# re-add v — same name, same position, same type, NEW field id: the exact
+# dropped-column-resurrection shape), then re-stamp the head's manifests
+# in place exactly as a foreign rewrite_manifests would (patch the Avro
+# OCF header's schema/schema-id metadata; the entries — and the Parquet
+# bytes they point at — stay byte-identical). compact must STILL refuse,
+# via the per-file Parquet field-id guard (compact.rs
+# ensure_file_schema_current), in dry-run AND --execute, mutating nothing.
+q 'drop table if exists demo.e2e_evo2' >/dev/null 2>&1 || true
+q 'create table demo.e2e_evo2 (id bigint, v text)' >/dev/null
+for i in 1 2 3; do
+  q "insert into demo.e2e_evo2 (id, v) values ($i, 'r$i')" >/dev/null
+done
+evo2_meta=$(curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_evo2") \
+  || fail "could not load demo.e2e_evo2's metadata over REST"
+evo2_loc=$(jq -r '.metadata.location' <<<"$evo2_meta")
+[[ "$evo2_loc" == s3://lakehouse/* ]] || fail "unexpected table location for demo.e2e_evo2: $evo2_loc"
+evo2_key=${evo2_loc#s3://lakehouse/}
+# Schema 1 = drop v, re-add v: name/position/type unchanged, NEW field id.
+evo2_new_schema=$(jq -c '.metadata as $m
+  | ($m.schemas[] | select(."schema-id" == $m."current-schema-id"))
+  | ."schema-id" += 1
+  | .fields |= map(if .name == "v" then .id = ($m."last-column-id" + 1) else . end)' <<<"$evo2_meta")
+evo2_last_col=$(jq '.metadata."last-column-id" + 1' <<<"$evo2_meta")
+curl -sf -X POST "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_evo2" \
+  -H 'Content-Type: application/json' -d "{
+  \"requirements\": [],
+  \"updates\": [
+    {\"action\":\"add-schema\",\"schema\": $evo2_new_schema,
+     \"last-column-id\": $evo2_last_col},
+    {\"action\":\"set-current-schema\",\"schema-id\": -1}
+  ]
+}" >/dev/null || fail "could not evolve demo.e2e_evo2's schema over REST"
+# Launder: re-stamp every data manifest in place to the (new) current
+# schema, leaving entries and data files byte-identical — the metadata
+# state a foreign rewrite_manifests produces.
+mkdir -p "$E2E_DIR/evo2-manifests"
+evo2_manifest_keys=$(aws --endpoint-url "$S3_ENDPOINT" s3 ls --recursive \
+    "s3://lakehouse/$evo2_key/metadata/" | awk '{print $4}' | grep -E -- '-m[0-9]+\.avro$') \
+  || fail "no data manifests found under demo.e2e_evo2's metadata dir"
+evo2_stamped=0
+while read -r mkey; do
+  [[ -n "$mkey" ]] || continue
+  mbase=$(basename "$mkey")
+  aws --endpoint-url "$S3_ENDPOINT" s3 cp "s3://lakehouse/$mkey" \
+    "$E2E_DIR/evo2-manifests/$mbase" >/dev/null \
+    || fail "could not download manifest $mkey"
+  python3 - "$E2E_DIR/evo2-manifests/$mbase" "$evo2_new_schema" 1 <<'PYEOF' \
+    || fail "could not re-stamp manifest $mkey"
+import sys
+path, schema_json, new_id = sys.argv[1], sys.argv[2], sys.argv[3]
+raw = open(path, "rb").read()
+assert raw[:4] == b"Obj\x01", "not an Avro OCF"
+pos = 4
+def rvlong():  # Avro zigzag varint decode
+    global pos
+    shift = n = 0
+    while True:
+        b = raw[pos]; pos += 1
+        n |= (b & 0x7F) << shift
+        shift += 7
+        if not b & 0x80:
+            break
+    return (n >> 1) ^ -(n & 1)
+def vlong(n):  # Avro zigzag varint encode
+    n = (n << 1) ^ (n >> 63)
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+meta = {}
+while True:  # the OCF header metadata map
+    count = rvlong()
+    if count == 0:
+        break
+    assert count > 0, "unsupported negative map block count"
+    for _ in range(count):
+        klen = rvlong(); k = raw[pos:pos + klen].decode(); pos += klen
+        vlen = rvlong(); v = raw[pos:pos + vlen]; pos += vlen
+        meta[k] = v
+assert "schema" in meta and "schema-id" in meta, sorted(meta)
+meta["schema"] = schema_json.encode()
+meta["schema-id"] = new_id.encode()
+out = b"Obj\x01" + vlong(len(meta))
+for k, v in meta.items():
+    out += vlong(len(k.encode())) + k.encode() + vlong(len(v)) + v
+out += vlong(0) + raw[pos:]  # sync marker + data blocks, untouched
+open(path, "wb").write(out)
+PYEOF
+  aws --endpoint-url "$S3_ENDPOINT" s3 cp "$E2E_DIR/evo2-manifests/$mbase" \
+    "s3://lakehouse/$mkey" >/dev/null || fail "could not upload re-stamped manifest $mkey"
+  evo2_stamped=$((evo2_stamped + 1))
+done <<<"$evo2_manifest_keys"
+[[ "$evo2_stamped" -ge 3 ]] \
+  || fail "laundering fixture re-stamped only $evo2_stamped manifest(s), expected >= 3"
+evo2_snaps_before=$(count_snaps e2e_evo2)
+# Dry run: the per-file pre-pass runs before the plan is printed, so even
+# a plan-only invocation surfaces the refusal (matching the other rails).
+if "$BIN" maintain compact --table demo.e2e_evo2 >"$E2E_DIR/compact-evo2-dry.log" 2>&1; then
+  cat "$E2E_DIR/compact-evo2-dry.log" >&2
+  fail "dry-run compact on laundered old-schema files must be refused"
+fi
+if grep -q 'was written under schema' "$E2E_DIR/compact-evo2-dry.log"; then
+  cat "$E2E_DIR/compact-evo2-dry.log" >&2
+  fail "refusal came from the manifest fast path — the laundering fixture failed to re-stamp"
+fi
+grep -q 'Parquet field id' "$E2E_DIR/compact-evo2-dry.log" \
+  || { cat "$E2E_DIR/compact-evo2-dry.log" >&2; fail "dry-run refusal did not come from the per-file field-id guard"; }
+pass "compact dry run refuses laundered old-schema files via the per-file field-id guard"
+if "$BIN" maintain compact --table demo.e2e_evo2 --execute \
+    >"$E2E_DIR/compact-evo2.log" 2>&1; then
+  cat "$E2E_DIR/compact-evo2.log" >&2
+  fail "compact --execute on laundered old-schema files must be refused"
+fi
+if grep -q 'was written under schema' "$E2E_DIR/compact-evo2.log"; then
+  cat "$E2E_DIR/compact-evo2.log" >&2
+  fail "refusal came from the manifest fast path — the laundering fixture failed to re-stamp"
+fi
+grep -Eq 'data file s3://[^ ]+\.parquet column "v"' "$E2E_DIR/compact-evo2.log" \
+  || { cat "$E2E_DIR/compact-evo2.log" >&2; fail "refusal did not name the data file and column"; }
+grep -q 'written with Parquet field id 2' "$E2E_DIR/compact-evo2.log" \
+  || { cat "$E2E_DIR/compact-evo2.log" >&2; fail "refusal did not name the file's stale field id"; }
+grep -q 'assigns field id 3' "$E2E_DIR/compact-evo2.log" \
+  || { cat "$E2E_DIR/compact-evo2.log" >&2; fail "refusal did not name the current schema's field id"; }
+grep -q 'nothing was rewritten' "$E2E_DIR/compact-evo2.log" \
+  || { cat "$E2E_DIR/compact-evo2.log" >&2; fail "refusal did not assert nothing was rewritten"; }
+assert_eq "laundered-file refusal committed nothing (snapshot count unchanged)" \
+  "$evo2_snaps_before" "$(count_snaps e2e_evo2)"
+pass "compact --execute refuses laundered old-schema files (per-file Parquet field-id guard)"
+curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_evo2?purgeRequested=true" >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
+# (cat) P6/Half B — authenticated NON-Lakekeeper-shaped catalog access through
+#       an OAuth2 gateway. A minimal spec-conformant OAuth2 gateway
+#       (bench/clients/catalog-gateway, Go stdlib: net/http +
+#       httputil.ReverseProxy) fronts THIS Lakekeeper on :8182 and REQUIRES a
+#       bearer on every catalog data/metadata call (the config discovery
+#       handshake and the token endpoint stay open). It is a by-construction
+#       auth harness, NOT a second Iceberg engine — Apache Polaris cannot be
+#       built on this box (its Gradle 9.6.1 wrapper download is proxy-denied;
+#       see docs/catalog-support.md). What it faithfully implements is the
+#       exact OAuth2 client-credentials wire flow the pinned iceberg-rust 0.9.1
+#       REST client speaks, plus real bearer enforcement. It proves BOTH B1
+#       auth props end to end:
+#         - `token` (pre-minted bearer): full CRUD through the front door
+#           (create namespace via authenticated curl, CREATE TABLE, INSERT,
+#           SELECT, AS OF time-travel) — reads AND copy-on-write writes
+#           authenticate (the DML commit client carries the same bearer).
+#         - `credential` (OAuth2 client-credentials): the REST client mints its
+#           OWN bearer from the token endpoint and reads / time-travels.
+#       Unauthenticated, bad-bearer and bad-client-secret calls are rejected.
+#       Ports 8182 (gateway), 5500 (token-path serve), 5501 (credential-path).
+# ---------------------------------------------------------------------------
+CATGW_PORT=8182
+CATGW_TOK_PORT=5500
+CATGW_CRED_PORT=5501
+CATGW_NS=catgw
+CATGW_PREMINT="premint-bearer-$$-$(date +%s)"
+CATGW_CLIENT="icegres:supersecret"
+CATGW_BIN="$E2E_DIR/catalog-gateway"
+CATGW_LOG="$E2E_DIR/catalog-gateway.log"
+CATGW_TOK_LOG="$E2E_DIR/serve-catgw-tok.log"
+CATGW_CRED_LOG="$E2E_DIR/serve-catgw-cred.log"
+CATGW_URI="http://127.0.0.1:$CATGW_PORT/catalog"
+CATGW_TOKEP="http://127.0.0.1:$CATGW_PORT/v1/oauth/tokens"
+log "(cat) B2 authenticated non-Lakekeeper catalog via OAuth2 gateway on :$CATGW_PORT"
+if ! command -v go >/dev/null 2>&1; then
+  log "    SKIPPED: go toolchain not available (needed to build the OAuth2 gateway)"
+else
+  # Build the gateway (stdlib only — no network, fast).
+  (cd "$REPO_DIR/bench/clients/catalog-gateway" && go build -o "$CATGW_BIN" .) \
+    || fail "catalog-gateway go build failed"
+  pass "catalog-gateway built (Go stdlib OAuth2 front door)"
+
+  # Crashed-run cleanup: scratch namespace/table, then start the gateway.
+  curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/$CATGW_NS/tables/t?purgeRequested=true" >/dev/null 2>&1 || true
+  curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/$CATGW_NS" >/dev/null 2>&1 || true
+  : >"$CATGW_LOG"
+  "$CATGW_BIN" -listen "127.0.0.1:$CATGW_PORT" -backend "http://127.0.0.1:8181" \
+    -pre-mint "$CATGW_PREMINT" >>"$CATGW_LOG" 2>&1 &
+  CATGW_PID=$!
+  echo "$CATGW_PID" >"$E2E_DIR/catalog-gateway.pid"
+  # Cleanup helper: stop both serves + the gateway + drop the scratch namespace.
+  catgw_cleanup() {
+    for pf in "$E2E_DIR/serve-catgw-tok.pid" "$E2E_DIR/serve-catgw-cred.pid" "$E2E_DIR/catalog-gateway.pid"; do
+      [[ -f "$pf" ]] || continue
+      local cp; cp=$(cat "$pf")
+      kill "$cp" 2>/dev/null || true
+      for _ in $(seq 1 20); do kill -0 "$cp" 2>/dev/null || break; sleep 0.2; done
+      kill -9 "$cp" 2>/dev/null || true
+      rm -f "$pf"
+    done
+    curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/$CATGW_NS/tables/t?purgeRequested=true" >/dev/null 2>&1 || true
+    curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/$CATGW_NS" >/dev/null 2>&1 || true
+  }
+  # Wait for the gateway's token endpoint to answer.
+  for _ in $(seq 1 40); do
+    curl -sf -o /dev/null -X POST "$CATGW_TOKEP" \
+      -d grant_type=client_credentials -d client_id=icegres -d client_secret=supersecret \
+      && break
+    kill -0 "$CATGW_PID" 2>/dev/null || { tail -n 20 "$CATGW_LOG" >&2; fail "catalog-gateway exited during startup"; }
+    sleep 0.25
+  done
+
+  # --- auth-door assertions (curl straight at the gateway) ---
+  catgw_ns_path="v1/$prefix/namespaces"
+  assert_eq "unauthenticated catalog call is rejected (401)" "401" \
+    "$(curl -s -o /dev/null -w '%{http_code}' "$CATGW_URI/$catgw_ns_path")"
+  assert_eq "bad bearer is rejected (401)" "401" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer not-a-real-token' "$CATGW_URI/$catgw_ns_path")"
+  assert_eq "config discovery handshake stays open (200)" "200" \
+    "$(curl -s -o /dev/null -w '%{http_code}' "$CATGW_URI/v1/config?warehouse=$WAREHOUSE")"
+  assert_eq "pre-minted bearer is accepted (200)" "200" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $CATGW_PREMINT" "$CATGW_URI/$catgw_ns_path")"
+  assert_eq "client-credentials grant with a bad secret is rejected (401)" "401" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$CATGW_TOKEP" \
+        -d grant_type=client_credentials -d client_id=icegres -d client_secret=WRONG)"
+  # A real client-credentials mint returns a usable bearer.
+  catgw_minted=$(curl -sf -X POST "$CATGW_TOKEP" \
+    -d grant_type=client_credentials -d client_id=icegres -d client_secret=supersecret -d scope=catalog \
+    | jq -r '.access_token // empty')
+  [[ -n "$catgw_minted" ]] || { catgw_cleanup; fail "client-credentials grant returned no access_token"; }
+  assert_eq "client-credentials-minted bearer authenticates a catalog call (200)" "200" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $catgw_minted" "$CATGW_URI/$catgw_ns_path")"
+
+  # Create the scratch namespace through the gateway's AUTHENTICATED door.
+  curl -sf -X POST -H "Authorization: Bearer $CATGW_PREMINT" -H 'Content-Type: application/json' \
+    "$CATGW_URI/$catgw_ns_path" -d "{\"namespace\":[\"$CATGW_NS\"],\"properties\":{}}" >/dev/null \
+    || { catgw_cleanup; fail "could not create namespace $CATGW_NS through the authenticated gateway"; }
+  pass "namespace created through the authenticated gateway front door"
+
+  # --- token-path serve: full CRUD through the gateway (`token` prop) ---
+  : >"$CATGW_TOK_LOG"
+  "$BIN" serve --host 127.0.0.1 --port "$CATGW_TOK_PORT" \
+    --catalog-uri "$CATGW_URI" --catalog-token "$CATGW_PREMINT" >>"$CATGW_TOK_LOG" 2>&1 &
+  echo $! >"$E2E_DIR/serve-catgw-tok.pid"
+  for _ in $(seq 1 60); do
+    psql -h 127.0.0.1 -p "$CATGW_TOK_PORT" -U postgres -d icegres -tAc 'select 1' >/dev/null 2>&1 && break
+    kill -0 "$(cat "$E2E_DIR/serve-catgw-tok.pid")" 2>/dev/null \
+      || { tail -n 20 "$CATGW_TOK_LOG" >&2; catgw_cleanup; fail "token-path serve exited during startup"; }
+    sleep 0.5
+  done
+  CATGW_TQ=(psql -h 127.0.0.1 -p "$CATGW_TOK_PORT" -U postgres -d icegres -tA -v ON_ERROR_STOP=1)
+  "${CATGW_TQ[@]}" -c "create table $CATGW_NS.t (id bigint, note varchar)" >/dev/null \
+    || { catgw_cleanup; fail "CREATE TABLE through the token-authenticated catalog failed"; }
+  "${CATGW_TQ[@]}" -c "insert into $CATGW_NS.t values (1,'a'),(2,'b'),(3,'c')" >/dev/null \
+    || { catgw_cleanup; fail "INSERT through the token-authenticated catalog failed (write client bearer)"; }
+  assert_eq "token-path: rows land through the authenticated write client" "3" \
+    "$("${CATGW_TQ[@]}" -c "select count(*) from $CATGW_NS.t")"
+  # Snapshot after the first insert (3 rows) for deterministic time travel.
+  catgw_snap1=$(curl -sf "$CATALOG_URI/v1/$prefix/namespaces/$CATGW_NS/tables/t" \
+    | jq -r '.metadata."current-snapshot-id"')
+  [[ -n "$catgw_snap1" && "$catgw_snap1" != null ]] || { catgw_cleanup; fail "could not read the 3-row snapshot id"; }
+  "${CATGW_TQ[@]}" -c "insert into $CATGW_NS.t values (4,'d'),(5,'e')" >/dev/null \
+    || { catgw_cleanup; fail "second INSERT through the token-authenticated catalog failed"; }
+  assert_eq "token-path: SELECT sees all committed rows" "5" \
+    "$("${CATGW_TQ[@]}" -c "select count(*) from $CATGW_NS.t")"
+  assert_eq "token-path: AS OF <snapshot> time-travels through the authenticated read client" "3" \
+    "$("${CATGW_TQ[@]}" -c "select count(*) from $CATGW_NS.t AS OF $catgw_snap1")"
+  pass "token prop: create/insert/select/time-travel all through the OAuth2 front door"
+
+  # --- credential-path serve: OAuth2 client-credentials (`credential` prop) ---
+  catgw_mints_before=$(grep -c 'token request OK' "$CATGW_LOG" || true)
+  : >"$CATGW_CRED_LOG"
+  "$BIN" serve --host 127.0.0.1 --port "$CATGW_CRED_PORT" \
+    --catalog-uri "$CATGW_URI" \
+    --catalog-credential "$CATGW_CLIENT" \
+    --catalog-oauth2-uri "$CATGW_TOKEP" \
+    --catalog-scope catalog >>"$CATGW_CRED_LOG" 2>&1 &
+  echo $! >"$E2E_DIR/serve-catgw-cred.pid"
+  for _ in $(seq 1 60); do
+    psql -h 127.0.0.1 -p "$CATGW_CRED_PORT" -U postgres -d icegres -tAc 'select 1' >/dev/null 2>&1 && break
+    kill -0 "$(cat "$E2E_DIR/serve-catgw-cred.pid")" 2>/dev/null \
+      || { tail -n 20 "$CATGW_CRED_LOG" >&2; catgw_cleanup; fail "credential-path serve exited during startup"; }
+    sleep 0.5
+  done
+  CATGW_CQ=(psql -h 127.0.0.1 -p "$CATGW_CRED_PORT" -U postgres -d icegres -tA -v ON_ERROR_STOP=1)
+  assert_eq "credential-path: OAuth2 client-credentials read sees the committed rows" "5" \
+    "$("${CATGW_CQ[@]}" -c "select count(*) from $CATGW_NS.t")"
+  assert_eq "credential-path: AS OF <snapshot> time-travel over the OAuth2-minted bearer" "3" \
+    "$("${CATGW_CQ[@]}" -c "select count(*) from $CATGW_NS.t AS OF $catgw_snap1")"
+  catgw_mints_after=$(grep -c 'token request OK' "$CATGW_LOG" || true)
+  [[ "$catgw_mints_after" -gt "$catgw_mints_before" ]] \
+    || { catgw_cleanup; fail "the credential-path client never ran the client-credentials grant against the token endpoint"; }
+  pass "credential prop: iceberg-rust minted its own bearer via the token endpoint and served reads/time-travel"
+
+  # --- secrets must never appear in the server logs (B1 redaction) ---
+  if grep -q "$CATGW_PREMINT" "$CATGW_TOK_LOG" || grep -q supersecret "$CATGW_TOK_LOG" "$CATGW_CRED_LOG"; then
+    catgw_cleanup
+    fail "a catalog secret (bearer token / client secret) leaked into a server log"
+  fi
+  pass "no catalog secret leaked into the server logs (bearer/client-secret redacted)"
+
+  # --- verify (P7) against the auth-guarded catalog: token form, --tail-dir.
+  #     Proves icegres verify carries the same catalog-auth surface as serve:
+  #     (1) it forwards --catalog-token to its OWN scratch servers, so their
+  #     read AND copy-on-write write planes authenticate through the gateway
+  #     (durability inserts, SIGKILLs, replays — a full write round trip); and
+  #     (2) it drops its scratch namespace through the AUTHENTICATED catalog
+  #     client, so nothing is stranded. A raw unauthenticated REST DELETE (the
+  #     pre-fix cleanup) would 401 against this guarded gateway and strand the
+  #     namespace — here an AUTHENTICATED GET for it must 404 after the run.
+  CATGW_VF_TAIL="$E2E_DIR/catgw-verify-tail"
+  rm -rf "$CATGW_VF_TAIL"; mkdir -p "$CATGW_VF_TAIL"
+  "$BIN" verify --suite durability --tail-dir "$CATGW_VF_TAIL" \
+    --catalog-uri "$CATGW_URI" --catalog-token "$CATGW_PREMINT" \
+    --json >"$E2E_DIR/catgw-verify.json" 2>"$E2E_DIR/catgw-verify.err" \
+    || { cat "$E2E_DIR/catgw-verify.err" >&2; catgw_cleanup; fail "icegres verify failed against the auth-guarded gateway (token form)"; }
+  assert_eq "verify (auth catalog): durability re-proven through the token-authenticated catalog (1 pass/0 fail/0 skip, PASS)" "1|0|0|PASS" \
+    "$(jq -r '[(.passed|tostring), (.failed|tostring), (.skipped|tostring), (.checks[] | select(.suite=="durability") | .status)] | join("|")' "$E2E_DIR/catgw-verify.json")"
+  catgw_vf_ns=$(jq -r '.namespace' "$E2E_DIR/catgw-verify.json")
+  assert_eq "verify (auth catalog): scratch namespace is run-scoped" "icegres_verify_" \
+    "$(printf '%s' "$catgw_vf_ns" | cut -c1-15)"
+  # DROPPED on exit through the authenticated catalog client: an AUTHENTICATED
+  # GET for the scratch namespace now 404s (created, tested, dropped — nothing
+  # stranded). The bearer is required: unauthenticated the gateway answers 401.
+  assert_eq "verify (auth catalog): scratch namespace DROPPED via the authenticated client (404, not stranded)" "404" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $CATGW_PREMINT" "$CATGW_URI/v1/$prefix/namespaces/$catgw_vf_ns")"
+  [[ -z "$(ls "$CATGW_VF_TAIL" 2>/dev/null)" ]] \
+    || { catgw_cleanup; fail "verify left scratch state in the tail dir: $(ls "$CATGW_VF_TAIL")"; }
+  pass "verify (P7): green against the OAuth2-guarded catalog; scratch namespace dropped through the authenticated client"
+
+  # --- verify honesty under PURE OAuth2 client-credentials (no --catalog-token):
+  #     the copy-on-write commit client carries no OAuth2-minted bearer, so the
+  #     write-based suites SKIP loudly (naming the fix) rather than FAIL — and
+  #     the scratch namespace is still created and dropped via the OAuth2 read
+  #     plane (exit 0, nothing stranded).
+  "$BIN" verify --suite durability --tail-dir "$CATGW_VF_TAIL" \
+    --catalog-uri "$CATGW_URI" \
+    --catalog-credential "$CATGW_CLIENT" \
+    --catalog-oauth2-uri "$CATGW_TOKEP" \
+    --catalog-scope catalog \
+    --json >"$E2E_DIR/catgw-verify-cred.json" 2>"$E2E_DIR/catgw-verify-cred.err" \
+    || { cat "$E2E_DIR/catgw-verify-cred.err" >&2; catgw_cleanup; fail "verify under credential-only auth did not exit 0 (it should SKIP loudly, not fail)"; }
+  assert_eq "verify (credential-only): write-based durability SKIPs loudly (0 pass/0 fail/1 skip, SKIP)" "0|0|1|SKIP" \
+    "$(jq -r '[(.passed|tostring), (.failed|tostring), (.skipped|tostring), (.checks[] | select(.suite=="durability") | .status)] | join("|")' "$E2E_DIR/catgw-verify-cred.json")"
+  jq -r '.checks[] | select(.suite=="durability") | .detail' "$E2E_DIR/catgw-verify-cred.json" | grep -q -- "--catalog-token" \
+    || { catgw_cleanup; fail "the credential-only skip does not name the --catalog-token fix"; }
+  pass "verify (credential-only): write-based suites SKIP loudly and name the --catalog-token fix"
+
+  catgw_cleanup
+  pass "(cat) cleanup: gateway + serves stopped, scratch namespace dropped"
+fi
+
+# ---------------------------------------------------------------------------
+# (ha) P3 icegresd-ha, process mode: automated tail-writer failover
+#      (--health-check-ms), zombie-writer fencing (SIGSTOP live-zombie),
+#      icegresd leader lease over icekeeperd (--lease-quorum), and
+#      autoscaling-lite read replicas (--read-replicas-max) with peer-tail
+#      wiring. Ports (all above every existing reservation; 5471-5473
+#      belong to tests/tail_durability.sh, 5461-5463 to bench.sh):
+#        5481-5483 data icekeeperd trio     5484-5486 lease icekeeperd trio
+#        5487/5488 failover icegresd/main   5490-5493 lease icegresd A/B
+#        5494/5495 fence pair Z/W           5496-5498 autoscale/main/tail-api
+# ---------------------------------------------------------------------------
+HA_KBIN="$ICEGRES_DIR/target/debug/icekeeperd"
+HA_QUORUM="127.0.0.1:5481,127.0.0.1:5482,127.0.0.1:5483"
+HA_LEASE_QUORUM="127.0.0.1:5484,127.0.0.1:5485,127.0.0.1:5486"
+HA_BUF_MS=600000 # 10 min: the flusher never auto-commits; replay is the only path
+log "(ha) P3 HA: keepers up (data 5481-5483, lease 5484-5486), scratch table"
+[[ -x "$HA_KBIN" ]] || fail "icekeeperd binary not found at $HA_KBIN (cargo build builds all bins)"
+for p in 5481 5482 5483 5484 5485 5486 5487 5488 5490 5491 5492 5493 5494 5495 5496 5497 5498; do
+  if (exec 3<>"/dev/tcp/$PG_HOST/$p") 2>/dev/null; then
+    exec 3>&- 3<&-
+    fail "something is already listening on :$p — stop it first"
+  fi
+done
+
+start_ha_keeper() { # start_ha_keeper <name> <port>
+  local name=$1 port=$2 dir="$E2E_DIR/ha-keeper-$1" log="$E2E_DIR/ha-keeper-$1.log"
+  "$HA_KBIN" serve --host 127.0.0.1 --port "$port" --data-dir "$dir" --node-id "$port" \
+    >>"$log" 2>&1 &
+  echo $! >"$E2E_DIR/ha-keeper-$name.pid"
+  for _ in $(seq 1 40); do
+    if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then exec 3>&- 3<&-; return 0; fi
+    kill -0 "$(cat "$E2E_DIR/ha-keeper-$name.pid")" 2>/dev/null \
+      || { tail -n 20 "$log" >&2; fail "ha keeper $name exited during startup"; }
+    sleep 0.25
+  done
+  fail "ha keeper $name not accepting on :$port within 10s"
+}
+
+rm -rf "$E2E_DIR"/ha-keeper-*
+start_ha_keeper d1 5481; start_ha_keeper d2 5482; start_ha_keeper d3 5483
+start_ha_keeper l1 5484; start_ha_keeper l2 5485; start_ha_keeper l3 5486
+pass "6 icekeeperd acceptors up (data trio + DEDICATED lease trio)"
+
+# Scratch table for the HA legs (never touches demo.trips).
+curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_ha?purgeRequested=true" >/dev/null 2>&1 || true
+curl -sf -X POST "$CATALOG_URI/v1/$prefix/namespaces/demo/tables" \
+  -H 'Content-Type: application/json' -d @- <<'JSON' >/dev/null
+{
+  "name": "e2e_ha",
+  "schema": {
+    "type": "struct",
+    "schema-id": 0,
+    "fields": [
+      {"id": 1, "name": "id", "required": false, "type": "long"},
+      {"id": 2, "name": "note", "required": false, "type": "string"}
+    ]
+  }
+}
+JSON
+
+# --- ha1: automated tail-writer failover THROUGH icegresd. A quorum-tailed
+#     writer compute takes acked buffered INSERTs under continuous load; the
+#     compute is kill -9'd mid-load; icegresd detects it (dead-port probe +
+#     supervised restart; --health-check-ms covers the wedged-but-alive
+#     case in ha1w below) and spawns a replacement whose --tail-quorum
+#     open() FENCES the old term and REPLAYS the un-flushed window before
+#     accepting. Measured end-to-end: failover_ms = kill -> first
+#     successful client write via the SAME icegresd endpoint; asserted:
+#     EVERY client-acked insert is readable on the replacement.
+HA_PORT=5487
+HA_MAIN=5488
+HA_LOG="$E2E_DIR/icegresd-ha.log"
+HA_STATUS="$E2E_DIR/icegresd-ha-status.json"
+log "(ha1) writer failover under load: kill -9 the quorum-tailed compute via icegresd on :$HA_PORT"
+: >"$HA_LOG"
+rm -f "$HA_STATUS"
+env ICEGRES_WRITE_BUFFER_MS="$HA_BUF_MS" ICEGRES_TAIL_QUORUM="$HA_QUORUM" \
+    ICEGRES_TAIL_QUORUM_TIMEOUT_MS=2000 \
+  "$DBIN" serve --host "$PG_HOST" --port "$HA_PORT" --main-port "$HA_MAIN" \
+  --icegres-bin "$BIN" --idle-shutdown-secs 300 --pool-size 0 \
+  --health-check-ms 250 --status-file "$HA_STATUS" >>"$HA_LOG" 2>&1 &
+echo $! >"$E2E_DIR/icegresd-ha.pid"
+for _ in $(seq 1 40); do
+  if (exec 3<>"/dev/tcp/$PG_HOST/$HA_PORT") 2>/dev/null; then exec 3>&- 3<&-; break; fi
+  sleep 0.25
+done
+ha_status() { jq -r --arg k "$1" ".computes[] | select(.key == \$k) | $2" "$HA_STATUS" 2>/dev/null; }
+HAQ=(psql -h "$PG_HOST" -p "$HA_PORT" -U postgres -d icegres -tA)
+assert_eq "quorum-tailed compute wakes through icegresd" "1" "$("${HAQ[@]}" -c 'select 1')"
+grep -q "durable quorum tail" "$HA_LOG" \
+  || fail "the compute did not announce the quorum tail (env not inherited?)"
+
+# The load driver: sequential INSERTs; every ACKED id is recorded with its
+# ack timestamp (an errored insert is NOT acked and NOT recorded).
+HA_ACKED="$E2E_DIR/ha-acked.txt"
+HA_STOP="$E2E_DIR/ha-stop"
+rm -f "$HA_ACKED" "$HA_STOP"
+touch "$HA_ACKED"
+(
+  i=0
+  while [[ ! -f "$HA_STOP" ]]; do
+    i=$((i + 1))
+    if psql -h "$PG_HOST" -p "$HA_PORT" -U postgres -d icegres -tA \
+         -c "insert into demo.e2e_ha (id, note) values ($i, 'ha-load')" >/dev/null 2>&1; then
+      echo "$i $(($(date +%s%N) / 1000000))" >>"$HA_ACKED"
+    fi
+    sleep 0.02
+  done
+) &
+HA_LOAD_PID=$!
+# Let the load ack a healthy baseline first.
+for _ in $(seq 1 100); do
+  (( $(wc -l <"$HA_ACKED") >= 15 )) && break
+  sleep 0.2
+done
+(( $(wc -l <"$HA_ACKED") >= 15 )) || { touch "$HA_STOP"; fail "load driver never got 15 acked inserts"; }
+
+ha_cpid=$(ha_status main .pid)
+[[ "$ha_cpid" =~ ^[0-9]+$ ]] || { touch "$HA_STOP"; fail "no compute pid in $HA_STATUS"; }
+ha_kill_ms=$(($(date +%s%N) / 1000000))
+kill -9 "$ha_cpid" || { touch "$HA_STOP"; fail "could not SIGKILL compute $ha_cpid"; }
+# failover_ms = kill -> first ACKED insert on the replacement, as observed
+# by the CLIENT through the unchanged endpoint.
+ha_recovered_ms=""
+for _ in $(seq 1 300); do
+  ha_recovered_ms=$(awk -v k="$ha_kill_ms" '$2 > k { print $2; exit }' "$HA_ACKED")
+  [[ -n "$ha_recovered_ms" ]] && break
+  sleep 0.1
+done
+[[ -n "$ha_recovered_ms" ]] || { touch "$HA_STOP"; tail -n 30 "$HA_LOG" >&2; fail "no insert ever acked after the writer kill (no failover)"; }
+FAILOVER_MS=$((ha_recovered_ms - ha_kill_ms))
+(( FAILOVER_MS < 15000 )) || fail "failover took ${FAILOVER_MS}ms (>15s)"
+pass "failover_ms=${FAILOVER_MS} (kill -9 writer under load -> first successful write on the replacement, via icegresd; debug build)"
+sleep 1
+touch "$HA_STOP"
+wait "$HA_LOAD_PID" 2>/dev/null || true
+grep -q "exited UNCLEANLY" "$HA_LOG" || fail "the writer kill was not logged as an unclean exit"
+# The replacement may come from EITHER recovery path — the supervisor's
+# backoff restart, or a connection's dead-port probe re-waking the slot
+# first (usually faster; the supervisor's spawn is then superseded).
+# Either way a second compute generation must have come up.
+[[ "$(grep -c "compute ready" "$HA_LOG")" -ge 2 ]] \
+  || fail "no replacement compute came up after the writer kill"
+
+# ZERO acked-row loss: every recorded acked id is SELECTable through the
+# replacement (whose election replayed the killed writer's un-flushed
+# window; nothing was committed — the 10-min cadence never fired).
+ha_acked_ids=$(awk '{print $1}' "$HA_ACKED" | sort -n | uniq)
+ha_acked_n=$(wc -l <<<"$ha_acked_ids")
+ha_in_list=$(paste -sd, <<<"$ha_acked_ids")
+ha_present=$("${HAQ[@]}" -c "select count(distinct id) from demo.e2e_ha where id in ($ha_in_list)")
+assert_eq "ZERO acked-row loss through the failover ($ha_acked_n acked inserts, incl. pre-kill window)" \
+  "$ha_acked_n" "$ha_present"
+
+# --- ha1w: the wedged-but-alive case a TCP probe misses. SIGSTOP two data
+#     acceptors; the next INSERT times out and POISONS the compute's tail —
+#     the process still accepts TCP and answers reads, but /health reports
+#     503. The --health-check-ms loop must kill it; after the acceptors
+#     resume, the next client connection spawns a replacement that replays
+#     (including the timed-out AMBIGUOUS insert, exactly once).
+log "(ha1w) wedged-but-alive writer: poisoned tail detected via /health and replaced"
+ha_cpid=$(ha_status main .pid)
+ha_hport=$(ha_status main .health_port)
+[[ "$ha_hport" =~ ^[0-9]+$ ]] || fail "no health_port in status (health checks not wired?)"
+curl -sf "http://127.0.0.1:$ha_hport/health" >/dev/null || fail "healthy compute must answer 200 on /health"
+kill -STOP "$(cat "$E2E_DIR/ha-keeper-d2.pid")" "$(cat "$E2E_DIR/ha-keeper-d3.pid")"
+set +e
+ha_poison_out=$(timeout 30 psql -h "$PG_HOST" -p "$HA_PORT" -U postgres -d icegres -c \
+  "insert into demo.e2e_ha (id, note) values (700001, 'ambiguous')" 2>&1)
+ha_poison_rc=$?
+set -e
+[[ $ha_poison_rc -ne 0 ]] || fail "the quorum-less INSERT was acked: $ha_poison_out"
+grep -q "POISONED" <<<"$ha_poison_out" || fail "unexpected quorum-less INSERT error: $ha_poison_out"
+# The health loop (250ms x 3 fails) must kill the wedged compute.
+ha_wedge_gone=0
+for _ in $(seq 1 100); do
+  if ! kill -0 "$ha_cpid" 2>/dev/null; then ha_wedge_gone=1; break; fi
+  sleep 0.1
+done
+[[ "$ha_wedge_gone" == 1 ]] || fail "the poisoned compute was never killed by the health loop"
+grep -q "consecutive health probes" "$HA_LOG" \
+  || fail "the health loop did not log the probe failures"
+pass "poisoned (wedged-but-alive) compute detected via /health 503 and killed for replacement"
+kill -CONT "$(cat "$E2E_DIR/ha-keeper-d2.pid")" "$(cat "$E2E_DIR/ha-keeper-d3.pid")"
+# The replacement replays; the AMBIGUOUS timed-out insert became durable on
+# the surviving acceptor and must appear EXACTLY ONCE (never twice).
+ha_amb=""
+for _ in $(seq 1 60); do
+  ha_amb=$("${HAQ[@]}" -c "select count(*) from demo.e2e_ha where id = 700001" 2>/dev/null) && [[ -n "$ha_amb" ]] && break
+  sleep 1
+done
+assert_eq "ambiguous timed-out insert replayed exactly once on the replacement" "1" "$ha_amb"
+assert_eq "acked pre-wedge rows all present on the second replacement" \
+  "$ha_acked_n" "$("${HAQ[@]}" -c "select count(distinct id) from demo.e2e_ha where id in ($ha_in_list)")"
+stop_icegresd_at "$E2E_DIR/icegresd-ha.pid"
+
+# --- ha1z: the no-double-writer proof. A SIGSTOPped writer is a LIVE
+#     zombie: it still holds its socket and, once resumed, would keep
+#     acking if fencing were not real. Fail over to a second writer on the
+#     same quorum, resume the zombie, and its next INSERT must ERROR with
+#     the superseded fence — a fenced zombie cannot ack.
+log "(ha1z) zombie-writer fencing: SIGSTOP writer -> failover -> SIGCONT -> fenced"
+HAZ_PORT=5494
+HAW_PORT=5495
+HAZ_LOG="$E2E_DIR/serve-ha-z.log"; : >"$HAZ_LOG"
+HAW_LOG="$E2E_DIR/serve-ha-w.log"; : >"$HAW_LOG"
+env ICEGRES_TAIL_QUORUM_TIMEOUT_MS=2000 \
+  "$BIN" serve --host "$PG_HOST" --port "$HAZ_PORT" --write-buffer-ms "$HA_BUF_MS" \
+  --tail-quorum "$HA_QUORUM" >>"$HAZ_LOG" 2>&1 &
+echo $! >"$E2E_DIR/serve-ha-z.pid"
+HAZQ=(psql -h "$PG_HOST" -p "$HAZ_PORT" -U postgres -d icegres -tA)
+for _ in $(seq 1 60); do
+  "${HAZQ[@]}" -c 'select 1' >/dev/null 2>&1 && break
+  kill -0 "$(cat "$E2E_DIR/serve-ha-z.pid")" 2>/dev/null \
+    || { tail -n 20 "$HAZ_LOG" >&2; fail "zombie-leg writer Z exited during startup"; }
+  sleep 0.5
+done
+haz_before=$("${HAZQ[@]}" -c 'select count(*) from demo.e2e_ha')
+"${HAZQ[@]}" -c "insert into demo.e2e_ha (id, note) values (500001, 'pre-stop')" >/dev/null
+kill -STOP "$(cat "$E2E_DIR/serve-ha-z.pid")"
+# W = the replacement: its open() elects a higher term (fencing Z at the
+# acceptors) and replays Z's acked rows before the listener binds.
+env ICEGRES_TAIL_QUORUM_TIMEOUT_MS=2000 \
+  "$BIN" serve --host "$PG_HOST" --port "$HAW_PORT" --write-buffer-ms "$HA_BUF_MS" \
+  --tail-quorum "$HA_QUORUM" >>"$HAW_LOG" 2>&1 &
+echo $! >"$E2E_DIR/serve-ha-w.pid"
+HAWQ=(psql -h "$PG_HOST" -p "$HAW_PORT" -U postgres -d icegres -tA)
+for _ in $(seq 1 60); do
+  "${HAWQ[@]}" -c 'select 1' >/dev/null 2>&1 && break
+  kill -0 "$(cat "$E2E_DIR/serve-ha-w.pid")" 2>/dev/null \
+    || { tail -n 20 "$HAW_LOG" >&2; fail "replacement writer W exited during startup"; }
+  sleep 0.5
+done
+assert_eq "replacement W replayed the stopped writer's acked rows" \
+  "$((haz_before + 1))" "$("${HAWQ[@]}" -c 'select count(*) from demo.e2e_ha')"
+kill -CONT "$(cat "$E2E_DIR/serve-ha-z.pid")"
+set +e
+haz_fence_out=$(timeout 30 "${HAZQ[@]}" -c \
+  "insert into demo.e2e_ha (id, note) values (500002, 'zombie-must-fail')" 2>&1)
+haz_fence_rc=$?
+set -e
+[[ $haz_fence_rc -ne 0 ]] || fail "the resumed zombie writer ACKED an insert: $haz_fence_out"
+grep -q "superseded by a newer server" <<<"$haz_fence_out" \
+  || fail "unexpected zombie-fence error: $haz_fence_out"
+pass "resumed zombie writer is FENCED (INSERT fails with the superseded error; no double-writer)"
+"${HAWQ[@]}" -c "insert into demo.e2e_ha (id, note) values (500003, 'owner-writes')" >/dev/null \
+  || fail "the fencing owner W stopped accepting writes"
+assert_eq "zombie's refused row never appears; owner's row does" "0|1" \
+  "$("${HAWQ[@]}" -c 'select count(*) from demo.e2e_ha where id = 500002')|$("${HAWQ[@]}" -c 'select count(*) from demo.e2e_ha where id = 500003')"
+stop_pidfile_generic "$E2E_DIR/serve-ha-z.pid"
+stop_pidfile_generic "$E2E_DIR/serve-ha-w.pid"
+
+# --- ha2: icegresd leader lease over the DEDICATED lease trio. A and B run
+#     with --lease-quorum; exactly one leads. The standby refuses clients
+#     (retryable 57P03) and spawns NOTHING (no double-spawn). kill -9 the
+#     leader: the standby observes the lease frozen for >= TTL, takes it
+#     over (term-fenced against the old leader), and serves.
+LSA_PORT=5490; LSA_MAIN=5491
+LSB_PORT=5492; LSB_MAIN=5493
+LEASE_TTL_MS=3000
+LSA_LOG="$E2E_DIR/icegresd-lease-a.log"; : >"$LSA_LOG"
+LSB_LOG="$E2E_DIR/icegresd-lease-b.log"; : >"$LSB_LOG"
+LSA_STATUS="$E2E_DIR/icegresd-lease-a-status.json"; rm -f "$LSA_STATUS"
+LSB_STATUS="$E2E_DIR/icegresd-lease-b-status.json"; rm -f "$LSB_STATUS"
+log "(ha2) leader lease: icegresd A (:$LSA_PORT) + B (:$LSB_PORT), TTL ${LEASE_TTL_MS}ms"
+"$DBIN" serve --host "$PG_HOST" --port "$LSA_PORT" --main-port "$LSA_MAIN" \
+  --icegres-bin "$BIN" --idle-shutdown-secs 300 --pool-size 0 \
+  --lease-quorum "$HA_LEASE_QUORUM" --lease-ttl-ms "$LEASE_TTL_MS" \
+  --lease-holder-id e2e-a --status-file "$LSA_STATUS" >>"$LSA_LOG" 2>&1 &
+echo $! >"$E2E_DIR/icegresd-lease-a.pid"
+lsa_leader=0
+for _ in $(seq 1 60); do
+  if [[ "$(jq -r .leader "$LSA_STATUS" 2>/dev/null)" == "true" ]]; then lsa_leader=1; break; fi
+  sleep 0.25
+done
+[[ "$lsa_leader" == 1 ]] || { tail -n 20 "$LSA_LOG" >&2; fail "A never acquired the (virgin) lease"; }
+"$DBIN" serve --host "$PG_HOST" --port "$LSB_PORT" --main-port "$LSB_MAIN" \
+  --icegres-bin "$BIN" --idle-shutdown-secs 300 --pool-size 0 \
+  --lease-quorum "$HA_LEASE_QUORUM" --lease-ttl-ms "$LEASE_TTL_MS" \
+  --lease-holder-id e2e-b --status-file "$LSB_STATUS" >>"$LSB_LOG" 2>&1 &
+echo $! >"$E2E_DIR/icegresd-lease-b.pid"
+for _ in $(seq 1 40); do
+  if (exec 3<>"/dev/tcp/$PG_HOST/$LSB_PORT") 2>/dev/null; then exec 3>&- 3<&-; break; fi
+  sleep 0.25
+done
+assert_eq "leader A serves clients" "1" \
+  "$(psql -h "$PG_HOST" -p "$LSA_PORT" -U postgres -d icegres -tA -c 'select 1')"
+sleep 1
+assert_eq "B is standby (status leader=false)" "false" "$(jq -r .leader "$LSB_STATUS")"
+set +e
+lsb_refuse=$(psql -h "$PG_HOST" -p "$LSB_PORT" -U postgres -d icegres -tA -c 'select 1' 2>&1)
+lsb_rc=$?
+set -e
+[[ $lsb_rc -ne 0 ]] || fail "standby B served a client: $lsb_refuse"
+grep -q "does not hold the leader lease" <<<"$lsb_refuse" \
+  || fail "unexpected standby refusal: $lsb_refuse"
+assert_eq "standby B spawned NOTHING (no double-spawn)" "0" \
+  "$(jq -r '.computes | length' "$LSB_STATUS")"
+pass "one leader serves; the standby refuses clients (57P03) and spawns no computes"
+
+lsa_cpid=$(jq -r '.computes[] | select(.key=="main") | .pid' "$LSA_STATUS")
+lsa_kill_ms=$(($(date +%s%N) / 1000000))
+kill -9 "$(cat "$E2E_DIR/icegresd-lease-a.pid")"
+rm -f "$E2E_DIR/icegresd-lease-a.pid"
+lsb_leader=0
+for _ in $(seq 1 200); do
+  if [[ "$(jq -r .leader "$LSB_STATUS" 2>/dev/null)" == "true" ]]; then lsb_leader=1; break; fi
+  sleep 0.1
+done
+takeover_ms=$(( $(date +%s%N) / 1000000 - lsa_kill_ms ))
+[[ "$lsb_leader" == 1 ]] || { tail -n 20 "$LSB_LOG" >&2; fail "standby B never took the lease over"; }
+(( takeover_ms < 3 * LEASE_TTL_MS )) \
+  || fail "lease takeover took ${takeover_ms}ms (> 3x TTL ${LEASE_TTL_MS}ms)"
+pass "kill -9 leader: standby held the lease in ${takeover_ms}ms (TTL ${LEASE_TTL_MS}ms; expiry needs >= TTL of frozen observations by design)"
+assert_eq "clients reconnect against the new leader and keep working" "20" \
+  "$(psql -h "$PG_HOST" -p "$LSB_PORT" -U postgres -d icegres -tA -c 'select count(*) from demo.cities')"
+grep -q "taking over the icegresd lease" "$LSB_LOG" \
+  || fail "B did not log the lease takeover (previous holder record)"
+# kill -9 of A orphaned its compute (no clean shutdown); it is fenced by
+# design on the DATA tail in quorum deployments (proven in ha1z) — here it
+# is just reaped so the harness leaves nothing behind.
+if [[ "$lsa_cpid" =~ ^[0-9]+$ ]] && kill -0 "$lsa_cpid" 2>/dev/null \
+    && [[ "$(ps -o comm= -p "$lsa_cpid" 2>/dev/null)" == icegres ]]; then
+  kill -9 "$lsa_cpid" 2>/dev/null || true
+fi
+stop_icegresd_at "$E2E_DIR/icegresd-lease-b.pid"
+
+# --- ha3: autoscaling-lite. icegresd with a buffered quorum-tailed main
+#     compute (tail API on :5498) and --read-replicas-max 2 (threshold 1,
+#     idle 2s). Two held "<db>:ro" sessions scale the pool to two RUNNING
+#     replicas; replicas are spawned with the tail env STRIPPED (proof:
+#     the writer keeps acking buffered writes — a replica that opened the
+#     same quorum would have fenced it) and --replica-peer-tail wired
+#     (proof: the writer's acked-but-UNFLUSHED row is readable on a
+#     replica within the event bound, cadence 10 min). Idle reaps both
+#     (the existing scale-to-zero); the main slot is never woken by reads.
+SCL_PORT=5496; SCL_MAIN=5497; SCL_TAIL_API=5498
+SCL_LOG="$E2E_DIR/icegresd-scale.log"; : >"$SCL_LOG"
+SCL_STATUS="$E2E_DIR/icegresd-scale-status.json"; rm -f "$SCL_STATUS"
+log "(ha3) autoscaling-lite: '<db>:ro' pool on :$SCL_PORT (max 2, threshold 1, idle 2s)"
+env ICEGRES_WRITE_BUFFER_MS="$HA_BUF_MS" ICEGRES_TAIL_QUORUM="$HA_QUORUM" \
+    ICEGRES_TAIL_QUORUM_TIMEOUT_MS=2000 ICEGRES_TAIL_API_PORT="$SCL_TAIL_API" \
+  "$DBIN" serve --host "$PG_HOST" --port "$SCL_PORT" --main-port "$SCL_MAIN" \
+  --icegres-bin "$BIN" --idle-shutdown-secs 2 --pool-size 0 \
+  --read-replicas-max 2 --read-replica-sessions 1 \
+  --replica-peer-tail "127.0.0.1:$SCL_TAIL_API" --status-file "$SCL_STATUS" \
+  >>"$SCL_LOG" 2>&1 &
+echo $! >"$E2E_DIR/icegresd-scale.pid"
+for _ in $(seq 1 40); do
+  if (exec 3<>"/dev/tcp/$PG_HOST/$SCL_PORT") 2>/dev/null; then exec 3>&- 3<&-; break; fi
+  sleep 0.25
+done
+scl_status() { jq -r --arg k "$1" ".computes[] | select(.key == \$k) | $2" "$SCL_STATUS" 2>/dev/null; }
+SCLQ=(psql -h "$PG_HOST" -p "$SCL_PORT" -U postgres -d icegres -tA)
+SCLRO=(psql -h "$PG_HOST" -p "$SCL_PORT" -U postgres -d "icegres:ro" -tA)
+# Writer up + one acked-but-unflushed row (10-min cadence: never commits).
+"${SCLQ[@]}" -c "insert into demo.e2e_ha (id, note) values (600001, 'peer-visible')" >/dev/null \
+  || fail "buffered INSERT through the autoscale icegresd failed"
+# Hold two :ro sessions (threshold 1 => the 2nd session wakes replica:1).
+( sleep 12 | psql -h "$PG_HOST" -p "$SCL_PORT" -U postgres -d "icegres:ro" >/dev/null 2>&1 ) &
+SCL_S1=$!
+scl_r0=0
+for _ in $(seq 1 60); do
+  if [[ "$(scl_status replica:0 .state)" == "running" ]]; then scl_r0=1; break; fi
+  sleep 0.25
+done
+[[ "$scl_r0" == 1 ]] || { tail -n 20 "$SCL_LOG" >&2; fail "replica:0 never spawned for the first :ro session"; }
+( sleep 12 | psql -h "$PG_HOST" -p "$SCL_PORT" -U postgres -d "icegres:ro" >/dev/null 2>&1 ) &
+SCL_S2=$!
+scl_r1=0
+for _ in $(seq 1 60); do
+  if [[ "$(scl_status replica:1 .state)" == "running" ]]; then scl_r1=1; break; fi
+  sleep 0.25
+done
+[[ "$scl_r1" == 1 ]] || { tail -n 20 "$SCL_LOG" >&2; fail "replica:1 never spawned at the session threshold"; }
+pass "two held :ro sessions scaled the read pool to two RUNNING replicas (threshold 1)"
+# Peer-tail wiring: the writer's UNFLUSHED buffered row is visible on a
+# replica within the event bound (a replica without --peer-tail would wait
+# for the 10-minute commit cadence).
+scl_peer=0
+for _ in $(seq 1 120); do
+  if [[ "$("${SCLRO[@]}" -c 'select count(*) from demo.e2e_ha where id = 600001' 2>/dev/null)" == "1" ]]; then
+    scl_peer=1; break
+  fi
+  sleep 0.25
+done
+[[ "$scl_peer" == 1 ]] || { tail -n 20 "$SCL_LOG" >&2; fail "the writer's unflushed row never became visible on a read replica (peer-tail wiring)"; }
+pass "read replica serves the writer's acked-but-UNFLUSHED row (peer-tail wired; event-bound, not commit-cadence)"
+# Env-strip proof: the WRITER still acks buffered writes — a replica that
+# had inherited ICEGRES_TAIL_QUORUM would have run an election and FENCED it.
+"${SCLQ[@]}" -c "insert into demo.e2e_ha (id, note) values (600002, 'writer-not-fenced')" >/dev/null \
+  || fail "the writer was FENCED — a replica must never inherit the tail env"
+pass "writer keeps acking with two replicas up (replicas never opened the tail: env stripped)"
+wait "$SCL_S1" "$SCL_S2" 2>/dev/null || true
+# Reap: with zero sessions, the replicas idle-exit (scale-to-zero).
+scl_reaped=0
+for _ in $(seq 1 80); do
+  if [[ "$(scl_status replica:0 .state)" == "stopped" && "$(scl_status replica:1 .state)" == "stopped" ]]; then
+    scl_reaped=1; break
+  fi
+  sleep 0.25
+done
+[[ "$scl_reaped" == 1 ]] || fail "idle replicas were not reaped (r0=$(scl_status replica:0 .state), r1=$(scl_status replica:1 .state))"
+pass "idle read replicas reaped (existing idle scale-to-zero; next :ro connection re-wakes)"
+stop_icegresd_at "$E2E_DIR/icegresd-scale.pid"
+
+# HA section cleanup: keepers down, scratch table dropped.
+for kn in d1 d2 d3 l1 l2 l3; do stop_keeper_at "$E2E_DIR/ha-keeper-$kn.pid"; done
+rm -rf "$E2E_DIR"/ha-keeper-*
+curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_ha?purgeRequested=true" >/dev/null 2>&1 || true
+pass "HA section cleanup (keepers stopped, scratch dropped)"
+
+# ---------------------------------------------------------------------------
+log "all assertions passed ($PASS_COUNT)"
