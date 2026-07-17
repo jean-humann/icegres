@@ -139,6 +139,27 @@ raw statement text, gated to that exact syntax — to the existing
    REST (capability probes exist; auth flows differ). Every catalog
    icegres serves is a market Lakebase's write-closed tier cannot enter.
 
+**Status (2026-07): catalog-breadth half SHIPPED** (scope:
+`docs/p6-scale-catalog-scope.md`). The one real coupling was auth: the
+catalog client is a stock iceberg-rust `RestCatalogBuilder` using only
+REST-spec-standard endpoints, so breadth = threading the crate's existing
+auth props through `CatalogOpts`. Added `--catalog-token` (pre-minted
+bearer), `--catalog-credential` (OAuth2 client-credentials),
+`--catalog-oauth2-uri`, `--catalog-scope` (env `ICEGRES_CATALOG_*`) —
+inserted into the catalog props map ONLY when set, so the default open
+Lakekeeper path is byte-identical (invariant I3); zero new dependencies
+(OAuth2 is already vendored in iceberg-rust 0.9.1); secrets carry a
+redacting `Debug`. Proven end to end against a spec-conformant OAuth2
+gateway (`bench/clients/catalog-gateway`, Go stdlib) that fronts the real
+Lakekeeper and genuinely 401s unauthenticated calls: full CRUD +
+time-travel on the `token` path, OAuth2 client-credentials reads on the
+`credential` path (e2e section `(cat)`). **Glue/SigV4 is blocked at the
+pin** (no SigV4 in `iceberg-catalog-rest 0.9.1`; re-check trigger on any
+bump). **Polaris is spec-compatible by construction but un-buildable on
+this box** (Gradle 9.6.1 download proxy-denied), so the second-catalog
+proof is a labeled auth harness, not a Polaris run. Full matrix + honest
+per-catalog labels: `docs/catalog-support.md`.
+
 ### P7 — `icegres verify`: the trust moat, productized
 Package the durability suites as a first-class command run against the
 OPERATOR'S deployment: kill -9 recovery on their tail backend, fencing,

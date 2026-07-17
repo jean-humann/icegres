@@ -258,7 +258,33 @@ impl OverwriteEngine {
         enforce_pk: bool,
         branch: Option<String>,
     ) -> Result<Self> {
-        let http = reqwest::Client::new();
+        // The copy-on-write DML commit path issues its OWN REST calls (config
+        // discovery, per-table commit, transactions/commit) through this
+        // client, separately from the read catalog. When the operator supplies
+        // a pre-minted bearer (`--catalog-token`) it must authenticate here
+        // too, or every write would 401 against an auth-guarded catalog. A
+        // static bearer has the same non-refreshing semantics as the read
+        // client's `token` prop, so they stay consistent. The OAuth2
+        // client-credentials (`--catalog-credential`) grant is NOT duplicated
+        // here (house rule: no hand-rolled auth; iceberg-rust 0.9.1 does not
+        // expose its token provider) — see docs/catalog-support.md for the
+        // write-plane-under-pure-client-credentials note. Absent a token this
+        // is `reqwest::Client::new()` byte-for-byte (invariant I3).
+        let http = match &opts.catalog_token {
+            Some(token) => {
+                use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+                let mut headers = HeaderMap::new();
+                let mut value = HeaderValue::from_str(&format!("Bearer {token}"))
+                    .context("--catalog-token is not a valid HTTP header value")?;
+                value.set_sensitive(true);
+                headers.insert(AUTHORIZATION, value);
+                reqwest::Client::builder()
+                    .default_headers(headers)
+                    .build()
+                    .context("failed to build the authenticated commit HTTP client")?
+            }
+            None => reqwest::Client::new(),
+        };
         let config_url = format!(
             "{}/v1/config?warehouse={}",
             opts.catalog_uri.trim_end_matches('/'),

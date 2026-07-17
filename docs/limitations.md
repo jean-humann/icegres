@@ -61,6 +61,39 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
   UPDATE/DELETE) when you need tail-latency acks; use transactions when
   you need multi-statement atomicity with honest conflict reporting.
 
+## Catalog auth / breadth (P6)
+
+Full account: [`docs/catalog-support.md`](catalog-support.md). Summary of the
+caveats:
+
+- **Serve any Iceberg REST catalog, with two auth flows.** icegres uses only
+  REST-spec-standard endpoints (no Lakekeeper-proprietary calls). Auth is now
+  configurable: `--catalog-token` (pre-minted bearer), `--catalog-credential`
+  (OAuth2 client-credentials) `+ --catalog-oauth2-uri` `+ --catalog-scope`.
+  With **no** auth flag the catalog props are byte-identical to before, so the
+  default open Lakekeeper path is unchanged (invariant I3). Proven end to end
+  against an OAuth2 gateway that genuinely rejects unauthenticated calls
+  (e2e section `(cat)`).
+- **The copy-on-write DML commit client authenticates via `--catalog-token`
+  only.** The write plane (`overwrite.rs`) sends the static bearer on config
+  discovery and every commit, so `--catalog-token` authenticates reads AND
+  writes. The OAuth2 **client-credentials** grant is not duplicated into the
+  commit client (no hand-rolled auth; iceberg-rust 0.9.1 does not expose its
+  token provider). So under a *pure* `--catalog-credential` deployment the
+  read/metadata/DDL/time-travel plane is authenticated but the data-commit
+  plane is not — serve read-mostly on the credential flow, or pass a
+  long-lived `--catalog-token` alongside for writes. Re-check trigger: wire the
+  provider into `overwrite.rs` once a pin exposes it.
+- **AWS Glue REST is blocked at the pin.** Glue's REST endpoint is AWS
+  SigV4-signed; `iceberg-catalog-rest 0.9.1` has no SigV4 support (verified by
+  grep) and we do not hand-roll it. Re-check on any pin bump past 0.9.1.
+- **Apache Polaris is not stood up on this box.** It is spec-compatible by
+  construction (same REST spec + the OAuth2 client-credentials flow now
+  supported) but un-buildable here: its wrapper pins Gradle 9.6.1, whose
+  download the agent proxy denies. The second-catalog proof is therefore a
+  spec-conformant OAuth2 **auth harness** fronting the real Lakekeeper, labeled
+  `by-construction` — not a claim of "proven against Polaris".
+
 ## Ingestion and cursors
 
 - **`COPY … FROM STDIN` is not supported on pgwire.** Bulk ingest is served by

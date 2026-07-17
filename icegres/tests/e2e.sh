@@ -3356,6 +3356,172 @@ pass "compact --execute refuses laundered old-schema files (per-file Parquet fie
 curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_evo2?purgeRequested=true" >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
+# (cat) P6/Half B — authenticated NON-Lakekeeper-shaped catalog access through
+#       an OAuth2 gateway. A minimal spec-conformant OAuth2 gateway
+#       (bench/clients/catalog-gateway, Go stdlib: net/http +
+#       httputil.ReverseProxy) fronts THIS Lakekeeper on :8182 and REQUIRES a
+#       bearer on every catalog data/metadata call (the config discovery
+#       handshake and the token endpoint stay open). It is a by-construction
+#       auth harness, NOT a second Iceberg engine — Apache Polaris cannot be
+#       built on this box (its Gradle 9.6.1 wrapper download is proxy-denied;
+#       see docs/catalog-support.md). What it faithfully implements is the
+#       exact OAuth2 client-credentials wire flow the pinned iceberg-rust 0.9.1
+#       REST client speaks, plus real bearer enforcement. It proves BOTH B1
+#       auth props end to end:
+#         - `token` (pre-minted bearer): full CRUD through the front door
+#           (create namespace via authenticated curl, CREATE TABLE, INSERT,
+#           SELECT, AS OF time-travel) — reads AND copy-on-write writes
+#           authenticate (the DML commit client carries the same bearer).
+#         - `credential` (OAuth2 client-credentials): the REST client mints its
+#           OWN bearer from the token endpoint and reads / time-travels.
+#       Unauthenticated, bad-bearer and bad-client-secret calls are rejected.
+#       Ports 8182 (gateway), 5500 (token-path serve), 5501 (credential-path).
+# ---------------------------------------------------------------------------
+CATGW_PORT=8182
+CATGW_TOK_PORT=5500
+CATGW_CRED_PORT=5501
+CATGW_NS=catgw
+CATGW_PREMINT="premint-bearer-$$-$(date +%s)"
+CATGW_CLIENT="icegres:supersecret"
+CATGW_BIN="$E2E_DIR/catalog-gateway"
+CATGW_LOG="$E2E_DIR/catalog-gateway.log"
+CATGW_TOK_LOG="$E2E_DIR/serve-catgw-tok.log"
+CATGW_CRED_LOG="$E2E_DIR/serve-catgw-cred.log"
+CATGW_URI="http://127.0.0.1:$CATGW_PORT/catalog"
+CATGW_TOKEP="http://127.0.0.1:$CATGW_PORT/v1/oauth/tokens"
+log "(cat) B2 authenticated non-Lakekeeper catalog via OAuth2 gateway on :$CATGW_PORT"
+if ! command -v go >/dev/null 2>&1; then
+  log "    SKIPPED: go toolchain not available (needed to build the OAuth2 gateway)"
+else
+  # Build the gateway (stdlib only — no network, fast).
+  (cd "$REPO_DIR/bench/clients/catalog-gateway" && go build -o "$CATGW_BIN" .) \
+    || fail "catalog-gateway go build failed"
+  pass "catalog-gateway built (Go stdlib OAuth2 front door)"
+
+  # Crashed-run cleanup: scratch namespace/table, then start the gateway.
+  curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/$CATGW_NS/tables/t?purgeRequested=true" >/dev/null 2>&1 || true
+  curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/$CATGW_NS" >/dev/null 2>&1 || true
+  : >"$CATGW_LOG"
+  "$CATGW_BIN" -listen "127.0.0.1:$CATGW_PORT" -backend "http://127.0.0.1:8181" \
+    -pre-mint "$CATGW_PREMINT" >>"$CATGW_LOG" 2>&1 &
+  CATGW_PID=$!
+  echo "$CATGW_PID" >"$E2E_DIR/catalog-gateway.pid"
+  # Cleanup helper: stop both serves + the gateway + drop the scratch namespace.
+  catgw_cleanup() {
+    for pf in "$E2E_DIR/serve-catgw-tok.pid" "$E2E_DIR/serve-catgw-cred.pid" "$E2E_DIR/catalog-gateway.pid"; do
+      [[ -f "$pf" ]] || continue
+      local cp; cp=$(cat "$pf")
+      kill "$cp" 2>/dev/null || true
+      for _ in $(seq 1 20); do kill -0 "$cp" 2>/dev/null || break; sleep 0.2; done
+      kill -9 "$cp" 2>/dev/null || true
+      rm -f "$pf"
+    done
+    curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/$CATGW_NS/tables/t?purgeRequested=true" >/dev/null 2>&1 || true
+    curl -sf -X DELETE "$CATALOG_URI/v1/$prefix/namespaces/$CATGW_NS" >/dev/null 2>&1 || true
+  }
+  # Wait for the gateway's token endpoint to answer.
+  for _ in $(seq 1 40); do
+    curl -sf -o /dev/null -X POST "$CATGW_TOKEP" \
+      -d grant_type=client_credentials -d client_id=icegres -d client_secret=supersecret \
+      && break
+    kill -0 "$CATGW_PID" 2>/dev/null || { tail -n 20 "$CATGW_LOG" >&2; fail "catalog-gateway exited during startup"; }
+    sleep 0.25
+  done
+
+  # --- auth-door assertions (curl straight at the gateway) ---
+  catgw_ns_path="v1/$prefix/namespaces"
+  assert_eq "unauthenticated catalog call is rejected (401)" "401" \
+    "$(curl -s -o /dev/null -w '%{http_code}' "$CATGW_URI/$catgw_ns_path")"
+  assert_eq "bad bearer is rejected (401)" "401" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer not-a-real-token' "$CATGW_URI/$catgw_ns_path")"
+  assert_eq "config discovery handshake stays open (200)" "200" \
+    "$(curl -s -o /dev/null -w '%{http_code}' "$CATGW_URI/v1/config?warehouse=$WAREHOUSE")"
+  assert_eq "pre-minted bearer is accepted (200)" "200" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $CATGW_PREMINT" "$CATGW_URI/$catgw_ns_path")"
+  assert_eq "client-credentials grant with a bad secret is rejected (401)" "401" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$CATGW_TOKEP" \
+        -d grant_type=client_credentials -d client_id=icegres -d client_secret=WRONG)"
+  # A real client-credentials mint returns a usable bearer.
+  catgw_minted=$(curl -sf -X POST "$CATGW_TOKEP" \
+    -d grant_type=client_credentials -d client_id=icegres -d client_secret=supersecret -d scope=catalog \
+    | jq -r '.access_token // empty')
+  [[ -n "$catgw_minted" ]] || { catgw_cleanup; fail "client-credentials grant returned no access_token"; }
+  assert_eq "client-credentials-minted bearer authenticates a catalog call (200)" "200" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $catgw_minted" "$CATGW_URI/$catgw_ns_path")"
+
+  # Create the scratch namespace through the gateway's AUTHENTICATED door.
+  curl -sf -X POST -H "Authorization: Bearer $CATGW_PREMINT" -H 'Content-Type: application/json' \
+    "$CATGW_URI/$catgw_ns_path" -d "{\"namespace\":[\"$CATGW_NS\"],\"properties\":{}}" >/dev/null \
+    || { catgw_cleanup; fail "could not create namespace $CATGW_NS through the authenticated gateway"; }
+  pass "namespace created through the authenticated gateway front door"
+
+  # --- token-path serve: full CRUD through the gateway (`token` prop) ---
+  : >"$CATGW_TOK_LOG"
+  "$BIN" serve --host 127.0.0.1 --port "$CATGW_TOK_PORT" \
+    --catalog-uri "$CATGW_URI" --catalog-token "$CATGW_PREMINT" >>"$CATGW_TOK_LOG" 2>&1 &
+  echo $! >"$E2E_DIR/serve-catgw-tok.pid"
+  for _ in $(seq 1 60); do
+    psql -h 127.0.0.1 -p "$CATGW_TOK_PORT" -U postgres -d icegres -tAc 'select 1' >/dev/null 2>&1 && break
+    kill -0 "$(cat "$E2E_DIR/serve-catgw-tok.pid")" 2>/dev/null \
+      || { tail -n 20 "$CATGW_TOK_LOG" >&2; catgw_cleanup; fail "token-path serve exited during startup"; }
+    sleep 0.5
+  done
+  CATGW_TQ=(psql -h 127.0.0.1 -p "$CATGW_TOK_PORT" -U postgres -d icegres -tA -v ON_ERROR_STOP=1)
+  "${CATGW_TQ[@]}" -c "create table $CATGW_NS.t (id bigint, note varchar)" >/dev/null \
+    || { catgw_cleanup; fail "CREATE TABLE through the token-authenticated catalog failed"; }
+  "${CATGW_TQ[@]}" -c "insert into $CATGW_NS.t values (1,'a'),(2,'b'),(3,'c')" >/dev/null \
+    || { catgw_cleanup; fail "INSERT through the token-authenticated catalog failed (write client bearer)"; }
+  assert_eq "token-path: rows land through the authenticated write client" "3" \
+    "$("${CATGW_TQ[@]}" -c "select count(*) from $CATGW_NS.t")"
+  # Snapshot after the first insert (3 rows) for deterministic time travel.
+  catgw_snap1=$(curl -sf "$CATALOG_URI/v1/$prefix/namespaces/$CATGW_NS/tables/t" \
+    | jq -r '.metadata."current-snapshot-id"')
+  [[ -n "$catgw_snap1" && "$catgw_snap1" != null ]] || { catgw_cleanup; fail "could not read the 3-row snapshot id"; }
+  "${CATGW_TQ[@]}" -c "insert into $CATGW_NS.t values (4,'d'),(5,'e')" >/dev/null \
+    || { catgw_cleanup; fail "second INSERT through the token-authenticated catalog failed"; }
+  assert_eq "token-path: SELECT sees all committed rows" "5" \
+    "$("${CATGW_TQ[@]}" -c "select count(*) from $CATGW_NS.t")"
+  assert_eq "token-path: AS OF <snapshot> time-travels through the authenticated read client" "3" \
+    "$("${CATGW_TQ[@]}" -c "select count(*) from $CATGW_NS.t AS OF $catgw_snap1")"
+  pass "token prop: create/insert/select/time-travel all through the OAuth2 front door"
+
+  # --- credential-path serve: OAuth2 client-credentials (`credential` prop) ---
+  catgw_mints_before=$(grep -c 'token request OK' "$CATGW_LOG" || true)
+  : >"$CATGW_CRED_LOG"
+  "$BIN" serve --host 127.0.0.1 --port "$CATGW_CRED_PORT" \
+    --catalog-uri "$CATGW_URI" \
+    --catalog-credential "$CATGW_CLIENT" \
+    --catalog-oauth2-uri "$CATGW_TOKEP" \
+    --catalog-scope catalog >>"$CATGW_CRED_LOG" 2>&1 &
+  echo $! >"$E2E_DIR/serve-catgw-cred.pid"
+  for _ in $(seq 1 60); do
+    psql -h 127.0.0.1 -p "$CATGW_CRED_PORT" -U postgres -d icegres -tAc 'select 1' >/dev/null 2>&1 && break
+    kill -0 "$(cat "$E2E_DIR/serve-catgw-cred.pid")" 2>/dev/null \
+      || { tail -n 20 "$CATGW_CRED_LOG" >&2; catgw_cleanup; fail "credential-path serve exited during startup"; }
+    sleep 0.5
+  done
+  CATGW_CQ=(psql -h 127.0.0.1 -p "$CATGW_CRED_PORT" -U postgres -d icegres -tA -v ON_ERROR_STOP=1)
+  assert_eq "credential-path: OAuth2 client-credentials read sees the committed rows" "5" \
+    "$("${CATGW_CQ[@]}" -c "select count(*) from $CATGW_NS.t")"
+  assert_eq "credential-path: AS OF <snapshot> time-travel over the OAuth2-minted bearer" "3" \
+    "$("${CATGW_CQ[@]}" -c "select count(*) from $CATGW_NS.t AS OF $catgw_snap1")"
+  catgw_mints_after=$(grep -c 'token request OK' "$CATGW_LOG" || true)
+  [[ "$catgw_mints_after" -gt "$catgw_mints_before" ]] \
+    || { catgw_cleanup; fail "the credential-path client never ran the client-credentials grant against the token endpoint"; }
+  pass "credential prop: iceberg-rust minted its own bearer via the token endpoint and served reads/time-travel"
+
+  # --- secrets must never appear in the server logs (B1 redaction) ---
+  if grep -q "$CATGW_PREMINT" "$CATGW_TOK_LOG" || grep -q supersecret "$CATGW_TOK_LOG" "$CATGW_CRED_LOG"; then
+    catgw_cleanup
+    fail "a catalog secret (bearer token / client secret) leaked into a server log"
+  fi
+  pass "no catalog secret leaked into the server logs (bearer/client-secret redacted)"
+
+  catgw_cleanup
+  pass "(cat) cleanup: gateway + serves stopped, scratch namespace dropped"
+fi
+
+# ---------------------------------------------------------------------------
 # (ha) P3 icegresd-ha, process mode: automated tail-writer failover
 #      (--health-check-ms), zombie-writer fencing (SIGSTOP live-zombie),
 #      icegresd leader lease over icekeeperd (--lease-quorum), and

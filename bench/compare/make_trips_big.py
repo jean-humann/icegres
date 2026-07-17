@@ -95,10 +95,14 @@ def main() -> int:
     ap.add_argument("--rows", type=int, default=DEFAULT_ROWS)
     ap.add_argument("--batches", type=int, default=DEFAULT_BATCHES)
     ap.add_argument("--force", action="store_true", help="drop and rebuild")
+    ap.add_argument("--table", default="trips_big",
+                    help="target table name under the demo namespace "
+                         "(default trips_big; the scale bench uses a "
+                         "dedicated, always-purged table)")
     args = ap.parse_args()
 
     cat = catalog()
-    ident = ("demo", "trips_big")
+    ident = ("demo", args.table)
 
     if cat.table_exists(ident):
         tbl = cat.load_table(ident)
@@ -106,9 +110,9 @@ def main() -> int:
             f.file.record_count for f in tbl.scan().plan_files()
         )
         if have == args.rows and not args.force:
-            print(f"demo.trips_big already has {have} rows — nothing to do")
+            print(f"demo.{args.table} already has {have} rows — nothing to do")
             return 0
-        print(f"dropping existing demo.trips_big (rows={have})")
+        print(f"dropping existing demo.{args.table} (rows={have})")
         cat.drop_table(ident, purge_requested=True)
 
     trips_schema = cat.load_table(("demo", "trips")).schema()

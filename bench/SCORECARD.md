@@ -415,6 +415,34 @@ single-node data. Same-box, same-data conclusion: icegres for
 interactive/OLTP-ish serving on one box; Trino/Spark remain the right
 tools for large-scale distributed analytics.
 
+## P6 scale curve (`bench/scale.sh`, run 20260716T141746Z)
+
+Single node, `demo.trips` schema (~14.2 Parquet bytes/row, zstd),
+generated per size and purged after. icegres restarted per size (cold,
+no `--freshness-ms`, no plan cache); 10–50 data files per table. p50 ms.
+Raw: `bench/results/scale-{5M,50M,300M,500M}-20260716T141746Z.json`.
+
+| rows | point_lookup | selective_join | filtered_count | full_agg |
+|---|---|---|---|---|
+| 5M   | 48.8 | 40.0 | 174.7 | 206.7 |
+| 50M  | 63.3 | 42.7 | 1592.8 | 1841.4 |
+| 300M | 54.5 | 54.6 | 9900.2 | 12538.3 |
+| 500M | 59.5 | 55.8 | 16038.7 | 19971.1 |
+
+**Reading it:** point lookup and selective join are **flat** across the
+100× data jump (planning-bound, not size-bound) — the interactive-serving
+advantage does not degrade with table size. `filtered_count` and
+`full_agg` scale **linearly** (full-scan classes) and leave the
+interactive band by 50M. 300M is the committed max (base 4.27 GB +
+second-copy margin within the ~14 GB post-cleanup allowance); 500M is a
+query-only stretch (no compaction headroom at that size — documented).
+The ~50 ms point-lookup floor here is the cold/many-file/no-freshness
+path; the hot path (`--freshness-ms` + `maintain compact`) is where the
+single-digit-ms headline numbers come from. This curve extends only the
+icegres side; the cross-engine Trino/Spark comparison stays at its
+published `bench/COMPARISON.md` scale (a live 500M Trino/Spark run was
+not re-run on this box — stated honestly).
+
 ## Trade-off ledger — what every millisecond cost in memory
 
 USER CONSTRAINT for round 5, applied retroactively to the whole session:
@@ -2493,3 +2521,40 @@ ran cold-first); reversing the order flips the sign, confirming warmup drift on
 this shared box, not a code regression. P5+P7 adds only new subcommands + an
 allocation-free per-query AS OF byte-scan gate on the query path; the drift-
 controlled read metrics are unchanged.
+
+### Bench 20260716T225110Z
+
+Release binary `icegres/target/release/icegres` · raw: `bench/results/bench-20260716T225110Z.json` ·
+warmups discarded: 3, iterations: 20, cold-start runs: 5, demo.trips data files: 1
+
+| metric | p50 | p95 | n / detail |
+|--------|-----|-----|------------|
+| connect_ms | 0.29 | 0.42 | n=20 |
+| point_lookup_ms | 15.41 | 26.77 | n=20 |
+| filtered_scan_ms | 14.47 | 30.71 | n=20 |
+| aggregate_ms | 7.92 | 9.86 | n=20 |
+| join_ms | 11.54 | 13.81 | n=20 |
+| insert_single_ms | 80.04 | 122.16 | n=20 |
+| insert_batch100_ms | 102.01 | 110.38 | n=20 |
+| freshness_ms | 52.39 | 59.9 | n=20 |
+| qps_8conn | 421.8 | — | median of 418.9, 421.8, 431.0 (8 conns, 10s windows) |
+| cold_start_ms | 69.34 | 87.48 | n=5 |
+| binary_size_mb | 131.25 | — | |
+| rss_idle_mb | 83.73 | — | |
+| rss_peak_mb | 98.2 | — | qps-window peak 96.79 MB, 434 samples @ 100ms |
+| rss_after_load_mb | 98.13 | — | |
+| insert_single_buffered_ms | 1.15 | 1.27 | n=20 |
+| freshness_buffered_ms | 7.2 | 53.89 | n=20 |
+| durable_ack_dir_ms | 3.44 | 5.15 | n=20 |
+| durable_ack_pg_ms | 5.98 | 8.08 | n=20 |
+| durable_ack_quorum_ms | 4.07 | 6.42 | n=20 |
+| cold_start_via_proxy_ms | 69 | 69 | n=5 |
+| failover_ms | 95 | 97 | n=5 |
+| connect_via_proxy_ms | 0.45 | 0.71 | n=20 |
+| qps_via_proxy_8conn | 408.4 | — | median of 408.4, 399.9, 432.2 (8 conns, 10s windows) |
+| adbc_query_point_ms | 9.0 | 12.1 | n=20 |
+| adbc_query_bigfilter_ms | 91.4 | 145.7 | n=10 |
+| adbc_bulk_ingest_100k_rows_s | 593817 | — | |
+| flight_q1_ms | 8.87 | 10.02 | n=15 |
+| flight_q1_fresh_ms | 5.31 | 7.68 | n=15 |
+| compact_scan_restore_ms | 37 | — | degraded p50 44 ms @ 24 files -> restored p50 37 ms @ 1 file(s); compact wall 147 ms |

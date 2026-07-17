@@ -2,7 +2,9 @@
 
 **A Postgres-wire and Arrow Flight SQL endpoint over an Apache Iceberg lakehouse.**
 
-`icegres` connects to an Iceberg REST catalog (Lakekeeper), mounts every
+`icegres` connects to any Iceberg REST catalog (Lakekeeper by default; static
+bearer or OAuth2 client-credentials auth for others — see
+[`docs/catalog-support.md`](docs/catalog-support.md)), mounts every
 namespace/table into a DataFusion session, and serves that session over **two
 first-class wire protocols** — the Postgres wire protocol and Arrow Flight SQL
 (ADBC). Any Postgres client (`psql`, JDBC/ODBC drivers, ORMs, BI tools) or ADBC
@@ -30,6 +32,7 @@ starts in ~0.3 s and serves interactive queries in single-digit milliseconds.
 | **Postgres wire** | Simple + extended protocol, `pg_catalog`/`information_schema` emulation, SCRAM-SHA-256 auth, TLS. Verified against psql, psycopg2, pg8000, SQLAlchemy, pgjdbc, psqlODBC. |
 | **Arrow Flight SQL / ADBC** | Second first-class protocol: queries stream as Arrow IPC, catalog metadata (`get_objects`), prepared statements, DML, and bulk ingest (one Iceberg commit per stream). In-process TLS (`grpc+tls://`). |
 | **OLTP over the lake** | `INSERT`/`UPDATE`/`DELETE` as copy-on-write Iceberg snapshots; explicit `BEGIN/COMMIT/ROLLBACK` with snapshot isolation, first-committer-wins concurrency (`40001`), and atomic multi-table COMMITs via the catalog's `transactions/commit` endpoint (Lakekeeper); opt-in primary-key enforcement. |
+| **Any Iceberg REST catalog** | REST-spec-standard surface only (no Lakekeeper-proprietary calls). Auth is configurable for non-open catalogs: pre-minted bearer (`--catalog-token`) or OAuth2 client-credentials (`--catalog-credential` + `--catalog-oauth2-uri` + `--catalog-scope`) — proven end to end against an OAuth2 gateway that rejects unauthenticated calls. Glue/SigV4 is blocked at the pinned iceberg-rust 0.9.1 (no SigV4). Full matrix + per-catalog status (proven-live vs by-construction): [`docs/catalog-support.md`](docs/catalog-support.md). |
 | **Time travel & branches** | `table@snapshot_id` reads plus `AS OF TIMESTAMP '...'` / `AS OF <snapshot_id>` SQL sugar (DuckDB/Databricks-style, rewritten to the same path; dialect note in [`docs/limitations.md`](docs/limitations.md)); Neon-style zero-copy branches (`icegres branch …`, `serve --branch`) — a branch is one metadata commit, no data copied — including whole-lakehouse branches (`branch create-all`/`drop-all`: every table, one atomic transaction, each table pinned to its captured main head — a consistent-or-nothing cross-table cut). |
 | **Branch diff & merge** | The preview-environment loop: `branch diff <a> <b> [--json]` compares refs per table over metadata only (fork point via snapshot lineage, advanced/diverged/created/dropped, summary-reported row deltas, schema changes); `branch merge <from> <to> [--execute]` fast-forwards every table whose target has not moved since the fork — the whole set in ONE atomic multi-table commit with the observed heads pinned (a racing foreign commit aborts it, nothing applied), dry-run by default; diverged tables get a per-table conflict report and refuse the run (no three-way row merge — rebase by re-branching). |
 | **`icegres verify`** | Re-prove the durability claims against YOUR deployment, not our CI box: spawns scratch servers on the configured catalog/store/tail, runs kill -9 recovery, exactly-once replay, stale-writer fencing, the freshness bound, and quorum failover from a dedicated scratch namespace (created, tested, dropped), and reports pass/fail per claim with the doc section that makes it (`--json` for tooling). Unconfigured backends SKIP loudly; exit 0 iff everything selected passes. Runbook: [`docs/deployment.md`](docs/deployment.md). |
@@ -52,9 +55,23 @@ the clear **interactive-serving** winner — small-query p50s of 7–10 ms vs
 Trino wins the largest full-table aggregations, and that gap widens with data
 volume or a real cluster.
 
-**Honest fit:** sub-second point / filtered / join queries, Postgres-protocol
-and ADBC compatibility, and scale-to-zero economics on lakehouse data. Leave
-100 GB+ distributed scans to Trino/Spark.
+**Where the advantage holds as data grows (measured, `bench/scale.sh`, single
+node, 5M → 500M rows — a 100× jump):** point lookups and selective joins stay
+**flat** — point ~49→59 ms, join ~40→56 ms — because their cost is bound by
+query planning, not table size. Full-table scans and aggregations scale
+**linearly** with data — a `GROUP BY` over the whole table goes ~0.2 s → ~20 s
+across the same range — and cross out of the interactive band by ~50M rows.
+That is the honest crossover: the lake-first architecture keeps
+**point/filtered/join serving cheap at any size**, and hands **full-scan
+analytics** to Trino/Spark. (The scale curve runs cold over many small files
+without the freshness/plan-cache hot path; `--freshness-ms` + `maintain
+compact` are what pull the point-lookup floor down to the single-digit
+headline numbers.)
+
+**Honest fit:** point / filtered / join serving that stays interactive as the
+table grows, Postgres-protocol and ADBC compatibility, and scale-to-zero
+economics on lakehouse data. Leave full-table scans and 100 GB+ distributed
+aggregations to Trino/Spark.
 
 ## The write-latency ladder (measured)
 

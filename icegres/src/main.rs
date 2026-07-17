@@ -66,7 +66,12 @@ use crate::overwrite::OverwriteEngine;
 use crate::txn::{TxnHook, TxnRegistry};
 
 /// Connection options for the Iceberg REST catalog and its object store.
-#[derive(Args, Clone, Debug)]
+///
+/// `Debug` is hand-written (below) so the two secret-bearing fields
+/// (`catalog_token`, `catalog_credential`) are redacted: a stray
+/// `info!(?opts)` / `{:?}` must never spill a bearer token or an OAuth2
+/// client secret into the logs.
+#[derive(Args, Clone)]
 pub struct CatalogOpts {
     /// Iceberg REST catalog base URI (Lakekeeper serves it under /catalog).
     #[arg(
@@ -99,6 +104,66 @@ pub struct CatalogOpts {
     /// S3 region.
     #[arg(long, env = "ICEGRES_S3_REGION", default_value = "us-east-1")]
     pub s3_region: String,
+
+    // --- Iceberg REST catalog authentication (breadth: serve any REST
+    // catalog, not just an open Lakekeeper). All four are OPTIONAL and,
+    // when unset, are NOT inserted into the catalog props map — so the
+    // default (open Lakekeeper) connection is byte-identical to before
+    // (invariant I3). iceberg-catalog-rest 0.9.1 reads these as plain
+    // string props (catalog.rs: `token`, `credential`, `oauth2-server-uri`,
+    // `scope`); no new dependency, no hand-rolled auth. ---
+    /// Pre-minted OAuth2 bearer token presented on every catalog request
+    /// (Iceberg REST `token` property). The token is used verbatim and is
+    /// never refreshed — supply a long-lived token or use
+    /// --catalog-credential for the client-credentials grant. SECRET:
+    /// redacted in logs. Also threaded into the copy-on-write DML commit
+    /// client so writes authenticate too (see overwrite.rs).
+    #[arg(long, env = "ICEGRES_CATALOG_TOKEN")]
+    pub catalog_token: Option<String>,
+
+    /// OAuth2 client credentials as `client_id:client_secret` (Iceberg REST
+    /// `credential` property): the REST client runs the client-credentials
+    /// grant against the token endpoint and presents the minted bearer,
+    /// refreshing it as it expires. A bare value with no colon is sent as
+    /// the client_secret. SECRET: redacted in logs. NOTE: this OAuth2 flow
+    /// authenticates the read/metadata plane; the copy-on-write DML commit
+    /// client authenticates only via --catalog-token at this pin (see
+    /// docs/catalog-support.md).
+    #[arg(long, env = "ICEGRES_CATALOG_CREDENTIAL")]
+    pub catalog_credential: Option<String>,
+
+    /// OAuth2 token endpoint URI for the client-credentials grant (Iceberg
+    /// REST `oauth2-server-uri` property). When unset the client derives
+    /// `{catalog-uri}/v1/oauth/tokens`.
+    #[arg(long, env = "ICEGRES_CATALOG_OAUTH2_URI")]
+    pub catalog_oauth2_uri: Option<String>,
+
+    /// OAuth2 scope requested during the client-credentials grant (Iceberg
+    /// REST `scope` property). When unset the client defaults to `catalog`.
+    #[arg(long, env = "ICEGRES_CATALOG_SCOPE")]
+    pub catalog_scope: Option<String>,
+}
+
+impl std::fmt::Debug for CatalogOpts {
+    /// Redact the two secret-bearing fields; every other field prints as-is.
+    /// `Some(secret)` renders as `Some("<redacted>")`, `None` as `None`, so
+    /// the presence/absence of a secret is still debuggable without leaking
+    /// its value.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redact = |v: &Option<String>| v.as_ref().map(|_| "<redacted>");
+        f.debug_struct("CatalogOpts")
+            .field("catalog_uri", &self.catalog_uri)
+            .field("warehouse", &self.warehouse)
+            .field("s3_endpoint", &self.s3_endpoint)
+            .field("s3_access_key", &self.s3_access_key)
+            .field("s3_secret_key", &self.s3_secret_key)
+            .field("s3_region", &self.s3_region)
+            .field("catalog_token", &redact(&self.catalog_token))
+            .field("catalog_credential", &redact(&self.catalog_credential))
+            .field("catalog_oauth2_uri", &self.catalog_oauth2_uri)
+            .field("catalog_scope", &self.catalog_scope)
+            .finish()
+    }
 }
 
 #[derive(Parser)]
