@@ -1,0 +1,9 @@
+# Pin the toolchain so every build (dev, Docker, release) is reproducible.
+# icegres links a large pinned dependency matrix (iceberg-rust 0.9.1,
+# datafusion 52, arrow 57, tonic 0.14) that is sensitive to compiler changes;
+# a floating toolchain is a supply-chain and reproducibility risk for a GA
+# artifact. Bump this deliberately, together with a full gate run.
+[toolchain]
+channel = "1.96.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
