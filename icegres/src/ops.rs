@@ -1,0 +1,1010 @@
+//! Operational features of `icegres serve`: scale-to-zero idle shutdown,
+//! a dedicated TCP/HTTP health endpoint, TLS, and SCRAM authentication.
+//!
+//! # TLS (`--tls-cert` / `--tls-key`, SPEC A7) and auth (`--auth-file`, A6)
+//!
+//! When any of `--idle-shutdown-secs`, `--tls-cert/--tls-key` or
+//! `--auth-file` is set, icegres runs its own accept loop (`serve_custom`)
+//! instead of datafusion-postgres's stock `serve()`:
+//!
+//! * TLS: certificate/key PEM files are loaded with `build_tls_acceptor`,
+//!   which FAILS THE BOOT on any error — unlike upstream
+//!   `serve_with_handlers`, which logs a warning and silently falls back to
+//!   plaintext. Like upstream Postgres without `hostssl` rules, a TLS-enabled
+//!   listener still accepts plaintext startup (clients choose via `sslmode`);
+//!   use `sslmode=require`/`verify-full` on clients to guarantee encryption.
+//! * Auth: with `--auth-file`, every connection must complete a
+//!   SCRAM-SHA-256 exchange against `pgauth::FileAuthSource` (wrong password
+//!   or unknown user → FATAL 28P01). Without it, the historical permissive
+//!   startup handler is kept and `main.rs` logs a startup WARN.
+//!
+//! # Scale-to-zero (`--idle-shutdown-secs`, SPEC §1 D5)
+//!
+//! With `--idle-shutdown-secs N` the server exits cleanly (code 0) once no
+//! client connection has been open for `N` consecutive seconds (the timer
+//! also starts at boot, so a server that never receives a connection shuts
+//! down after `N` seconds). Because icegres computes are stateless — every
+//! byte of durable state lives in the Iceberg catalog + object store (parity
+//! probe D1) and a cold start is fast (parity probe D3) — exiting is safe at
+//! any idle moment.
+//!
+//! Supervisor pattern: run icegres under any socket-activating or
+//! auto-restarting supervisor and let the *supervisor* provide the
+//! scale-from-zero half:
+//!
+//! ```text
+//! # systemd (restart-on-demand flavor): the unit exits when idle and the
+//! # next client connection is what wakes it up via socket activation
+//! [Service]
+//! ExecStart=/usr/local/bin/icegres serve --idle-shutdown-secs 300
+//! Restart=on-failure          # clean idle exit (code 0) does NOT restart
+//!
+//! # or a shell supervisor that restarts on demand:
+//! while :; do icegres serve --idle-shutdown-secs 300; done
+//! ```
+//!
+//! The health endpoint (below) deliberately does **not** count as client
+//! activity, so liveness probes never keep an idle server alive.
+//!
+//! # Health endpoint (`--health-port`, SPEC §1 E2)
+//!
+//! A minimal HTTP responder on a separate port: any TCP connection (and any
+//! HTTP request path, e.g. `GET /health`) receives `HTTP/1.1 200 OK` with
+//! body `ok\n`. It answers as soon as the pgwire listener is up, and it is a
+//! *liveness* probe: it asserts the process is alive and accepting, not that
+//! the catalog is reachable. A full readiness probe is a pgwire round trip
+//! (`psql -c 'select 1'`), which is what the bench/parity harnesses use.
+//! Plain TCP health checks (e.g. Kubernetes `tcpSocket`, `nc -z`) work too:
+//! connect + close is enough.
+
+use std::collections::HashMap;
+use std::fmt::Debug;
+use std::fs::File;
+use std::io::BufReader;
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context as _, Result};
+use async_trait::async_trait;
+use datafusion::common::{DFSchema, ParamValues};
+use datafusion::logical_expr::{EmptyRelation, LogicalPlan};
+use datafusion::prelude::SessionContext;
+use datafusion::sql::sqlparser::ast::{
+    CopyOption, CopySource, CopyTarget, Ident, Statement as SqlStatement,
+};
+use datafusion_postgres::arrow_pg::datatypes::arrow_schema_to_pg_fields;
+use datafusion_postgres::arrow_pg::encoder::{encode_value, Encoder as ArrowPgEncoder};
+use datafusion_postgres::pgwire::api::auth::noop::NoopStartupHandler;
+use datafusion_postgres::pgwire::api::auth::sasl::scram::ScramAuth;
+use datafusion_postgres::pgwire::api::auth::sasl::SASLAuthStartupHandler;
+use datafusion_postgres::pgwire::api::auth::{
+    AuthSource, DefaultServerParameterProvider, StartupHandler,
+};
+use datafusion_postgres::pgwire::api::portal::Format;
+use datafusion_postgres::pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
+use datafusion_postgres::pgwire::api::results::{
+    CopyCsvOptions, CopyEncoder, CopyResponse, Response,
+};
+use datafusion_postgres::pgwire::api::{ClientInfo, ErrorHandler, PgWireServerHandlers};
+use datafusion_postgres::pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use datafusion_postgres::pgwire::messages::copy::CopyData;
+use datafusion_postgres::pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
+use datafusion_postgres::pgwire::tokio::tokio_rustls::rustls;
+use datafusion_postgres::pgwire::tokio::{process_socket, TlsAcceptor};
+use datafusion_postgres::{DfSessionService, QueryHook};
+use futures::{Sink, StreamExt as _};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tracing::{info, warn, Instrument};
+
+// auth backend is injected as a trait object (dyn AuthSource) so the concrete
+// FileAuthSource backend can live behind the `managed` feature.
+use crate::txn::TxnRegistry;
+
+/// Core seam for the managed basic-auth backend: verify a plaintext
+/// username/password (used by the Flight SQL handshake). The concrete
+/// implementation — `pgauth::FileAuthSource`'s SCRAM verifier store — lives
+/// behind the `managed` feature; core holds only this trait object, so the
+/// open-source build carries no auth backend.
+pub trait BasicAuthVerifier: Send + Sync {
+    fn verify_password(&self, user: &str, password: &str) -> bool;
+}
+
+/// Startup handler that accepts every connection without authentication —
+/// the same behavior as datafusion-postgres's stock `serve()` path (its
+/// `SimpleStartupHandler` is not exported, so we declare our own).
+struct AcceptAllStartupHandler;
+impl NoopStartupHandler for AcceptAllStartupHandler {}
+
+/// Per-connection startup handler: permissive (no `--auth-file`) or
+/// SCRAM-SHA-256 against the loaded auth file. An enum because
+/// `PgWireServerHandlers::startup_handler` must name one concrete type. The
+/// `Scram` arm carries the shared per-peer throttle (audit #4).
+enum IcegresStartupHandler {
+    Open(AcceptAllStartupHandler),
+    Scram(
+        SASLAuthStartupHandler<DefaultServerParameterProvider>,
+        Arc<AuthThrottle>,
+    ),
+}
+
+#[async_trait]
+impl StartupHandler for IcegresStartupHandler {
+    async fn on_startup<C>(
+        &self,
+        client: &mut C,
+        message: PgWireFrontendMessage,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        match self {
+            IcegresStartupHandler::Open(h) => h.on_startup(client, message).await,
+            IcegresStartupHandler::Scram(h, throttle) => {
+                let ip = client.socket_addr().ip();
+                // Slow a brute-forcer down BEFORE the exchange, proportional to
+                // its recent failures from this IP.
+                if let Some(delay) = throttle.penalty(ip) {
+                    tokio::time::sleep(delay).await;
+                }
+                let res = h.on_startup(client, message).await;
+                // Record only genuine credential rejections. We do NOT reset on
+                // Ok: `on_startup` is called once per SASL message, and the
+                // intermediate steps of a *successful* exchange also return Ok —
+                // resetting there would wipe the count every message. Failures
+                // instead decay after `AUTH_WINDOW`, so a legitimate user who
+                // mistyped once heals on their own without ever handing an
+                // attacker a counter reset.
+                if let Err(e) = &res {
+                    if is_auth_failure(e) {
+                        throttle.record_failure(ip);
+                    }
+                }
+                return res;
+            }
+        }
+    }
+}
+
+/// Per-peer failed-authentication throttle (production-readiness audit #4):
+/// a brute-forcer opening connection after connection to guess passwords is
+/// slowed by an escalating delay applied BEFORE each SASL exchange, keyed by
+/// source IP. Only consulted when `--auth-file` is set (no auth ⇒ no failures).
+/// A successful auth clears the peer; failures older than `AUTH_WINDOW` decay.
+#[derive(Default)]
+struct AuthThrottle {
+    peers: Mutex<HashMap<IpAddr, (u32, Instant)>>,
+}
+
+/// Failures older than this decay to zero (a legitimate user who once mistyped
+/// is not penalized forever).
+const AUTH_WINDOW: Duration = Duration::from_secs(60);
+/// Per-failure backoff step and its cap.
+const AUTH_STEP: Duration = Duration::from_millis(250);
+const AUTH_MAX_DELAY: Duration = Duration::from_secs(5);
+
+impl AuthThrottle {
+    /// Backoff to apply before this peer's next auth attempt, if any.
+    fn penalty(&self, ip: IpAddr) -> Option<Duration> {
+        let peers = self.peers.lock().expect("auth throttle lock poisoned");
+        let (count, last) = peers.get(&ip)?;
+        if *count == 0 || last.elapsed() >= AUTH_WINDOW {
+            return None;
+        }
+        Some(AUTH_STEP.saturating_mul(*count).min(AUTH_MAX_DELAY))
+    }
+
+    /// Record a failed auth from `ip` (escalates its backoff).
+    fn record_failure(&self, ip: IpAddr) {
+        let mut peers = self.peers.lock().expect("auth throttle lock poisoned");
+        // Bound memory under a many-IP flood: drop peers whose last failure has
+        // decayed out of the window before inserting.
+        peers.retain(|_, (_, last)| last.elapsed() < AUTH_WINDOW);
+        let entry = peers.entry(ip).or_insert((0, Instant::now()));
+        if entry.1.elapsed() >= AUTH_WINDOW {
+            entry.0 = 0;
+        }
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = Instant::now();
+        warn!(%ip, failures = entry.0, "failed authentication; throttling this peer");
+    }
+}
+
+/// Whether a startup error is a credentials rejection, as opposed to a
+/// protocol/IO error. Two shapes reach here: an unknown user is rejected by
+/// our auth source with SQLSTATE 28P01 (`pgauth::auth_failed`), and a wrong
+/// password fails inside pgwire's SCRAM exchange as `InvalidPassword`.
+fn is_auth_failure(e: &PgWireError) -> bool {
+    matches!(e, PgWireError::UserError(info) if info.code == "28P01")
+        || matches!(e, PgWireError::InvalidPassword(_))
+}
+
+/// Error handler mirroring the stock factory's logging behavior.
+struct LoggingErrorHandler;
+impl ErrorHandler for LoggingErrorHandler {
+    fn on_error<C>(&self, _client: &C, error: &mut PgWireError)
+    where
+        C: ClientInfo,
+    {
+        info!("Sending error: {error}");
+    }
+}
+
+/// pgwire handler factory equivalent to datafusion-postgres's private
+/// `HandlerFactory` (same `DfSessionService` with the default query hooks),
+/// plus optional SCRAM auth. `startup_handler()` is invoked once per
+/// connection by `process_socket`, so the SASL state machine it returns is
+/// per-connection as pgwire requires.
+struct IcegresHandlerFactory {
+    service: Arc<crate::traced::TracedService>,
+    auth: Option<Arc<dyn AuthSource>>,
+    /// Per-peer failed-auth throttle (audit #4); only consulted when auth is on.
+    throttle: Arc<AuthThrottle>,
+}
+
+impl PgWireServerHandlers for IcegresHandlerFactory {
+    fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
+        self.service.clone()
+    }
+
+    fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
+        self.service.clone()
+    }
+
+    fn startup_handler(&self) -> Arc<impl StartupHandler> {
+        match &self.auth {
+            Some(source) => {
+                let auth_db = source.clone();
+                Arc::new(IcegresStartupHandler::Scram(
+                    SASLAuthStartupHandler::new(
+                        Arc::new(DefaultServerParameterProvider::default()),
+                    )
+                    .with_scram(ScramAuth::new(auth_db)),
+                    self.throttle.clone(),
+                ))
+            }
+            None => Arc::new(IcegresStartupHandler::Open(AcceptAllStartupHandler)),
+        }
+    }
+
+    fn error_handler(&self) -> Arc<impl ErrorHandler> {
+        Arc::new(LoggingErrorHandler)
+    }
+}
+
+/// Build a rustls `TlsAcceptor` from PEM cert/key paths. Unlike upstream
+/// datafusion-postgres (`serve_with_handlers` logs a warning and serves
+/// PLAINTEXT when TLS setup fails), any error here aborts startup —
+/// misconfigured TLS must never silently downgrade to unencrypted.
+pub fn build_tls_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor> {
+    // pgwire's SSLRequest upgrade does not use ALPN, so advertise none.
+    build_tls_acceptor_with_alpn(cert_path, key_path, &[])
+}
+
+/// As [`build_tls_acceptor`], but advertising the given ALPN protocols. The
+/// Flight SQL / gRPC listener passes `[b"h2"]` — HTTP/2 over TLS requires the
+/// `h2` ALPN token, so without it a strict gRPC client refuses to upgrade.
+pub fn build_tls_acceptor_with_alpn(
+    cert_path: &str,
+    key_path: &str,
+    alpn: &[&[u8]],
+) -> Result<TlsAcceptor> {
+    // Same crypto provider as upstream setup_tls (pgwire ships the ring
+    // feature); install_default is idempotent, ignore the AlreadyInstalled err.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let certs = rustls_pemfile::certs(&mut BufReader::new(
+        File::open(cert_path)
+            .with_context(|| format!("failed to open TLS certificate {cert_path}"))?,
+    ))
+    .collect::<std::io::Result<Vec<_>>>()
+    .with_context(|| format!("failed to parse PEM certificate(s) in {cert_path}"))?;
+    if certs.is_empty() {
+        anyhow::bail!("no PEM certificate found in {cert_path}");
+    }
+
+    let key = rustls_pemfile::private_key(&mut BufReader::new(
+        File::open(key_path).with_context(|| format!("failed to open TLS key {key_path}"))?,
+    ))
+    .with_context(|| format!("failed to parse PEM private key in {key_path}"))?
+    .ok_or_else(|| anyhow::anyhow!("no PEM private key found in {key_path}"))?;
+
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .context("invalid TLS certificate/key pair")?;
+    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+/// Monotonic per-connection id for the correlation span (audit #11).
+static CONN_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// How often the idle watchdog wakes up to check the idle condition.
+const IDLE_POLL: Duration = Duration::from_millis(250);
+
+/// Serve the pgwire protocol like datafusion-postgres's `serve()`, with the
+/// icegres-specific extensions: optional scale-to-zero idle shutdown
+/// (`idle_secs`), optional TLS (`tls`), and optional SCRAM auth (`auth`).
+/// Used whenever any of those is configured; the flagless path in `main.rs`
+/// keeps the stock upstream loop byte-for-byte.
+///
+/// With `idle_secs = Some(n)` the loop exits cleanly (`Ok(())`) once there
+/// have been zero client connections for `n` consecutive seconds (boot
+/// counts); with `None` it runs forever.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_custom(
+    ctx: Arc<SessionContext>,
+    // For the AS OF raw-SQL rewrite (asof.rs): snapshot resolution needs
+    // catalog metadata before the statement is parsed.
+    catalog: Arc<dyn iceberg::Catalog>,
+    host: &str,
+    port: u16,
+    idle_secs: Option<u64>,
+    tls: Option<TlsAcceptor>,
+    auth: Option<Arc<dyn AuthSource>>,
+    hooks: Vec<Arc<dyn QueryHook>>,
+    txn_registry: Arc<TxnRegistry>,
+    // When buffered-write mode is on, flush the buffer on graceful shutdown so
+    // a clean stop (rolling deploy) loses NO acked rows — only an unclean kill
+    // does, which is the documented durability contract.
+    write_buffer: Option<Arc<crate::buffer::WriteBuffer>>,
+) -> Result<()> {
+    let addr = format!("{host}:{port}");
+    let listener = TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("failed to bind pgwire listener on {addr}"))?;
+    info!(
+        listen_addr = %addr,
+        idle_shutdown_secs = idle_secs,
+        tls = tls.is_some(),
+        auth = auth.is_some(),
+        "listening (custom accept loop)"
+    );
+
+    let factory = Arc::new(IcegresHandlerFactory {
+        service: Arc::new(crate::traced::TracedService::new(
+            Arc::new(DfSessionService::new_with_hooks(ctx, hooks)),
+            catalog,
+        )),
+        auth,
+        throttle: Arc::new(AuthThrottle::default()),
+    });
+    let idle_window = idle_secs.map(Duration::from_secs);
+    let active = Arc::new(AtomicUsize::new(0));
+    // Instant of the last transition to the fully-idle state (boot counts).
+    let idle_since = Arc::new(Mutex::new(Instant::now()));
+
+    // Bound concurrent connections so a flood cannot exhaust FDs/memory by
+    // building per-connection DataFusion+Arrow state without limit
+    // (production-readiness audit #4). Acquiring the permit BEFORE accepting
+    // the next socket backpressures the accept loop into the OS backlog rather
+    // than spawning unbounded handler tasks. `ICEGRES_MAX_CONNECTIONS` (default
+    // 512); 0 disables the cap.
+    let max_conns = max_connections_limit();
+    let conn_limiter = max_conns.map(|n| Arc::new(tokio::sync::Semaphore::new(n)));
+    if let Some(n) = max_conns {
+        info!(max_connections = n, "connection concurrency cap enabled");
+    }
+
+    loop {
+        // Hold a permit across accept+process; drop when the handler ends.
+        let permit = match &conn_limiter {
+            Some(sem) => Some(sem.clone().acquire_owned().await.expect("semaphore closed")),
+            None => None,
+        };
+        tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((socket, peer)) => {
+                    active.fetch_add(1, Ordering::SeqCst);
+                    crate::metrics::metrics()
+                        .connections_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    crate::metrics::metrics()
+                        .connections_active
+                        .fetch_add(1, Ordering::Relaxed);
+                    let factory = factory.clone();
+                    let active = active.clone();
+                    let idle_since = idle_since.clone();
+                    let tls = tls.clone();
+                    let txn_registry = txn_registry.clone();
+                    // Per-connection correlation span (audit #11): every log
+                    // emitted while handling this connection — including the
+                    // TracedService query timings and slow-query WARNs — carries
+                    // conn_id + peer, so interleaved concurrent-connection logs
+                    // can be de-multiplexed and a slow query attributed.
+                    let conn_id = CONN_SEQ.fetch_add(1, Ordering::Relaxed);
+                    let span = tracing::info_span!("conn", id = conn_id, %peer);
+                    tokio::spawn(
+                        async move {
+                            let _permit = permit; // released when the handler ends
+                            if let Err(e) = process_socket(socket, tls, factory).await {
+                                warn!("error processing socket: {e}");
+                            }
+                            // Disconnect = implicit ROLLBACK: drop any open
+                            // transaction buffered for this connection (nothing
+                            // was committed, so nothing needs undoing).
+                            txn_registry.disconnect(&peer);
+                            // Reset the idle clock BEFORE decrementing so the
+                            // watchdog can never observe (active == 0, stale
+                            // idle_since).
+                            *idle_since.lock().expect("idle clock lock poisoned") = Instant::now();
+                            active.fetch_sub(1, Ordering::SeqCst);
+                            crate::metrics::metrics()
+                                .connections_active
+                                .fetch_sub(1, Ordering::Relaxed);
+                        }
+                        .instrument(span),
+                    );
+                }
+                Err(e) => warn!("error accepting socket: {e}"),
+            },
+            _ = tokio::time::sleep(IDLE_POLL), if idle_window.is_some() => {
+                let idle_for = idle_since.lock().expect("idle clock lock poisoned").elapsed();
+                if active.load(Ordering::SeqCst) == 0
+                    && idle_window.is_some_and(|w| idle_for >= w)
+                {
+                    info!(
+                        idle_secs = idle_for.as_secs(),
+                        "no client connections within the idle window; shutting down (scale-to-zero)"
+                    );
+                    return Ok(());
+                }
+            }
+            sig = shutdown_signal() => {
+                info!(signal = %sig, "shutdown signal received; draining in-flight connections");
+                drain_connections(&active).await;
+                // Drain finished (no in-flight INSERT can still be buffering),
+                // so flush the write buffer: a clean shutdown must not lose the
+                // acked-but-uncommitted rows the durability contract only
+                // permits an UNCLEAN kill to drop.
+                if let Some(buf) = &write_buffer {
+                    if buf.has_pending() {
+                        info!("flushing write buffer before clean shutdown");
+                        match buf.flush_now().await {
+                            Ok(()) => info!(
+                                "write buffer flushed on shutdown; no acked rows lost"
+                            ),
+                            // With a durable tail the failure is not lossy:
+                            // the rows replay from disk on the next boot.
+                            Err(e) if buf.tail_enabled() => warn!(
+                                "write-buffer flush on shutdown FAILED; acked rows remain \
+                                 durable in the local tail and replay on the next boot \
+                                 with the same --tail-dir: {e:#}"
+                            ),
+                            Err(e) => warn!(
+                                "write-buffer flush on shutdown FAILED; up to the last \
+                                 cadence of acked rows may be lost: {e:#}"
+                            ),
+                        }
+                    }
+                }
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Concurrent-connection cap from `ICEGRES_MAX_CONNECTIONS` (parsed once).
+/// `0` disables the cap; default 512.
+fn max_connections_limit() -> Option<usize> {
+    const DEFAULT: usize = 512;
+    match std::env::var("ICEGRES_MAX_CONNECTIONS") {
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(0) => None,
+            Ok(n) => Some(n),
+            Err(_) => {
+                warn!(value = %raw, default = DEFAULT, "invalid ICEGRES_MAX_CONNECTIONS; using default");
+                Some(DEFAULT)
+            }
+        },
+        Err(_) => Some(DEFAULT),
+    }
+}
+
+/// Resolve on SIGTERM (k8s/systemd stop) or SIGINT (Ctrl-C), whichever first.
+/// Returns the signal name for logging. Shared by the pgwire accept loop and
+/// the Flight SQL server so both drain on the same signals.
+pub async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => {
+                // Fall back to Ctrl-C only if SIGTERM can't be registered.
+                let _ = tokio::signal::ctrl_c().await;
+                return "SIGINT";
+            }
+        };
+        tokio::select! {
+            _ = term.recv() => "SIGTERM",
+            _ = tokio::signal::ctrl_c() => "SIGINT",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "SIGINT"
+    }
+}
+
+/// Grace period to let in-flight requests finish before exit on shutdown.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Stop accepting and wait (up to [`DRAIN_TIMEOUT`]) for in-flight connections
+/// to complete, so a rolling deploy (SIGTERM) does not sever running queries.
+async fn drain_connections(active: &Arc<AtomicUsize>) {
+    let deadline = Instant::now() + DRAIN_TIMEOUT;
+    loop {
+        let n = active.load(Ordering::SeqCst);
+        if n == 0 {
+            info!("all connections drained; exiting cleanly");
+            return;
+        }
+        if Instant::now() >= deadline {
+            // Name the queries still running past the grace period (audit #9
+            // in-flight visibility) so an operator knows what a forced exit cut.
+            for (id, kind, elapsed) in crate::traced::in_flight().snapshot() {
+                warn!(
+                    query_id = id,
+                    kind,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "query still in flight at forced shutdown"
+                );
+            }
+            warn!(
+                remaining = n,
+                in_flight = crate::traced::in_flight().count(),
+                "drain grace period elapsed; exiting with connections still active"
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// COPY ... TO STDOUT (SPEC A11 lane 2: adbc_driver_postgresql reads)
+// ---------------------------------------------------------------------------
+
+/// Query hook answering `COPY (SELECT ...) TO STDOUT (FORMAT binary|text|csv)`
+/// and `COPY table [(cols)] TO STDOUT ...` with a real `CopyOutResponse` +
+/// PGCOPY-encoded `CopyData` stream, on BOTH protocols (libpq `PQexecParams`
+/// drives COPY through the extended protocol; psql's `COPY` uses simple).
+///
+/// This is the read path `adbc_driver_postgresql` requires: the driver wraps
+/// every result fetch in `COPY (query) TO STDOUT (FORMAT binary)` and decodes
+/// the PG binary COPY framing into Arrow. Values are encoded per-field by
+/// arrow-pg's `encode_value` — the exact binary encoders the normal DataRow
+/// path uses — through pgwire's `CopyEncoder` (which adds the PGCOPY
+/// header/row framing; the binary trailer comes from `CopyResponse::new`).
+///
+/// Why a `QueryHook` and not pgwire's `CopyHandler` trait: `CopyHandler`
+/// (pgwire src/api/copy.rs) handles the *frontend* copy messages of `COPY
+/// FROM STDIN` (CopyData/CopyDone/CopyFail). COPY TO is initiated by a
+/// regular query whose response is `Response::CopyOut`; the stock
+/// `NoopHandler` remains in place so `COPY FROM STDIN` fails loudly
+/// ("feature not implemented") instead of hanging.
+///
+/// Scope (rejected loudly with 0A000 otherwise):
+/// * `TO STDOUT` only (no files/programs — the server must not write disk);
+/// * options: `FORMAT binary|text|csv` and CSV `HEADER` (Postgres defaults
+///   otherwise: text format, tab delimiter, `\N` null);
+/// * `COPY ... FROM STDIN` is out of scope (use INSERT/adbc_ingest).
+///
+/// Runs BEFORE TxnHook in the hook chain: inside an explicit transaction a
+/// COPY TO reads the latest committed snapshot (statement-level consistency)
+/// rather than the transaction's pinned view — the ADBC driver's read flow
+/// (BEGIN; COPY ...; COMMIT) sees exactly one snapshot per COPY either way.
+pub struct CopyOutHook;
+
+/// The COPY output format requested in the statement options.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum CopyOutFormat {
+    Text,
+    Csv { header: bool },
+    Binary,
+}
+
+/// `feature_not_supported` (0A000) for out-of-scope COPY forms.
+fn copy_reject(msg: String) -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".to_string(),
+        "0A000".to_string(),
+        msg,
+    )))
+}
+
+/// Parse a COPY statement into `(select_sql, format)` when it is a supported
+/// `COPY ... TO STDOUT`; `Ok(None)` when the statement is not COPY at all.
+fn translate_copy(stmt: &SqlStatement) -> PgWireResult<Option<(String, CopyOutFormat)>> {
+    let SqlStatement::Copy {
+        source,
+        to,
+        target,
+        options,
+        legacy_options,
+        ..
+    } = stmt
+    else {
+        return Ok(None);
+    };
+    if !*to {
+        return Err(copy_reject(
+            "COPY ... FROM is not supported; load data with INSERT or ADBC bulk ingest \
+             (icegres flight-serve)"
+                .to_string(),
+        ));
+    }
+    if !matches!(target, CopyTarget::Stdout) {
+        return Err(copy_reject(format!(
+            "COPY TO {target} is not supported (only COPY ... TO STDOUT)"
+        )));
+    }
+    let mut format = CopyOutFormat::Text;
+    let mut header = false;
+    for opt in options {
+        match opt {
+            CopyOption::Format(ident) => {
+                format = match ident.value.to_lowercase().as_str() {
+                    "text" => CopyOutFormat::Text,
+                    "csv" => CopyOutFormat::Csv { header: false },
+                    "binary" => CopyOutFormat::Binary,
+                    other => {
+                        return Err(copy_reject(format!(
+                            "COPY format {other:?} is not supported (text, csv, binary)"
+                        )))
+                    }
+                };
+            }
+            CopyOption::Header(h) => header = *h,
+            other => {
+                return Err(copy_reject(format!(
+                    "COPY option {other} is not supported (FORMAT text|csv|binary, HEADER)"
+                )))
+            }
+        }
+    }
+    if !legacy_options.is_empty() {
+        return Err(copy_reject(
+            "legacy (pre-9.0) COPY options are not supported; use COPY (...) TO STDOUT \
+             (FORMAT ...)"
+                .to_string(),
+        ));
+    }
+    if header {
+        match &mut format {
+            CopyOutFormat::Csv { header } => *header = true,
+            _ => {
+                return Err(copy_reject(
+                    "COPY HEADER is only supported with FORMAT csv".to_string(),
+                ))
+            }
+        }
+    }
+    let select_sql = match source {
+        CopySource::Query(query) => query.to_string(),
+        CopySource::Table {
+            table_name,
+            columns,
+        } => {
+            let cols = if columns.is_empty() {
+                "*".to_string()
+            } else {
+                columns
+                    .iter()
+                    .map(|c: &Ident| c.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            format!("SELECT {cols} FROM {table_name}")
+        }
+    };
+    Ok(Some((select_sql, format)))
+}
+
+impl CopyOutHook {
+    /// Execute the underlying SELECT and build the streaming CopyOut
+    /// response (rows are encoded batch-by-batch as they arrive).
+    async fn run(
+        &self,
+        select_sql: &str,
+        format: CopyOutFormat,
+        ctx: &SessionContext,
+    ) -> PgWireResult<Response> {
+        let df = ctx
+            .sql(select_sql)
+            .await
+            .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+        let stream = df
+            .execute_stream()
+            .await
+            .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+        let arrow_schema = stream.schema();
+        let pg_fields = Arc::new(arrow_schema_to_pg_fields(
+            &arrow_schema,
+            &Format::UnifiedText,
+            None,
+        )?);
+        let ncols = pg_fields.len();
+
+        let mut encoder = match format {
+            CopyOutFormat::Binary => CopyEncoder::new_binary(pg_fields.clone()),
+            CopyOutFormat::Text => CopyEncoder::new_text(pg_fields.clone(), Default::default()),
+            CopyOutFormat::Csv { .. } => {
+                CopyEncoder::new_csv(pg_fields.clone(), CopyCsvOptions::default())
+            }
+        };
+        // CSV HEADER: one leading CopyData with the column-name row.
+        let head = if let CopyOutFormat::Csv { header: true } = format {
+            let mut line = pg_fields
+                .iter()
+                .map(|f| f.name().replace('"', "\"\""))
+                .collect::<Vec<_>>()
+                .join(",");
+            line.push('\n');
+            Some(Ok(CopyData::new(bytes_from(line.into_bytes()))))
+        } else {
+            None
+        };
+
+        // Row stream: encode each batch as it arrives; any encode/scan error
+        // surfaces as CopyFail via pgwire's send_copy_out_response.
+        let fields = pg_fields.clone();
+        let emitted = Arc::new(AtomicBool::new(false));
+        let emitted_rows = emitted.clone();
+        let rows = stream
+            .map(move |batch_res| -> Vec<PgWireResult<CopyData>> {
+                let batch = match batch_res {
+                    Ok(batch) => batch,
+                    Err(e) => return vec![Err(PgWireError::ApiError(Box::new(e)))],
+                };
+                let schema = batch.schema();
+                let mut out = Vec::with_capacity(batch.num_rows());
+                for row in 0..batch.num_rows() {
+                    for (i, arr) in batch.columns().iter().enumerate() {
+                        if let Err(e) =
+                            encode_value(&mut encoder, arr, row, schema.field(i), &fields[i])
+                        {
+                            out.push(Err(e));
+                            return out;
+                        }
+                    }
+                    emitted_rows.store(true, Ordering::Relaxed);
+                    out.push(Ok(ArrowPgEncoder::take_row(&mut encoder)));
+                }
+                out
+            })
+            .flat_map(futures::stream::iter);
+        // Zero-row binary COPY still needs the PGCOPY header (take_copy only
+        // writes it with the first row); the trailer is appended by
+        // CopyResponse::new. Evaluated lazily AFTER the row stream finishes.
+        let tail = futures::stream::iter(std::iter::once(())).filter_map(move |()| {
+            let need_header = format == CopyOutFormat::Binary && !emitted.load(Ordering::Relaxed);
+            futures::future::ready(need_header.then(|| {
+                let mut header = Vec::with_capacity(19);
+                header.extend_from_slice(b"PGCOPY\n\xFF\r\n\x00");
+                header.extend_from_slice(&[0u8; 8]); // flags + extension len
+                Ok(CopyData::new(bytes_from(header)))
+            }))
+        });
+        let data_stream = futures::stream::iter(head).chain(rows).chain(tail);
+
+        let format_code: i8 = if format == CopyOutFormat::Binary {
+            1
+        } else {
+            0
+        };
+        Ok(Response::CopyOut(CopyResponse::new(
+            format_code,
+            ncols,
+            data_stream,
+        )))
+    }
+}
+
+/// `bytes::Bytes` via prost's re-export (same crate version pgwire links).
+fn bytes_from(v: Vec<u8>) -> prost::bytes::Bytes {
+    prost::bytes::Bytes::from(v)
+}
+
+#[async_trait]
+impl QueryHook for CopyOutHook {
+    async fn handle_simple_query(
+        &self,
+        statement: &SqlStatement,
+        session_context: &SessionContext,
+        _client: &mut (dyn ClientInfo + Send + Sync),
+    ) -> Option<PgWireResult<Response>> {
+        let (sql, format) = match translate_copy(statement) {
+            Ok(Some(parsed)) => parsed,
+            Ok(None) => return None,
+            Err(e) => return Some(Err(e)),
+        };
+        Some(self.run(&sql, format, session_context).await)
+    }
+
+    async fn handle_extended_parse_query(
+        &self,
+        sql: &SqlStatement,
+        _session_context: &SessionContext,
+        _client: &(dyn ClientInfo + Send + Sync),
+    ) -> Option<PgWireResult<LogicalPlan>> {
+        match translate_copy(sql) {
+            Ok(Some(_)) => {
+                // Placeholder plan: DataFusion cannot plan COPY TO STDOUT;
+                // execution happens in handle_extended_query. Describe on the
+                // portal reports no columns — the CopyOutResponse carries the
+                // real column count/formats, which is what libpq consumes.
+                Some(Ok(LogicalPlan::EmptyRelation(EmptyRelation {
+                    produce_one_row: false,
+                    schema: Arc::new(DFSchema::empty()),
+                })))
+            }
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    async fn handle_extended_query(
+        &self,
+        statement: &SqlStatement,
+        _logical_plan: &LogicalPlan,
+        params: &ParamValues,
+        session_context: &SessionContext,
+        _client: &mut (dyn ClientInfo + Send + Sync),
+    ) -> Option<PgWireResult<Response>> {
+        let (sql, format) = match translate_copy(statement) {
+            Ok(Some(parsed)) => parsed,
+            Ok(None) => return None,
+            Err(e) => return Some(Err(e)),
+        };
+        let has_params = match params {
+            ParamValues::List(l) => !l.is_empty(),
+            ParamValues::Map(m) => !m.is_empty(),
+        };
+        if has_params {
+            return Some(Err(copy_reject(
+                "parameterized COPY ($n bind values) is not supported; inline the values"
+                    .to_string(),
+            )));
+        }
+        Some(self.run(&sql, format, session_context).await)
+    }
+}
+
+/// Timeout for the `/ready` catalog probe. Kept short so a hung catalog turns
+/// into a fast 503 rather than a slow readiness check.
+const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Cheap catalog reachability check for `/ready`: list top-level namespaces
+/// with a bounded timeout. `Ok` = the REST catalog answered (dependency up).
+async fn catalog_ready(catalog: &Arc<dyn iceberg::Catalog>) -> bool {
+    matches!(
+        tokio::time::timeout(READY_PROBE_TIMEOUT, catalog.list_namespaces(None)).await,
+        Ok(Ok(_))
+    )
+}
+
+/// Bind the HTTP health endpoint on `host:port` and serve it from a background
+/// task, distinguishing **liveness** from **readiness**:
+///
+/// * `GET /ready` (and `/readyz`) does a bounded catalog round-trip →
+///   `200 ready` if the REST catalog answered, else `503` — so a load balancer
+///   pulls a compute out of rotation when its lakehouse dependency is down
+///   instead of routing queries that will all fail (production-readiness #10).
+/// * Any other path (and a bare TCP connect) is a **liveness** probe →
+///   `200 ok`: the process is alive and accepting — UNLESS a durable tail is
+///   attached and has wedged itself (`buffer.tail_health()`, e.g. the quorum
+///   tail poisoned after being fenced or losing its quorum), in which case
+///   `/health` answers `503 tail unhealthy: ...`: such a compute still
+///   accepts TCP but can never ack a write, and a supervisor (icegresd
+///   `--health-check-ms`) must replace it rather than route to it. Without
+///   tail flags (`buffer` is `None` or has no tail) the response is exactly
+///   the previous unconditional `200 ok`.
+///
+/// Binding errors are returned (loud at startup); per-connection errors are
+/// logged and ignored.
+pub async fn spawn_health_listener(
+    host: &str,
+    port: u16,
+    catalog: Arc<dyn iceberg::Catalog>,
+    buffer: Option<Arc<crate::buffer::WriteBuffer>>,
+) -> Result<()> {
+    let addr = format!("{host}:{port}");
+    let listener = TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("failed to bind health listener on {addr}"))?;
+    info!(health_addr = %addr, "health endpoint listening (liveness /health, catalog-aware /ready)");
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((mut socket, _)) => {
+                    let catalog = catalog.clone();
+                    let buffer = buffer.clone();
+                    tokio::spawn(async move {
+                        // Best-effort read of the request line (a plain TCP
+                        // connect-and-close liveness check sends nothing).
+                        let mut buf = [0u8; 1024];
+                        let n = socket.read(&mut buf).await.unwrap_or(0);
+                        let req = String::from_utf8_lossy(&buf[..n]);
+                        let path = req
+                            .split_whitespace()
+                            .nth(1)
+                            .map(|p| p.split('?').next().unwrap_or(p).to_string())
+                            .unwrap_or_default();
+                        if path == "/metrics" {
+                            // Prometheus text exposition of the operational
+                            // counters (production-readiness #8).
+                            let body = crate::metrics::metrics().render_prometheus();
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: text/plain; version=0.0.4\r\n\
+                                 content-length: {}\r\nconnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = socket.write_all(head.as_bytes()).await;
+                            let _ = socket.write_all(body.as_bytes()).await;
+                            let _ = socket.shutdown().await;
+                            return;
+                        }
+                        let response: Vec<u8> = if path == "/ready" || path == "/readyz" {
+                            if catalog_ready(&catalog).await {
+                                b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n\
+                                  content-length: 6\r\nconnection: close\r\n\r\nready\n"
+                                    .to_vec()
+                            } else {
+                                b"HTTP/1.1 503 Service Unavailable\r\ncontent-type: text/plain\r\n\
+                                  content-length: 10\r\nconnection: close\r\n\r\nnot ready\n"
+                                    .to_vec()
+                            }
+                        } else {
+                            // Liveness. With a durable tail attached, a
+                            // wedged tail (poisoned: fenced/quorum-timeout)
+                            // means the process can never ack a write again
+                            // — report 503 so a supervisor replaces it. The
+                            // probe is a sync channel round trip, so it runs
+                            // off the async worker.
+                            let tail_wedged: Option<String> = match &buffer {
+                                Some(buf) if buf.tail_enabled() => {
+                                    let buf = buf.clone();
+                                    tokio::task::spawn_blocking(move || buf.tail_health())
+                                        .await
+                                        .unwrap_or_else(|e| {
+                                            Err(anyhow::anyhow!("tail health probe panicked: {e}"))
+                                        })
+                                        .err()
+                                        .map(|e| format!("{e:#}"))
+                                }
+                                _ => None,
+                            };
+                            match tail_wedged {
+                                None => b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n\
+                                          content-length: 3\r\nconnection: close\r\n\r\nok\n"
+                                    .to_vec(),
+                                Some(why) => {
+                                    let body = format!("tail unhealthy: {why}\n");
+                                    format!(
+                                        "HTTP/1.1 503 Service Unavailable\r\ncontent-type: \
+                                         text/plain\r\ncontent-length: {}\r\nconnection: \
+                                         close\r\n\r\n{body}",
+                                        body.len()
+                                    )
+                                    .into_bytes()
+                                }
+                            }
+                        };
+                        let _ = socket.write_all(&response).await;
+                        let _ = socket.shutdown().await;
+                    });
+                }
+                Err(e) => warn!("health listener accept error: {e}"),
+            }
+        }
+    });
+    Ok(())
+}

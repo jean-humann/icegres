@@ -1,0 +1,145 @@
+[package]
+name = "icegres"
+version = "0.1.0"
+edition = "2021"
+description = "Postgres wire endpoint over an Iceberg lakehouse (Lakekeeper + RustFS)"
+license = "Apache-2.0"
+
+# Open-core split. The lakehouse SQL server, the authorization *seam*
+# (Authorizer trait + AuthzHook enforcement), and all wire/driver support are
+# open source and always compiled. The security *backends* — SCRAM
+# authentication (pgauth::FileAuthSource) and the ReBAC authorization policy
+# engine (authz::FileAuthorizer) — live behind the `managed` feature: the
+# "classic auth / authz" managed add-on. Default builds include it; a pure
+# open-source distribution is built with `--no-default-features`, where
+# `--auth-file` / `--authz-file` return a clear "managed add-on" error and the
+# server runs open (any user, all tables).
+[features]
+default = ["managed"]
+managed = []
+
+[[bin]]
+name = "icegres"
+path = "src/main.rs"
+
+# The minimal control plane (wake-on-connect proxy / branch router /
+# compute supervisor). A second bin target in the same crate: it shares the
+# dependency graph but compiles ONLY src/bin/icegresd.rs (none of the
+# datafusion/iceberg modules), so it links a few MB, not 120.
+[[bin]]
+name = "icegresd"
+path = "src/bin/icegresd.rs"
+
+# The quorum-tail acceptor daemon (roadmap §3 backend 3). Same pattern as
+# icegresd: a third bin target sharing the dependency graph but compiling
+# only its own file plus the `#[path]`-included consensus modules
+# (src/segment.rs + src/quorum/*) — none of the datafusion/iceberg stack.
+[[bin]]
+name = "icekeeperd"
+path = "src/bin/icekeeperd.rs"
+
+[dependencies]
+# Iceberg stack (all pinned to the same 0.9.1 — do not bump independently)
+iceberg = "=0.9.1"
+iceberg-catalog-rest = "=0.9.1"
+iceberg-datafusion = "=0.9.1"
+iceberg-storage-opendal = "=0.9.1"
+
+# Query engine — 52.5.0 satisfies iceberg-datafusion (^52.2) AND datafusion-postgres (^52)
+datafusion = "=52.5.0"
+
+# Postgres wire front-end (re-exports pgwire, arrow_pg, datafusion_pg_catalog)
+datafusion-postgres = "=0.15.0"
+
+# Arrow — must stay on 57.x to match datafusion 52 / iceberg 0.9.1
+arrow = "=57.3.1"
+
+# Arrow Flight SQL endpoint (`icegres flight-serve`, SPEC A11): the ADBC
+# first-class surface. arrow-flight 57.3.1 matches arrow 57.3.1 and pulls
+# tonic 0.14 / prost 0.14 (gRPC transport; both listed so flight.rs can name
+# their types). base64 decodes the Basic auth handshake header.
+arrow-flight = { version = "=57.3.1", features = ["flight-sql"] }
+tonic = "0.14"
+prost = "0.14"
+base64 = "0.22"
+
+# Trimmed from "full" to exactly what icegres uses: #[tokio::main] +
+# select!/spawn (rt-multi-thread, macros), TcpListener (net), Async{Read,Write}Ext
+# (io-util), time::sleep (time). "process" + "signal" exist for icegresd
+# (compute spawning/supervision + SIGTERM shutdown; gate-verified size-neutral
+# on the icegres binary). "parking_lot" (tokio-internal fast mutexes,
+# enabled by "full") was A/B-benchmarked and measured a no-op on this box
+# (qps_8conn 417 with vs 413-420 without) — left off. Transitive deps (pgwire,
+# datafusion, opendal) enable their own tokio features via unification — do
+# not re-add "full".
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "process", "signal"] }
+# default features minus "color" (anstream/anstyle) and "suggestions" (strsim):
+# icegres is a server binary, fancy CLI error rendering is not worth the bytes.
+clap = { version = "4.6", default-features = false, features = ["std", "help", "usage", "error-context", "derive", "env"] }
+futures = "0.3"
+# UPDATE/DELETE (overwrite.rs) commits hand-built snapshots through the
+# Iceberg REST protocol. All three crates are ALREADY in the dependency graph
+# (reqwest+serde_json via iceberg-catalog-rest, uuid via iceberg), so these
+# direct deps add no new code to the binary.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+# Orphan-file GC (`icegres maintain remove-orphans`, src/maintain.rs) needs an
+# object-store LISTING, which the pinned iceberg-rust 0.9.1 FileIO does not
+# expose (delete/exists/read/write only). opendal 0.55.0 with services-s3 is
+# ALREADY compiled into the binary at exactly this version (dependency of
+# iceberg-storage-opendal 0.9.1, which enables services-s3 itself), so this
+# direct dep adds no new code and changes nothing in Cargo.lock beyond listing
+# it as a dependency of icegres. The S3 operator is built from the same
+# CatalogOpts S3 settings context.rs feeds to FileIO (path-style forced,
+# config-load/EC2-metadata disabled).
+opendal = { version = "=0.55.0", features = ["services-s3"] }
+# PEM parsing for --tls-cert/--tls-key. Already in the tree transitively via
+# datafusion-postgres; rustls itself is reached through pgwire's re-export of
+# tokio_rustls so no second rustls version can drift in.
+rustls-pemfile = "2"
+# Durable-tail WAL frame checksums (src/tail.rs). Already in the dependency
+# graph transitively (parquet et al.) at exactly this version, so the pin
+# matches Cargo.lock and adds no new code to the binary. Arrow IPC framing
+# for the same file comes through the existing `arrow` facade (arrow::ipc).
+crc32fast = "=1.5.0"
+# Durable-tail directory lock (src/tail.rs): flock(LOCK_EX | LOCK_NB) so two
+# icegres processes can never share one --tail-dir (double-apply / cross-
+# truncate hazard). Already in the tree transitively at exactly this version.
+libc = "=0.2.186"
+# Durable-tail Postgres backend (src/tail_pg.rs, --tail-url). Pinned EXACTLY
+# because the wire-protocol crates it builds on — postgres-protocol 0.6.12 and
+# postgres-types 0.2.14 — are ALREADY in this graph (pgwire/arrow-pg via
+# datafusion-postgres), and 0.7.18 is the version known to resolve against
+# exactly that pair on this toolchain (bench/harness pins the same trio); a
+# floating bound could drag the shared protocol crates and with them the
+# pinned pgwire matrix. Default features only ("runtime" = tokio connect);
+# no with-* type extensions — the tail schema is TEXT/BIGINT/BYTEA only.
+tokio-postgres = "=0.7.18"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+async-trait = "0.1"
+
+# Test-only: tokio's paused clock (`#[tokio::test(start_paused = true)]`) so
+# the freshness refresher supervisor's respawn window (60 s) is testable in
+# milliseconds. Dev-dependency feature unification applies to test builds
+# only — the shipped binary's tokio feature set above is unchanged.
+[dev-dependencies]
+tokio = { version = "1.52", features = ["test-util"] }
+
+# Resource hygiene: symbols stripped from the release binary (rust symbol tables
+# on the datafusion+iceberg graph are enormous). binary_size_mb and rss are
+# gated metrics (bench/gate.sh). lto = "thin" was measured and rejected: the
+# binary came out ~3 MB BIGGER than strip-only (122.9 vs 120.0 MB — inlining
+# outweighed dead-code elimination on this graph) and the incremental
+# edit-compile-link cycle went from ~33-35 s to ~351 s on this 4-core box.
+[profile.release]
+strip = "symbols"
+
+[lints.rust]
+rust_2018_idioms = { level = "deny", priority = -1 }
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"

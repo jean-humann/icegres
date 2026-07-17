@@ -1,0 +1,41 @@
+$ psql -h 127.0.0.1 -p 5439 -U postgres -d icegres
+              List of relations
+ Schema |       Name       | Type  |  Owner   
+--------+------------------+-------+----------
+ demo   | cities           | table | postgres
+ demo   | cities$manifests | table | postgres
+ demo   | cities$snapshots | table | postgres
+ demo   | trips            | table | postgres
+ demo   | trips$manifests  | table | postgres
+ demo   | trips$snapshots  | table | postgres
+(6 rows)
+
+select count(*) as trips from demo.trips;
+ trips 
+-------
+   283
+(1 row)
+
+select city, count(*) as trips, round(avg(fare), 2) as avg_fare
+from demo.trips group by city order by trips desc, city limit 5;
+  city  | trips | avg_fare 
+--------+-------+----------
+ Berlin |    21 |    25.42
+ London |    21 |    27.98
+ Lisbon |    18 |    22.25
+ Zurich |    18 |    28.69
+ Oslo   |    17 |    24.63
+(5 rows)
+
+select c.country, count(*) as trips, round(sum(t.distance_km), 1) as total_km
+from demo.trips t join demo.cities c on t.city = c.city
+group by c.country order by total_km desc limit 5;
+    country     | trips | total_km 
+----------------+-------+----------
+ United Kingdom |    33 |    596.9
+ Germany        |    32 |    560.0
+ Italy          |    24 |    347.8
+ Switzerland    |    18 |    333.2
+ France         |    25 |    315.3
+(5 rows)
+
