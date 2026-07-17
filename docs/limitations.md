@@ -61,6 +61,39 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
   UPDATE/DELETE) when you need tail-latency acks; use transactions when
   you need multi-statement atomicity with honest conflict reporting.
 
+## Catalog auth / breadth (P6)
+
+Full account: [`docs/catalog-support.md`](catalog-support.md). Summary of the
+caveats:
+
+- **Serve any Iceberg REST catalog, with two auth flows.** icegres uses only
+  REST-spec-standard endpoints (no Lakekeeper-proprietary calls). Auth is now
+  configurable: `--catalog-token` (pre-minted bearer), `--catalog-credential`
+  (OAuth2 client-credentials) `+ --catalog-oauth2-uri` `+ --catalog-scope`.
+  With **no** auth flag the catalog props are byte-identical to before, so the
+  default open Lakekeeper path is unchanged (invariant I3). Proven end to end
+  against an OAuth2 gateway that genuinely rejects unauthenticated calls
+  (e2e section `(cat)`).
+- **The copy-on-write DML commit client authenticates via `--catalog-token`
+  only.** The write plane (`overwrite.rs`) sends the static bearer on config
+  discovery and every commit, so `--catalog-token` authenticates reads AND
+  writes. The OAuth2 **client-credentials** grant is not duplicated into the
+  commit client (no hand-rolled auth; iceberg-rust 0.9.1 does not expose its
+  token provider). So under a *pure* `--catalog-credential` deployment the
+  read/metadata/DDL/time-travel plane is authenticated but the data-commit
+  plane is not — serve read-mostly on the credential flow, or pass a
+  long-lived `--catalog-token` alongside for writes. Re-check trigger: wire the
+  provider into `overwrite.rs` once a pin exposes it.
+- **AWS Glue REST is blocked at the pin.** Glue's REST endpoint is AWS
+  SigV4-signed; `iceberg-catalog-rest 0.9.1` has no SigV4 support (verified by
+  grep) and we do not hand-roll it. Re-check on any pin bump past 0.9.1.
+- **Apache Polaris is not stood up on this box.** It is spec-compatible by
+  construction (same REST spec + the OAuth2 client-credentials flow now
+  supported) but un-buildable here: its wrapper pins Gradle 9.6.1, whose
+  download the agent proxy denies. The second-catalog proof is therefore a
+  spec-conformant OAuth2 **auth harness** fronting the real Lakekeeper, labeled
+  `by-construction` — not a claim of "proven against Polaris".
+
 ## Ingestion and cursors
 
 - **`COPY … FROM STDIN` is not supported on pgwire.** Bulk ingest is served by
@@ -670,6 +703,20 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
   that has no un-flushed frames at probe time — it WOULD be fenced by the
   verify run, so point verify at dedicated or quiesced acceptors
   (deployment.md §12).
+- **Against an auth-guarded catalog, verify carries the full `serve`
+  catalog-auth surface** — the `--catalog-token` / `--catalog-credential`
+  / `--catalog-oauth2-uri` / `--catalog-scope` flags are forwarded to its
+  scratch servers, and the create-test-**drop** cleanup runs through the
+  authenticated catalog client (a raw unauthenticated REST DELETE would 401
+  and strand the scratch namespace). Two consequences carry over from the
+  write plane (`docs/catalog-support.md`): (1) under a **pure**
+  `--catalog-credential` deployment (OAuth2 client-credentials, no static
+  `--catalog-token`), the copy-on-write commit client cannot authenticate,
+  so verify's write-based suites **SKIP loudly** — supply `--catalog-token`
+  to re-prove them; (2) the catalog client's `drop_table` requests no
+  object-store purge, so verify's dropped scratch tables leave their data
+  files to the object store's own lifecycle (object-store cleanup is out of
+  verify's reach, as above).
 
 ## Transport / security
 

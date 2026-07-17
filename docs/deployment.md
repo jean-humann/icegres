@@ -625,6 +625,12 @@ icegres verify --tail-quorum k1:5471,k2:5471,k3:5471
 
 # one suite, machine-readable report, keep the evidence for support
 icegres verify --suite exactly-once --json --keep-evidence /tmp/evidence
+
+# auth-guarded catalog: pass the same --catalog-* flags you give `serve`.
+# They are forwarded to verify's scratch servers, and cleanup drops the
+# scratch namespace through the authenticated client.
+icegres verify --catalog-uri https://catalog.example/catalog \
+  --catalog-token "$BEARER" --tail-dir /var/lib/icegres/verify-tail
 ```
 
 Unlike `icegres serve`, verify takes its tail backend **only from the
@@ -641,12 +647,25 @@ flags keep their env bindings: the catalog is read-mostly and shared by
 design — verify only creates, tests, and drops its own scratch
 namespace in it.)
 
+**Auth-guarded catalogs.** verify carries the full `serve` catalog-auth
+surface. Pass the same `--catalog-token` / `--catalog-credential` /
+`--catalog-oauth2-uri` / `--catalog-scope` you use for `serve` (or set the
+`ICEGRES_CATALOG_*` env vars — unlike the tail vars, the catalog vars are
+honored): verify forwards them to every scratch server and drops the
+scratch namespace through the authenticated catalog client. One honesty
+rail carries over from the write plane (`docs/catalog-support.md`): under a
+**pure** `--catalog-credential` deployment (OAuth2 client-credentials, no
+`--catalog-token`), the copy-on-write commit client cannot authenticate, so
+verify's write-based suites **SKIP loudly** naming the fix. Supply
+`--catalog-token` to re-prove them.
+
 What it does, mechanically: creates a dedicated scratch namespace
-`icegres_verify_<nonce>` (refused if it pre-exists; dropped — with its
-tables purged — on every exit path, including Ctrl-C), spawns its own
-scratch `icegres serve` processes against your catalog flags, drives them
-over pgwire, and SIGKILLs *only those children* exactly like the CI
-harness does. Suites: `durability` (acked rows survive kill -9 via tail
+`icegres_verify_<nonce>` (refused if it pre-exists; dropped, with its
+tables, on every exit path, including Ctrl-C — the drop goes through the
+**authenticated** catalog client, so it succeeds against an auth-guarded
+catalog too), spawns its own scratch `icegres serve` processes against
+your catalog flags, drives them over pgwire, and SIGKILLs *only those
+children* exactly like the CI harness does. Suites: `durability` (acked rows survive kill -9 via tail
 replay), `exactly-once` (watermark replay + post-flush sequence floor),
 `fencing` (a second writer on the same tail identity is excluded),
 `freshness` (a foreign commit becomes visible within `--freshness-ms` +

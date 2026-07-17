@@ -684,6 +684,10 @@ mod tests {
             s3_access_key: env("ICEGRES_S3_ACCESS_KEY", "rustfsadmin"),
             s3_secret_key: env("ICEGRES_S3_SECRET_KEY", "rustfssecret"),
             s3_region: env("ICEGRES_S3_REGION", "us-east-1"),
+            catalog_token: None,
+            catalog_credential: None,
+            catalog_oauth2_uri: None,
+            catalog_scope: None,
         }
     }
 

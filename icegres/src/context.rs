@@ -33,7 +33,7 @@ pub const DEFAULT_SCHEMA: &str = "demo";
 /// Connect to the Iceberg REST catalog (Lakekeeper) with S3 file IO
 /// pointed at the configured S3-compatible object store (RustFS).
 pub async fn connect_catalog(opts: &CatalogOpts) -> Result<Arc<dyn Catalog>> {
-    let props = HashMap::from([
+    let mut props = HashMap::from([
         (REST_CATALOG_PROP_URI.to_string(), opts.catalog_uri.clone()),
         (
             REST_CATALOG_PROP_WAREHOUSE.to_string(),
@@ -50,6 +50,17 @@ pub async fn connect_catalog(opts: &CatalogOpts) -> Result<Arc<dyn Catalog>> {
         (S3_DISABLE_EC2_METADATA.to_string(), "true".to_string()),
     ]);
 
+    // Iceberg REST catalog authentication (breadth). Inserted ONLY when the
+    // operator set the corresponding flag/env, so the default open-Lakekeeper
+    // path leaves `props` byte-identical to before (invariant I3). These are
+    // the exact literal string keys iceberg-catalog-rest 0.9.1 reads
+    // (catalog.rs): `token`, `credential`, `oauth2-server-uri`, `scope`. The
+    // crate is not re-exporting them as constants, so they are inserted as
+    // literals — the RestCatalog `load()` builder copies every prop except
+    // uri/warehouse into the client config, where the OAuth2 client (already
+    // vendored in iceberg-rust 0.9.1) consumes them.
+    apply_catalog_auth(&mut props, opts);
+
     let catalog = RestCatalogBuilder::default()
         .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
             configured_scheme: "s3".to_string(),
@@ -64,6 +75,34 @@ pub async fn connect_catalog(opts: &CatalogOpts) -> Result<Arc<dyn Catalog>> {
             )
         })?;
     Ok(Arc::new(catalog))
+}
+
+/// Literal Iceberg REST prop keys the pinned `iceberg-catalog-rest 0.9.1`
+/// client reads for OAuth2 (it exports no constants for them — see
+/// catalog.rs `get_token_endpoint`/`token`/`credential`/`extra_oauth_params`).
+const PROP_TOKEN: &str = "token";
+const PROP_CREDENTIAL: &str = "credential";
+const PROP_OAUTH2_URI: &str = "oauth2-server-uri";
+const PROP_SCOPE: &str = "scope";
+
+/// Insert the REST-catalog auth props into `props` for every auth flag the
+/// operator actually set. Absent flags insert nothing, so the default path is
+/// byte-identical (invariant I3). Factored out so it is unit-testable without
+/// a live catalog. Also used by the write client (overwrite.rs) to keep the
+/// static `token` in sync.
+pub(crate) fn apply_catalog_auth(props: &mut HashMap<String, String>, opts: &CatalogOpts) {
+    if let Some(token) = &opts.catalog_token {
+        props.insert(PROP_TOKEN.to_string(), token.clone());
+    }
+    if let Some(credential) = &opts.catalog_credential {
+        props.insert(PROP_CREDENTIAL.to_string(), credential.clone());
+    }
+    if let Some(uri) = &opts.catalog_oauth2_uri {
+        props.insert(PROP_OAUTH2_URI.to_string(), uri.clone());
+    }
+    if let Some(scope) = &opts.catalog_scope {
+        props.insert(PROP_SCOPE.to_string(), scope.clone());
+    }
 }
 
 /// DataFusion session configuration tuned for this workload (small-batch
@@ -252,4 +291,134 @@ async fn build_session_context_inner(
     }
     ctx.register_catalog(CATALOG_NAME, Arc::new(mem));
     Ok(ctx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A CatalogOpts with the historical (open-Lakekeeper) defaults and no
+    /// auth flags set — the byte-identical default path.
+    fn opts_no_auth() -> CatalogOpts {
+        CatalogOpts {
+            catalog_uri: "http://127.0.0.1:8181/catalog".to_string(),
+            warehouse: "lakehouse".to_string(),
+            s3_endpoint: "http://127.0.0.1:9000".to_string(),
+            s3_access_key: "rustfsadmin".to_string(),
+            s3_secret_key: "rustfssecret".to_string(),
+            s3_region: "us-east-1".to_string(),
+            catalog_token: None,
+            catalog_credential: None,
+            catalog_oauth2_uri: None,
+            catalog_scope: None,
+        }
+    }
+
+    #[test]
+    fn auth_props_absent_when_no_flags_set() {
+        let mut props = HashMap::new();
+        apply_catalog_auth(&mut props, &opts_no_auth());
+        assert!(props.is_empty(), "no auth flag set must insert no props");
+        for key in [PROP_TOKEN, PROP_CREDENTIAL, PROP_OAUTH2_URI, PROP_SCOPE] {
+            assert!(!props.contains_key(key), "{key} must be absent");
+        }
+    }
+
+    #[test]
+    fn token_prop_present_only_when_set() {
+        let mut opts = opts_no_auth();
+        opts.catalog_token = Some("pre-minted-bearer-xyz".to_string());
+        let mut props = HashMap::new();
+        apply_catalog_auth(&mut props, &opts);
+        assert_eq!(
+            props.get(PROP_TOKEN).map(String::as_str),
+            Some("pre-minted-bearer-xyz")
+        );
+        // Only the token prop — nothing else leaks in.
+        assert!(!props.contains_key(PROP_CREDENTIAL));
+        assert!(!props.contains_key(PROP_OAUTH2_URI));
+        assert!(!props.contains_key(PROP_SCOPE));
+    }
+
+    #[test]
+    fn credential_flow_props_present_only_when_set() {
+        let mut opts = opts_no_auth();
+        opts.catalog_credential = Some("icegres:supersecret".to_string());
+        opts.catalog_oauth2_uri = Some("http://127.0.0.1:8182/v1/oauth/tokens".to_string());
+        opts.catalog_scope = Some("catalog".to_string());
+        let mut props = HashMap::new();
+        apply_catalog_auth(&mut props, &opts);
+        assert_eq!(
+            props.get(PROP_CREDENTIAL).map(String::as_str),
+            Some("icegres:supersecret")
+        );
+        assert_eq!(
+            props.get(PROP_OAUTH2_URI).map(String::as_str),
+            Some("http://127.0.0.1:8182/v1/oauth/tokens")
+        );
+        assert_eq!(props.get(PROP_SCOPE).map(String::as_str), Some("catalog"));
+        assert!(!props.contains_key(PROP_TOKEN));
+    }
+
+    #[test]
+    fn default_props_are_byte_identical_with_and_without_the_helper() {
+        // The full props map built by connect_catalog, minus the auth call,
+        // must equal the same map WITH apply_catalog_auth when no flag is set.
+        let opts = opts_no_auth();
+        let base = || {
+            HashMap::from([
+                (REST_CATALOG_PROP_URI.to_string(), opts.catalog_uri.clone()),
+                (
+                    REST_CATALOG_PROP_WAREHOUSE.to_string(),
+                    opts.warehouse.clone(),
+                ),
+                (S3_ENDPOINT.to_string(), opts.s3_endpoint.clone()),
+                (S3_ACCESS_KEY_ID.to_string(), opts.s3_access_key.clone()),
+                (S3_SECRET_ACCESS_KEY.to_string(), opts.s3_secret_key.clone()),
+                (S3_REGION.to_string(), opts.s3_region.clone()),
+                (S3_PATH_STYLE_ACCESS.to_string(), "true".to_string()),
+                (S3_DISABLE_CONFIG_LOAD.to_string(), "true".to_string()),
+                (S3_DISABLE_EC2_METADATA.to_string(), "true".to_string()),
+            ])
+        };
+        let untouched = base();
+        let mut with_auth = base();
+        apply_catalog_auth(&mut with_auth, &opts);
+        assert_eq!(untouched, with_auth);
+    }
+
+    #[test]
+    fn debug_redacts_secret_fields_but_keeps_others() {
+        let mut opts = opts_no_auth();
+        opts.catalog_token = Some("SECRET_BEARER_TOKEN".to_string());
+        opts.catalog_credential = Some("icegres:SECRET_CLIENT_PW".to_string());
+        opts.catalog_oauth2_uri = Some("http://127.0.0.1:8182/v1/oauth/tokens".to_string());
+        opts.catalog_scope = Some("catalog".to_string());
+        let dbg = format!("{opts:?}");
+        // Secrets must NOT appear in any log/debug rendering.
+        assert!(
+            !dbg.contains("SECRET_BEARER_TOKEN"),
+            "bearer token leaked: {dbg}"
+        );
+        assert!(
+            !dbg.contains("SECRET_CLIENT_PW"),
+            "client secret leaked: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "redaction marker missing: {dbg}"
+        );
+        // Non-secret fields stay visible for debuggability.
+        assert!(dbg.contains("http://127.0.0.1:8182/v1/oauth/tokens"));
+        assert!(dbg.contains("catalog"));
+        assert!(dbg.contains("lakehouse"));
+    }
+
+    #[test]
+    fn debug_renders_none_for_unset_secrets() {
+        let dbg = format!("{:?}", opts_no_auth());
+        // Absence is still debuggable: unset secrets render as None, not <redacted>.
+        assert!(dbg.contains("catalog_token: None"), "{dbg}");
+        assert!(dbg.contains("catalog_credential: None"), "{dbg}");
+    }
 }
