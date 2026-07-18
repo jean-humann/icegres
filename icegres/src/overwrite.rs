@@ -2705,35 +2705,57 @@ fn data_file_write_properties(
 }
 
 /// Map the Iceberg `write.parquet.compression-codec` / `-level` table properties
-/// to a parquet codec, defaulting to **zstd** (Iceberg's default) when unset or
-/// unrecognized. A malformed level falls back to the codec default rather than
-/// failing the write. Pure, so it is unit-tested without a live table.
+/// to a parquet codec, defaulting to **zstd** (Iceberg's default) when unset. A
+/// codec that is set but not one this build supports is logged and falls back to
+/// zstd rather than being silently discarded; a malformed level falls back to
+/// the codec default rather than failing the write. Pure, so it is unit-tested
+/// without a live table.
 fn write_compression(
     props: &std::collections::HashMap<String, String>,
 ) -> datafusion::parquet::basic::Compression {
-    use datafusion::parquet::basic::{Compression, GzipLevel, ZstdLevel};
+    use datafusion::parquet::basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel};
     let level = props.get("write.parquet.compression-level");
-    match props
-        .get("write.parquet.compression-codec")
-        .map(|s| s.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("uncompressed") | Some("none") => Compression::UNCOMPRESSED,
-        Some("snappy") => Compression::SNAPPY,
-        Some("lz4") => Compression::LZ4_RAW,
-        Some("gzip") => Compression::GZIP(
-            level
-                .and_then(|l| l.parse().ok())
-                .and_then(|l| GzipLevel::try_new(l).ok())
-                .unwrap_or_default(),
-        ),
-        _ => Compression::ZSTD(
+    let zstd = || {
+        Compression::ZSTD(
             level
                 .and_then(|l| l.parse().ok())
                 .and_then(|l| ZstdLevel::try_new(l).ok())
                 .or_else(|| ZstdLevel::try_new(3).ok())
                 .unwrap_or_default(),
+        )
+    };
+    let Some(codec) = props
+        .get("write.parquet.compression-codec")
+        .map(|s| s.to_ascii_lowercase())
+    else {
+        return zstd(); // unset → zstd default
+    };
+    match codec.as_str() {
+        "uncompressed" | "none" => Compression::UNCOMPRESSED,
+        "snappy" => Compression::SNAPPY,
+        "lz4" | "lz4_raw" => Compression::LZ4_RAW,
+        "zstd" => zstd(),
+        "gzip" => Compression::GZIP(
+            level
+                .and_then(|l| l.parse().ok())
+                .and_then(|l| GzipLevel::try_new(l).ok())
+                .unwrap_or_default(),
         ),
+        "brotli" => Compression::BROTLI(
+            level
+                .and_then(|l| l.parse().ok())
+                .and_then(|l| BrotliLevel::try_new(l).ok())
+                .unwrap_or_default(),
+        ),
+        other => {
+            // Set but unsupported here (e.g. lzo): don't silently discard the
+            // operator's intent — surface it, then use the zstd default.
+            tracing::warn!(
+                codec = other,
+                "unsupported write.parquet.compression-codec; writing zstd"
+            );
+            zstd()
+        }
     }
 }
 
@@ -2887,6 +2909,20 @@ mod tests {
         assert!(matches!(
             write_compression(&map(&[("write.parquet.compression-codec", "gzip")])),
             Compression::GZIP(_)
+        ));
+        // brotli and lz4_raw are honored, not silently downgraded to zstd.
+        assert!(matches!(
+            write_compression(&map(&[("write.parquet.compression-codec", "brotli")])),
+            Compression::BROTLI(_)
+        ));
+        assert_eq!(
+            write_compression(&map(&[("write.parquet.compression-codec", "lz4_raw")])),
+            Compression::LZ4_RAW
+        );
+        // A set-but-unsupported codec falls back to a valid zstd (with a warn).
+        assert!(matches!(
+            write_compression(&map(&[("write.parquet.compression-codec", "lzo")])),
+            Compression::ZSTD(_)
         ));
         // A malformed level does not fail — it falls back to a valid zstd codec.
         assert!(matches!(
