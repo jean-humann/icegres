@@ -138,7 +138,7 @@ degrade, not OOM-kill the pod.
 
 | Env var | Default | Effect |
 |---|---|---|
-| `ICEGRES_MEMORY_LIMIT_MB` | 70% of `/proc/meminfo` (1 GiB floor) | Size of the `FairSpillPool`. `0` = unbounded (not recommended). Over budget → operators spill to disk, then `ResourcesExhausted`, never OOM. |
+| `ICEGRES_MEMORY_LIMIT_MB` | 70% of `/proc/meminfo` (RAM assumed 1 GiB if unreadable) | Size of the `FairSpillPool`. `0` = unbounded (not recommended). Over budget → operators spill to disk, then `ResourcesExhausted`, never OOM. |
 | `ICEGRES_MAX_CONNECTIONS` | 512 | Accept-loop concurrency cap; excess connections wait in the OS backlog instead of spawning unbounded per-connection state. |
 
 Set the pool a few hundred MB below the container memory limit to leave room
@@ -166,7 +166,7 @@ snapshot). A Lakekeeper blip must surface as a bounded error, not a hang.
 |---|---|---|
 | `ICEGRES_CATALOG_TIMEOUT_MS` | 5000 | Per `load_table` timeout. `0` = no timeout. |
 | `ICEGRES_CATALOG_RETRIES` | 2 | Retries with exponential backoff on timeout/failure. |
-| `ICEGRES_STALE_READ_ON_CATALOG_ERROR` | off | If `true`, serve the last cached snapshot when the catalog is unreachable (availability over exact freshness). Default is to propagate the error. |
+| `ICEGRES_STALE_READ_ON_CATALOG_ERROR` | mode-dependent | When the catalog is unreachable: exact mode propagates the error by default, freshness mode serves the last refreshed snapshot by default. Set `1` (serve stale) or `0` (fail loud) to override either mode explicitly. |
 
 Object-store request timeouts are NOT yet configurable (a limitation of the
 pinned `iceberg-storage-opendal` 0.9.1) — see `docs/limitations.md`.
@@ -338,6 +338,11 @@ exactly once by the restart's election).
 ---
 
 ## 10. Quick reference — operational env vars
+
+A names-only cheat sheet of the knobs most relevant to a deployment.
+**[`configuration.md`](configuration.md) is the complete reference** — every
+flag and env var with its default and meaning, including the scan, cache, and
+DataFusion tuning knobs not listed here.
 
 ```
 # Lakehouse

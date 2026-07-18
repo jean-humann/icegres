@@ -126,7 +126,10 @@ psql -h 127.0.0.1 -p 5439 -U postgres -d icegres
 ### Configuration
 
 All flags have working defaults for the local stack and can also be set via
-environment variables:
+environment variables. The common flags are below;
+**[`docs/configuration.md`](../docs/configuration.md) is the complete reference**
+— every flag and `ICEGRES_*` / `ICEGRESD_*` / `ICEKEEPER_*` env var (including the
+scan, cache, and DataFusion tuning knobs), grouped with defaults and meanings.
 
 | Flag | Env var | Default | Description |
 |---|---|---|---|
@@ -147,6 +150,7 @@ environment variables:
 | `--branch` (serve) | `ICEGRES_BRANCH` | `main` | Serve a zero-copy branch: reads pin to the ref's head, all writes commit to the ref with `assert-ref-snapshot-id` (never touching other branches) |
 | `--freshness-ms` (serve) | `ICEGRES_FRESHNESS_MS` | `0` (exact) | Opt-in bounded-staleness reads: scans serve the cached snapshot with no per-scan catalog check; ONE background task polls the catalog every N ms (up to 8 tables refreshed concurrently) and swaps changed snapshots. Own writes stay read-your-own-writes exact (synchronous invalidation); foreign commits visible within ~N ms + one refresh round trip — a slow table delays only itself (retry-free per-table refresh timeout min(4·N, 2 s); the next pass retries), never other tables (WARN on enable). Also enables the physical-plan cache. During a catalog outage reads keep serving the last refreshed snapshot (`ICEGRES_STALE_READ_ON_CATALOG_ERROR=0` fails loudly instead); worst-case age = `icegres_freshness_age_ms` on `/metrics`, sampled at refresher pass start (healthy ≈ N) |
 |  | `ICEGRES_PLAN_CACHE_ENTRIES` | `256` | LRU capacity of the physical-plan cache (active only with `--freshness-ms > 0`; `0` disables it) |
+|  | `ICEGRES_RESULT_CACHE_BYTES` | `0` (off) | Byte budget for the opt-in result cache: repeated identical queries at an unchanged snapshot are served from cached result batches with no execution or IO (freshness mode only; same version invalidation as the plan cache) |
 | `--write-buffer-ms` (serve) | `ICEGRES_WRITE_BUFFER_MS` | `0` (sync) | Opt-in buffered writes: INSERTs ack from an in-memory buffer, group-committed every N ms; unclean kill loses ≤N ms of acked writes (WARN on enable) |
 |  | `ICEGRES_WRITE_BUFFER_MAX_ROWS` | `50000` | Row threshold that forces an early flush in buffered mode |
 | `--tail-dir` (serve) | `ICEGRES_TAIL_DIR` | off | Durable local tail for buffered writes (requires `--write-buffer-ms > 0`): fsync'd per-table WAL appended BEFORE each buffered ack, replayed on boot — closes the unclean-kill loss window (node/disk loss still loses the tail) |
@@ -159,17 +163,15 @@ environment variables:
 
 Logging uses `tracing` with an env filter: `RUST_LOG=debug icegres serve`.
 Every connection runs inside a correlation span (`conn` id + peer) so
-interleaved concurrent-connection logs de-multiplex, and each query is timed:
-one over `ICEGRES_SLOW_QUERY_MS` (default 1000; `0` disables) logs a slow-query
-WARN and increments `icegres_queries_slow_total`. Other GA operational env vars
-(memory pool `ICEGRES_MEMORY_LIMIT_MB`, connection cap
-`ICEGRES_MAX_CONNECTIONS`, catalog timeout/retry
-`ICEGRES_CATALOG_TIMEOUT_MS`/`_RETRIES`, `/metrics` on `--health-port` —
-including `icegres_queries_in_flight`/`_slow_total`/`_query_duration_ms_total`,
-`ICEGRES_LOG_FORMAT=json`) are set the same way. When `--auth-file` is set, a
+interleaved concurrent-connection logs de-multiplex. The remaining operational
+knobs — memory pool (`ICEGRES_MEMORY_LIMIT_MB`), connection cap
+(`ICEGRES_MAX_CONNECTIONS`), catalog timeout/retry, slow-query threshold,
+`ICEGRES_LOG_FORMAT=json`, scan and cache tuning, and the `/metrics` series — are
+listed with their defaults in
+[`docs/configuration.md`](../docs/configuration.md). When `--auth-file` is set, a
 per-source-IP **failed-auth backoff** slows credential brute-forcing (failures
 decay after 60 s; a successful login is never delayed beyond the current
-penalty). The **Flight SQL** listener now supports in-process TLS via
+penalty). The **Flight SQL** listener supports in-process TLS via
 `flight-serve --tls-cert/--tls-key` (advertises the `h2` ALPN; `grpc+tls://`
 clients connect directly, no front proxy needed).
 
