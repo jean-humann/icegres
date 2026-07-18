@@ -28,7 +28,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CHART="$ROOT/deploy/helm/icegres"
 VALUES_DIR="$ROOT/deploy/helm/tests/values"
 GOLDEN_DIR="$ROOT/deploy/helm/tests/golden"
-PROFILES=(defaults ha tail-dir tail-quorum readreplicas-tls-auth)
+PROFILES=(defaults ha tail-dir tail-quorum readreplicas-tls-auth flight-grpcweb)
 RELEASE=icegres
 NAMESPACE=icegres-system
 KUBE_VERSIONS=(1.31.0 1.34.0)
@@ -412,6 +412,32 @@ if [ -n "${wnp:-}" ]; then
 fi
 grep -q '^kind: ServiceMonitor$' "$r" \
     && ok "ServiceMonitor rendered when gated on" || bad "ServiceMonitor missing"
+
+# (h) flight profile: the Arrow Flight SQL listener + gRPC-web surface
+fr="$TMP/render-flight-grpcweb.yaml"
+flight_doc="$(doc "$fr" Deployment "$RELEASE-flight")" \
+    && ok "flight Deployment rendered" || bad "flight Deployment missing"
+if [ -n "${flight_doc:-}" ]; then
+    echo "$flight_doc" | grep -q 'ICEGRES_GRPC_WEB' \
+        && ok "flight gRPC-web enabled" || bad "ICEGRES_GRPC_WEB missing"
+    echo "$flight_doc" | grep -q 'value: "https://dash.example"' \
+        && ok "flight CORS origin pinned" || bad "CORS origin not pinned"
+    echo "$flight_doc" | grep -q 'ICEGRES_FLIGHT_TLS_CERT' \
+        && ok "flight TLS terminates in-process" || bad "flight TLS env missing"
+    echo "$flight_doc" | grep -q 'ICEGRES_AUTH_FILE' \
+        && ok "flight basic auth wired" || bad "flight auth env missing"
+    # Same fencing rule as read replicas: a Flight process opening the
+    # writer's tail would fence it.
+    echo "$flight_doc" | grep -qE 'ICEGRES_TAIL_(QUORUM|DIR|URL)|ICEGRES_WRITE_BUFFER' \
+        && bad "flight leaked tail/buffer env (would fence the writer)" \
+        || ok "flight carries no tail/buffer env"
+fi
+doc "$fr" NetworkPolicy "$RELEASE-flight" | grep -q "port: 50051" \
+    && ok "flight NetworkPolicy segments the client port" \
+    || bad "flight NetworkPolicy missing"
+grep -q "^# Source: icegres/templates/flight-deployment.yaml" "$TMP/render-defaults.yaml" \
+    && bad "defaults leaked the flight Deployment" \
+    || ok "defaults render no flight objects"
 
 echo "---- tests/helm.sh: $PASS passed, $FAIL failed"
 exit $((FAIL > 0))

@@ -1,0 +1,160 @@
+{{- include "icegres.validate" . -}}
+{{- if .Values.flight.enabled }}
+{{/*
+The Arrow Flight SQL endpoint (`icegres flight-serve`): the ADBC fast
+lane and — with flight.grpcWeb — the browser-dashboard endpoint
+(@icegres/flight-web speaks gRPC-web straight at this port; see
+docs/frontend-dashboards.md). Stateless read computes like -read, and
+like them rendered WITHOUT any buffered-write/tail environment (a
+Flight process opening the writer's tail would fence it). flight-serve
+exposes no HTTP health port, so probes are TCP on the gRPC port — the
+listener binds only after the catalog session is wired, which is the
+same "accepting = serving" contract the health probe encodes elsewhere.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "icegres.fullname" . }}-flight
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegres.labels" . | nindent 4 }}
+    app.kubernetes.io/component: flight
+spec:
+  replicas: {{ int .Values.flight.replicas }}
+  selector:
+    matchLabels:
+      {{- include "icegres.selectorLabels" (dict "ctx" $ "component" "flight") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "icegres.labels" . | nindent 8 }}
+        app.kubernetes.io/component: flight
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "icegres.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "icegres.selectorLabels" (dict "ctx" $ "component" "flight") | nindent 20 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: 40
+      containers:
+        - name: flight
+          image: {{ include "icegres.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["flight-serve", "--host", "0.0.0.0"]
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "icegres.fullname" . }}
+          env:
+            - name: ICEGRES_FLIGHT_PORT
+              value: {{ .Values.flight.port | quote }}
+            - name: ICEGRES_S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "icegres.s3SecretName" . }}
+                  key: s3-access-key
+            - name: ICEGRES_S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "icegres.s3SecretName" . }}
+                  key: s3-secret-key
+            {{- if .Values.auth.enabled }}
+            - name: ICEGRES_AUTH_FILE
+              value: /etc/icegres/auth/users
+            {{- else }}
+            - name: ICEGRES_INSECURE
+              value: "true"
+            {{- end }}
+            {{- if .Values.tls.enabled }}
+            - name: ICEGRES_FLIGHT_TLS_CERT
+              value: /etc/icegres/tls/tls.crt
+            - name: ICEGRES_FLIGHT_TLS_KEY
+              value: /etc/icegres/tls/tls.key
+            {{- end }}
+            {{- if .Values.flight.grpcWeb }}
+            - name: ICEGRES_GRPC_WEB
+              value: "true"
+            - name: ICEGRES_CORS_ORIGIN
+              value: {{ .Values.flight.corsOrigin | quote }}
+            {{- end }}
+            {{- if ne .Values.flight.resultCompression "zstd" }}
+            - name: ICEGRES_RESULT_COMPRESSION
+              value: {{ .Values.flight.resultCompression | quote }}
+            {{- end }}
+            {{- if gt (int .Values.flight.freshnessMs) 0 }}
+            - name: ICEGRES_FRESHNESS_MS
+              value: {{ .Values.flight.freshnessMs | quote }}
+            {{- end }}
+            {{- with .Values.flight.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: flight
+              containerPort: {{ int .Values.flight.port }}
+          startupProbe:
+            tcpSocket:
+              port: flight
+            periodSeconds: 2
+            failureThreshold: 60
+          livenessProbe:
+            tcpSocket:
+              port: flight
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: flight
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.flight.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.auth.enabled }}
+            - name: auth
+              mountPath: /etc/icegres/auth
+              readOnly: true
+            {{- end }}
+            {{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: /etc/icegres/tls
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.auth.enabled }}
+        - name: auth
+          secret:
+            secretName: {{ include "icegres.authSecretName" . }}
+            items:
+              - key: users
+                path: users
+        {{- end }}
+        {{- if .Values.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.existingSecret }}
+        {{- end }}
+{{- end }}
