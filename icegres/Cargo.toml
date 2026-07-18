@@ -123,6 +123,18 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 async-trait = "0.1"
+# Global allocator for all three binaries. arrow/parquet/DataFusion are
+# allocation-heavy (per-batch buffers, RowConverter, Arrow IPC encode) and the
+# default system malloc contends across the multi-threaded tokio runtime.
+# mimalloc is a small, self-contained arena allocator (~200 KB — well within the
+# binary-size gate). No secure-mode overhead (default features only).
+mimalloc = { version = "0.1", default-features = false }
+# HashDoS-resistant fast hasher for the keyed upsert map, whose keys are
+# client-supplied PK bytes hashed on every keyed write. ahash 0.7.8 is ALREADY
+# in the dependency graph at exactly this version, so this direct dep reuses it
+# and adds no new code; its randomized seed keeps the map collision-attack
+# resistant, unlike a fixed-seed hasher (FxHash) which a server must not expose.
+ahash = "0.7"
 
 # Test-only: tokio's paused clock (`#[tokio::test(start_paused = true)]`) so
 # the freshness refresher supervisor's respawn window (60 s) is testable in

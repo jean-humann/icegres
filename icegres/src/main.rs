@@ -4,6 +4,12 @@
 //! and tables through DataFusion, and serves them over the Postgres wire
 //! protocol via datafusion-postgres.
 
+// arrow/parquet/DataFusion are allocation-heavy (per-batch buffers,
+// RowConverter, Arrow IPC encode); mimalloc cuts the cross-thread malloc
+// contention the system allocator shows on the multi-threaded runtime.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// `AS OF` time-travel SQL sugar — raw-statement rewrite to the
 /// `table@snapshot` path (roadmap-v2 P5; see the module's dialect note).
 mod asof;
