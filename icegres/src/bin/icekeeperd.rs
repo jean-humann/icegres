@@ -71,6 +71,10 @@ enum KCommand {
     },
 }
 
+// Match the main icegres binary: mimalloc as the global allocator.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
