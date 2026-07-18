@@ -52,7 +52,10 @@ datafusion = "=52.5.0"
 datafusion-postgres = "=0.15.0"
 
 # Arrow — must stay on 57.x to match datafusion 52 / iceberg 0.9.1
-arrow = "=57.3.1"
+# `ipc_compression` turns on arrow-ipc's lz4/zstd codecs (reusing the `zstd`
+# and `lz4_flex` crates already in the graph via opendal/object_store) so Flight
+# result IPC buffers can be ZSTD-compressed on the wire — no new dependencies.
+arrow = { version = "=57.3.1", features = ["ipc_compression"] }
 
 # Arrow Flight SQL endpoint (`icegres flight-serve`, SPEC A11): the ADBC
 # first-class surface. arrow-flight 57.3.1 matches arrow 57.3.1 and pulls
