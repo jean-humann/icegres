@@ -2688,6 +2688,55 @@ pub fn align_batch(batch: &RecordBatch, target: &ArrowSchemaRef) -> Result<Recor
         .map_err(|e| anyhow!("rows do not fit the table schema (nullability/type): {e}"))
 }
 
+/// Build the Parquet [`WriterProperties`] for data files.
+///
+/// The parquet crate defaults to `Compression::UNCOMPRESSED`; the icegres scan
+/// path is bytes/IO-bound (one ~1 ms object GET per file), so writing
+/// uncompressed data inflates the dominant read cost and storage. This honors
+/// the Iceberg table's `write.parquet.compression-codec` /
+/// `write.parquet.compression-level` properties and otherwise defaults to
+/// **zstd** — the modern Iceberg default — instead of leaving files raw.
+fn data_file_write_properties(
+    table: &Table,
+) -> datafusion::parquet::file::properties::WriterProperties {
+    datafusion::parquet::file::properties::WriterProperties::builder()
+        .set_compression(write_compression(table.metadata().properties()))
+        .build()
+}
+
+/// Map the Iceberg `write.parquet.compression-codec` / `-level` table properties
+/// to a parquet codec, defaulting to **zstd** (Iceberg's default) when unset or
+/// unrecognized. A malformed level falls back to the codec default rather than
+/// failing the write. Pure, so it is unit-tested without a live table.
+fn write_compression(
+    props: &std::collections::HashMap<String, String>,
+) -> datafusion::parquet::basic::Compression {
+    use datafusion::parquet::basic::{Compression, GzipLevel, ZstdLevel};
+    let level = props.get("write.parquet.compression-level");
+    match props
+        .get("write.parquet.compression-codec")
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("uncompressed") | Some("none") => Compression::UNCOMPRESSED,
+        Some("snappy") => Compression::SNAPPY,
+        Some("lz4") => Compression::LZ4_RAW,
+        Some("gzip") => Compression::GZIP(
+            level
+                .and_then(|l| l.parse().ok())
+                .and_then(|l| GzipLevel::try_new(l).ok())
+                .unwrap_or_default(),
+        ),
+        _ => Compression::ZSTD(
+            level
+                .and_then(|l| l.parse().ok())
+                .and_then(|l| ZstdLevel::try_new(l).ok())
+                .or_else(|| ZstdLevel::try_new(3).ok())
+                .unwrap_or_default(),
+        ),
+    }
+}
+
 /// The standard iceberg-rust data-file writer stack (identical to the one
 /// iceberg-datafusion's INSERT path builds): rolling Parquet writer with
 /// default target file size, writing under the table's data location.
@@ -2696,7 +2745,7 @@ async fn new_data_writer(
     commit_uuid: &Uuid,
 ) -> Result<impl IcebergWriter<arrow::array::RecordBatch, Vec<DataFile>>> {
     let parquet_builder = ParquetWriterBuilder::new_with_match_mode(
-        datafusion::parquet::file::properties::WriterProperties::default(),
+        data_file_write_properties(table),
         table.metadata().current_schema().clone(),
         FieldMatchMode::Name,
     );
@@ -2725,7 +2774,7 @@ pub(crate) async fn new_compact_data_writer(
     target_file_size: usize,
 ) -> Result<impl IcebergWriter<arrow::array::RecordBatch, Vec<DataFile>>> {
     let parquet_builder = ParquetWriterBuilder::new_with_match_mode(
-        datafusion::parquet::file::properties::WriterProperties::default(),
+        data_file_write_properties(table),
         table.metadata().current_schema().clone(),
         FieldMatchMode::Name,
     );
@@ -2815,6 +2864,39 @@ mod tests {
     use super::*;
     use arrow::array::{Float64Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
+
+    #[test]
+    fn write_compression_defaults_to_zstd_and_honors_table_properties() {
+        use datafusion::parquet::basic::Compression;
+        let map = |kv: &[(&str, &str)]| {
+            kv.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        // Unset → zstd (NOT the parquet-crate UNCOMPRESSED default).
+        assert!(matches!(write_compression(&map(&[])), Compression::ZSTD(_)));
+        // Codec names are honored, case-insensitively.
+        assert!(matches!(
+            write_compression(&map(&[("write.parquet.compression-codec", "SNAPPY")])),
+            Compression::SNAPPY
+        ));
+        assert_eq!(
+            write_compression(&map(&[("write.parquet.compression-codec", "uncompressed")])),
+            Compression::UNCOMPRESSED
+        );
+        assert!(matches!(
+            write_compression(&map(&[("write.parquet.compression-codec", "gzip")])),
+            Compression::GZIP(_)
+        ));
+        // A malformed level does not fail — it falls back to a valid zstd codec.
+        assert!(matches!(
+            write_compression(&map(&[
+                ("write.parquet.compression-codec", "zstd"),
+                ("write.parquet.compression-level", "not-a-number"),
+            ])),
+            Compression::ZSTD(_)
+        ));
+    }
 
     #[test]
     fn multi_table_transaction_body_wraps_per_table_requirements() {
