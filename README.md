@@ -140,8 +140,13 @@ docker run --rm -p 5439:5439 -p 8080:8080 \
 
 | Doc | What's in it |
 |---|---|
+| [`docs/architecture.md`](docs/architecture.md) | The system overview: components, read path, write paths, commit protocol, durability ladder, HA topology — with pointers into the module rustdocs. |
 | [`icegres/README.md`](icegres/README.md) | Full CLI/flag/env reference and per-feature detail (auth, TLS, transactions, PK, branches, buffered writes, ADBC, `icegresd`). |
-| [`docs/deployment.md`](docs/deployment.md) | Operator guide: container, health/readiness/metrics probes, graceful shutdown, resource limits, security, table maintenance (expiry + GC + compaction), full env-var reference, Kubernetes/Helm install matrix + HA runbook (§11). |
+| [`docs/configuration.md`](docs/configuration.md) | Every operator-facing knob — flags and env vars across all three binaries, with defaults and meanings. |
+| [`docs/clients.md`](docs/clients.md) | Copy-paste connection recipes: psql, psycopg2, SQLAlchemy, JDBC, ODBC, ADBC/Flight SQL, BI tools. |
+| [`docs/deployment.md`](docs/deployment.md) | Operator guide: container, health/readiness/metrics probes, graceful shutdown, resource limits, security, table maintenance (expiry + GC + compaction), Kubernetes/Helm install matrix + HA runbook (§11). |
+| [`deploy/helm/icegres/README.md`](deploy/helm/icegres/README.md) | The Helm chart: topologies, complete values reference, operational sharp edges. |
+| [`docs/troubleshooting.md`](docs/troubleshooting.md) | The error catalog: SQLSTATEs, startup refusals, runtime failure modes with remedies, what to alert on. |
 | [`docs/limitations.md`](docs/limitations.md) | Every deliberate non-goal / caveat, with its workaround and why-not-yet. |
 | [`docs/cqrs-topology.md`](docs/cqrs-topology.md) | CQRS reference topology — which tier serves OLTP vs API vs BI, with measured latencies. |
 | [`docs/production-readiness-audit.md`](docs/production-readiness-audit.md) | Multi-agent pre-GA audit and how each finding was closed. |
