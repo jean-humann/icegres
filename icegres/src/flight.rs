@@ -157,6 +157,54 @@ struct TokenEntry {
     issued: Instant,
 }
 
+/// Decode a `Basic` base64 payload into `(user, password)` (shared by the
+/// Handshake RPC and the per-RPC header path).
+fn decode_basic_credentials(b64: &str) -> Result<(String, String), Status> {
+    let decoded = BASE64_ANY_PAD
+        .decode(b64)
+        .map_err(|_| Status::unauthenticated("Basic credentials are not valid base64"))?;
+    let creds = String::from_utf8(decoded)
+        .map_err(|_| Status::unauthenticated("Basic credentials are not valid UTF-8"))?;
+    let (user, password) = creds
+        .split_once(':')
+        .ok_or_else(|| Status::unauthenticated("expected user:password credentials"))?;
+    Ok((user.to_string(), password.to_string()))
+}
+
+/// Verify per-RPC `Basic` credentials, caching successes so the SCRAM
+/// PBKDF2 (4096 iterations) runs once per credential per TTL window rather
+/// than on every RPC. Failures are re-verified every time — a wrong
+/// password never enters the cache, so brute force stays KDF-priced.
+fn verify_basic_cached(
+    b64: &str,
+    auth: &Arc<dyn BasicAuthVerifier>,
+    cache: &Mutex<HashMap<String, TokenEntry>>,
+) -> Result<String, Status> {
+    {
+        let mut store = cache.lock().expect("basic token lock");
+        let now = Instant::now();
+        store.retain(|_, e| now.duration_since(e.issued) < TOKEN_TTL);
+        if let Some(entry) = store.get(b64) {
+            return Ok(entry.user.clone());
+        }
+    }
+    let (user, password) = decode_basic_credentials(b64)?;
+    if !auth.verify_password(&user, &password) {
+        warn!(user, "flight per-RPC basic auth rejected (bad credentials)");
+        return Err(Status::unauthenticated(format!(
+            "password authentication failed for user \"{user}\""
+        )));
+    }
+    cache.lock().expect("basic token lock").insert(
+        b64.to_string(),
+        TokenEntry {
+            user: user.clone(),
+            issued: Instant::now(),
+        },
+    );
+    Ok(user)
+}
+
 struct FlightSqlServiceImpl {
     ctx: Arc<SessionContext>,
     engine: Arc<OverwriteEngine>,
@@ -170,6 +218,17 @@ struct FlightSqlServiceImpl {
     /// Bearer tokens issued by successful handshakes (per-boot, random) ->
     /// their bound identity and issue time (TTL-pruned on use).
     tokens: Mutex<HashMap<String, TokenEntry>>,
+    /// Per-RPC `Basic` credentials already verified against the SCRAM store
+    /// (keyed by the raw base64 credential string) -> identity + verify time.
+    /// gRPC-web clients cannot run the bidirectional Handshake RPC, so they
+    /// authenticate every call with a Basic header; this cache keeps the
+    /// 4096-iteration PBKDF2 check off the per-RPC hot path (same TTL and
+    /// pruning as handshake tokens). Failed attempts are never cached.
+    basic_tokens: Mutex<HashMap<String, TokenEntry>>,
+    /// Result-batch IPC compression (`--result-compression`): `Some(ZSTD)`
+    /// by default; `None` serves uncompressed batches for clients whose
+    /// arrow build lacks the zstd feature.
+    ipc_compression: Option<arrow::ipc::CompressionType>,
     prepared: Mutex<HashMap<String, Prepared>>,
     sql_info: SqlInfoData,
     /// Buffered-write overlay source. `Some` only on the tail-api listener
@@ -276,25 +335,38 @@ impl FlightSqlServiceImpl {
     /// it to the authenticated principal. Returns `None` when auth is disabled
     /// (no identity; authorization is also necessarily disabled in that case).
     fn authorize<T>(&self, request: &Request<T>) -> Result<Option<String>, Status> {
-        if self.auth.is_none() {
+        let Some(auth) = &self.auth else {
             return Ok(None);
-        }
+        };
         let header = request
             .metadata()
             .get("authorization")
-            .ok_or_else(|| Status::unauthenticated("no authorization header; handshake first"))?
+            .ok_or_else(|| {
+                Status::unauthenticated(
+                    "no authorization header; handshake first or send per-RPC Basic credentials",
+                )
+            })?
             .to_str()
             .map_err(|_| Status::unauthenticated("authorization header is not valid ASCII"))?;
-        let token = header
-            .strip_prefix("Bearer ")
-            .ok_or_else(|| Status::unauthenticated("expected 'Bearer <token>' authorization"))?;
-        let mut store = self.tokens.lock().expect("token lock");
-        let now = Instant::now();
-        store.retain(|_, e| now.duration_since(e.issued) < TOKEN_TTL);
-        match store.get(token) {
-            Some(entry) => Ok(Some(entry.user.clone())),
-            None => Err(Status::unauthenticated("unknown or expired bearer token")),
+        if let Some(token) = header.strip_prefix("Bearer ") {
+            let mut store = self.tokens.lock().expect("token lock");
+            let now = Instant::now();
+            store.retain(|_, e| now.duration_since(e.issued) < TOKEN_TTL);
+            return match store.get(token) {
+                Some(entry) => Ok(Some(entry.user.clone())),
+                None => Err(Status::unauthenticated("unknown or expired bearer token")),
+            };
         }
+        // Per-RPC Basic credentials: the only auth flow gRPC-web can carry
+        // (Handshake is a bidirectional stream, absent from that protocol).
+        // Native clients may use it too — it is how ADBC header-auth modes
+        // behave against other Flight SQL servers.
+        if let Some(b64) = header.strip_prefix("Basic ") {
+            return verify_basic_cached(b64, auth, &self.basic_tokens).map(Some);
+        }
+        Err(Status::unauthenticated(
+            "expected 'Bearer <token>' or 'Basic <credentials>' authorization",
+        ))
     }
 
     /// Gate a SQL statement against the ReBAC policy (no-op when authz is
@@ -532,7 +604,7 @@ impl FlightSqlServiceImpl {
             let t = Instant::now();
             let data: Vec<Result<arrow_flight::FlightData, Status>> =
                 FlightDataEncoderBuilder::new()
-                    .with_options(flight_ipc_options())
+                    .with_options(flight_ipc_options(self.ipc_compression))
                     .with_schema(schema)
                     .build(stream::iter(batches.into_iter().map(Ok)))
                     .map_err(Status::from)
@@ -544,7 +616,7 @@ impl FlightSqlServiceImpl {
         let stream = datafusion::physical_plan::execute_stream(plan, task_ctx)
             .map_err(|e| Status::internal(format!("execution failed: {e}")))?;
         let flight = FlightDataEncoderBuilder::new()
-            .with_options(flight_ipc_options())
+            .with_options(flight_ipc_options(self.ipc_compression))
             .with_schema(schema)
             .build(stream.map_err(|e| FlightError::ExternalError(Box::new(e))))
             .map_err(Status::from);
@@ -593,7 +665,7 @@ impl FlightSqlServiceImpl {
             .map_err(|e| Status::internal(format!("execution failed: {e}")))?;
         let schema = stream.schema();
         let flight = FlightDataEncoderBuilder::new()
-            .with_options(flight_ipc_options())
+            .with_options(flight_ipc_options(self.ipc_compression))
             .with_schema(schema)
             .build(stream.map_err(|e| FlightError::ExternalError(Box::new(e))))
             .map_err(Status::from);
@@ -845,22 +917,15 @@ impl FlightSqlService for FlightSqlServiceImpl {
             let b64 = header.strip_prefix("Basic ").ok_or_else(|| {
                 Status::unauthenticated(format!("only Basic auth is implemented, got {header:?}"))
             })?;
-            let decoded = BASE64_ANY_PAD
-                .decode(b64)
-                .map_err(|_| Status::unauthenticated("Basic credentials are not valid base64"))?;
-            let creds = String::from_utf8(decoded)
-                .map_err(|_| Status::unauthenticated("Basic credentials are not valid UTF-8"))?;
-            let (user, password) = creds
-                .split_once(':')
-                .ok_or_else(|| Status::unauthenticated("expected user:password credentials"))?;
-            if !source.verify_password(user, password) {
+            let (user, password) = decode_basic_credentials(b64)?;
+            if !source.verify_password(&user, &password) {
                 warn!(user, "flight handshake rejected (bad credentials)");
                 return Err(Status::unauthenticated(format!(
                     "password authentication failed for user \"{user}\""
                 )));
             }
             info!(user, "flight handshake authenticated");
-            authenticated_user = user.to_string();
+            authenticated_user = user;
         }
         let token = uuid::Uuid::new_v4().to_string();
         self.tokens.lock().expect("token lock").insert(
@@ -1626,6 +1691,8 @@ pub async fn spawn_tail_api(
         sql_info: build_sql_info(),
         write_buffer: Some(buffer),
         read_only: true,
+        basic_tokens: Mutex::new(HashMap::new()),
+        ipc_compression: Some(arrow::ipc::CompressionType::ZSTD),
         plans: PlanCache::from_env(),
         stash: Mutex::new(HashMap::new()),
     };
@@ -1658,26 +1725,59 @@ pub async fn spawn_tail_api(
     Ok(())
 }
 
+/// Listener configuration for [`run`] beyond the bind address (kept as a
+/// struct so the CLI surface can grow without another parameter each time).
+pub struct ListenerOpts {
+    pub auth_file: Option<PathBuf>,
+    pub authorizer: Option<SharedAuthorizer>,
+    pub tls: Option<(String, String)>,
+    pub freshness_ms: u64,
+    /// Also answer gRPC-web (`--grpc-web`): tonic-web translates the
+    /// fetch()-compatible framing in-process so browsers can run Flight SQL
+    /// against this port directly; native gRPC clients are unaffected.
+    pub grpc_web: bool,
+    /// CORS origin echoed on gRPC-web responses/preflights (`--cors-origin`).
+    pub cors_origin: String,
+    /// Result-batch IPC compression (`--result-compression`).
+    pub ipc_compression: Option<arrow::ipc::CompressionType>,
+}
+
 /// Run the Flight SQL endpoint (blocks until SIGINT).
 pub async fn run(
     opts: &CatalogOpts,
     host: &str,
     port: u16,
-    auth_file: Option<PathBuf>,
-    authorizer: Option<SharedAuthorizer>,
-    tls: Option<(String, String)>,
-    freshness_ms: u64,
+    listener_opts: ListenerOpts,
 ) -> Result<()> {
+    let ListenerOpts {
+        auth_file,
+        authorizer,
+        tls,
+        freshness_ms,
+        grpc_web,
+        cors_origin,
+        ipc_compression,
+    } = listener_opts;
     let start = std::time::Instant::now();
+    // Validate the CORS origin up front: it is inserted into response headers
+    // verbatim, so a non-header-safe value must abort startup, not per-RPC.
+    let cors_origin = http::HeaderValue::from_str(&cors_origin)
+        .with_context(|| format!("--cors-origin {cors_origin:?} is not a valid header value"))?;
     // Build the TLS acceptor up front so a bad cert/key aborts startup (no
     // silent plaintext fallback), exactly like the pgwire listener.
     let tls_acceptor = match &tls {
         // gRPC is HTTP/2 over TLS: advertise the `h2` ALPN token so clients
-        // negotiate HTTP/2 instead of refusing the connection.
+        // negotiate HTTP/2 instead of refusing the connection. With
+        // --grpc-web, also offer `http/1.1` — gRPC-web is legal over either,
+        // and fetch() in some proxies/browsers lands on HTTP/1.1.
         Some((cert, key)) => Some(crate::ops::build_tls_acceptor_with_alpn(
             cert,
             key,
-            &[b"h2"],
+            if grpc_web {
+                &[b"h2", b"http/1.1"]
+            } else {
+                &[b"h2"]
+            },
         )?),
         None => None,
     };
@@ -1728,6 +1828,8 @@ pub async fn run(
         sql_info: build_sql_info(),
         write_buffer: None,
         read_only: false,
+        basic_tokens: Mutex::new(HashMap::new()),
+        ipc_compression,
         plans: PlanCache::from_env(),
         stash: Mutex::new(HashMap::new()),
     };
@@ -1742,6 +1844,7 @@ pub async fn run(
     info!(
         %addr,
         tls = tls_acceptor.is_some(),
+        grpc_web,
         startup_ms = start.elapsed().as_millis() as u64,
         "flight-serve ready (Arrow Flight SQL)"
     );
@@ -1759,15 +1862,40 @@ pub async fn run(
         info!(signal = %sig, "shutdown signal received; draining Flight RPCs");
     };
 
-    match tls_acceptor {
-        Some(acceptor) => {
+    // With --grpc-web the same port answers both wires: tonic-web recognizes
+    // the `application/grpc-web*` content types and translates them; native
+    // gRPC (h2 + `application/grpc`) passes through untouched. CORS sits
+    // OUTSIDE the translator so browser preflights (OPTIONS never reaches a
+    // gRPC service) are answered before protocol dispatch.
+    match (tls_acceptor, grpc_web) {
+        (Some(acceptor), true) => {
+            tuned_flight_server()
+                .accept_http1(true)
+                .layer(CorsLayer::new(cors_origin))
+                .layer(tonic_web::GrpcWebLayer::new())
+                .add_service(svc)
+                .serve_with_incoming_shutdown(tls_incoming(listener, acceptor), shutdown)
+                .await
+                .context("flight sql server (TLS, grpc-web) failed")?;
+        }
+        (Some(acceptor), false) => {
             tuned_flight_server()
                 .add_service(svc)
                 .serve_with_incoming_shutdown(tls_incoming(listener, acceptor), shutdown)
                 .await
                 .context("flight sql server (TLS) failed")?;
         }
-        None => {
+        (None, true) => {
+            tuned_flight_server()
+                .accept_http1(true)
+                .layer(CorsLayer::new(cors_origin))
+                .layer(tonic_web::GrpcWebLayer::new())
+                .add_service(svc)
+                .serve_with_incoming_shutdown(tcp_incoming(listener), shutdown)
+                .await
+                .context("flight sql server (grpc-web) failed")?;
+        }
+        (None, false) => {
             tuned_flight_server()
                 .add_service(svc)
                 .serve_with_incoming_shutdown(tcp_incoming(listener), shutdown)
@@ -1778,6 +1906,97 @@ pub async fn run(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// CORS for gRPC-web (browser dashboards)
+// ---------------------------------------------------------------------------
+//
+// Browsers gate cross-origin fetch() behind CORS; a gRPC-web call from a
+// dashboard origin needs the preflight answered and the response marked.
+// Hand-rolled as ~80 lines instead of adding tower-http to the supply chain
+// for three headers. Scope is deliberately exactly gRPC-web's needs: POST
+// with the grpc-web content types plus the OPTIONS preflight.
+
+/// Headers a browser is allowed to send on gRPC-web calls. `authorization`
+/// is present because per-RPC Basic credentials are the only auth flow the
+/// protocol can carry (no Handshake stream).
+const CORS_ALLOW_HEADERS: &str = "content-type, x-grpc-web, x-user-agent, authorization";
+/// Trailer-carried gRPC status surfaced as headers by the grpc-web protocol —
+/// the browser client cannot read them unless they are exposed.
+const CORS_EXPOSE_HEADERS: &str =
+    "grpc-status, grpc-message, grpc-status-details-bin, grpc-encoding";
+
+#[derive(Clone)]
+struct CorsLayer {
+    origin: http::HeaderValue,
+}
+
+impl CorsLayer {
+    fn new(origin: http::HeaderValue) -> Self {
+        Self { origin }
+    }
+}
+
+impl<S> tower::Layer<S> for CorsLayer {
+    type Service = CorsService<S>;
+    fn layer(&self, inner: S) -> Self::Service {
+        CorsService {
+            inner,
+            origin: self.origin.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CorsService<S> {
+    inner: S,
+    origin: http::HeaderValue,
+}
+
+impl<S, B> tower::Service<http::Request<B>> for CorsService<S>
+where
+    S: tower::Service<http::Request<B>, Response = http::Response<tonic::body::Body>>,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = futures::future::BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: http::Request<B>) -> Self::Future {
+        if req.method() == http::Method::OPTIONS {
+            // Preflight: answer directly — OPTIONS never reaches gRPC.
+            let resp = http::Response::builder()
+                .status(http::StatusCode::NO_CONTENT)
+                .header("access-control-allow-origin", self.origin.clone())
+                .header("access-control-allow-methods", "POST, OPTIONS")
+                .header("access-control-allow-headers", CORS_ALLOW_HEADERS)
+                .header("access-control-max-age", "86400")
+                .body(tonic::body::Body::empty())
+                .expect("static preflight response");
+            return Box::pin(futures::future::ok(resp));
+        }
+        let origin = self.origin.clone();
+        let fut = self.inner.call(req);
+        Box::pin(async move {
+            let mut resp = fut.await?;
+            let headers = resp.headers_mut();
+            headers.insert("access-control-allow-origin", origin);
+            headers.insert(
+                "access-control-expose-headers",
+                http::HeaderValue::from_static(CORS_EXPOSE_HEADERS),
+            );
+            Ok(resp)
+        })
+    }
+}
+
 /// IPC write options for Flight result streams: ZSTD-compress the Arrow buffers.
 ///
 /// Compression is applied at the Arrow IPC layer (not gRPC-level) so each buffer
@@ -1785,9 +2004,11 @@ pub async fn run(
 /// arrow `ipc_compression` feature; if it were ever built without it,
 /// `try_with_compression` errors and we fall back to uncompressed rather than
 /// failing the stream.
-fn flight_ipc_options() -> arrow::ipc::writer::IpcWriteOptions {
+fn flight_ipc_options(
+    compression: Option<arrow::ipc::CompressionType>,
+) -> arrow::ipc::writer::IpcWriteOptions {
     arrow::ipc::writer::IpcWriteOptions::default()
-        .try_with_compression(Some(arrow::ipc::CompressionType::ZSTD))
+        .try_with_compression(compression)
         .unwrap_or_default()
 }
 
@@ -1969,7 +2190,7 @@ mod tests {
         .unwrap();
 
         // Options must actually carry a compression codec (not silently None).
-        let opts = flight_ipc_options();
+        let opts = flight_ipc_options(Some(arrow::ipc::CompressionType::ZSTD));
         let mut buf = Vec::new();
         {
             let mut w = StreamWriter::try_new_with_options(&mut buf, &schema, opts).unwrap();
@@ -1979,6 +2200,185 @@ mod tests {
         let mut reader = StreamReader::try_new(std::io::Cursor::new(&buf), None).unwrap();
         let decoded = reader.next().unwrap().unwrap();
         assert_eq!(decoded, batch);
+
+        // --result-compression none: the stream must stay decodable AND be
+        // larger than the compressed one (proof compression was really off).
+        let plain_opts = flight_ipc_options(None);
+        let mut plain = Vec::new();
+        {
+            let mut w =
+                StreamWriter::try_new_with_options(&mut plain, &schema, plain_opts).unwrap();
+            // Repetitive payload so ZSTD has something to win on.
+            let big = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(vec![7; 4096])),
+                    Arc::new(StringArray::from(vec!["repetitive"; 4096])),
+                ],
+            )
+            .unwrap();
+            w.write(&big).unwrap();
+            w.finish().unwrap();
+        }
+        let mut zstd = Vec::new();
+        {
+            let mut w = StreamWriter::try_new_with_options(
+                &mut zstd,
+                &schema,
+                flight_ipc_options(Some(arrow::ipc::CompressionType::ZSTD)),
+            )
+            .unwrap();
+            let big = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(vec![7; 4096])),
+                    Arc::new(StringArray::from(vec!["repetitive"; 4096])),
+                ],
+            )
+            .unwrap();
+            w.write(&big).unwrap();
+            w.finish().unwrap();
+        }
+        assert!(zstd.len() < plain.len() / 2, "zstd should compress heavily");
+        let mut reader = StreamReader::try_new(std::io::Cursor::new(&plain), None).unwrap();
+        assert_eq!(reader.next().unwrap().unwrap().num_rows(), 4096);
+    }
+
+    #[test]
+    fn basic_credentials_decode_padded_and_unpadded() {
+        // Padded (standard clients) and unpadded (Go ADBC) both decode.
+        let padded = base64::engine::general_purpose::STANDARD.encode("u:pw");
+        assert_eq!(
+            decode_basic_credentials(&padded).unwrap(),
+            ("u".into(), "pw".into())
+        );
+        let unpadded = padded.trim_end_matches('=').to_string();
+        assert_eq!(
+            decode_basic_credentials(&unpadded).unwrap(),
+            ("u".into(), "pw".into())
+        );
+        // Password may itself contain ':' — only the FIRST split counts.
+        let tricky = base64::engine::general_purpose::STANDARD.encode("u:p:w");
+        assert_eq!(
+            decode_basic_credentials(&tricky).unwrap(),
+            ("u".into(), "p:w".into())
+        );
+        assert!(decode_basic_credentials("!!notbase64!!").is_err());
+        let no_colon = base64::engine::general_purpose::STANDARD.encode("nocolon");
+        assert!(decode_basic_credentials(&no_colon).is_err());
+    }
+
+    /// Stub verifier counting KDF invocations, so the cache behavior of
+    /// per-RPC Basic auth is observable.
+    struct CountingVerifier {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl BasicAuthVerifier for CountingVerifier {
+        fn verify_password(&self, user: &str, password: &str) -> bool {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            user == "bench" && password == "secret"
+        }
+    }
+
+    #[test]
+    fn per_rpc_basic_auth_caches_successes_only() {
+        let verifier = Arc::new(CountingVerifier {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let auth: Arc<dyn BasicAuthVerifier> = verifier.clone();
+        let cache = Mutex::new(HashMap::new());
+        let good = base64::engine::general_purpose::STANDARD.encode("bench:secret");
+        let bad = base64::engine::general_purpose::STANDARD.encode("bench:wrong");
+
+        // First success runs the KDF; the repeat is served from the cache.
+        assert_eq!(verify_basic_cached(&good, &auth, &cache).unwrap(), "bench");
+        assert_eq!(verify_basic_cached(&good, &auth, &cache).unwrap(), "bench");
+        assert_eq!(verifier.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Failures are never cached: every wrong attempt pays the KDF.
+        assert!(verify_basic_cached(&bad, &auth, &cache).is_err());
+        assert!(verify_basic_cached(&bad, &auth, &cache).is_err());
+        assert_eq!(verifier.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// Inner stub for the CORS layer: answers every request with 200 and a
+    /// marker header, so pass-through vs short-circuit is distinguishable.
+    #[derive(Clone)]
+    struct OkService;
+    impl tower::Service<http::Request<()>> for OkService {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = futures::future::Ready<Result<Self::Response, Self::Error>>;
+        fn poll_ready(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, _req: http::Request<()>) -> Self::Future {
+            let resp = http::Response::builder()
+                .status(200)
+                .header("x-inner", "reached")
+                .body(tonic::body::Body::empty())
+                .unwrap();
+            futures::future::ready(Ok(resp))
+        }
+    }
+
+    #[tokio::test]
+    async fn cors_layer_preflight_and_response_marking() {
+        use tower::Layer as _;
+        let origin = http::HeaderValue::from_static("https://dash.example");
+        let mut svc = CorsLayer::new(origin).layer(OkService);
+
+        // OPTIONS preflight is answered by the layer itself (never reaches
+        // the gRPC service) with the allow set browsers require.
+        let preflight = http::Request::builder()
+            .method(http::Method::OPTIONS)
+            .uri("/arrow.flight.protocol.FlightService/DoGet")
+            .body(())
+            .unwrap();
+        let resp = tower::Service::call(&mut svc, preflight).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::NO_CONTENT);
+        assert!(
+            resp.headers().get("x-inner").is_none(),
+            "must not pass through"
+        );
+        assert_eq!(
+            resp.headers().get("access-control-allow-origin").unwrap(),
+            "https://dash.example"
+        );
+        let allowed = resp
+            .headers()
+            .get("access-control-allow-headers")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            allowed.contains("authorization"),
+            "Basic auth header must be allowed"
+        );
+
+        // A normal call passes through and gets origin + exposed trailers.
+        let post = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("/arrow.flight.protocol.FlightService/DoGet")
+            .body(())
+            .unwrap();
+        let resp = tower::Service::call(&mut svc, post).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        assert_eq!(resp.headers().get("x-inner").unwrap(), "reached");
+        assert_eq!(
+            resp.headers().get("access-control-allow-origin").unwrap(),
+            "https://dash.example"
+        );
+        assert!(resp
+            .headers()
+            .get("access-control-expose-headers")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("grpc-status"));
     }
 
     #[test]

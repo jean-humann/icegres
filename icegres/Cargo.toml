@@ -65,6 +65,15 @@ arrow-flight = { version = "=57.3.1", features = ["flight-sql"] }
 tonic = "0.14"
 prost = "0.14"
 base64 = "0.22"
+# gRPC-web on the Flight listener (`flight-serve --grpc-web`): browsers cannot
+# speak native gRPC, so tonic-web translates the fetch()-compatible gRPC-web
+# framing in-process — no Envoy sidecar needed for browser dashboards. http and
+# tower are already in the graph via tonic; named directly so flight.rs can
+# implement the small CORS layer around it (kept hand-rolled instead of
+# pulling tower-http into the supply chain for three headers).
+tonic-web = "0.14"
+http = "1"
+tower = "0.5"
 
 # Trimmed from "full" to exactly what icegres uses: #[tokio::main] +
 # select!/spawn (rt-multi-thread, macros), TcpListener (net), Async{Read,Write}Ext
