@@ -1,0 +1,24 @@
+{
+  "name": "icegres-js-bench",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Frontend data-path probes and benchmark for icegres: browser dashboards over Flight SQL (Arrow) vs pgwire (JSON), through a proxy or gRPC-web direct.",
+  "scripts": {
+    "bundle": "node build.mjs",
+    "proxy": "node proxy/server.js",
+    "grpcweb": "node proxy/grpcweb.js",
+    "bench": "node bench/run.mjs"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.12.5",
+    "@grpc/proto-loader": "^0.7.13",
+    "@lakehouse-rs/flight-sql-client": "^0.0.10",
+    "apache-arrow": "^21.0.0",
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "playwright-core": "^1.49.0"
+  }
+}
