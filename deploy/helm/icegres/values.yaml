@@ -199,6 +199,32 @@ computes:
     limits: { memory: 2Gi }
   extraEnv: []
 
+# --- Arrow Flight SQL listener (`icegres flight-serve`) ------------------------
+# The Arrow-native read endpoint: ADBC clients, and — with grpcWeb — browser
+# dashboards querying the lakehouse directly (@icegres/flight-web,
+# docs/frontend-dashboards.md). Stateless like the read replicas; scale with
+# a plain HPA. Reuses the chart's auth/TLS secrets: auth.enabled mounts the
+# same users file (Flight basic auth / per-RPC Basic over gRPC-web),
+# tls.enabled the same cert pair.
+flight:
+  enabled: false
+  replicas: 1
+  port: 50051
+  # Also answer gRPC-web on the port (browsers; native gRPC unaffected).
+  grpcWeb: false
+  # CORS origin for gRPC-web. Pin to the dashboard origin when auth is on.
+  corsOrigin: "*"
+  # zstd (measured ~5x wire reduction) | none (zstd-less clients).
+  resultCompression: zstd
+  # Bounded-staleness reads + plan cache (same semantics as computes).
+  freshnessMs: 0
+  service:
+    type: ClusterIP
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { memory: 2Gi }
+  extraEnv: []
+
 # --- icekeeperd trios ----------------------------------------------------------
 # Data quorum trio (tail.mode=quorum). Acceptors are tiny (an fsync'd
 # record log; no catalog/S3 access) and MUST land on different nodes for

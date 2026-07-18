@@ -1,0 +1,19 @@
+# Profile: the browser-dashboard surface — Arrow Flight SQL listener with
+# gRPC-web on, pinned CORS origin, auth + TLS reusing the chart secrets,
+# NetworkPolicies segmenting the new client port.
+flight:
+  enabled: true
+  replicas: 2
+  grpcWeb: true
+  corsOrigin: https://dash.example
+  freshnessMs: 250
+auth:
+  enabled: true
+  users: |
+    # generated with `icegres auth hash`
+    dash SCRAM-SHA-256$4096:c2FsdA==$c3RvcmVk:c2VydmVy
+tls:
+  enabled: true
+  existingSecret: icegres-tls
+networkPolicy:
+  enabled: true

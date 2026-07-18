@@ -1,0 +1,22 @@
+{{- include "icegres.validate" . -}}
+{{- if .Values.flight.enabled }}
+# The Arrow Flight SQL endpoint: ADBC clients (grpc://) and — with
+# flight.grpcWeb — browser dashboards connect HERE. gRPC needs no
+# session affinity; a Service load-balances streams per-connection.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "icegres.fullname" . }}-flight
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegres.labels" . | nindent 4 }}
+    app.kubernetes.io/component: flight
+spec:
+  type: {{ .Values.flight.service.type }}
+  selector:
+    {{- include "icegres.selectorLabels" (dict "ctx" $ "component" "flight") | nindent 4 }}
+  ports:
+    - name: flight
+      port: {{ int .Values.flight.port }}
+      targetPort: flight
+{{- end }}
