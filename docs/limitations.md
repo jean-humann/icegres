@@ -191,6 +191,46 @@ caveats:
   wall-clock. Statement-timeout integration at the execution layer is a
   follow-up.
 
+## Memory under load (per-operation bounds)
+
+Measured with `bench/mem.sh` (server peak RSS, `VmHWM`, one operation per fresh
+server, at 100k–4M rows). Reads and bulk ingest are bounded and do not scale
+with data volume; the remaining growth points are per-operation and listed with
+their hard limits.
+
+- **Reads stream — bounded.** Both `SELECT` over pgwire and Flight `DoGet`
+  execute the plan as a lazy `SendableRecordBatchStream` and encode
+  batch-by-batch with socket / HTTP-2 backpressure; a full result set is never
+  materialized. Peak RSS is bounded by one in-flight record batch per scan
+  partition (≈ scan parallelism × row-group size), not by result-set size — a
+  50M-row `SELECT` streams. The only full-materialization read path is gated
+  behind the diagnostic `ICEGRES_QUERY_TIMING=1` (off in production).
+- **Bulk ingest streams — bounded.** Flight `CommandStatementIngest` (ADBC
+  `adbc_ingest`) writes the upload straight to Parquet through a rolling writer
+  as batches arrive and commits one fast-append; peak RSS is bounded by the
+  writer's target file size, **not** the ingest volume. There is no per-ingest
+  size cap and none is needed — a multi-GB ingest holds only the current batch
+  plus per-file metadata resident.
+- **PK-enforced writes materialize the whole-table key set — per-write limit.**
+  A single INSERT/UPDATE/DELETE against a table with a declared primary key
+  buffers the PK columns of every final row in memory to run the uniqueness
+  check (`overwrite.rs`, `pk_rows`/`check_pk`). **Hard limit:** keep the total
+  primary-key-column bytes of the table within available RAM for PK-enforced
+  writes; without a PK, writes stream. (Plain bulk ingest does not enforce PK.)
+- **Copy-on-write DML / compaction read one data file at a time — bounded by
+  file size.** UPDATE/DELETE and `maintain compact` decode one existing data
+  file into memory at a time (`overwrite.rs::read_parquet_file`); the write-out
+  is streamed. **Hard limit:** peak ≈ the largest single data file's decoded
+  size — keep the target data-file size (and any pre-existing large files)
+  within RAM. Streaming this per-file read is upstream-gated by
+  `iceberg-rust` 0.9.1's eager whole-file reader.
+- **Buffered mode grows unbounded during a catalog outage — operational
+  limit.** See the write-buffer section below: in health the in-memory buffer
+  is capped at `ICEGRES_WRITE_BUFFER_MAX_ROWS` (default 50k), but while the
+  catalog is unreachable the flusher cannot drain and the buffer (and its tail
+  frames) grow for the duration of the outage. **Bound the outage window** (or
+  the sustained write rate under it) to keep this within RAM.
+
 ## Write buffer (opt-in)
 
 - **`--write-buffer-ms > 0` trades durability for latency.** In buffered mode an
