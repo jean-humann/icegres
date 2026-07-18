@@ -217,7 +217,10 @@ struct KeyedState {
     /// The declared `icegres.primary-key` columns (canonical names).
     pk_cols: Vec<String>,
     /// Encoded PK -> latest op (per-key last-writer-wins within the window).
-    entries: HashMap<Vec<u8>, KeyedEntry>,
+    /// ahash (randomized seed) rather than SipHash: these keys are client-
+    /// supplied PK bytes hashed on every keyed write, and the seed keeps the
+    /// map collision-attack resistant on a server.
+    entries: ahash::AHashMap<Vec<u8>, KeyedEntry>,
     next_stamp: u64,
     /// Stamps BELOW this were taken by a flush snapshot (every snapshot
     /// covers the whole live map, so this is simply `next_stamp` at the
@@ -696,7 +699,7 @@ impl BufferState {
         if entry.keyed.is_none() {
             entry.keyed = Some(KeyedState {
                 pk_cols: pk_cols.to_vec(),
-                entries: HashMap::new(),
+                entries: ahash::AHashMap::default(),
                 next_stamp: 1,
                 claimed_below: 1,
             });
