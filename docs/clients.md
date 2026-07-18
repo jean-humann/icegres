@@ -120,6 +120,30 @@ isql icegres
 # or DSN-less: "DRIVER={PostgreSQL Unicode};SERVER=localhost;PORT=5439;DATABASE=icegres"
 ```
 
+## Browser JavaScript — `@icegres/flight-web` (gRPC-web, Arrow end-to-end)
+
+Start the Flight listener with gRPC-web enabled (`flight-serve --grpc-web`),
+then query straight from the page — results stay Arrow all the way into
+`apache-arrow` (measured ~2.5–2.8× faster than JSON at 100k–1M rows,
+[frontend-dashboards.md](frontend-dashboards.md)):
+
+```js
+import { FlightWebClient } from "@icegres/flight-web"; // clients/flight-web
+
+const db = new FlightWebClient({
+  baseUrl: "http://localhost:50051",
+  credentials: { username: "u", password: "pw" },  // when --auth-file is set
+});
+const table = await db.query(
+  "SELECT city, count(*) AS trips FROM demo.trips GROUP BY city",
+);
+```
+
+Auth over gRPC-web is per-RPC Basic (there is no Handshake in that
+protocol) — pair with `--tls-cert/--tls-key` and pin `--cors-origin`. Node
+backends can use the same package (`@icegres/flight-web/zstd-node`), plain
+`@grpc/grpc-js` (see `bench/clients/js/lib/flight.js`), or ADBC.
+
 ## BI tools / anything Postgres
 
 Anything that speaks the Postgres wire protocol connects like a stock

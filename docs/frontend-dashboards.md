@@ -23,25 +23,27 @@ and
 | Path | Browser wire | Who talks to icegres | Verdict |
 |---|---|---|---|
 | `arrow-proxy` | Arrow IPC (ZSTD-compressed batches) | Node proxy → Flight SQL `:50051` | **Recommended default** |
-| `grpcweb-direct` | gRPC-web FlightData frames | the browser, through a stateless translator | **Recommended when no app backend exists** |
+| `grpcweb-direct` | gRPC-web FlightData frames | the browser itself (`flight-serve --grpc-web`) | **Recommended when no app backend exists** |
 | `flight-json` | JSON | Node proxy → Flight SQL, rows flattened server-side | loses: pays decode + stringify + parse + 5× wire |
 | `pg-json` | JSON | Node proxy → node-postgres `:5439` | loses: same JSON tax, plus row-oriented transport |
 
 Two facts frame the comparison:
 
 - **Browsers cannot speak native gRPC** (no HTTP/2 trailer access), so
-  "query icegres directly from the frontend" always needs a *protocol*
-  translator (Envoy's `grpc_web` filter, or the bundled Node bridge). The
-  translator is stateless and passes message bytes through untouched — it is
-  infrastructure, not an app backend.
-- **There is no official Arrow Flight client for browser JS.** The
-  `apache-arrow` npm package covers the IPC format only. The probe's browser
-  client (`web/flight-web.js` + `lib/pb.js`, ~300 lines total, no codegen)
-  implements the spec-faithful `GetFlightInfo` → `DoGet` flow over
-  gRPC-web framing, reassembles FlightData into an IPC stream, and hands it
-  to `apache-arrow`. Node backends have real options today:
-  `@grpc/grpc-js` (pure JS, used by the proxy) or the Rust-native
-  `@lakehouse-rs/flight-sql-client`.
+  "query icegres directly from the frontend" needs a protocol translation.
+  icegres now performs it in-process: `flight-serve --grpc-web` makes the
+  Flight port itself answer gRPC-web (tonic-web layer + CORS), so the
+  benchmark's `grpcweb-direct` lane runs with **no extra process at all**.
+  (An Envoy `grpc_web` filter in front of a plain listener remains a valid
+  deployment shape; the client works unchanged against either.)
+- **There is no official Arrow Flight client for browser JS** — the
+  `apache-arrow` npm package covers the IPC format only. icegres ships one:
+  [`@icegres/flight-web`](../clients/flight-web/) (~300 lines, no codegen)
+  implements the spec-faithful `GetFlightInfo` → `DoGet` flow over gRPC-web,
+  reassembles FlightData into an IPC stream, decodes with `apache-arrow`,
+  and supports per-RPC Basic auth, AbortController cancellation, and
+  progressive per-batch rendering. Node backends have real options today:
+  `@grpc/grpc-js` (pure JS, used by the proxy) or ADBC.
 
 ## Results — real Chromium 141, headless, 7 reps, 2 warmups, median
 
@@ -90,7 +92,11 @@ icegres applies on DoGet (`flight_ipc_options`) is doing real work here —
 
 `grpcweb-direct` pays one extra round-trip (`GetFlightInfo` before `DoGet`),
 visible only on tiny queries (+25 ms at 20 ms RTT); by 10k rows it ties, and
-the server's plan-stash makes the second RPC cheap.
+the server's plan-stash makes the second RPC cheap. Re-measured against the
+native `--grpc-web` listener (recorded in
+`bench/results/frontend-paths-2026-07-18-native-grpcweb.json`), the lane
+matches or slightly beats the arrow-proxy lane — the bridged numbers above
+are the conservative ones.
 
 ## Backend reference (Node, no browser)
 
@@ -116,22 +122,29 @@ for servers that send uncompressed batches.
 
 - **ZSTD codec registration is mandatory.** icegres compresses DoGet
   batches; `apache-arrow` JS ships only a codec *registry*. Register
-  `node:zlib`'s zstd in Node and `fzstd` in the browser (see
-  `lib/zstd-node.js` / `web/zstd-web.js` — the browser codec must re-base
-  fzstd's subarray output to byte offset 0 or arrow-js hits typed-array
-  alignment errors).
+  `node:zlib`'s zstd in Node and `fzstd` in the browser — importing
+  `@icegres/flight-web` does it for you (the browser codec re-bases fzstd's
+  subarray output to byte offset 0, or arrow-js hits typed-array alignment
+  errors). Servers can instead run `--result-compression none`.
 - **Types survive only on the Arrow lanes.** JSON silently stringifies
   int64/numeric (node-postgres returns `count(*)` as a string) and loses
   timestamp precision; Arrow delivers real typed columns, which is also
   what chart libraries want.
+- **Auth over gRPC-web is per-RPC Basic.** The Flight Handshake RPC is a
+  bidirectional stream, which the gRPC-web protocol cannot carry; with
+  `--auth-file`, browser clients send `authorization: Basic …` on every
+  call and the server verifies it per-RPC (successes cached server-side so
+  the SCRAM KDF stays off the hot path). Always pair with
+  `--tls-cert/--tls-key` and pin `--cors-origin` to the dashboard origin.
 - **Security.** `grpcweb-direct` exposes the SQL surface to the browser —
   fine for internal dashboards behind `--auth-file` + TLS + `--authz-file`
   scoping (the Flight endpoint enforces per-principal read scopes); for
   public-facing apps prefer `arrow-proxy` with a fixed query allowlist
   rather than raw SQL pass-through.
-- **In production**, replace the Node translator with Envoy's `grpc_web`
-  filter in front of `:50051`; `web/flight-web.js` works unchanged against
-  it.
+- **In production**, either enable `--grpc-web` on the listener (TLS
+  in-process, `http/1.1` ALPN added automatically) or terminate with an
+  Envoy `grpc_web` filter; `@icegres/flight-web` works unchanged against
+  both.
 
 ## Bench-environment notes
 
