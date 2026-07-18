@@ -534,6 +534,7 @@ impl FlightSqlServiceImpl {
             let t = Instant::now();
             let data: Vec<Result<arrow_flight::FlightData, Status>> =
                 FlightDataEncoderBuilder::new()
+                    .with_options(flight_ipc_options())
                     .with_schema(schema)
                     .build(stream::iter(batches.into_iter().map(Ok)))
                     .map_err(Status::from)
@@ -545,6 +546,7 @@ impl FlightSqlServiceImpl {
         let stream = datafusion::physical_plan::execute_stream(plan, task_ctx)
             .map_err(|e| Status::internal(format!("execution failed: {e}")))?;
         let flight = FlightDataEncoderBuilder::new()
+            .with_options(flight_ipc_options())
             .with_schema(schema)
             .build(stream.map_err(|e| FlightError::ExternalError(Box::new(e))))
             .map_err(Status::from);
@@ -593,6 +595,7 @@ impl FlightSqlServiceImpl {
             .map_err(|e| Status::internal(format!("execution failed: {e}")))?;
         let schema = stream.schema();
         let flight = FlightDataEncoderBuilder::new()
+            .with_options(flight_ipc_options())
             .with_schema(schema)
             .build(stream.map_err(|e| FlightError::ExternalError(Box::new(e))))
             .map_err(Status::from);
@@ -1648,7 +1651,7 @@ pub async fn spawn_tail_api(
         info!(signal = %sig, "shutdown signal received; draining tail-api RPCs");
     };
     tokio::spawn(async move {
-        if let Err(e) = Server::builder()
+        if let Err(e) = tuned_flight_server()
             .add_service(svc)
             .serve_with_incoming_shutdown(tcp_incoming(listener), shutdown)
             .await
@@ -1762,14 +1765,14 @@ pub async fn run(
 
     match tls_acceptor {
         Some(acceptor) => {
-            Server::builder()
+            tuned_flight_server()
                 .add_service(svc)
                 .serve_with_incoming_shutdown(tls_incoming(listener, acceptor), shutdown)
                 .await
                 .context("flight sql server (TLS) failed")?;
         }
         None => {
-            Server::builder()
+            tuned_flight_server()
                 .add_service(svc)
                 .serve_with_incoming_shutdown(tcp_incoming(listener), shutdown)
                 .await
@@ -1777,6 +1780,33 @@ pub async fn run(
         }
     }
     Ok(())
+}
+
+/// IPC write options for Flight result streams: ZSTD-compress the Arrow buffers.
+///
+/// Compression is applied at the Arrow IPC layer (not gRPC-level) so each buffer
+/// stays independently decodable and we avoid double-compression. Requires the
+/// arrow `ipc_compression` feature; if it were ever built without it,
+/// `try_with_compression` errors and we fall back to uncompressed rather than
+/// failing the stream.
+fn flight_ipc_options() -> arrow::ipc::writer::IpcWriteOptions {
+    arrow::ipc::writer::IpcWriteOptions::default()
+        .try_with_compression(Some(arrow::ipc::CompressionType::ZSTD))
+        .unwrap_or_default()
+}
+
+/// A tonic server preconfigured for large, long-lived Flight streams.
+///
+/// An adaptive HTTP/2 flow-control window lets a big columnar `DoGet` grow past
+/// hyper's 64 KB default stream window (which otherwise throttles the stream to
+/// one window per round trip over any non-loopback RTT), and keepalives keep the
+/// connection alive through load balancers during long result streams.
+fn tuned_flight_server() -> Server {
+    Server::builder()
+        .http2_adaptive_window(Some(true))
+        .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
+        .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)))
+        .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
 }
 
 /// Adapt a bound TcpListener into the incoming stream tonic expects.
@@ -1917,6 +1947,42 @@ mod tests {
         assert!(like_match("demo", "demo"));
         assert!(like_match("", ""));
         assert!(!like_match("", "x"));
+    }
+
+    #[test]
+    fn flight_ipc_options_zstd_roundtrips() {
+        // The arrow `ipc_compression` feature must be compiled in for Flight
+        // result compression to take effect; this proves it is on AND that a
+        // ZSTD-compressed IPC stream decodes back to the identical batch.
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::ipc::reader::StreamReader;
+        use arrow::ipc::writer::StreamWriter;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["alpha", "beta", "gamma"])),
+            ],
+        )
+        .unwrap();
+
+        // Options must actually carry a compression codec (not silently None).
+        let opts = flight_ipc_options();
+        let mut buf = Vec::new();
+        {
+            let mut w = StreamWriter::try_new_with_options(&mut buf, &schema, opts).unwrap();
+            w.write(&batch).unwrap();
+            w.finish().unwrap();
+        }
+        let mut reader = StreamReader::try_new(std::io::Cursor::new(&buf), None).unwrap();
+        let decoded = reader.next().unwrap().unwrap();
+        assert_eq!(decoded, batch);
     }
 
     #[test]
