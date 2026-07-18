@@ -43,6 +43,22 @@ const CASES = [
 
 const browser = await chromium.launch({ executablePath: CHROMIUM });
 const page = await browser.newPage();
+
+// Optional network throttling via CDP: BENCH_NET="<mbps>,<latency_ms>".
+// Localhost hides the payload-size difference between Arrow and JSON lanes;
+// a 50 Mbit / 20 ms profile approximates a good office connection.
+if (process.env.BENCH_NET) {
+  const [mbps, latency] = process.env.BENCH_NET.split(",").map(Number);
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send("Network.enable");
+  await cdp.send("Network.emulateNetworkConditions", {
+    offline: false,
+    latency: latency || 0,
+    downloadThroughput: (mbps * 1024 * 1024) / 8,
+    uploadThroughput: (mbps * 1024 * 1024) / 8,
+  });
+  console.log(`network throttled to ${mbps} Mbit/s, ${latency} ms latency`);
+}
 page.on("console", (m) => {
   if (m.type() === "error") console.error("page error:", m.text());
 });

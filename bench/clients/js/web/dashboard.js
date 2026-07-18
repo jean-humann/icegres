@@ -44,13 +44,13 @@ function renderTiles(rows) {
 }
 
 function renderBars(rows) {
-  const W = 300;
+  const W = 360;
   const H = 24 * rows.length + 8;
   $("bars").innerHTML = "";
   const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, width: "100%" }, $("bars"));
   const max = Math.max(...rows.map((r) => Number(r.trips)), 1);
   rows.forEach((r, i) => {
-    const w = Math.max((Number(r.trips) / max) * (W - 130), 2);
+    const w = Math.max((Number(r.trips) / max) * (W - 160), 2);
     const y = i * 24 + 4;
     const bar = el(
       "rect",
@@ -102,12 +102,22 @@ function renderLine(rows) {
   });
 }
 
+function fmtCell(col, v) {
+  if (col === "ts") {
+    // Arrow lanes yield epoch millis; the pg-json lane an ISO string.
+    const d = typeof v === "number" ? new Date(v) : new Date(String(v));
+    if (!Number.isNaN(d.getTime()))
+      return d.toISOString().slice(0, 19).replace("T", " ");
+  }
+  return typeof v === "number" ? fmt.format(v) : String(v ?? "");
+}
+
 function renderTable(rows, cols) {
   const head = cols.map((c) => `<th>${c}</th>`).join("");
   const body = rows
     .map(
       (r) =>
-        `<tr>${cols.map((c) => `<td>${typeof r[c] === "number" ? fmt.format(r[c]) : String(r[c] ?? "")}</td>`).join("")}</tr>`,
+        `<tr>${cols.map((c) => `<td>${fmtCell(c, r[c])}</td>`).join("")}</tr>`,
     )
     .join("");
   $("tbl").innerHTML = `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;

@@ -4,6 +4,7 @@
 // what any proxy adds on top of the browser numbers.
 
 import { performance } from "node:perf_hooks";
+import "../lib/zstd-node.js";
 import { tableFromIPC } from "apache-arrow";
 import pgpkg from "pg";
 import { connect, queryToIpcBuffer } from "../lib/flight.js";
@@ -29,9 +30,7 @@ const grpcClient = connect(FLIGHT_ADDR);
 const nativeClient = await createFlightSqlClient({
   host: FLIGHT_ADDR.split(":")[0],
   port: Number(FLIGHT_ADDR.split(":")[1]),
-  useTls: false,
-  username: undefined,
-  password: undefined,
+  tls: false,
   headers: [],
 });
 const pgPool = new pgpkg.Pool({ connectionString: PG_URL, max: 4 });
