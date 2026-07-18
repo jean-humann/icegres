@@ -2808,3 +2808,31 @@ ingest lands exactly 250,000 rows, `sum(trip_id)` matches, and commits as
 **exactly one snapshot** — atomicity preserved. Raw curves:
 `bench/results/mem-baseline-buffered-ingest.md`,
 `bench/results/mem-streaming-ingest.md`.
+
+## Optimizer statistics: manifest-list row counts (2026-07)
+
+`TunedIcebergScan` now reports the scanned snapshot's live row count to
+DataFusion (`partition_statistics`), summed from the manifest LIST's
+`added+existing_rows_count` over data manifests — one small object GET per
+snapshot, cached per `(table uuid, snapshot id)`. `ICEGRES_TABLE_STATS=0`
+disables. Tables with delete manifests or missing counts report no statistics.
+
+**Measured (2M-row `demo.trips_big` ⋈ 20-row `demo.cities`, count-aggregated
+join, debug profile, n=15 — the plan flip itself is profile-independent):**
+
+| | build side | join mode | p50 |
+|---|---|---|---|
+| stats off | unknown → as written | `Partitioned` | 2335 ms |
+| stats on | `cities` (rows=20) | `CollectLeft` | **818 ms (2.9×)** |
+
+With statistics, `JoinSelection` swaps the hash-join build side to the small
+table and collects it once, instead of partition-hashing the 2M-row side.
+`EXPLAIN` now shows `rows=` on every tuned scan.
+
+**Advisory-only guarantee (review-driven):** the count is deliberately
+reported INEXACT even when exact — `Precision::Exact` would let DataFusion's
+`AggregateStatistics` rule answer ungrouped `COUNT(*)` from metadata without
+executing the scan, which would gut `icegres verify`'s count-probe durability
+checks and make dishonest foreign metadata into wrong query results. Verified
+live: `COUNT(*)` on the 2M table executes the real scan (~1 s, scan present
+in EXPLAIN, no PlaceholderRow shortcut) while the join speedup is unaffected.
