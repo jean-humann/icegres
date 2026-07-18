@@ -2769,3 +2769,42 @@ clean; `cargo test --release` 405 passed (incl. 2 new); `tail_durability.sh`
 71/71; `tests/e2e.sh` 295/295 (exit 0). Zero protocol change — Arrow IPC
 compression and HTTP/2 flow control are transparent to conformant clients;
 results are byte-identical after decode.
+
+## Memory under load: streaming bulk ingest (2026-07)
+
+Measured with `bench/mem.sh` — server peak RSS (`VmHWM`), one operation per
+fresh server, Δ = peak − post-startup baseline. Confirms the memory audit
+empirically and proves the streaming-ingest fix.
+
+**Before (ingest fully buffered the upload):** ingest peak RSS grew ~linearly
+with volume — the materialized write path.
+
+| rows | ingest Δ | read-flight Δ | read-pg Δ |
+|---:|---:|---:|---:|
+| 100k | +26 MB | +27 MB | +25 MB |
+| 500k | +57 MB | +38 MB | +38 MB |
+| 2M | +138 MB | +66 MB | +68 MB |
+| 4M | **+243 MB** | +98 MB | +100 MB |
+
+Slope ≈ 55 MB per million rows (unbounded); extrapolated ~40M rows → ~2.2 GB.
+
+**After (ingest streams into a rolling writer, one fast-append commit):**
+
+| rows | ingest Δ | read-flight Δ | read-pg Δ |
+|---:|---:|---:|---:|
+| 100k | +18 MB | +27 MB | +25 MB |
+| 500k | +30 MB | +31 MB | +28 MB |
+| 2M | +42 MB | +33 MB | +32 MB |
+| 4M | **+60 MB** | +37 MB | +35 MB |
+
+Ingest peak dropped **4.0× at 4M rows** (243 → 60 MB) and the slope flattened
+~6× (≈ 9 MB/M, plateauing at one row-group buffer) — ingest now sits in the same
+bounded band as the reads. Reads were bounded before and after (they stream);
+their peak also fell because the rolling writer emits size-bounded row groups
+instead of one giant one.
+
+**Correctness (release, live stack):** a 3-batch (100k+100k+50k) streaming
+ingest lands exactly 250,000 rows, `sum(trip_id)` matches, and commits as
+**exactly one snapshot** — atomicity preserved. Raw curves:
+`bench/results/mem-baseline-buffered-ingest.md`,
+`bench/results/mem-streaming-ingest.md`.
