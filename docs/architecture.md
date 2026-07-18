@@ -76,7 +76,8 @@ flowchart LR
   metadata check per scan), snapshot-pinned time travel (`table@snapshot_id`),
   and the stale-serve-on-catalog-error policy.
 - `scan.rs` — `TunedIcebergScan`: IO-tuned Iceberg scans (concurrent object
-  GETs, right-sized batches).
+  GETs, right-sized batches) that also feed each snapshot's live row count to
+  the optimizer so hash joins pick the smaller build side.
 - `freshness.rs` / `plancache.rs` — opt-in bounded-staleness mode: a
   background refresher replaces the per-scan catalog check, which also enables
   the physical-plan cache and the opt-in result cache (both invalidated by
