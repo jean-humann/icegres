@@ -87,8 +87,6 @@ use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
 use base64::engine::DecodePaddingMode;
 use base64::Engine as _;
 use datafusion::common::{ParamValues, ScalarValue};
-use datafusion::dataframe::DataFrameWriteOptions;
-use datafusion::logical_expr::dml::InsertOp;
 use datafusion::prelude::{DataFrame, SessionContext};
 use futures::{stream, Stream, StreamExt, TryStreamExt};
 use prost::Message;
@@ -102,7 +100,7 @@ use crate::buffer::WriteBuffer;
 use crate::cache::MetadataVersion;
 use crate::context::{self, CATALOG_NAME, DEFAULT_SCHEMA};
 use crate::ops::BasicAuthVerifier;
-use crate::overwrite::{quote_ident, CommitConflict, ConstraintViolation, OverwriteEngine};
+use crate::overwrite::{CommitConflict, ConstraintViolation, OverwriteEngine};
 use crate::plancache::{self, PlanCache, PlanKey};
 use crate::{dml, CatalogOpts};
 use datafusion::physical_plan::ExecutionPlan;
@@ -727,7 +725,9 @@ fn encode_schema(schema: &Schema) -> Result<prost::bytes::Bytes, Status> {
     Ok(message.0)
 }
 
-/// Decode the DoPut Arrow stream into record batches.
+/// Decode the DoPut Arrow stream into record batches (fully buffered). Used by
+/// the prepared-statement param-binding paths, where the payload is small
+/// (bound parameter rows), not a bulk data upload.
 async fn decode_put_stream(stream: PeekableFlightDataStream) -> Result<Vec<RecordBatch>, Status> {
     // into_peekable(), NOT into_inner(): the do_put dispatcher has already
     // peeked the first message (it carries the descriptor AND the schema),
@@ -736,6 +736,17 @@ async fn decode_put_stream(stream: PeekableFlightDataStream) -> Result<Vec<Recor
         .try_collect::<Vec<_>>()
         .await
         .map_err(|e| Status::invalid_argument(format!("cannot decode bound Arrow data: {e}")))
+}
+
+/// Decode the DoPut Arrow stream LAZILY: a batch stream that yields each
+/// RecordBatch as it arrives off the wire, never collecting the whole upload.
+/// This is what bulk ingest feeds into the streaming append so server memory
+/// stays bounded regardless of ingest volume.
+fn decode_put_stream_lazy(
+    stream: PeekableFlightDataStream,
+) -> impl futures::Stream<Item = anyhow::Result<RecordBatch>> {
+    FlightRecordBatchStream::new_from_flight_data(stream.into_peekable().map_err(FlightError::from))
+        .map(|r| r.map_err(|e| anyhow::anyhow!("cannot decode ingested Arrow data: {e}")))
 }
 
 /// Convert bound parameter batches into per-row `$1..$n` value sets.
@@ -1257,41 +1268,26 @@ impl FlightSqlService for FlightSqlServiceImpl {
             }
         }
 
-        let batches = decode_put_stream(request.into_inner()).await?;
-        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        if rows == 0 {
-            return Ok(0);
-        }
-        info!(
-            table = %format!("{namespace}.{table}"),
-            batches = batches.len(),
-            rows,
-            "DoPut(CommandStatementIngest): appending as one Iceberg commit"
-        );
-        // The whole stream goes through iceberg-datafusion's INSERT plan in
-        // ONE execution: rolling Parquet writer (default target file size)
-        // + a single fast-append commit. Same path as `INSERT INTO ... SELECT`.
-        let df = self
-            .ctx
-            .read_batches(batches)
-            .map_err(|e| Status::invalid_argument(format!("cannot read Arrow batches: {e}")))?;
-        let target = format!(
-            "{}.{}.{}",
-            quote_ident(CATALOG_NAME),
-            quote_ident(&namespace),
-            quote_ident(&table)
-        );
-        let result = df
-            .write_table(
-                &target,
-                DataFrameWriteOptions::new().with_insert_operation(InsertOp::Append),
-            )
+        // Stream the upload straight into a rolling Parquet writer and commit
+        // it as ONE fast-append: peak memory is bounded by the writer's target
+        // file size, NOT the ingest volume. (The prior path collected every
+        // batch into a Vec and re-held it in a MemTable through the INSERT, so
+        // a large upload was resident in full.) Same one-commit atomicity.
+        let ident = iceberg::TableIdent::from_strs([namespace.as_str(), table.as_str()])
+            .map_err(|e| Status::invalid_argument(format!("bad table identifier: {e}")))?;
+        let batch_stream = decode_put_stream_lazy(request.into_inner());
+        let outcome = self
+            .engine
+            .append_stream(&ident, batch_stream)
             .await
             .map_err(|e| Status::invalid_argument(format!("ingest failed: {e}")))?;
-        let count = count_from_batches(&result);
-        // iceberg-datafusion reports the committed row count; trust it over
-        // our pre-count if present, but never report 0 for a non-empty put.
-        Ok(if count > 0 { count } else { rows as i64 })
+        info!(
+            table = %format!("{namespace}.{table}"),
+            rows = outcome.rows,
+            snapshot_id = ?outcome.snapshot_id,
+            "DoPut(CommandStatementIngest): streamed append committed as one Iceberg commit"
+        );
+        Ok(outcome.rows as i64)
     }
 
     // ------------------------------------------------------------------

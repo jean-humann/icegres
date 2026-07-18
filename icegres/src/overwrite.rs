@@ -173,6 +173,11 @@ pub struct DmlStatement {
 pub enum TableOp {
     /// Rows appended by INSERT (already aligned to the table Arrow schema).
     Append(Vec<RecordBatch>),
+    /// Data files already written to object storage, to be included in the
+    /// ADDED set of this commit without buffering their rows. Used by the
+    /// streaming ingest path, which writes the upload straight to Parquet as
+    /// it arrives rather than materializing every batch first.
+    AppendFiles(Vec<DataFile>),
     /// A buffered UPDATE/DELETE.
     Dml(DmlStatement),
 }
@@ -528,6 +533,120 @@ impl OverwriteEngine {
         bail!(
             "INSERT into {ident} lost the optimistic-concurrency race {MAX_COMMIT_ATTEMPTS} \
              times; giving up (no partial effects were committed). Conflicts: {}",
+            conflicts.join(" | ")
+        )
+    }
+
+    /// Stream-append a batch stream into an existing table as ONE fast-append
+    /// commit, holding only the current batch (plus the small per-file
+    /// metadata) in memory — never the whole upload. This is the bulk-ingest
+    /// path: the Flight DoPut stream is written straight to Parquet as it
+    /// arrives, so peak memory is bounded by the rolling writer's target file
+    /// size regardless of ingest volume.
+    ///
+    /// The data files are written ONCE, before the commit loop. On an
+    /// optimistic-concurrency conflict the retry only re-runs the metadata
+    /// commit against fresh table state — the already-durable data files are
+    /// never re-encoded. Atomicity is preserved: either the single snapshot
+    /// lands or nothing does (a lost race leaves the files as unreferenced
+    /// orphans that GC reclaims). No PK enforcement — matching the prior
+    /// bulk-append semantics.
+    pub async fn append_stream<S>(&self, ident: &TableIdent, stream: S) -> Result<DmlOutcome>
+    where
+        S: futures::Stream<Item = Result<RecordBatch>>,
+    {
+        use futures::StreamExt;
+
+        // Anchor the writer to the load-time schema; data files carry field
+        // ids, so a later commit against refreshed metadata stays sound.
+        let table = self
+            .catalog
+            .load_table(ident)
+            .await
+            .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?;
+        let arrow_target: ArrowSchemaRef = Arc::new(
+            schema_to_arrow_schema(table.metadata().current_schema())
+                .map_err(|e| anyhow!("schema conversion failed: {e}"))?,
+        );
+        let commit_uuid = Uuid::new_v4();
+        let mut writer = new_data_writer(&table, &commit_uuid).await?;
+        let mut rows: u64 = 0;
+        futures::pin_mut!(stream);
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            rows += batch.num_rows() as u64;
+            let aligned = align_batch(&batch, &arrow_target)?;
+            writer
+                .write(aligned)
+                .await
+                .map_err(|e| anyhow!("failed to write ingested rows: {e}"))?;
+        }
+        let data_files = writer
+            .close()
+            .await
+            .map_err(|e| anyhow!("failed to close ingest data writer: {e}"))?;
+        if rows == 0 || data_files.is_empty() {
+            return Ok(DmlOutcome {
+                rows: 0,
+                attempts: 0,
+                snapshot_id: None,
+            });
+        }
+
+        // Commit the pre-written files as a fast append, with the same
+        // optimistic-concurrency retry as the other write paths. prepare_commit
+        // borrows the ops each attempt (it clones the DataFile metadata into the
+        // manifest), so the files are reused across retries without rewriting.
+        let ops = [TableOp::AppendFiles(data_files)];
+        let mut conflicts: Vec<String> = Vec::new();
+        for attempt in 1..=MAX_COMMIT_ATTEMPTS {
+            let table = self
+                .catalog
+                .load_table(ident)
+                .await
+                .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?;
+            let prepared = prepare_commit(&table, &ops, None, &self.branch, None)
+                .await
+                .with_context(|| format!("ingest into {ident} failed"))?;
+            let Some(prepared) = prepared else {
+                return Ok(DmlOutcome {
+                    rows: 0,
+                    attempts: attempt,
+                    snapshot_id: None,
+                });
+            };
+            match self
+                .post_commit(
+                    &ident.namespace().to_url_string(),
+                    ident.name(),
+                    &prepared.request,
+                )
+                .await?
+            {
+                CommitOutcome::Committed => {
+                    return Ok(DmlOutcome {
+                        rows,
+                        attempts: attempt,
+                        snapshot_id: Some(prepared.snapshot_id),
+                    });
+                }
+                CommitOutcome::Conflict(msg) => {
+                    tracing::warn!(
+                        table = %ident,
+                        attempt,
+                        "ingest commit conflict (409), re-committing against fresh metadata: {msg}"
+                    );
+                    conflicts.push(msg);
+                }
+            }
+        }
+        bail!(
+            "ingest into {ident} lost the optimistic-concurrency race \
+             {MAX_COMMIT_ATTEMPTS} times; giving up (the written data files are \
+             unreferenced orphans, reclaimed by GC). Conflicts: {}",
             conflicts.join(" | ")
         )
     }
@@ -2030,6 +2149,19 @@ pub async fn prepare_commit(
         stage(&mut t_parquet_encode, t);
     }
 
+    // ---- Pre-written data files (streaming ingest). Their rows were written
+    // to object storage straight off the upload stream, so they are added to
+    // the ADDED set here without being buffered or re-encoded. ----
+    let mut prewritten: Vec<DataFile> = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        if let TableOp::AppendFiles(files) = op {
+            let r: u64 = files.iter().map(|f| f.record_count()).sum();
+            rows_by_op[i] = r;
+            appended_rows += r;
+            prewritten.extend(files.iter().cloned());
+        }
+    }
+
     if !any_file_changed && appended_rows == 0 {
         // Net no-op: nothing to commit.
         return Ok(None);
@@ -2062,13 +2194,16 @@ pub async fn prepare_commit(
         // Closing the rolling Parquet writer flushes the encoder and
         // performs the data-file PUT(s) to object storage.
         let t = timing.then(Instant::now);
-        let added: Vec<DataFile> = match data_writer.as_mut() {
+        let mut added: Vec<DataFile> = match data_writer.as_mut() {
             Some(w) => w
                 .close()
                 .await
                 .map_err(|e| anyhow!("failed to close data file writer: {e}"))?,
             None => Vec::new(),
         };
+        // Files written directly from a streaming ingest are already durable;
+        // fold them into the ADDED set alongside any newly-encoded rows.
+        added.extend(prewritten);
         Ok::<_, anyhow::Error>((added, t.map(|t| t.elapsed()).unwrap_or_default()))
     };
     // One rewritten manifest holding EXISTING (kept) + DELETED (removed)

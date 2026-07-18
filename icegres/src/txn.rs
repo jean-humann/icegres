@@ -286,7 +286,9 @@ impl TxnTable {
             .iter()
             .filter_map(|op| match op {
                 TableOp::Append(b) => Some(b.iter().cloned()),
-                TableOp::Dml(_) => None,
+                // Pre-written files never occur in a transaction's buffered ops
+                // (streaming ingest is an autocommit fast-append path).
+                TableOp::Dml(_) | TableOp::AppendFiles(_) => None,
             })
             .flatten()
             .collect()
