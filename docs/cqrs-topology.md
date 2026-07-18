@@ -71,7 +71,14 @@ workload classes on the same single-copy tables:
    round trip — tables refresh concurrently with a per-table timeout, so a
    slow table delays only itself (staleness age exported on `/metrics`,
    sampled at refresher pass start). Suited to read-mostly API computes;
-   leave it off where cross-compute exactness matters.
+   leave it off where cross-compute exactness matters. A further opt-in,
+   `ICEGRES_RESULT_CACHE_BYTES=<budget>`, adds a byte-bounded **result**
+   cache on top: a repeated identical query at an unchanged snapshot is
+   served straight from cached result batches — no planning, execution, or
+   IO — with the same `(table, version)` invalidation as the plan cache (a
+   commit or buffered write on any scanned table bumps the version and
+   drops the entry). Ideal for dashboards and health probes; hit/miss
+   counters are exported as `icegres_result_cache_{hits,misses}_total`.
 2. **Buffered event writes** (`--write-buffer-ms N`, opt-in) — telemetry,
    audit logs, clickstream, anything append-only and loss-tolerant for
    ≤ N ms: INSERT acks at **~1.3–1.5 ms p50** from the in-memory buffer,

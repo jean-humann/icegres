@@ -1,5 +1,21 @@
 //! Physical-plan cache for repeated simple-protocol SELECT shapes
-//! (registered only with `--freshness-ms > 0`).
+//! (registered only with `--freshness-ms > 0`), plus an opt-in
+//! materialized-**result** cache on top of it.
+//!
+//! # Result cache (opt-in)
+//!
+//! [`ResultCache`] is a byte-bounded LRU keyed on the SAME [`PlanKey`] and
+//! validated through the SAME freshness `(table, version)` set as the plan
+//! cache. A hit serves the cached result batches directly — no planning, no
+//! execution, no object-store IO — so a repeated identical query against an
+//! unchanged snapshot (dashboards, health probes, hot point-lookups) returns
+//! from memory. It rides the plan cache's exact soundness envelope
+//! ([`current_version`] is `Some` only for a freshness-managed, overlay-free
+//! provider, so any commit or buffered write bumps the version and
+//! invalidates), and is populated by teeing the executing stream
+//! ([`CachingTee`]) so only completed, small-enough results are cached; a
+//! partial/errored/oversized result never is. Off unless
+//! `ICEGRES_RESULT_CACHE_BYTES > 0`.
 //!
 //! # What upstream already caches (investigated, not duplicated)
 //!
@@ -80,11 +96,14 @@
 //! divergence timing.rs documents.
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::ParamValues;
@@ -104,7 +123,7 @@ use datafusion_postgres::pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use datafusion_postgres::pgwire::messages::data::DataRow;
 use datafusion_postgres::pgwire::types::format::FormatOptions;
 use datafusion_postgres::QueryHook;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 
 use crate::cache::{CachingTableProvider, MetadataVersion};
 use crate::metrics::metrics;
@@ -307,6 +326,270 @@ pub(crate) fn versions_current_with(
         .all(|(table, version)| resolve(table).as_ref() == Some(version))
 }
 
+// ---------------------------------------------------------------------------
+// Result cache: a MATERIALIZED-result sibling of [`PlanCache`], keyed on the
+// same [`PlanKey`] and validated through the same freshness versions. A hit
+// serves the cached result batches directly — no planning, no execution, no
+// object-store IO — for repeated identical queries against an unchanged
+// snapshot (dashboards, health probes, hot point-lookups). It rides the exact
+// same soundness envelope as the plan cache: `current_version` is `Some` only
+// for a freshness-managed, overlay-free provider, so any commit or buffered
+// write bumps the version and invalidates the entry. Off unless
+// `ICEGRES_RESULT_CACHE_BYTES > 0` (and, like the plan cache, inert without
+// `--freshness-ms > 0`). Bounded by total decoded bytes, LRU-evicted.
+// ---------------------------------------------------------------------------
+
+struct ResultEntry {
+    batches: Arc<Vec<RecordBatch>>,
+    schema: ArrowSchemaRef,
+    tables: Vec<(String, MetadataVersion)>,
+    bytes: usize,
+    last_used: u64,
+}
+
+struct ResultCacheInner {
+    map: HashMap<PlanKey, ResultEntry>,
+    clock: u64,
+    total_bytes: usize,
+}
+
+pub(crate) struct ResultCache {
+    inner: StdMutex<ResultCacheInner>,
+    /// Total decoded-byte budget (`ICEGRES_RESULT_CACHE_BYTES`; 0 = disabled).
+    budget: usize,
+    /// A single result larger than this is never cached, so several distinct
+    /// results always coexist (one huge result can't monopolize the budget).
+    per_result_cap: usize,
+}
+
+impl ResultCache {
+    pub(crate) fn from_env() -> Arc<Self> {
+        let budget = match std::env::var("ICEGRES_RESULT_CACHE_BYTES") {
+            Ok(raw) => raw.trim().parse::<usize>().unwrap_or_else(|_| {
+                tracing::warn!(value = %raw, "invalid ICEGRES_RESULT_CACHE_BYTES; result cache disabled");
+                0
+            }),
+            Err(_) => 0,
+        };
+        Arc::new(Self {
+            inner: StdMutex::new(ResultCacheInner {
+                map: HashMap::new(),
+                clock: 0,
+                total_bytes: 0,
+            }),
+            budget,
+            per_result_cap: budget / 4,
+        })
+    }
+
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.budget > 0
+    }
+
+    fn lookup_with(
+        &self,
+        key: &PlanKey,
+        resolve: impl Fn(&str) -> Option<MetadataVersion>,
+    ) -> Option<(Arc<Vec<RecordBatch>>, ArrowSchemaRef)> {
+        if self.budget == 0 {
+            return None;
+        }
+        let mut guard = crate::freshness::recover("result cache", self.inner.lock());
+        let inner = &mut *guard;
+        let entry = inner.map.get_mut(key)?;
+        if !versions_current_with(&entry.tables, &resolve) {
+            let bytes = entry.bytes;
+            inner.map.remove(key);
+            inner.total_bytes = inner.total_bytes.saturating_sub(bytes);
+            return None;
+        }
+        inner.clock += 1;
+        entry.last_used = inner.clock;
+        Some((entry.batches.clone(), entry.schema.clone()))
+    }
+
+    fn lookup(&self, key: &PlanKey) -> Option<(Arc<Vec<RecordBatch>>, ArrowSchemaRef)> {
+        self.lookup_with(key, current_version)
+    }
+
+    fn insert(
+        &self,
+        key: PlanKey,
+        batches: Vec<RecordBatch>,
+        schema: ArrowSchemaRef,
+        tables: Vec<(String, MetadataVersion)>,
+        bytes: usize,
+    ) {
+        // Never cache: disabled, an oversized single result, an empty result,
+        // or a table-less statement (nothing to invalidate against).
+        if self.budget == 0 || bytes == 0 || bytes > self.per_result_cap || tables.is_empty() {
+            return;
+        }
+        let mut guard = crate::freshness::recover("result cache", self.inner.lock());
+        let inner = &mut *guard;
+        if let Some(old) = inner.map.remove(&key) {
+            inner.total_bytes = inner.total_bytes.saturating_sub(old.bytes);
+        }
+        inner.clock += 1;
+        let last_used = inner.clock;
+        inner.total_bytes += bytes;
+        inner.map.insert(
+            key,
+            ResultEntry {
+                batches: Arc::new(batches),
+                schema,
+                tables,
+                bytes,
+                last_used,
+            },
+        );
+        // Evict least-recently-used entries until back within the byte budget.
+        while inner.total_bytes > self.budget {
+            let Some(lru) = inner
+                .map
+                .iter()
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            if let Some(e) = inner.map.remove(&lru) {
+                inner.total_bytes = inner.total_bytes.saturating_sub(e.bytes);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn with_budget(budget: usize) -> Self {
+        Self {
+            inner: StdMutex::new(ResultCacheInner {
+                map: HashMap::new(),
+                clock: 0,
+                total_bytes: 0,
+            }),
+            budget,
+            per_result_cap: budget / 4,
+        }
+    }
+
+    #[cfg(test)]
+    fn entry_count(&self) -> usize {
+        crate::freshness::recover("result cache", self.inner.lock())
+            .map
+            .len()
+    }
+
+    #[cfg(test)]
+    fn total_bytes(&self) -> usize {
+        crate::freshness::recover("result cache", self.inner.lock()).total_bytes
+    }
+}
+
+/// Where a streamed result is captured for the result cache: the target cache,
+/// the key, the validated `(table, version)` set, and the result schema.
+struct PopulateSink {
+    cache: Arc<ResultCache>,
+    key: PlanKey,
+    schema: ArrowSchemaRef,
+    tables: Vec<(String, MetadataVersion)>,
+}
+
+/// Wraps the executing RecordBatch stream: forwards every batch to the client
+/// unchanged while cloning it (Arc-cheap) into an accumulator, and on CLEAN
+/// completion inserts the whole result into the [`ResultCache`]. A result that
+/// exceeds the per-result cap, that errors, or whose stream is dropped before
+/// completion (client disconnect) is never cached — no partial results.
+struct CachingTee {
+    inner: datafusion::physical_plan::SendableRecordBatchStream,
+    acc: Vec<RecordBatch>,
+    bytes: usize,
+    cap: usize,
+    poisoned: bool,
+    inserted: bool,
+    sink: PopulateSink,
+}
+
+impl CachingTee {
+    fn store(&mut self) {
+        if self.inserted || self.poisoned || self.acc.is_empty() {
+            return;
+        }
+        self.inserted = true;
+        let batches = std::mem::take(&mut self.acc);
+        self.sink.cache.insert(
+            self.sink.key.clone(),
+            batches,
+            self.sink.schema.clone(),
+            self.sink.tables.clone(),
+            self.bytes,
+        );
+    }
+}
+
+impl Stream for CachingTee {
+    type Item = datafusion::error::Result<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // CachingTee is Unpin (every field is), so a plain &mut is sound.
+        let this = self.get_mut();
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(batch))) => {
+                if !this.poisoned {
+                    let b = batch.get_array_memory_size();
+                    if this.bytes + b > this.cap {
+                        // Too big to cache: stop accumulating, free what we held.
+                        this.poisoned = true;
+                        this.acc.clear();
+                        this.bytes = 0;
+                    } else {
+                        this.bytes += b;
+                        this.acc.push(batch.clone());
+                    }
+                }
+                Poll::Ready(Some(Ok(batch)))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                this.poisoned = true;
+                this.acc.clear();
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Ready(None) => {
+                this.store();
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// Serve a result-cache hit directly: encode the cached batches to wire rows
+/// with no planning, execution, or IO.
+fn respond_cached(
+    batches: Arc<Vec<RecordBatch>>,
+    schema: ArrowSchemaRef,
+    client: &mut (dyn ClientInfo + Send + Sync),
+    total: Instant,
+    record_stages: bool,
+) -> PgWireResult<Response> {
+    let format_options = Arc::new(FormatOptions::from_client_metadata(client.metadata()));
+    let fields = Arc::new(arrow_schema_to_pg_fields(
+        &schema,
+        &Format::UnifiedText,
+        Some(format_options),
+    )?);
+    let mut rows: Vec<PgWireResult<DataRow>> = Vec::new();
+    for batch in batches.iter() {
+        rows.extend(encode_recordbatch(fields.clone(), batch.clone()));
+    }
+    if record_stages {
+        timing::record("total", total.elapsed());
+    }
+    Ok(Response::Query(QueryResponse::new(
+        fields,
+        futures::stream::iter(rows),
+    )))
+}
+
 /// Why a planned statement cannot be cached (kept for tests/debugging).
 #[derive(Debug, PartialEq)]
 pub(crate) enum Uncacheable {
@@ -400,6 +683,9 @@ fn timeout_error() -> PgWireError {
 /// cache (see the module docs).
 pub struct PlanCacheHook {
     cache: PlanCache,
+    /// Materialized-result cache (opt-in via `ICEGRES_RESULT_CACHE_BYTES`): a
+    /// hit skips planning, execution, AND IO for a repeated identical query.
+    results: Arc<ResultCache>,
     /// Same compatibility parser the wire handler uses — only exercised in
     /// `ICEGRES_QUERY_TIMING=1` mode to measure the real parse cost of the
     /// stage breakdown (timing.rs).
@@ -410,6 +696,7 @@ impl PlanCacheHook {
     pub fn new() -> Self {
         Self {
             cache: PlanCache::from_env(),
+            results: ResultCache::from_env(),
             parser: PostgresCompatibilityParser::new(),
         }
     }
@@ -434,9 +721,35 @@ impl PlanCacheHook {
         let state = ctx.state();
         let key = PlanKey::from_state(&state, sql.clone());
 
-        // HIT: every referenced table is fresh at the planned version.
+        // RESULT HIT: a repeated identical query at an unchanged version —
+        // served straight from cached result batches, no planning/exec/IO.
+        if self.results.is_enabled() {
+            if let Some((batches, schema)) = self.results.lookup(&key) {
+                metrics()
+                    .result_cache_hits_total
+                    .fetch_add(1, Ordering::Relaxed);
+                return respond_cached(batches, schema, client, total, record_stages);
+            }
+            metrics()
+                .result_cache_misses_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        // Build the sink that captures a streamed result into the result cache
+        // (only when enabled, and only for cacheable statements — see the
+        // per-call-site `tables` gate below).
+        let make_sink = |schema: ArrowSchemaRef, tables: Vec<(String, MetadataVersion)>| {
+            self.results.is_enabled().then(|| PopulateSink {
+                cache: self.results.clone(),
+                key: key.clone(),
+                schema,
+                tables,
+            })
+        };
+
+        // PLAN HIT: every referenced table is fresh at the planned version.
         let lookup_started = Instant::now();
-        if let Some((plan, schema, _tables)) = self.cache.lookup(&key) {
+        if let Some((plan, schema, tables)) = self.cache.lookup(&key) {
             // Rebuild the plan's internal nodes so per-instance execution
             // state starts fresh (see [`reset_plan`]) — the expensive leaf
             // scans (pruned file lists) are reused as-is.
@@ -447,7 +760,17 @@ impl PlanCacheHook {
             if record_stages {
                 timing::record("plan_cache_hit", lookup_started.elapsed());
             }
-            return respond(plan, schema, state.task_ctx(), client, record_stages, total).await;
+            let sink = make_sink(schema.clone(), tables);
+            return respond(
+                plan,
+                schema,
+                state.task_ctx(),
+                client,
+                record_stages,
+                total,
+                sink,
+            )
+            .await;
         }
         metrics()
             .plan_cache_misses_total
@@ -492,6 +815,7 @@ impl PlanCacheHook {
             timing::record("plan_physical", t.elapsed());
         }
         let schema = plan.schema();
+        let mut sink = None;
         if let Ok(tables) = tables_before {
             // … and require them UNCHANGED after: the physical plan scanned
             // the providers' cached snapshots, so `before == after == fresh`
@@ -502,10 +826,24 @@ impl PlanCacheHook {
             // the LRU and the hit/miss counters for no measurable win.
             let unchanged = versions_current(&tables);
             if unchanged && !tables.is_empty() && plan_safe_to_cache(&plan) {
-                self.cache.insert(key, plan.clone(), schema.clone(), tables);
+                // The result cache rides the same eligibility gate as the plan
+                // cache, so a streamed result is captured only when a re-plan
+                // would also have cached (and thus been version-invalidated).
+                sink = make_sink(schema.clone(), tables.clone());
+                self.cache
+                    .insert(key.clone(), plan.clone(), schema.clone(), tables);
             }
         }
-        respond(plan, schema, state.task_ctx(), client, record_stages, total).await
+        respond(
+            plan,
+            schema,
+            state.task_ctx(),
+            client,
+            record_stages,
+            total,
+            sink,
+        )
+        .await
     }
 }
 
@@ -556,6 +894,7 @@ async fn respond(
     client: &mut (dyn ClientInfo + Send + Sync),
     record_stages: bool,
     total: Instant,
+    populate: Option<PopulateSink>,
 ) -> PgWireResult<Response> {
     let format_options = Arc::new(FormatOptions::from_client_metadata(client.metadata()));
     let fields = Arc::new(arrow_schema_to_pg_fields(
@@ -582,8 +921,23 @@ async fn respond(
         )));
     }
     let stream = execute_stream(plan, task_ctx).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+    // Tee the executing stream into the result cache when the statement is
+    // cacheable and the cache is enabled; otherwise pass it through untouched.
+    let raw: Pin<Box<dyn Stream<Item = datafusion::error::Result<RecordBatch>> + Send>> =
+        match populate {
+            Some(sink) if sink.cache.is_enabled() => Box::pin(CachingTee {
+                inner: stream,
+                acc: Vec::new(),
+                bytes: 0,
+                cap: sink.cache.per_result_cap,
+                poisoned: false,
+                inserted: false,
+                sink,
+            }),
+            _ => Box::pin(stream),
+        };
     let fields_ref = fields.clone();
-    let pg_row_stream = stream
+    let pg_row_stream = raw
         .map(move |batch| {
             let rows: Box<dyn Iterator<Item = PgWireResult<DataRow>> + Send + Sync> = match batch {
                 Ok(batch) => encode_recordbatch(fields_ref.clone(), batch),
@@ -637,7 +991,6 @@ mod tests {
     use super::*;
     use datafusion::arrow::array::Int64Array;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::datasource::MemTable;
     use datafusion::physical_plan::empty::EmptyExec;
 
@@ -713,6 +1066,92 @@ mod tests {
         let hit = |sql: &str| cache.lookup_with(&key(sql, "demo"), |_| None).is_some();
         assert!(hit("select 9") && hit("select 6"));
         assert!(!hit("select 0") && !hit("select 5"));
+    }
+
+    fn result_schema() -> ArrowSchemaRef {
+        Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]))
+    }
+    fn result_batch(rows: usize) -> RecordBatch {
+        RecordBatch::try_new(
+            result_schema(),
+            vec![Arc::new(Int64Array::from(
+                (0..rows as i64).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn result_cache_hit_then_version_bump_evicts_and_reclaims_bytes() {
+        let cache = ResultCache::with_budget(1 << 20);
+        let b = result_batch(100);
+        let bytes = b.get_array_memory_size();
+        let v1: MetadataVersion = (Some("v1".into()), Some(1));
+        let v2: MetadataVersion = (Some("v2".into()), Some(2));
+        let k = key("select * from t", "demo");
+        cache.insert(
+            k.clone(),
+            vec![b],
+            result_schema(),
+            vec![("demo\u{1f}t".into(), v1.clone())],
+            bytes,
+        );
+        assert_eq!(cache.entry_count(), 1);
+        // Same version: hit, returns the cached batches.
+        let hit = cache.lookup_with(&k, |_| Some(v1.clone()));
+        assert!(hit.is_some());
+        assert_eq!(hit.unwrap().0.len(), 1);
+        // Version bumped (a commit): miss, entry evicted, bytes reclaimed.
+        assert!(cache.lookup_with(&k, |_| Some(v2.clone())).is_none());
+        assert_eq!(cache.entry_count(), 0);
+        assert_eq!(cache.total_bytes(), 0);
+    }
+
+    #[test]
+    fn result_cache_rejects_oversized_untabled_and_empty() {
+        let cache = ResultCache::with_budget(1000); // per-result cap = 250
+        let k = key("select * from t", "demo");
+        let tbl = vec![("demo\u{1f}t".into(), (Some("v1".into()), Some(1)))];
+        // Oversized (bytes > per-result cap): not cached.
+        cache.insert(
+            k.clone(),
+            vec![result_batch(1)],
+            result_schema(),
+            tbl.clone(),
+            9999,
+        );
+        assert_eq!(cache.entry_count(), 0);
+        // Table-less statement: not cached (nothing to invalidate against).
+        cache.insert(
+            k.clone(),
+            vec![result_batch(1)],
+            result_schema(),
+            vec![],
+            100,
+        );
+        assert_eq!(cache.entry_count(), 0);
+        // Empty result (0 bytes): not cached.
+        cache.insert(k, vec![], result_schema(), tbl, 0);
+        assert_eq!(cache.entry_count(), 0);
+    }
+
+    #[test]
+    fn result_cache_evicts_lru_to_stay_within_byte_budget() {
+        let cache = ResultCache::with_budget(300); // per-result cap 75; entries 60 B
+        let cur = |_: &str| Some((Some("v1".into()), Some(1)));
+        for i in 0..10 {
+            cache.insert(
+                key(&format!("select {i}"), "demo"),
+                vec![result_batch(1)],
+                result_schema(),
+                vec![(format!("demo\u{1f}t{i}"), (Some("v1".into()), Some(1)))],
+                60,
+            );
+        }
+        assert!(cache.total_bytes() <= 300);
+        assert_eq!(cache.entry_count(), 5); // 300 / 60
+        assert!(cache.lookup_with(&key("select 9", "demo"), cur).is_some());
+        assert!(cache.lookup_with(&key("select 0", "demo"), cur).is_none());
     }
 
     async fn ctx_with_memtable() -> SessionContext {

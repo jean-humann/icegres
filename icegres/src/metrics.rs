@@ -61,6 +61,13 @@ pub struct Metrics {
     /// Physical-plan cache misses — including statements that turned out
     /// not to be cacheable (volatile expressions, non-cacheable tables).
     pub plan_cache_misses_total: AtomicU64,
+    /// Result cache hits (plancache.rs): a repeated identical query served
+    /// from cached result batches with no planning, execution, or IO. Active
+    /// only with `--freshness-ms > 0` AND `ICEGRES_RESULT_CACHE_BYTES > 0`.
+    pub result_cache_hits_total: AtomicU64,
+    /// Result cache misses — the query was planned/executed normally (and its
+    /// result cached if small enough).
+    pub result_cache_misses_total: AtomicU64,
     /// WORST-CASE milliseconds since the last applied peer-tail event,
     /// maximized over every configured peer (gauge, peer.rs; sampled every
     /// second while `--peer-tail` is configured) — so a healthy peer can
@@ -108,6 +115,8 @@ impl Metrics {
         let fa = self.freshness_age_ms.load(Ordering::Relaxed);
         let pch = self.plan_cache_hits_total.load(Ordering::Relaxed);
         let pcm = self.plan_cache_misses_total.load(Ordering::Relaxed);
+        let rch = self.result_cache_hits_total.load(Ordering::Relaxed);
+        let rcm = self.result_cache_misses_total.load(Ordering::Relaxed);
         let pta = self.peer_tail_age_ms.load(Ordering::Relaxed);
         // Per-peer tail-age series (one line per configured peer, sorted for
         // stable output; empty without --peer-tail).
@@ -170,6 +179,12 @@ impl Metrics {
              # HELP icegres_plan_cache_misses_total Physical-plan cache misses.\n\
              # TYPE icegres_plan_cache_misses_total counter\n\
              icegres_plan_cache_misses_total {pcm}\n\
+             # HELP icegres_result_cache_hits_total Result cache hits (served with no execution or IO).\n\
+             # TYPE icegres_result_cache_hits_total counter\n\
+             icegres_result_cache_hits_total {rch}\n\
+             # HELP icegres_result_cache_misses_total Result cache misses.\n\
+             # TYPE icegres_result_cache_misses_total counter\n\
+             icegres_result_cache_misses_total {rcm}\n\
              # HELP icegres_peer_tail_age_max_ms Worst-case milliseconds since \
              the last applied peer-tail event across every configured peer \
              (0 without --peer-tail; grows while any peer is silent and its \
