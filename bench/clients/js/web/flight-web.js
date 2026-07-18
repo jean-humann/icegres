@@ -6,6 +6,7 @@
 // Uses fetch() streaming, so record batches are parsed incrementally as they
 // arrive rather than after the last byte.
 
+import "./zstd-web.js";
 import { tableFromIPC } from "apache-arrow";
 import {
   encodeAny,

@@ -17,6 +17,7 @@ import http from "node:http";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import "../lib/zstd-node.js";
 import { tableFromIPC } from "apache-arrow";
 import pgpkg from "pg";
 import { connect, queryToIpc, queryToIpcBuffer } from "../lib/flight.js";

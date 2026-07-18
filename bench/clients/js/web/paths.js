@@ -3,6 +3,7 @@
 // `bytes` is what actually crossed the wire to the browser and `rows` is the
 // decoded, renderable result (array of row objects for charts/tables).
 
+import "./zstd-web.js";
 import { tableFromIPC } from "apache-arrow";
 import { flightQuery } from "./flight-web.js";
 
