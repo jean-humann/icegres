@@ -94,12 +94,23 @@ the server's plan-stash makes the second RPC cheap.
 
 ## Backend reference (Node, no browser)
 
-For the proxy itself, the pure-JS `@grpc/grpc-js` client and the native
-`@lakehouse-rs/flight-sql-client` are equivalent for dashboard-sized
-results; both comfortably outrun `pg` once results grow, because pgwire is a
-row-oriented text protocol that node-postgres must parse value-by-value.
-(Measured table in `bench/clients/js/README.md` run instructions;
-`bench/node-bench.mjs`.)
+For the proxy side, the pure-JS `@grpc/grpc-js` Flight client outruns
+node-postgres once results grow — pgwire is a row-oriented text protocol
+that must be parsed value-by-value (`bench/node-bench.mjs`, medians):
+
+| case | flight-grpc-js | pg-wire |
+|---|---|---|
+| agg 8 rows | 64 ms | 70 ms |
+| 10k rows | **123 ms** | 139 ms |
+| 100k rows | **242 ms** | 410 ms |
+| 1M rows | **2.30 s** | 4.37 s |
+
+The Rust-native `@lakehouse-rs/flight-sql-client` (v0.0.10) is **not usable
+against icegres today**: its bundled arrow-flight is compiled without the
+`zstd` IPC feature, so the first compressed DoGet batch panics a tokio
+worker ("zstd IPC decompression requires the zstd feature") and the query
+promise never settles. The lane stays in the harness behind `BENCH_NATIVE=1`
+for servers that send uncompressed batches.
 
 ## Practicalities
 

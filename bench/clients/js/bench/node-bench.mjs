@@ -27,12 +27,18 @@ const SQLS = {
 };
 
 const grpcClient = connect(FLIGHT_ADDR);
-const nativeClient = await createFlightSqlClient({
-  host: FLIGHT_ADDR.split(":")[0],
-  port: Number(FLIGHT_ADDR.split(":")[1]),
-  tls: false,
-  headers: [],
-});
+// The native client's bundled arrow-flight lacks the `zstd` IPC feature and
+// PANICS (then hangs the promise) on icegres's compressed DoGet batches:
+//   "zstd IPC decompression requires the zstd feature".
+// Keep the lane opt-in for servers that send uncompressed batches.
+const nativeClient = process.env.BENCH_NATIVE
+  ? await createFlightSqlClient({
+      host: FLIGHT_ADDR.split(":")[0],
+      port: Number(FLIGHT_ADDR.split(":")[1]),
+      tls: false,
+      headers: [],
+    })
+  : null;
 const pgPool = new pgpkg.Pool({ connectionString: PG_URL, max: 4 });
 
 const LANES = {
@@ -40,10 +46,12 @@ const LANES = {
     const buf = await queryToIpcBuffer(grpcClient, sql);
     return tableFromIPC(buf).numRows;
   },
-  "flight-native": async (sql) => {
-    const buf = await nativeClient.query(sql);
-    return tableFromIPC(buf).numRows;
-  },
+  ...(nativeClient && {
+    "flight-native": async (sql) => {
+      const buf = await nativeClient.query(sql);
+      return tableFromIPC(buf).numRows;
+    },
+  }),
   "pg-wire": async (sql) => (await pgPool.query(sql)).rows.length,
 };
 
