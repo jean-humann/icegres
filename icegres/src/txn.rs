@@ -377,7 +377,7 @@ impl TableProvider for TunedProvider {
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let plan = self.inner.scan(state, projection, filters, limit).await?;
-        Ok(crate::scan::tune(plan))
+        Ok(crate::scan::tune(plan).await)
     }
     fn supports_filters_pushdown(
         &self,
@@ -420,9 +420,8 @@ impl TableProvider for UnionProvider {
             // No per-child limit: a limit hint applied before the union
             // would be sound (union only concatenates), but passing None
             // keeps the semantics trivially obvious.
-            children.push(crate::scan::tune(
-                part.scan(state, projection, filters, None).await?,
-            ));
+            children
+                .push(crate::scan::tune(part.scan(state, projection, filters, None).await?).await);
         }
         UnionExec::try_new(children)
     }

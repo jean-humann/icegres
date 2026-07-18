@@ -577,7 +577,9 @@ impl TableProvider for CachingTableProvider {
             // MemTable child keeps the original projection, so the union's
             // child schemas still match.
             let committed = match &overlay.suppress {
-                None => crate::scan::tune(provider.scan(state, projection, filters, None).await?),
+                None => {
+                    crate::scan::tune(provider.scan(state, projection, filters, None).await?).await
+                }
                 Some(sup) => {
                     let (scan_proj, out_proj) =
                         widen_projection(projection, &self.schema, &sup.pk_cols)
@@ -586,7 +588,8 @@ impl TableProvider for CachingTableProvider {
                         provider
                             .scan(state, scan_proj.as_ref(), filters, None)
                             .await?,
-                    );
+                    )
+                    .await;
                     Arc::new(crate::keyed::KeySuppressExec::try_new(
                         inner,
                         &sup.pk_cols,
@@ -607,7 +610,7 @@ impl TableProvider for CachingTableProvider {
         let plan = provider.scan(state, projection, filters, limit).await?;
         // Re-run plain table scans at higher object-store IO concurrency
         // (see scan.rs); non-scan plans pass through unchanged.
-        Ok(crate::scan::tune(plan))
+        Ok(crate::scan::tune(plan).await)
     }
 
     fn supports_filters_pushdown(
