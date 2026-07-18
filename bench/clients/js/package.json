@@ -13,6 +13,7 @@
   "dependencies": {
     "@grpc/grpc-js": "^1.12.5",
     "@grpc/proto-loader": "^0.7.13",
+    "@icegres/flight-web": "file:../../../clients/flight-web",
     "@lakehouse-rs/flight-sql-client": "^0.0.10",
     "apache-arrow": "^21.0.0",
     "fzstd": "^0.1.1",

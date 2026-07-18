@@ -1,7 +1,7 @@
 // Drives the in-browser benchmark with real Chromium via playwright-core.
-// Assumes: icegres pgwire :5439 + flight :50051 up, proxy :8090 and grpc-web
-// bridge :8091 running, dist/ bundled. Writes bench/results JSON + a markdown
-// table to stdout.
+// Assumes: icegres pgwire :5439 up, `flight-serve --grpc-web` on :50051 (the
+// grpcweb-direct lane talks to it natively), proxy :8090 running, and dist/
+// bundled. Writes bench/results JSON + a markdown table to stdout.
 
 import { chromium } from "playwright-core";
 import { writeFile } from "node:fs/promises";
