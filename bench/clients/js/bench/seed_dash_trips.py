@@ -31,7 +31,12 @@ tbl = pa.table(
 
 conn = flight.connect("grpc://127.0.0.1:50051")
 cur = conn.cursor()
-cur.adbc_ingest("dash_trips", tbl, mode="create_append", db_schema_name="demo")
+# Chunk the stream: the Flight client caps outbound gRPC messages at 16 MiB,
+# so feed the ingest as ~100k-row record batches instead of one giant batch.
+reader = pa.RecordBatchReader.from_batches(
+    tbl.schema, tbl.to_batches(max_chunksize=100_000)
+)
+cur.adbc_ingest("dash_trips", reader, mode="create_append", db_schema_name="demo")
 conn.commit()
 cur.execute("SELECT count(*) FROM demo.dash_trips")
 print("dash_trips rows:", cur.fetchone()[0])
