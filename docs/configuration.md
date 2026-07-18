@@ -107,6 +107,7 @@ See [`deployment.md`](deployment.md) for auth/authz file formats and rollout.
 | `ICEGRES_SCAN_CONCURRENCY` | `32` (`0` disables the wrapper) | IO concurrency for Iceberg scans — manifest files, manifest entries, and data files fetched in parallel. Tuned against local RustFS on a 4-core box; raise it for higher-latency object stores, lower it to cap concurrent S3 requests. |
 | `ICEGRES_SCAN_BATCH_SIZE` | `8192` (`0` = the reader's 1024 default) | Parquet reader batch size; matching DataFusion's execution batch size cuts per-batch overhead on large scans. |
 | `ICEGRES_SCAN_ROW_SELECTION` | off | When enabled, the Parquet reader consults the page (column) index to skip non-matching data pages inside surviving row groups. **Off by default** because iceberg-rust's own writer emits no page index, so enabling it makes the reader error on icegres-written files — only enable it for external datasets whose files carry a page index. |
+| `ICEGRES_TABLE_STATS` | on (`0`/`false`/`off`/`no` disables) | Feed each scanned snapshot's live row count to the DataFusion optimizer so hash joins pick the smaller build side. The count comes from the manifest *list* (one small object GET per snapshot, cached per `(table, snapshot)`); tables with delete manifests or missing counts honestly report no statistics. Deliberately advisory-only (reported inexact): statistics can never answer a query — `COUNT(*)` always executes the real scan, so results never depend on metadata. |
 
 ## Write buffer & durable tail (`icegres serve`)
 
