@@ -11,7 +11,7 @@ import {
   encodeCommandStatementQuery,
   flightDataToIpc,
   ipcEos,
-} from "./pb.js";
+} from "@icegres/flight-web/pb";
 
 const require = createRequire(import.meta.url);
 const grpc = require("@grpc/grpc-js");

@@ -5,9 +5,11 @@
 
 import "./zstd-web.js";
 import { tableFromIPC } from "apache-arrow";
-import { flightQuery } from "./flight-web.js";
+import { FlightWebClient } from "@icegres/flight-web";
 
-const GRPCWEB_BASE = `http://${location.hostname}:8091`;
+// Native gRPC-web on the Flight port itself (flight-serve --grpc-web).
+const GRPCWEB_BASE = `http://${location.hostname}:50051`;
+const flightWeb = new FlightWebClient({ baseUrl: GRPCWEB_BASE });
 
 function tableToRows(table) {
   const names = table.schema.fields.map((f) => f.name);
@@ -64,9 +66,10 @@ async function pgJson(sql) {
 
 /** Browser speaks Flight SQL itself over gRPC-web — no app backend. */
 async function grpcWebDirect(sql) {
-  const { table, ipcBytes } = await flightQuery(GRPCWEB_BASE, sql);
+  const ipc = await flightWeb.queryIpc(sql);
+  const table = tableFromIPC(ipc);
   const { rows, cols } = tableToRows(table);
-  return { rows, cols, bytes: ipcBytes, rowCount: table.numRows };
+  return { rows, cols, bytes: ipc.length, rowCount: table.numRows };
 }
 
 export const PATHS = {

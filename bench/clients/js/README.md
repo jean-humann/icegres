@@ -13,20 +13,18 @@ icegres?** Four end-to-end paths are implemented behind one interface
 | `flight-json` | JSON | Node proxy → Flight SQL, rows flattened server-side | Flight `:50051` |
 | `pg-json` | JSON | Node proxy → node-postgres | pgwire `:5439` |
 
-Browsers cannot speak native gRPC (no trailer access), so "direct" still
-requires a stateless protocol translator — `proxy/grpcweb.js` here, Envoy's
-`grpc_web` filter in production. It forwards opaque bytes; all protobuf and
-Arrow work happens in the page (`web/flight-web.js`, `lib/pb.js`).
+Browsers cannot speak native gRPC (no trailer access); the `grpcweb-direct`
+lane talks to `flight-serve --grpc-web`, which translates gRPC-web
+in-process. All protobuf and Arrow work happens in the page via the
+[`@icegres/flight-web`](../../../clients/flight-web/) client package.
 
 ## Layout
 
-- `lib/pb.js` — minimal protobuf codec for the Flight query path (shared
-  Node/browser); Arrow IPC re-assembly from FlightData messages.
 - `lib/flight.js` — Node Flight SQL client (GetFlightInfo → DoGet) over
-  `@grpc/grpc-js` and `proto/flight.proto`.
+  `@grpc/grpc-js` and `proto/flight.proto` (protobuf codec comes from
+  `@icegres/flight-web/pb`).
 - `proxy/server.js` — the thin backend: `/api/arrow`, `/api/flight-json`,
   `/api/pg-json` + static files. Port 8090.
-- `proxy/grpcweb.js` — gRPC-web ⇄ gRPC translator. Port 8091.
 - `web/dashboard.html` — demo dashboard with a data-path selector.
 - `web/bench.html` + `web/bench-page.js` — in-browser benchmark harness.
 - `bench/run.mjs` — Playwright driver (real Chromium), writes results JSON.
@@ -41,8 +39,7 @@ Arrow work happens in the page (`web/flight-web.js`, `lib/pb.js`).
 npm install --ignore-scripts
 node build.mjs                       # bundle web/ -> dist/
 python3 bench/seed_dash_trips.py     # once, stack must be up
-node proxy/server.js &               # :8090
-node proxy/grpcweb.js &              # :8091
+node proxy/server.js &               # :8090  (flight-serve --grpc-web on :50051)
 node bench/run.mjs                   # browser bench -> bench-results.json
 node bench/node-bench.mjs            # backend reference lanes
 ```
