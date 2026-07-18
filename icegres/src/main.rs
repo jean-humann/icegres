@@ -63,7 +63,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{bail, Context as _, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use datafusion_postgres::auth::AuthManager;
 use datafusion_postgres::datafusion_pg_catalog::pg_catalog::setup_pg_catalog;
 use datafusion_postgres::hooks::set_show::SetShowHook;
@@ -458,6 +458,32 @@ enum Command {
               default_missing_value = "true", default_value = "false",
               value_parser = clap::builder::BoolishValueParser::new())]
         insecure: bool,
+
+        /// Also speak gRPC-web on the same port, so browsers can run Flight
+        /// SQL directly (fetch() cannot carry native gRPC). Native gRPC
+        /// clients are unaffected. Auth over gRPC-web uses a per-RPC
+        /// `authorization: Basic ...` header — the bidirectional Handshake
+        /// RPC does not exist in the gRPC-web protocol. CORS preflights are
+        /// answered for --cors-origin.
+        #[arg(long = "grpc-web", env = "ICEGRES_GRPC_WEB", num_args = 0..=1,
+              default_missing_value = "true", default_value = "false",
+              value_parser = clap::builder::BoolishValueParser::new())]
+        grpc_web: bool,
+
+        /// Origin allowed by CORS on gRPC-web responses (browser dashboards
+        /// are cross-origin from this listener). Default `*` suits
+        /// token-free internal use; set your dashboard origin explicitly
+        /// when running with --auth-file so credentials never span origins.
+        #[arg(long, env = "ICEGRES_CORS_ORIGIN", default_value = "*")]
+        cors_origin: String,
+
+        /// Compression for Flight result batches (Arrow IPC buffer level).
+        /// `zstd` (default) is what the measured 5x wire reduction comes
+        /// from; `none` restores uncompressed batches for clients whose
+        /// arrow build lacks the zstd feature.
+        #[arg(long, env = "ICEGRES_RESULT_COMPRESSION", value_enum,
+              default_value_t = ResultCompression::Zstd)]
+        result_compression: ResultCompression,
     },
     /// Create and populate the demo namespace/tables (idempotent).
     Seed {
@@ -673,6 +699,24 @@ enum BranchCmd {
     },
 }
 
+/// Flight result-batch compression (`flight-serve --result-compression`).
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ResultCompression {
+    /// ZSTD-compress Arrow IPC buffers (the measured 5x wire reduction).
+    Zstd,
+    /// Uncompressed batches, for clients without zstd IPC support.
+    None,
+}
+
+impl ResultCompression {
+    fn to_ipc(self) -> Option<arrow::ipc::CompressionType> {
+        match self {
+            ResultCompression::Zstd => Some(arrow::ipc::CompressionType::ZSTD),
+            ResultCompression::None => None,
+        }
+    }
+}
+
 /// `icegres maintain` subcommands.
 #[derive(Subcommand)]
 enum MaintainCmd {
@@ -850,6 +894,9 @@ async fn main() -> Result<()> {
             tls_key,
             freshness_ms,
             insecure,
+            grpc_web,
+            cors_origin,
+            result_compression,
         } => {
             // Flight authorization needs an authenticated principal: reject
             // --authz-file without --auth-file rather than trusting an
@@ -868,10 +915,15 @@ async fn main() -> Result<()> {
                 &catalog,
                 &host,
                 port,
-                auth_file,
-                authorizer,
-                tls,
-                freshness_ms,
+                flight::ListenerOpts {
+                    auth_file,
+                    authorizer,
+                    tls,
+                    freshness_ms,
+                    grpc_web,
+                    cors_origin,
+                    ipc_compression: result_compression.to_ipc(),
+                },
             )
             .await
         }
