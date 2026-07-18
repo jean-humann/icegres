@@ -3,3 +3,4 @@ dist/
 bench-results.json
 *.log
 *.png
+*.out
