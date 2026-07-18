@@ -2742,3 +2742,30 @@ warmups discarded: 3, iterations: 20, cold-start runs: 5, demo.trips data files:
 | flight_q1_ms | 9.06 | 9.45 | n=15 |
 | flight_q1_fresh_ms | 4.85 | 5.99 | n=15 |
 | compact_scan_restore_ms | 41 | — | degraded p50 50 ms @ 24 files -> restored p50 41 ms @ 1 file(s); compact wall 153 ms |
+
+## Write compression + Flight transport tuning (2026-07)
+
+A mid-2026 Arrow/Flight/ADBC/Iceberg performance audit found the serving hot
+path already optimal but flagged two locally-fixable leaks; both are now closed.
+
+- **Written Parquet was UNCOMPRESSED.** Both data-file writers used
+  `WriterProperties::default()`. Now `data_file_write_properties()` honors the
+  Iceberg `write.parquet.compression-codec` / `-level` table properties and
+  defaults to zstd.
+  - Correctness on real output: a data file written by the live e2e run reports
+    parquet codec **ZSTD** (was UNCOMPRESSED).
+  - Representative magnitude (trips-like, 200k rows, the writer's zstd-3):
+    **4,763,585 B uncompressed → 2,835,207 B = 1.68x smaller, 40% fewer bytes.**
+    The scan path is bytes/IO-bound, so this cuts ~40% of the dominant read
+    cost (and storage), not just disk.
+- **Flight transport had no compression / default HTTP/2 window.** Result IPC
+  now ZSTD-compresses the Arrow buffers (Arrow-level, via `IpcWriteOptions`;
+  arrow `ipc_compression` feature, no new dependency), and every listener uses
+  an adaptive HTTP/2 window (past hyper's 64 KB default) plus keepalives.
+  Proven by a ZSTD IPC round-trip unit test and the e2e Flight round-trip suite.
+
+Gates green at this change: `cargo clippy --release --all-targets -- -D warnings`
+clean; `cargo test --release` 405 passed (incl. 2 new); `tail_durability.sh`
+71/71; `tests/e2e.sh` 295/295 (exit 0). Zero protocol change — Arrow IPC
+compression and HTTP/2 flow control are transparent to conformant clients;
+results are byte-identical after decode.
