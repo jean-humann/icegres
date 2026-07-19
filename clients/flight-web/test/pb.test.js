@@ -73,3 +73,20 @@ test("IPC chunk framing is 8-byte aligned with continuation marker", () => {
   assert.equal(chunk.length, 8 + declared + body.length);
   assert.deepEqual([...ipcEos()], [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0]);
 });
+
+// --- credential encoding ----------------------------------------------------
+import { FlightWebClient } from "../src/client.js";
+
+test("Basic credentials are UTF-8 encoded, not Latin-1", () => {
+  // A non-ASCII password must survive as its UTF-8 bytes: the server decodes
+  // the Basic payload with String::from_utf8 and would reject Latin-1 btoa.
+  const client = new FlightWebClient({
+    baseUrl: "http://x",
+    credentials: { username: "café", password: "pä€ss" },
+  });
+  const b64 = client.authHeader.replace("Basic ", "");
+  const decoded = Buffer.from(b64, "base64");
+  assert.equal(decoded.toString("utf8"), "café:pä€ss");
+  // And the bytes are genuinely multi-byte UTF-8, not one-byte Latin-1.
+  assert.ok(decoded.length > "café:pä€ss".length);
+});

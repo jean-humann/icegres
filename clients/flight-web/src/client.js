@@ -24,6 +24,13 @@ import {
 
 const SVC = "/arrow.flight.protocol.FlightService";
 
+/** Uint8Array -> base64 without the btoa Latin-1 trap. */
+function bytesToBase64(bytes) {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+
 /** Wrap one protobuf message in a gRPC-web request body (5-byte frame). */
 function grpcWebBody(message) {
   const head = new Uint8Array(5);
@@ -55,13 +62,14 @@ export class FlightWebClient {
     this.base = baseUrl.replace(/\/$/, "");
     this.retries = retries;
     this.fetch = fetchImpl ?? fetch.bind(globalThis);
+    // UTF-8 then base64: the server decodes the Basic payload as UTF-8
+    // bytes (btoa alone is Latin-1 and corrupts any non-ASCII credential).
     this.authHeader = credentials
       ? "Basic " +
-        btoa(
-          `${credentials.username}:${credentials.password}`
-            .split("")
-            .map((c) => (c.charCodeAt(0) > 255 ? "?" : c))
-            .join(""),
+        bytesToBase64(
+          new TextEncoder().encode(
+            `${credentials.username}:${credentials.password}`,
+          ),
         )
       : null;
   }
@@ -93,18 +101,30 @@ export class FlightWebClient {
       );
     }
     const reader = resp.body.getReader();
-    let buf = new Uint8Array(0);
+    // Chunks accumulate in a list and are stitched only when a frame
+    // completes — appending to one growing buffer would be O(n^2) while a
+    // large record batch spans many fetch chunks.
+    let chunks = [];
+    let buffered = 0;
+    let sawTrailers = false;
     try {
       for (;;) {
         const { done, value } = await reader.read();
-        if (value) buf = buf.length ? concatBytes([buf, value]) : value;
-        while (buf.length >= 5) {
+        if (value && value.length) {
+          chunks.push(value);
+          buffered += value.length;
+        }
+        while (buffered >= 5) {
+          if (chunks.length > 1) chunks = [concatBytes(chunks)];
+          const buf = chunks[0];
           const flags = buf[0];
           const len = new DataView(buf.buffer, buf.byteOffset).getUint32(1, false);
-          if (buf.length < 5 + len) break;
+          if (buffered < 5 + len) break;
           const payload = buf.subarray(5, 5 + len);
-          buf = buf.subarray(5 + len);
+          chunks = [buf.subarray(5 + len)];
+          buffered -= 5 + len;
           if (flags & 0x80) {
+            sawTrailers = true;
             const trailers = new TextDecoder().decode(payload);
             const status = Number(trailers.match(/grpc-status:\s*(\d+)/)?.[1] ?? 0);
             if (status !== 0) {
@@ -115,7 +135,17 @@ export class FlightWebClient {
           }
           yield payload;
         }
-        if (done) return;
+        if (done) {
+          // The trailers frame is mandatory in gRPC-web: a body that ends
+          // without one is a truncated stream (proxy died, server drained),
+          // NOT a complete result — rendering it would silently drop rows.
+          if (!sawTrailers) {
+            throw new Error(
+              `gRPC-web stream on ${path} ended without a trailers frame (truncated response)`,
+            );
+          }
+          return;
+        }
       }
     } finally {
       reader.releaseLock();
