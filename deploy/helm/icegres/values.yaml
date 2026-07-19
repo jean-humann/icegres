@@ -216,6 +216,9 @@ flight:
   corsOrigin: "*"
   # zstd (measured ~5x wire reduction) | none (zstd-less clients).
   resultCompression: zstd
+  # Reject every write (INSERT/UPDATE/DELETE/DROP) on this listener. The
+  # posture for a browser SQL explorer serving arbitrary user SELECTs.
+  readOnly: false
   # Bounded-staleness reads + plan cache (same semantics as computes).
   freshnessMs: 0
   # Resource guards (0 = off). Set these before exposing the port to

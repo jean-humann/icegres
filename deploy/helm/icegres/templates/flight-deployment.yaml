@@ -122,6 +122,10 @@ spec:
             - name: ICEGRES_HEALTH_PORT
               value: {{ .Values.flight.healthPort | quote }}
             {{- end }}
+            {{- if .Values.flight.readOnly }}
+            - name: ICEGRES_FLIGHT_READ_ONLY
+              value: "true"
+            {{- end }}
             {{- with .Values.flight.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
