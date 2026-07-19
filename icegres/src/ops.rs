@@ -174,9 +174,11 @@ impl StartupHandler for IcegresStartupHandler {
 /// a brute-forcer opening connection after connection to guess passwords is
 /// slowed by an escalating delay applied BEFORE each SASL exchange, keyed by
 /// source IP. Only consulted when `--auth-file` is set (no auth ⇒ no failures).
-/// A successful auth clears the peer; failures older than `AUTH_WINDOW` decay.
+/// Failures older than `AUTH_WINDOW` decay. Shared seam: the Flight listener
+/// applies the SAME throttle to its basic-auth handshake and per-RPC `Basic`
+/// headers (flight.rs), so every credential-guessing surface backs off alike.
 #[derive(Default)]
-struct AuthThrottle {
+pub(crate) struct AuthThrottle {
     peers: Mutex<HashMap<IpAddr, (u32, Instant)>>,
 }
 
@@ -189,7 +191,7 @@ const AUTH_MAX_DELAY: Duration = Duration::from_secs(5);
 
 impl AuthThrottle {
     /// Backoff to apply before this peer's next auth attempt, if any.
-    fn penalty(&self, ip: IpAddr) -> Option<Duration> {
+    pub(crate) fn penalty(&self, ip: IpAddr) -> Option<Duration> {
         let peers = self.peers.lock().expect("auth throttle lock poisoned");
         let (count, last) = peers.get(&ip)?;
         if *count == 0 || last.elapsed() >= AUTH_WINDOW {
@@ -199,7 +201,7 @@ impl AuthThrottle {
     }
 
     /// Record a failed auth from `ip` (escalates its backoff).
-    fn record_failure(&self, ip: IpAddr) {
+    pub(crate) fn record_failure(&self, ip: IpAddr) {
         let mut peers = self.peers.lock().expect("auth throttle lock poisoned");
         // Bound memory under a many-IP flood: drop peers whose last failure has
         // decayed out of the window before inserting.
