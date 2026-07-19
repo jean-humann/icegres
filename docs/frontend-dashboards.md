@@ -164,12 +164,12 @@ untrusted.
   surfaces them as `FlightError`.
 - **Raw SQL vs allowlist**: `grpcweb-direct` sends whatever SQL the page
   builds. That is fine behind auth+authz for an internal tool. For a
-  **public-facing** app, do not expose raw SQL — put the `arrow-proxy`
-  shape in front (`bench/clients/js/proxy/server.js`) reduced to a
-  **named-query allowlist**: the proxy maps `{name, params}` to a fixed,
-  parameterized statement and refuses anything else, staying a byte
-  forwarder for the Arrow stream. This keeps the Arrow-end-to-end speed
-  while removing arbitrary-SQL exposure.
+  **public-facing** app, do not expose raw SQL — use
+  [`@icegres/flight-proxy`](../clients/flight-proxy/), the named-query
+  allowlist BFF: the browser sends a query *name* + typed params, the proxy
+  maps it to a fixed statement (injection-proof — no free-form string
+  parameter exists) and streams the Arrow result untouched. Keeps the
+  Arrow-end-to-end speed, removes arbitrary-SQL exposure.
 - **Observability**: scrape `/metrics` (served on the flight `--health-port`)
   for the `icegres_flight_*` series — RPC count, in-flight gauge, summed
   duration, bytes out, aborted-by-guard count, auth failures. On the
