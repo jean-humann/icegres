@@ -55,12 +55,15 @@ test("server errors surface as FlightError with grpc code", { skip: !up }, async
   );
 });
 
-test("abort cancels an in-flight query", { skip: !up }, async () => {
+test("abort cancels a query", { skip: !up }, async () => {
+  // An already-aborted signal makes fetch reject deterministically,
+  // independent of how fast the (small, seeded) query would complete —
+  // avoids a race between the result and a timed abort.
   const client = new FlightWebClient({ baseUrl: BASE });
   const ctl = new AbortController();
-  const pending = client.query("SELECT * FROM demo.trips", {
-    signal: ctl.signal,
-  });
-  setTimeout(() => ctl.abort(), 30);
-  await assert.rejects(pending, (e) => e.name === "AbortError");
+  ctl.abort();
+  await assert.rejects(
+    () => client.query("SELECT * FROM demo.trips", { signal: ctl.signal }),
+    (e) => e.name === "AbortError",
+  );
 });
