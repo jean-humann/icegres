@@ -129,7 +129,12 @@ function renderTable(rows, cols) {
   $("tbl").innerHTML = `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
 }
 
+let refreshSeq = 0;
 async function refresh() {
+  // Guard against overlapping refreshes (rapid clicks / path switches): only
+  // the most recent call may write the DOM, so a slower stale response cannot
+  // land after — and mislabel — a newer one.
+  const seq = ++refreshSeq;
   const pathName = $("path").value;
   const fn = PATHS[pathName];
   $("status").textContent = "loading…";
@@ -138,6 +143,7 @@ async function refresh() {
     const [tiles, byCity, overTime, latest] = await Promise.all(
       [QUERIES.tiles, QUERIES.byCity, QUERIES.overTime, QUERIES.latest].map(fn),
     );
+    if (seq !== refreshSeq) return; // superseded by a newer refresh
     renderTiles(tiles.rows);
     renderBars(byCity.rows);
     renderLine(overTime.rows);
@@ -147,6 +153,7 @@ async function refresh() {
       performance.now() - t0,
     )} ms, ${fmt.format(bytes / 1024)} KiB over the wire`;
   } catch (e) {
+    if (seq !== refreshSeq) return;
     $("status").innerHTML = `<span class="err">${esc(e)}</span>`;
   }
 }
