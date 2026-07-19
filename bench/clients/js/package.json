@@ -7,7 +7,6 @@
   "scripts": {
     "bundle": "node build.mjs",
     "proxy": "node proxy/server.js",
-    "grpcweb": "node proxy/grpcweb.js",
     "bench": "node bench/run.mjs"
   },
   "dependencies": {

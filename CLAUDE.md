@@ -55,6 +55,7 @@ history rules below and must exit 0. Then confirm the review and gates.
 
 ## Layout
 - `icegres/` — the Rust crate (Postgres-wire + Arrow Flight SQL over Iceberg).
+- `clients/` — official client packages (JS: `flight-web`, browser gRPC-web).
 - `deploy/helm/` — Helm chart (single-node, quorum, read-replica topologies).
 - `infra/` — local development stack scripts.
 - `bench/` — benchmark + SQL-parity harness and recorded result artifacts.
