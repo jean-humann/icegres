@@ -174,11 +174,16 @@ fn decode_basic_credentials(b64: &str) -> Result<(String, String), Status> {
 /// Verify per-RPC `Basic` credentials, caching successes so the SCRAM
 /// PBKDF2 (4096 iterations) runs once per credential per TTL window rather
 /// than on every RPC. Failures are re-verified every time — a wrong
-/// password never enters the cache, so brute force stays KDF-priced.
-fn verify_basic_cached(
+/// password never enters the cache, so brute force stays KDF-priced — and
+/// additionally pay the same per-peer backoff as a failed pgwire SASL
+/// exchange (applied BEFORE the KDF, like pgwire applies it before the
+/// exchange; cache hits skip it, so authenticated traffic never sleeps).
+async fn verify_basic_cached(
     b64: &str,
     auth: &Arc<dyn BasicAuthVerifier>,
     cache: &Mutex<HashMap<String, TokenEntry>>,
+    throttle: &crate::ops::AuthThrottle,
+    peer: Option<std::net::IpAddr>,
 ) -> Result<String, Status> {
     {
         let mut store = cache.lock().expect("basic token lock");
@@ -188,8 +193,14 @@ fn verify_basic_cached(
             return Ok(entry.user.clone());
         }
     }
+    if let Some(delay) = peer.and_then(|ip| throttle.penalty(ip)) {
+        tokio::time::sleep(delay).await;
+    }
     let (user, password) = decode_basic_credentials(b64)?;
     if !auth.verify_password(&user, &password) {
+        if let Some(ip) = peer {
+            throttle.record_failure(ip);
+        }
         warn!(user, "flight per-RPC basic auth rejected (bad credentials)");
         return Err(Status::unauthenticated(format!(
             "password authentication failed for user \"{user}\""
@@ -229,6 +240,11 @@ struct FlightSqlServiceImpl {
     /// by default; `None` serves uncompressed batches for clients whose
     /// arrow build lacks the zstd feature.
     ipc_compression: Option<arrow::ipc::CompressionType>,
+    /// Per-peer failed-auth backoff — the same throttle (and constants) the
+    /// pgwire listener applies before every SASL exchange, here consulted
+    /// before handshake and per-RPC `Basic` verification so all three
+    /// credential-guessing surfaces slow a brute-forcer identically.
+    throttle: Arc<crate::ops::AuthThrottle>,
     prepared: Mutex<HashMap<String, Prepared>>,
     sql_info: SqlInfoData,
     /// Buffered-write overlay source. `Some` only on the tail-api listener
@@ -334,7 +350,7 @@ impl FlightSqlServiceImpl {
     /// Enforce the bearer token on every RPC when auth is enabled and resolve
     /// it to the authenticated principal. Returns `None` when auth is disabled
     /// (no identity; authorization is also necessarily disabled in that case).
-    fn authorize<T>(&self, request: &Request<T>) -> Result<Option<String>, Status> {
+    async fn authorize<T>(&self, request: &Request<T>) -> Result<Option<String>, Status> {
         let Some(auth) = &self.auth else {
             return Ok(None);
         };
@@ -362,7 +378,10 @@ impl FlightSqlServiceImpl {
         // Native clients may use it too — it is how ADBC header-auth modes
         // behave against other Flight SQL servers.
         if let Some(b64) = header.strip_prefix("Basic ") {
-            return verify_basic_cached(b64, auth, &self.basic_tokens).map(Some);
+            let ip = request.remote_addr().map(|a| a.ip());
+            return verify_basic_cached(b64, auth, &self.basic_tokens, &self.throttle, ip)
+                .await
+                .map(Some);
         }
         Err(Status::unauthenticated(
             "expected 'Bearer <token>' or 'Basic <credentials>' authorization",
@@ -918,7 +937,15 @@ impl FlightSqlService for FlightSqlServiceImpl {
                 Status::unauthenticated(format!("only Basic auth is implemented, got {header:?}"))
             })?;
             let (user, password) = decode_basic_credentials(b64)?;
+            // Same per-peer backoff as a pgwire SASL exchange (audit #4).
+            let peer = request.remote_addr().map(|a| a.ip());
+            if let Some(delay) = peer.and_then(|ip| self.throttle.penalty(ip)) {
+                tokio::time::sleep(delay).await;
+            }
             if !source.verify_password(&user, &password) {
+                if let Some(ip) = peer {
+                    self.throttle.record_failure(ip);
+                }
                 warn!(user, "flight handshake rejected (bad credentials)");
                 return Err(Status::unauthenticated(format!(
                     "password authentication failed for user \"{user}\""
@@ -958,7 +985,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandStatementQuery,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        let principal = self.authorize(&request)?;
+        let principal = self.authorize(&request).await?;
         let sql = query.query.clone();
         self.check_sql(&principal, &sql)?;
         debug!(%sql, "GetFlightInfo(CommandStatementQuery)");
@@ -1006,7 +1033,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         ticket: TicketStatementQuery,
         request: Request<Ticket>,
     ) -> Result<Response<<Self::FlightService as FlightService>::DoGetStream>, Status> {
-        let principal = self.authorize(&request)?;
+        let principal = self.authorize(&request).await?;
         let (handle, sql) = decode_plan_ticket(&ticket.statement_handle)?;
         // Authorization stays per-RPC: the ticket's SQL is re-checked even
         // when the plan itself comes from the stash.
@@ -1044,7 +1071,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: ActionCreatePreparedStatementRequest,
         request: Request<Action>,
     ) -> Result<ActionCreatePreparedStatementResult, Status> {
-        let principal = self.authorize(&request)?;
+        let principal = self.authorize(&request).await?;
         let sql = query.query.clone();
         self.check_sql(&principal, &sql)?;
         debug!(%sql, "CreatePreparedStatement");
@@ -1100,7 +1127,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: ActionClosePreparedStatementRequest,
         request: Request<Action>,
     ) -> Result<(), Status> {
-        self.authorize(&request)?;
+        self.authorize(&request).await?;
         let handle = String::from_utf8(query.prepared_statement_handle.to_vec())
             .map_err(|_| Status::invalid_argument("invalid prepared statement handle"))?;
         self.prepared.lock().expect("prepared lock").remove(&handle);
@@ -1112,7 +1139,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandPreparedStatementQuery,
         request: Request<PeekableFlightDataStream>,
     ) -> Result<DoPutPreparedStatementResult, Status> {
-        self.authorize(&request)?;
+        self.authorize(&request).await?;
         let handle = String::from_utf8(query.prepared_statement_handle.to_vec())
             .map_err(|_| Status::invalid_argument("invalid prepared statement handle"))?;
         let batches = decode_put_stream(request.into_inner()).await?;
@@ -1132,7 +1159,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         cmd: CommandPreparedStatementQuery,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        self.authorize(&request)?;
+        self.authorize(&request).await?;
         let handle = String::from_utf8(cmd.prepared_statement_handle.to_vec())
             .map_err(|_| Status::invalid_argument("invalid prepared statement handle"))?;
         // Answer from the schema captured at create time — no second plan pass.
@@ -1156,7 +1183,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         cmd: CommandPreparedStatementQuery,
         request: Request<Ticket>,
     ) -> Result<Response<<Self::FlightService as FlightService>::DoGetStream>, Status> {
-        let principal = self.authorize(&request)?;
+        let principal = self.authorize(&request).await?;
         let handle = String::from_utf8(cmd.prepared_statement_handle.to_vec())
             .map_err(|_| Status::invalid_argument("invalid prepared statement handle"))?;
         let (sql, params, stashed) = {
@@ -1222,7 +1249,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandPreparedStatementUpdate,
         request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
-        let principal = self.authorize(&request)?;
+        let principal = self.authorize(&request).await?;
         let handle = String::from_utf8(query.prepared_statement_handle.to_vec())
             .map_err(|_| Status::invalid_argument("invalid prepared statement handle"))?;
         let sql = {
@@ -1261,7 +1288,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         ticket: CommandStatementUpdate,
         request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
-        let principal = self.authorize(&request)?;
+        let principal = self.authorize(&request).await?;
         if ticket.transaction_id.is_some() {
             return Err(Status::unimplemented(
                 "Flight SQL transactions are not supported",
@@ -1277,7 +1304,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         ticket: CommandStatementIngest,
         request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
-        let principal = self.authorize(&request)?;
+        let principal = self.authorize(&request).await?;
         self.reject_if_read_only()?;
         if ticket.transaction_id.is_some() {
             return Err(Status::unimplemented(
@@ -1364,7 +1391,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandGetCatalogs,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        self.authorize(&request)?;
+        self.authorize(&request).await?;
         let schema = GetCatalogsBuilder::new().schema();
         Ok(Response::new(Self::make_info(
             &schema,
@@ -1378,7 +1405,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         _query: CommandGetCatalogs,
         request: Request<Ticket>,
     ) -> Result<Response<<Self::FlightService as FlightService>::DoGetStream>, Status> {
-        self.authorize(&request)?;
+        self.authorize(&request).await?;
         let mut builder = GetCatalogsBuilder::new();
         builder.append(CATALOG_NAME);
         let batch = builder
@@ -1392,7 +1419,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandGetDbSchemas,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        self.authorize(&request)?;
+        self.authorize(&request).await?;
         let schema = GetDbSchemasBuilder::new(None::<String>, None::<String>).schema();
         Ok(Response::new(Self::make_info(
             &schema,
@@ -1406,7 +1433,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandGetDbSchemas,
         request: Request<Ticket>,
     ) -> Result<Response<<Self::FlightService as FlightService>::DoGetStream>, Status> {
-        self.authorize(&request)?;
+        self.authorize(&request).await?;
         let mut builder = GetDbSchemasBuilder::new(
             query.catalog.clone(),
             query.db_schema_filter_pattern.clone(),
@@ -1431,7 +1458,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandGetTables,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        self.authorize(&request)?;
+        self.authorize(&request).await?;
         let schema = GetTablesBuilder::new(
             None::<String>,
             None::<String>,
@@ -1452,7 +1479,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandGetTables,
         request: Request<Ticket>,
     ) -> Result<Response<<Self::FlightService as FlightService>::DoGetStream>, Status> {
-        self.authorize(&request)?;
+        self.authorize(&request).await?;
         // The builder applies catalog/table-type filters itself; the schema
         // pattern is applied here (we enumerate schemas), the table pattern
         // by the builder at build() time.
@@ -1520,7 +1547,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandGetTableTypes,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        self.authorize(&request)?;
+        self.authorize(&request).await?;
         Ok(Response::new(Self::make_info(
             &table_types_schema(),
             query,
@@ -1533,7 +1560,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         _query: CommandGetTableTypes,
         request: Request<Ticket>,
     ) -> Result<Response<<Self::FlightService as FlightService>::DoGetStream>, Status> {
-        self.authorize(&request)?;
+        self.authorize(&request).await?;
         let batch = RecordBatch::try_new(
             Arc::new(table_types_schema()),
             vec![Arc::new(arrow::array::StringArray::from(vec![TABLE_TYPE]))],
@@ -1547,7 +1574,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandGetSqlInfo,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        self.authorize(&request)?;
+        self.authorize(&request).await?;
         let schema = self.sql_info.schema();
         Ok(Response::new(Self::make_info(
             &schema,
@@ -1561,7 +1588,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandGetSqlInfo,
         request: Request<Ticket>,
     ) -> Result<Response<<Self::FlightService as FlightService>::DoGetStream>, Status> {
-        self.authorize(&request)?;
+        self.authorize(&request).await?;
         let batch = self
             .sql_info
             .record_batch(query.info)
@@ -1580,7 +1607,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         request: Request<Ticket>,
         message: arrow_flight::sql::Any,
     ) -> Result<Response<<Self::FlightService as FlightService>::DoGetStream>, Status> {
-        let principal = self.authorize(&request)?;
+        let principal = self.authorize(&request).await?;
         let ticket = crate::tailapi::TailTicket::from_any(&message)
             .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
         let Some(ticket) = ticket else {
@@ -1693,6 +1720,7 @@ pub async fn spawn_tail_api(
         read_only: true,
         basic_tokens: Mutex::new(HashMap::new()),
         ipc_compression: Some(arrow::ipc::CompressionType::ZSTD),
+        throttle: Arc::new(crate::ops::AuthThrottle::default()),
         plans: PlanCache::from_env(),
         stash: Mutex::new(HashMap::new()),
     };
@@ -1782,6 +1810,15 @@ pub async fn run(
         None => None,
     };
     let auth = load_basic_auth(&auth_file)?;
+    // Mirror the pgwire listener's posture warnings: gRPC-web auth is a
+    // per-RPC Basic header, so WITHOUT TLS the password itself crosses the
+    // wire on every call — louder than the handshake-once flow, same fix.
+    if auth.is_some() && grpc_web && tls.is_none() {
+        warn!(
+            "--grpc-web with --auth-file but WITHOUT --tls-cert/--tls-key: browser clients send \
+             Basic credentials in CLEARTEXT on every RPC; terminate TLS here or in front"
+        );
+    }
 
     info!(
         catalog_uri = %opts.catalog_uri,
@@ -1830,6 +1867,7 @@ pub async fn run(
         read_only: false,
         basic_tokens: Mutex::new(HashMap::new()),
         ipc_compression,
+        throttle: Arc::new(crate::ops::AuthThrottle::default()),
         plans: PlanCache::from_env(),
         stash: Mutex::new(HashMap::new()),
     };
@@ -2280,25 +2318,48 @@ mod tests {
         }
     }
 
-    #[test]
-    fn per_rpc_basic_auth_caches_successes_only() {
+    #[tokio::test(start_paused = true)]
+    async fn per_rpc_basic_auth_caches_successes_and_throttles_failures() {
         let verifier = Arc::new(CountingVerifier {
             calls: std::sync::atomic::AtomicUsize::new(0),
         });
         let auth: Arc<dyn BasicAuthVerifier> = verifier.clone();
         let cache = Mutex::new(HashMap::new());
+        let throttle = crate::ops::AuthThrottle::default();
+        let peer = Some(std::net::IpAddr::from([10, 0, 0, 7]));
         let good = base64::engine::general_purpose::STANDARD.encode("bench:secret");
         let bad = base64::engine::general_purpose::STANDARD.encode("bench:wrong");
 
         // First success runs the KDF; the repeat is served from the cache.
-        assert_eq!(verify_basic_cached(&good, &auth, &cache).unwrap(), "bench");
-        assert_eq!(verify_basic_cached(&good, &auth, &cache).unwrap(), "bench");
+        let got = verify_basic_cached(&good, &auth, &cache, &throttle, peer).await;
+        assert_eq!(got.unwrap(), "bench");
+        let got = verify_basic_cached(&good, &auth, &cache, &throttle, peer).await;
+        assert_eq!(got.unwrap(), "bench");
         assert_eq!(verifier.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-        // Failures are never cached: every wrong attempt pays the KDF.
-        assert!(verify_basic_cached(&bad, &auth, &cache).is_err());
-        assert!(verify_basic_cached(&bad, &auth, &cache).is_err());
+        // Failures are never cached: every wrong attempt pays the KDF — and
+        // escalates the same per-peer backoff pgwire applies (visible here as
+        // paused-clock time consumed by the pre-verification sleep).
+        let t0 = tokio::time::Instant::now();
+        assert!(verify_basic_cached(&bad, &auth, &cache, &throttle, peer)
+            .await
+            .is_err());
+        assert_eq!(t0.elapsed(), Duration::ZERO, "first failure pays no delay");
+        assert!(verify_basic_cached(&bad, &auth, &cache, &throttle, peer)
+            .await
+            .is_err());
+        assert!(
+            t0.elapsed() >= Duration::from_millis(250),
+            "second attempt from the throttled peer must back off"
+        );
         assert_eq!(verifier.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        // A throttled peer does NOT slow already-authenticated traffic: the
+        // cached credential still short-circuits before the penalty.
+        let t1 = tokio::time::Instant::now();
+        let got = verify_basic_cached(&good, &auth, &cache, &throttle, peer).await;
+        assert_eq!(got.unwrap(), "bench");
+        assert_eq!(t1.elapsed(), Duration::ZERO, "cache hits skip the backoff");
     }
 
     /// Inner stub for the CORS layer: answers every request with 200 and a
