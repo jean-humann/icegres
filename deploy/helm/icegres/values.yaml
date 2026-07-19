@@ -218,8 +218,32 @@ flight:
   resultCompression: zstd
   # Bounded-staleness reads + plan cache (same semantics as computes).
   freshnessMs: 0
+  # Resource guards (0 = off). Set these before exposing the port to
+  # untrusted browsers: a per-query wall-clock ceiling (ms), a per-result
+  # byte cap, and a cap on concurrent query streams (the Flight analogue of
+  # a connection cap). Rendered as ICEGRES_FLIGHT_* env.
+  statementTimeoutMs: 0
+  maxResultBytes: 0
+  maxConcurrentRpcs: 0
+  # HTTP /health + /metrics port for this listener (the icegres_flight_*
+  # Prometheus series live here). Scraped by the ServiceMonitor when set.
+  healthPort: 8080
   service:
     type: ClusterIP
+  # Ingress exposing the Flight port outside the cluster. gRPC-web rides
+  # plain HTTP/2, so ANY ingress that speaks h2c to the backend works; the
+  # snippet below is nginx-ingress. For a public dashboard, pair with
+  # grpcWeb + a pinned corsOrigin + TLS + the resource guards above.
+  ingress:
+    enabled: false
+    className: ""
+    # Merged onto the rendered annotations. The nginx defaults below set the
+    # backend protocol and relax body/timeout limits for large result
+    # streams; override className/annotations for a different controller.
+    annotations: {}
+    host: ""
+    # TLS: names a kubernetes.io/tls secret for the host (edge termination).
+    tlsSecret: ""
   resources:
     requests: { cpu: 250m, memory: 512Mi }
     limits: { memory: 2Gi }

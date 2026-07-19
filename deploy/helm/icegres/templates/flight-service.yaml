@@ -11,6 +11,9 @@ metadata:
   labels:
     {{- include "icegres.labels" . | nindent 4 }}
     app.kubernetes.io/component: flight
+    {{- if and .Values.flight.healthPort .Values.metrics.serviceMonitor.enabled }}
+    icegres.io/metrics: "true"
+    {{- end }}
 spec:
   type: {{ .Values.flight.service.type }}
   selector:
@@ -19,4 +22,9 @@ spec:
     - name: flight
       port: {{ int .Values.flight.port }}
       targetPort: flight
+    {{- if .Values.flight.healthPort }}
+    - name: health
+      port: {{ int .Values.flight.healthPort }}
+      targetPort: health
+    {{- end }}
 {{- end }}

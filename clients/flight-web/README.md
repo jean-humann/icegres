@@ -29,6 +29,12 @@ await db.queryBatches("SELECT * FROM demo.trips", (batch, i) => {
 const ctl = new AbortController();
 db.query("SELECT …", { signal: ctl.signal });
 ctl.abort();
+
+// Real-user monitoring: one sample per query()
+const db2 = new FlightWebClient({
+  baseUrl: "https://lakehouse.example:50051",
+  onTiming: ({ sql, ms, bytes, rows, ok }) => rum.send({ sql, ms, bytes, rows, ok }),
+});
 ```
 
 ## Server prerequisites

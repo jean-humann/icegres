@@ -157,6 +157,9 @@ spec:
     - name: flight
       port: 50051
       targetPort: flight
+    - name: health
+      port: 8080
+      targetPort: health
 ---
 # Source: icegres/templates/icegresd-service.yaml
 # The client endpoint (pgwire). With ha.enabled the leadership readiness
@@ -317,9 +320,19 @@ spec:
               value: "https://dash.example"
             - name: ICEGRES_FRESHNESS_MS
               value: "250"
+            - name: ICEGRES_FLIGHT_STATEMENT_TIMEOUT_MS
+              value: "30000"
+            - name: ICEGRES_FLIGHT_MAX_RESULT_BYTES
+              value: "8.388608e+06"
+            - name: ICEGRES_FLIGHT_MAX_CONCURRENT_RPCS
+              value: "64"
+            - name: ICEGRES_HEALTH_PORT
+              value: "8080"
           ports:
             - name: flight
               containerPort: 50051
+            - name: health
+              containerPort: 8080
           startupProbe:
             tcpSocket:
               port: flight
@@ -331,8 +344,10 @@ spec:
             periodSeconds: 10
             failureThreshold: 3
           readinessProbe:
-            tcpSocket:
-              port: flight
+            # /ready is catalog-aware once a health port is served.
+            httpGet:
+              path: /ready
+              port: health
             periodSeconds: 5
           resources:
             limits:
@@ -597,3 +612,39 @@ spec:
         - name: tls
           secret:
             secretName: icegres-tls
+---
+# Source: icegres/templates/flight-ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: icegres-flight
+  namespace: icegres-system
+  labels:
+    helm.sh/chart: icegres-0.1.0
+    app.kubernetes.io/name: icegres
+    app.kubernetes.io/instance: icegres
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: flight
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: "GRPC"
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - "dash.example"
+      secretName: icegres-tls
+  rules:
+    - host: "dash.example"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: icegres-flight
+                port:
+                  number: 50051

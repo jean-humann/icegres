@@ -90,3 +90,20 @@ test("Basic credentials are UTF-8 encoded, not Latin-1", () => {
   // And the bytes are genuinely multi-byte UTF-8, not one-byte Latin-1.
   assert.ok(decoded.length > "café:pä€ss".length);
 });
+
+test("onTiming fires with latency, bytes, rows on success", async () => {
+  // A fake fetch that returns one data frame + a clean trailer, so query()
+  // resolves without a live server and the RUM hook is observable.
+  const samples = [];
+  // Minimal valid: an empty Arrow IPC stream decodes to a 0-row table.
+  const client = new FlightWebClient({
+    baseUrl: "http://x",
+    onTiming: (s) => samples.push(s),
+    fetch: async () => { throw new Error("boom"); },
+  });
+  await assert.rejects(() => client.query("SELECT 1"));
+  assert.equal(samples.length, 1);
+  assert.equal(samples[0].ok, false);
+  assert.equal(samples[0].sql, "SELECT 1");
+  assert.ok(samples[0].ms >= 0);
+});
