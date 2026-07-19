@@ -106,12 +106,32 @@ spec:
             - name: ICEGRES_FRESHNESS_MS
               value: {{ .Values.flight.freshnessMs | quote }}
             {{- end }}
+            {{- if gt (int .Values.flight.statementTimeoutMs) 0 }}
+            - name: ICEGRES_FLIGHT_STATEMENT_TIMEOUT_MS
+              value: {{ .Values.flight.statementTimeoutMs | quote }}
+            {{- end }}
+            {{- if gt (int .Values.flight.maxResultBytes) 0 }}
+            - name: ICEGRES_FLIGHT_MAX_RESULT_BYTES
+              value: {{ .Values.flight.maxResultBytes | quote }}
+            {{- end }}
+            {{- if gt (int .Values.flight.maxConcurrentRpcs) 0 }}
+            - name: ICEGRES_FLIGHT_MAX_CONCURRENT_RPCS
+              value: {{ .Values.flight.maxConcurrentRpcs | quote }}
+            {{- end }}
+            {{- if .Values.flight.healthPort }}
+            - name: ICEGRES_HEALTH_PORT
+              value: {{ .Values.flight.healthPort | quote }}
+            {{- end }}
             {{- with .Values.flight.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
           ports:
             - name: flight
               containerPort: {{ int .Values.flight.port }}
+            {{- if .Values.flight.healthPort }}
+            - name: health
+              containerPort: {{ int .Values.flight.healthPort }}
+            {{- end }}
           startupProbe:
             tcpSocket:
               port: flight
@@ -123,8 +143,15 @@ spec:
             periodSeconds: 10
             failureThreshold: 3
           readinessProbe:
+            {{- if .Values.flight.healthPort }}
+            # /ready is catalog-aware once a health port is served.
+            httpGet:
+              path: /ready
+              port: health
+            {{- else }}
             tcpSocket:
               port: flight
+            {{- end }}
             periodSeconds: 5
           resources:
             {{- toYaml .Values.flight.resources | nindent 12 }}

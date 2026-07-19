@@ -56,11 +56,19 @@ export class FlightWebClient {
    *   (idempotent, result-free) GetFlightInfo call. DoGet is never retried:
    *   a mid-stream failure surfaces rather than silently re-running a query.
    * @param {typeof fetch} [opts.fetch] fetch override (tests, polyfills)
+   * @param {(m: {sql: string, ms: number, bytes: number, rows: number|null,
+   *   ok: boolean, error?: string}) => void} [opts.onTiming] real-user
+   *   monitoring hook: called once per query() with its end-to-end latency,
+   *   bytes received, decoded row count, and outcome. Wire it to your RUM /
+   *   analytics sink so the measured dashboard latency stays measured in
+   *   production. Never throws into the query path (errors in the hook are
+   *   swallowed).
    */
-  constructor({ baseUrl, credentials, retries = 1, fetch: fetchImpl } = {}) {
+  constructor({ baseUrl, credentials, retries = 1, fetch: fetchImpl, onTiming } = {}) {
     if (!baseUrl) throw new Error("FlightWebClient requires baseUrl");
     this.base = baseUrl.replace(/\/$/, "");
     this.retries = retries;
+    this.onTiming = onTiming ?? null;
     this.fetch = fetchImpl ?? fetch.bind(globalThis);
     // UTF-8 then base64: the server decodes the Basic payload as UTF-8
     // bytes (btoa alone is Latin-1 and corrupts any non-ASCII credential).
@@ -203,14 +211,46 @@ export class FlightWebClient {
     return concatBytes(chunks);
   }
 
+  /** Emit an onTiming sample, swallowing any hook error. */
+  #emitTiming(sample) {
+    if (!this.onTiming) return;
+    try {
+      this.onTiming(sample);
+    } catch {
+      // A misbehaving RUM hook must never break a query.
+    }
+  }
+
   /**
    * Run `sql` and return an apache-arrow Table. Requires `apache-arrow` (a
    * peer dependency) and a registered ZSTD codec (see ./zstd.js) unless the
-   * server runs `--result-compression none`.
+   * server runs `--result-compression none`. Reports an onTiming sample.
    */
   async query(sql, opts) {
     const { tableFromIPC } = await import("apache-arrow");
-    return tableFromIPC(await this.queryIpc(sql, opts));
+    const t0 = (globalThis.performance ?? Date).now();
+    try {
+      const ipc = await this.queryIpc(sql, opts);
+      const table = tableFromIPC(ipc);
+      this.#emitTiming({
+        sql,
+        ms: (globalThis.performance ?? Date).now() - t0,
+        bytes: ipc.length,
+        rows: table.numRows,
+        ok: true,
+      });
+      return table;
+    } catch (e) {
+      this.#emitTiming({
+        sql,
+        ms: (globalThis.performance ?? Date).now() - t0,
+        bytes: 0,
+        rows: null,
+        ok: false,
+        error: String(e),
+      });
+      throw e;
+    }
   }
 
   /**

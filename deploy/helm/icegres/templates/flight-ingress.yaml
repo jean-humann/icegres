@@ -1,0 +1,54 @@
+{{- include "icegres.validate" . -}}
+{{- if and .Values.flight.enabled .Values.flight.ingress.enabled }}
+{{/*
+Exposes the Arrow Flight SQL port outside the cluster for browser
+dashboards. gRPC-web is plain HTTP/2, so any ingress that speaks h2c to
+the backend works; the defaults here are nginx-ingress
+(backend-protocol GRPC, relaxed body/read limits for large result
+streams). Override flight.ingress.className/annotations for a different
+controller (a Gateway API HTTPRoute is the modern alternative — same
+requirement: h2c to the Service, generous stream timeouts).
+
+For a PUBLIC dashboard this belongs behind flight.grpcWeb=true, a pinned
+flight.corsOrigin, TLS (flight.ingress.tlsSecret), and the flight
+resource guards (statementTimeoutMs / maxResultBytes / maxConcurrentRpcs)
+— an ingress does not bound query cost.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "icegres.fullname" . }}-flight
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "icegres.labels" . | nindent 4 }}
+    app.kubernetes.io/component: flight
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: "GRPC"
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    {{- with .Values.flight.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- with .Values.flight.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if .Values.flight.ingress.tlsSecret }}
+  tls:
+    - hosts:
+        - {{ required "flight.ingress.host is required with tlsSecret" .Values.flight.ingress.host | quote }}
+      secretName: {{ .Values.flight.ingress.tlsSecret }}
+  {{- end }}
+  rules:
+    - host: {{ required "flight.ingress.host is required when flight.ingress.enabled" .Values.flight.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "icegres.fullname" . }}-flight
+                port:
+                  number: {{ int .Values.flight.port }}
+{{- end }}

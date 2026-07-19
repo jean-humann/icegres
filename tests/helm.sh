@@ -435,6 +435,22 @@ fi
 doc "$fr" NetworkPolicy "$RELEASE-flight" | grep -q "port: 50051" \
     && ok "flight NetworkPolicy segments the client port" \
     || bad "flight NetworkPolicy missing"
+if [ -n "${flight_doc:-}" ]; then
+    echo "$flight_doc" | grep -q 'ICEGRES_FLIGHT_STATEMENT_TIMEOUT_MS' \
+        && ok "flight statement timeout wired" || bad "flight statement timeout env missing"
+    echo "$flight_doc" | grep -q 'ICEGRES_FLIGHT_MAX_RESULT_BYTES' \
+        && ok "flight result-byte cap wired" || bad "flight result cap env missing"
+    echo "$flight_doc" | grep -q 'ICEGRES_FLIGHT_MAX_CONCURRENT_RPCS' \
+        && ok "flight concurrency cap wired" || bad "flight concurrency cap env missing"
+    echo "$flight_doc" | grep -q 'ICEGRES_HEALTH_PORT' \
+        && ok "flight health/metrics port wired" || bad "flight health port env missing"
+fi
+ing="$(doc "$fr" Ingress "$RELEASE-flight")"
+[ -n "$ing" ] && ok "flight Ingress rendered" || bad "flight Ingress missing"
+echo "$ing" | grep -q 'backend-protocol: "GRPC"' \
+    && ok "flight Ingress speaks gRPC to the backend" || bad "flight Ingress backend-protocol wrong"
+echo "$ing" | grep -q 'host: "dash.example"' \
+    && ok "flight Ingress host pinned" || bad "flight Ingress host missing"
 grep -q "^# Source: icegres/templates/flight-deployment.yaml" "$TMP/render-defaults.yaml" \
     && bad "defaults leaked the flight Deployment" \
     || ok "defaults render no flight objects"

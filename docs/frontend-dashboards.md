@@ -146,6 +146,42 @@ for servers that send uncompressed batches.
   Envoy `grpc_web` filter; `@icegres/flight-web` works unchanged against
   both.
 
+## Production checklist
+
+The feature is deployable for an internal dashboard once these are set;
+the resource limits and query allowlist are the gate for anything
+untrusted.
+
+- **Transport & auth**: `--grpc-web --tls-cert/--tls-key --auth-file`,
+  with `--cors-origin` pinned to the dashboard origin and `--authz-file`
+  scoping each principal to its readable tables. Failed auth (both
+  handshake and per-RPC Basic) is per-source-IP throttled like pgwire.
+- **Resource limits** (a runaway query is otherwise unbounded):
+  `--flight-statement-timeout-ms` (per-query wall clock),
+  `--flight-max-result-bytes` (per-result byte cap), and
+  `--flight-max-concurrent-rpcs` (in-flight stream cap). Over-limit
+  queries return `DEADLINE_EXCEEDED` / `RESOURCE_EXHAUSTED`; the client
+  surfaces them as `FlightError`.
+- **Raw SQL vs allowlist**: `grpcweb-direct` sends whatever SQL the page
+  builds. That is fine behind auth+authz for an internal tool. For a
+  **public-facing** app, do not expose raw SQL — put the `arrow-proxy`
+  shape in front (`bench/clients/js/proxy/server.js`) reduced to a
+  **named-query allowlist**: the proxy maps `{name, params}` to a fixed,
+  parameterized statement and refuses anything else, staying a byte
+  forwarder for the Arrow stream. This keeps the Arrow-end-to-end speed
+  while removing arbitrary-SQL exposure.
+- **Observability**: scrape `/metrics` (served on the flight `--health-port`)
+  for the `icegres_flight_*` series — RPC count, in-flight gauge, summed
+  duration, bytes out, aborted-by-guard count, auth failures. On the
+  client, pass an `onTiming` callback to `FlightWebClient` to feed real
+  dashboard latency/bytes/rows into your RUM sink.
+- **Deploy**: the Helm chart's `flight.*` values render the listener,
+  Service, NetworkPolicy, an optional gRPC-web `Ingress`
+  (`flight.ingress.enabled`, nginx `backend-protocol: GRPC` by default),
+  and the `/metrics` port for the ServiceMonitor.
+- **CI**: `tests/browser-flight.sh` exercises the whole path in real
+  Chromium (skips when deps absent); it runs in `bench/gate.sh` with e2e.
+
 ## Bench-environment notes
 
 Run in a sandbox where Lakekeeper/RustFS binaries could not be fetched: the
