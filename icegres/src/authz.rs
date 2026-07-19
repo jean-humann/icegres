@@ -430,6 +430,40 @@ pub fn required_checks(stmt: &Statement, default_ns: &str) -> Vec<(Action, Table
     checks
 }
 
+/// Whether `stmt` is side-effect-free and therefore admissible on a
+/// `--read-only` Flight listener.
+///
+/// This is a distinct concern from [`required_checks`], which enumerates the
+/// ReBAC data-plane checks a statement needs: DDL such as `CREATE TABLE` or
+/// `ALTER` requires no table-grant check (and so yields none there), yet must
+/// still be refused on a read-only endpoint. This predicate is therefore
+/// **fail-closed** — a statement form not positively known to be read-only
+/// (any DML or DDL: INSERT/UPDATE/DELETE/MERGE, CREATE/CTAS, ALTER, DROP,
+/// TRUNCATE, COPY … FROM, or a form added by a future parser) is treated as a
+/// write. Classification is by statement form, never string matching, so
+/// comments or whitespace cannot disguise a write.
+pub fn is_read_only(stmt: &Statement) -> bool {
+    match stmt {
+        // Pure reads plus read-only metadata/session forms.
+        Statement::Query(_)
+        | Statement::ShowVariable { .. }
+        | Statement::ShowStatus { .. }
+        | Statement::Set { .. }
+        | Statement::StartTransaction { .. }
+        | Statement::Commit { .. }
+        | Statement::Rollback { .. } => true,
+        // EXPLAIN is a read UNLESS ANALYZE actually executes the inner
+        // statement — then it is read-only only if that statement is.
+        Statement::Explain {
+            analyze, statement, ..
+        } => !*analyze || is_read_only(statement),
+        // COPY … TO is a read; COPY … FROM writes.
+        Statement::Copy { to, .. } => *to,
+        // DML, DDL, and any unrecognized form: refuse.
+        _ => false,
+    }
+}
+
 /// Recursively collect ReadData checks for every base table referenced by a
 /// query (FROM, JOINs, subqueries, CTEs, set operations).
 fn collect_query_reads(
