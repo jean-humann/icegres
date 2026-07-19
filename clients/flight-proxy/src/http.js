@@ -34,24 +34,66 @@ export async function readJson(req, limit = 64 * 1024) {
   return chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {};
 }
 
+/** Map a gRPC (Flight) error to an HTTP status; default 500. Used to turn a
+ *  pre-stream query failure into a meaningful response instead of a 200. */
+function grpcStatusToHttp(code) {
+  switch (code) {
+    case 3: // INVALID_ARGUMENT — bad SQL / planning error
+      return 400;
+    case 16: // UNAUTHENTICATED
+      return 401;
+    case 7: // PERMISSION_DENIED
+      return 403;
+    case 5: // NOT_FOUND
+      return 404;
+    case 8: // RESOURCE_EXHAUSTED — result cap / concurrency
+      return 429;
+    case 4: // DEADLINE_EXCEEDED — statement timeout
+      return 504;
+    case 14: // UNAVAILABLE
+      return 503;
+    default:
+      return 500;
+  }
+}
+
 /**
  * Stream a Flight SQL result to the browser as Arrow IPC, untouched. `run` is
- * invoked with a per-chunk writer. On a mid-stream failure the response
- * headers are already sent, so the status cannot change: report via `onError`
- * and destroy the socket to signal an incomplete stream.
+ * invoked with a per-chunk writer.
+ *
+ * The 200 header is deferred until the FIRST chunk arrives, so a query that
+ * fails before any bytes (the common case: a SQL syntax error surfaced at
+ * GetFlightInfo) returns a real JSON error with a mapped status — not a
+ * 200-then-truncated stream the browser reports as a network error. Once
+ * streaming has begun the status cannot change, so a mid-stream failure is
+ * reported via `onError` and the socket destroyed to signal truncation.
  */
 export async function streamArrow(res, cors, run, onError) {
-  res.writeHead(200, {
-    "content-type": ARROW_CONTENT_TYPE,
-    "cache-control": "no-store",
-    ...cors,
-  });
+  let started = false;
+  const begin = () => {
+    if (started) return;
+    started = true;
+    res.writeHead(200, {
+      "content-type": ARROW_CONTENT_TYPE,
+      "cache-control": "no-store",
+      ...cors,
+    });
+  };
   try {
-    await run((chunk) => res.write(chunk));
+    await run((chunk) => {
+      begin();
+      res.write(chunk);
+    });
+    begin(); // a zero-chunk result still completes as an (empty) 200 stream
     res.end();
   } catch (e) {
     onError(e);
-    res.destroy(e);
+    if (started) {
+      res.destroy(e);
+    } else {
+      const status = grpcStatusToHttp(e && e.code);
+      sendJson(res, status, { error: (e && e.message) || String(e) }, cors);
+    }
   }
 }
 
