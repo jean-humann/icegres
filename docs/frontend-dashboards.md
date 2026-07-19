@@ -7,10 +7,15 @@ should carry them — and does the frontend need a backend at all?
 result staying in Arrow IPC form all the way into `apache-arrow` in the
 browser, either through a ~40-line pass-through proxy endpoint
 (`arrow-proxy`) or with the browser speaking Flight SQL itself through a
-gRPC-web translator (`grpcweb-direct`). Both beat converting to JSON by
-**2.5–2.8× end-to-end latency at dashboard-realistic network speeds** and
-**5–6× on wire size**, and the gap widens with row count. Below ~1k rows any
-path is fine — latency is dominated by query execution, not encoding.
+gRPC-web translator (`grpcweb-direct`). Both beat converting to JSON on latency, and the gap widens with row count.
+The **durable, compression-independent win is ~20–35% on localhost** at
+100k–1M rows — the pure serialize / parse / GC tax of pivoting to JSON and
+re-parsing it into a million heap objects. Once bandwidth is finite the gap
+grows to **~2.5×**, though that figure (and the wire-size numbers below) also
+reflects that Arrow batches are ZSTD-compressed while the recorded JSON was
+not — see [the compression caveat](#a-note-on-compression) before quoting the
+multipliers. Below ~1k rows any path is fine — latency is dominated by query
+execution, not encoding.
 
 Probes, harness, and the demo dashboard live in
 [`bench/clients/js/`](../bench/clients/js/); recorded runs in
@@ -24,7 +29,7 @@ and
 |---|---|---|---|
 | `arrow-proxy` | Arrow IPC (ZSTD-compressed batches) | Node proxy → Flight SQL `:50051` | **Recommended default** |
 | `grpcweb-direct` | gRPC-web FlightData frames | the browser itself (`flight-serve --grpc-web`) | **Recommended when no app backend exists** |
-| `flight-json` | JSON | Node proxy → Flight SQL, rows flattened server-side | loses: pays decode + stringify + parse + 5× wire |
+| `flight-json` | JSON | Node proxy → Flight SQL, rows flattened server-side | loses: pays decode + stringify + parse tax |
 | `pg-json` | JSON | Node proxy → node-postgres `:5439` | loses: same JSON tax, plus row-oriented transport |
 
 Two facts frame the comparison:
@@ -86,9 +91,28 @@ near-zero-copy.
 | 1M rows | **8.6 s** | 8.8 s | 21.8 s | 22.9 s |
 
 Once bandwidth is finite the wire-size gap converts directly into user-felt
-latency: **2.5–2.8× faster at 100k–1M rows**. The ZSTD batch compression
-icegres applies on DoGet (`flight_ipc_options`) is doing real work here —
-18.7 MiB versus 96 MiB for the same million rows.
+latency: **~2.5× faster at 100k–1M rows** in these runs. Note this figure is
+inflated by compression (see below): the ZSTD batch compression icegres
+applies on DoGet (`flight_ipc_options`) shipped 18.7 MiB where the
+*uncompressed* JSON shipped 82–96 MiB, and a gzip'd JSON endpoint would
+recover most of that. The compression-independent win is the localhost gap
+above.
+
+### A note on compression
+
+The recorded JSON figures above are **uncompressed**, while the Arrow lanes
+carry ZSTD-compressed batches — so the wire-size multipliers (4.4–5.1× at 1M
+rows) and, at throttled bandwidth, part of the latency multiplier are a
+*compression* effect, not a *format* effect. A production JSON endpoint would
+gzip its responses; JSON of tabular data compresses well, which narrows the
+wire gap substantially. The bench proxy now gzips the JSON lanes by default
+and reports the true encoded size via an `x-wire-bytes` header (see
+`bench/clients/js/proxy/server.js`), so a re-run measures Arrow-zstd against
+gzip'd-JSON on equal footing; the artifacts committed here predate that change
+and should be read with this caveat. What does **not** depend on compression
+is the localhost latency gap — Arrow forwards server-encoded buffers and wraps
+them near-zero-copy, where JSON must be stringified server-side and parsed
+into a million heap objects client-side regardless of transport compression.
 
 `grpcweb-direct` pays one extra round-trip (`GetFlightInfo` before `DoGet`),
 visible only on tiny queries (+25 ms at 20 ms RTT); by 10k rows it ties, and

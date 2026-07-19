@@ -10,8 +10,10 @@ import { FlightWebClient } from "@icegres/flight-web";
 // Native gRPC-web on the Flight port itself (flight-serve --grpc-web).
 // The port is overridable via ?grpcwebPort= so the CI smoke gate can point
 // the browser at its own test listener (defaults to the dev-stack 50051).
-const GRPCWEB_PORT =
-  new URLSearchParams(location.search).get("grpcwebPort") || "50051";
+// Validate the port is purely numeric so a crafted ?grpcwebPort=80@evil.com
+// cannot smuggle a userinfo host and repoint the Flight client off-origin.
+const rawPort = new URLSearchParams(location.search).get("grpcwebPort");
+const GRPCWEB_PORT = /^\d{1,5}$/.test(rawPort ?? "") ? rawPort : "50051";
 const GRPCWEB_BASE = `http://${location.hostname}:${GRPCWEB_PORT}`;
 const flightWeb = new FlightWebClient({ baseUrl: GRPCWEB_BASE });
 
@@ -50,10 +52,15 @@ function jsonPath(endpoint) {
     if (!resp.ok) throw new Error(await resp.text());
     const buf = await resp.arrayBuffer();
     const rows = JSON.parse(new TextDecoder().decode(buf));
+    // Measure the bytes that actually crossed the wire: with a gzip'd JSON
+    // response fetch decompresses transparently, so buf.byteLength is the
+    // UNCOMPRESSED size — use the proxy's x-wire-bytes (the encoded length)
+    // so this is comparable to the Arrow lanes' compressed IPC byteLength.
+    const wire = Number(resp.headers.get("x-wire-bytes")) || buf.byteLength;
     return {
       rows,
       cols: rows.length ? Object.keys(rows[0]) : [],
-      bytes: buf.byteLength,
+      bytes: wire,
       rowCount: rows.length,
     };
   };

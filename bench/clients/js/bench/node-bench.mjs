@@ -26,6 +26,25 @@ const SQLS = {
     "SELECT trip_id, city, fare, distance_km, ts FROM demo.dash_trips ORDER BY trip_id LIMIT 1000000",
 };
 
+// Fully materialize an Arrow table to JS values so the Flight lanes do the
+// same work node-postgres does when it builds row objects — otherwise
+// tableFromIPC(buf).numRows (columnar, no per-cell decode) understates the
+// Flight lanes' cost and overstates their advantage over pg-wire.
+function materializeRows(buf) {
+  const table = tableFromIPC(buf);
+  const names = table.schema.fields.map((f) => f.name);
+  let n = 0;
+  for (const row of table) {
+    for (const name of names) {
+      const v = row[name];
+      // Touch every cell (mirror pg's bigint->number handling).
+      void (typeof v === "bigint" ? Number(v) : v);
+    }
+    n++;
+  }
+  return n;
+}
+
 const grpcClient = connect(FLIGHT_ADDR);
 // The native client's bundled arrow-flight lacks the `zstd` IPC feature and
 // PANICS (then hangs the promise) on icegres's compressed DoGet batches:
@@ -44,12 +63,12 @@ const pgPool = new pgpkg.Pool({ connectionString: PG_URL, max: 4 });
 const LANES = {
   "flight-grpc-js": async (sql) => {
     const buf = await queryToIpcBuffer(grpcClient, sql);
-    return tableFromIPC(buf).numRows;
+    return materializeRows(buf);
   },
   ...(nativeClient && {
     "flight-native": async (sql) => {
       const buf = await nativeClient.query(sql);
-      return tableFromIPC(buf).numRows;
+      return materializeRows(buf);
     },
   }),
   "pg-wire": async (sql) => (await pgPool.query(sql)).rows.length,
