@@ -15,6 +15,7 @@
 
 import http from "node:http";
 import { readFile } from "node:fs/promises";
+import { gzipSync } from "node:zlib";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import "../lib/zstd-node.js";
@@ -55,6 +56,29 @@ function tableToRows(table) {
   return rows;
 }
 
+/**
+ * Send `rows` as JSON, gzip-compressed when the client accepts it — the
+ * shape any production REST endpoint serves. Without this the JSON lanes ship
+ * uncompressed against the Arrow lanes' zstd batches, so the "wire bytes"
+ * comparison would credit Arrow with a compression win any gzip'd proxy
+ * erases. `x-wire-bytes` reports the exact number of bytes written to the
+ * socket (gzip auto-decompresses in the browser, so a byteLength on the
+ * decoded body would report the uncompressed size, not the wire size).
+ */
+function sendJsonRows(req, res, rows) {
+  const body = Buffer.from(JSON.stringify(rows));
+  const gzip = /\bgzip\b/.test(req.headers["accept-encoding"] || "");
+  const payload = gzip ? gzipSync(body) : body;
+  res.writeHead(200, {
+    "content-type": "application/json",
+    "cache-control": "no-store",
+    "content-length": String(payload.length),
+    "x-wire-bytes": String(payload.length),
+    ...(gzip ? { "content-encoding": "gzip" } : {}),
+  });
+  res.end(payload);
+}
+
 async function handleApi(req, res, url) {
   const sql = url.searchParams.get("sql");
   if (!sql) {
@@ -71,19 +95,10 @@ async function handleApi(req, res, url) {
     res.end();
   } else if (route === "/api/flight-json") {
     const buf = await queryToIpcBuffer(flight, sql);
-    const rows = tableToRows(tableFromIPC(buf));
-    res.writeHead(200, {
-      "content-type": "application/json",
-      "cache-control": "no-store",
-    });
-    res.end(JSON.stringify(rows));
+    sendJsonRows(req, res, tableToRows(tableFromIPC(buf)));
   } else if (route === "/api/pg-json") {
     const out = await pgPool.query(sql);
-    res.writeHead(200, {
-      "content-type": "application/json",
-      "cache-control": "no-store",
-    });
-    res.end(JSON.stringify(out.rows));
+    sendJsonRows(req, res, out.rows);
   } else {
     res.writeHead(404).end("unknown api route");
   }
