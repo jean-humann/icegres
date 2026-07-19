@@ -115,6 +115,12 @@ spec:
       from:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+    {{- if .Values.flight.healthPort }}
+    # Health/metrics: kubelet /ready probe + Prometheus scrapes of the
+    # Flight per-RPC metrics arrive from CNI-specific sources — admit any.
+    - ports:
+        - port: {{ int .Values.flight.healthPort }}
+    {{- end }}
 {{- end }}
 {{- if eq .Values.tail.mode "quorum" }}
 ---

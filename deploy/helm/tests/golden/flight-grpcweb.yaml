@@ -76,6 +76,10 @@ spec:
     # dashboards — a client port, same clientFrom contract as pgwire.
     - ports:
         - port: 50051
+    # Health/metrics: kubelet /ready probe + Prometheus scrapes of the
+    # Flight per-RPC metrics arrive from CNI-specific sources — admit any.
+    - ports:
+        - port: 8080
 ---
 # Source: icegres/templates/serviceaccount.yaml
 apiVersion: v1
@@ -323,7 +327,7 @@ spec:
             - name: ICEGRES_FLIGHT_STATEMENT_TIMEOUT_MS
               value: "30000"
             - name: ICEGRES_FLIGHT_MAX_RESULT_BYTES
-              value: "8.388608e+06"
+              value: "8388608"
             - name: ICEGRES_FLIGHT_MAX_CONCURRENT_RPCS
               value: "64"
             - name: ICEGRES_HEALTH_PORT
@@ -629,7 +633,8 @@ metadata:
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/component: flight
   annotations:
-    nginx.ingress.kubernetes.io/backend-protocol: "GRPC"
+    
+    nginx.ingress.kubernetes.io/backend-protocol: GRPCS
     nginx.ingress.kubernetes.io/proxy-body-size: "0"
     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"

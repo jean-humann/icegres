@@ -432,14 +432,23 @@ if [ -n "${flight_doc:-}" ]; then
         && bad "flight leaked tail/buffer env (would fence the writer)" \
         || ok "flight carries no tail/buffer env"
 fi
-doc "$fr" NetworkPolicy "$RELEASE-flight" | grep -q "port: 50051" \
+flight_np="$(doc "$fr" NetworkPolicy "$RELEASE-flight")"
+echo "$flight_np" | grep -q "port: 50051" \
     && ok "flight NetworkPolicy segments the client port" \
     || bad "flight NetworkPolicy missing"
+echo "$flight_np" | grep -q "port: 8080" \
+    && ok "flight NetworkPolicy opens the health/metrics port" \
+    || bad "flight NetworkPolicy blocks health/metrics (probes + scrapes fail)"
 if [ -n "${flight_doc:-}" ]; then
     echo "$flight_doc" | grep -q 'ICEGRES_FLIGHT_STATEMENT_TIMEOUT_MS' \
         && ok "flight statement timeout wired" || bad "flight statement timeout env missing"
     echo "$flight_doc" | grep -q 'ICEGRES_FLIGHT_MAX_RESULT_BYTES' \
         && ok "flight result-byte cap wired" || bad "flight result cap env missing"
+    # Guard the int64 cast: a large byte cap must render as a plain integer,
+    # not Helm float sci-notation ("8.388608e+06"), which clap rejects at boot.
+    echo "$flight_doc" | grep -A1 'ICEGRES_FLIGHT_MAX_RESULT_BYTES' | grep -q 'value: "8388608"' \
+        && ok "flight result cap renders as an integer" \
+        || bad "flight result cap mis-rendered (int64 cast missing?)"
     echo "$flight_doc" | grep -q 'ICEGRES_FLIGHT_MAX_CONCURRENT_RPCS' \
         && ok "flight concurrency cap wired" || bad "flight concurrency cap env missing"
     echo "$flight_doc" | grep -q 'ICEGRES_HEALTH_PORT' \
@@ -449,8 +458,10 @@ if [ -n "${flight_doc:-}" ]; then
 fi
 ing="$(doc "$fr" Ingress "$RELEASE-flight")"
 [ -n "$ing" ] && ok "flight Ingress rendered" || bad "flight Ingress missing"
-echo "$ing" | grep -q 'backend-protocol: "GRPC"' \
-    && ok "flight Ingress speaks gRPC to the backend" || bad "flight Ingress backend-protocol wrong"
+# The profile terminates TLS at the flight pod (tls.enabled), so nginx must
+# speak gRPC-over-TLS (GRPCS) to the backend, not plaintext h2c.
+echo "$ing" | grep -q 'backend-protocol: GRPCS' \
+    && ok "flight Ingress speaks GRPCS to the TLS backend" || bad "flight Ingress backend-protocol wrong"
 echo "$ing" | grep -q 'host: "dash.example"' \
     && ok "flight Ingress host pinned" || bad "flight Ingress host missing"
 grep -q "^# Source: icegres/templates/flight-deployment.yaml" "$TMP/render-defaults.yaml" \

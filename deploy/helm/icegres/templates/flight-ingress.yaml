@@ -23,13 +23,21 @@ metadata:
     {{- include "icegres.labels" . | nindent 4 }}
     app.kubernetes.io/component: flight
   annotations:
-    nginx.ingress.kubernetes.io/backend-protocol: "GRPC"
-    nginx.ingress.kubernetes.io/proxy-body-size: "0"
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    {{/*
+    backend-protocol is GRPCS when the flight pod terminates TLS itself
+    (tls.enabled) — nginx must speak h2 over TLS, not plaintext h2c, or the
+    backend handshake fails. User annotations are merged LAST so an override
+    (e.g. a non-nginx controller) wins with no duplicate map key.
+    */}}
+    {{- $ann := dict
+        "nginx.ingress.kubernetes.io/backend-protocol" (ternary "GRPCS" "GRPC" .Values.tls.enabled)
+        "nginx.ingress.kubernetes.io/proxy-body-size" "0"
+        "nginx.ingress.kubernetes.io/proxy-read-timeout" "3600"
+        "nginx.ingress.kubernetes.io/proxy-send-timeout" "3600" }}
     {{- with .Values.flight.ingress.annotations }}
-    {{- toYaml . | nindent 4 }}
+    {{- $ann = merge (deepCopy .) $ann }}
     {{- end }}
+    {{- toYaml $ann | nindent 4 }}
 spec:
   {{- with .Values.flight.ingress.className }}
   ingressClassName: {{ . }}
