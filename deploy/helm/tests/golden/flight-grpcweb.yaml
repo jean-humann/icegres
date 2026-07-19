@@ -328,6 +328,8 @@ spec:
               value: "64"
             - name: ICEGRES_HEALTH_PORT
               value: "8080"
+            - name: ICEGRES_FLIGHT_READ_ONLY
+              value: "true"
           ports:
             - name: flight
               containerPort: 50051

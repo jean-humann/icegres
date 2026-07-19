@@ -444,6 +444,8 @@ if [ -n "${flight_doc:-}" ]; then
         && ok "flight concurrency cap wired" || bad "flight concurrency cap env missing"
     echo "$flight_doc" | grep -q 'ICEGRES_HEALTH_PORT' \
         && ok "flight health/metrics port wired" || bad "flight health port env missing"
+    echo "$flight_doc" | grep -q 'ICEGRES_FLIGHT_READ_ONLY' \
+        && ok "flight read-only wired" || bad "flight read-only env missing"
 fi
 ing="$(doc "$fr" Ingress "$RELEASE-flight")"
 [ -n "$ing" ] && ok "flight Ingress rendered" || bad "flight Ingress missing"

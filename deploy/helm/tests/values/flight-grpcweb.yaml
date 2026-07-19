@@ -10,6 +10,7 @@ flight:
   statementTimeoutMs: 30000
   maxResultBytes: 8388608
   maxConcurrentRpcs: 64
+  readOnly: true
   ingress:
     enabled: true
     className: nginx
