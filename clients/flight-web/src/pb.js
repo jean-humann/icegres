@@ -170,6 +170,12 @@ const EOS = Uint8Array.from([0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0]);
  * continuation marker + padded metadata length + flatbuffer header + body.
  */
 export function flightDataToIpc(dataHeader, dataBody) {
+  // A FlightData with no data_header carries only app_metadata (proto3 omits
+  // the empty field on the wire), not an Arrow IPC message. Emitting the
+  // standard continuation + length prefix for a zero-length header would
+  // produce exactly the IPC end-of-stream marker (FF FF FF FF 00 00 00 00)
+  // and prematurely truncate the reassembled stream — so contribute nothing.
+  if (dataHeader.length === 0) return new Uint8Array(0);
   const headLen = dataHeader.length;
   const pad = (8 - ((headLen + 8) % 8)) % 8;
   const prefix = new Uint8Array(8 + headLen + pad);
