@@ -536,22 +536,21 @@ impl FlightSqlServiceImpl {
         let stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql)
             .map_err(|e| Status::invalid_argument(format!("sql parse error: {e}")))?;
 
-        // Read-only enforcement (--read-only): reject any write BEFORE authz
-        // and independently of whether authz is configured. This is the single
-        // choke point every SQL entry funnels through (query flow, prepared
-        // statements, DML-via-DoGet), so an INSERT that executes through the
-        // DoGet path — not just execute_update/DoPut — is caught here too.
-        // Write classification reuses the authz analyzer, so it is
-        // statement-form based, never string matching.
+        // Read-only enforcement (--read-only): reject anything that is not a
+        // pure read BEFORE authz and independently of whether authz is
+        // configured. This is the single choke point every SQL entry funnels
+        // through (query flow, prepared statements, DML-via-DoGet), so a write
+        // that executes through the DoGet path — not just execute_update/DoPut
+        // — is caught here too. `is_read_only` is fail-closed and
+        // statement-form based (never string matching), so DDL (CREATE/CTAS,
+        // ALTER, TRUNCATE) is refused here rather than left to the engine's
+        // incidental non-support of it.
         if self.read_only {
             for stmt in &stmts {
-                let writes = authz::required_checks(stmt, &self.default_namespace)
-                    .iter()
-                    .any(|(a, _)| matches!(a, authz::Action::WriteData | authz::Action::DropTable));
-                if writes {
+                if !authz::is_read_only(stmt) {
                     return Err(Status::permission_denied(
-                        "this Flight endpoint is read-only (--read-only): \
-                         INSERT/UPDATE/DELETE/DROP are not permitted",
+                        "this Flight endpoint is read-only (--read-only): only read \
+                         statements (SELECT/SHOW/EXPLAIN) are permitted",
                     ));
                 }
             }
@@ -2842,17 +2841,13 @@ mod tests {
 
     #[test]
     fn read_only_write_classification() {
-        // The exact predicate check_sql uses under --read-only: a statement
-        // "writes" iff its authz checks require WriteData or DropTable. This
-        // is statement-form based (never string matching), so it catches an
-        // INSERT no matter which RPC path executes it.
+        // The exact predicate check_sql uses under --read-only: a statement is
+        // refused unless it is positively classified read-only. Fail-closed
+        // and statement-form based (never string matching), so it catches a
+        // write no matter which RPC path executes it.
         let writes = |sql: &str| {
             let stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
-            stmts.iter().any(|stmt| {
-                authz::required_checks(stmt, "demo")
-                    .iter()
-                    .any(|(a, _)| matches!(a, authz::Action::WriteData | authz::Action::DropTable))
-            })
+            stmts.iter().any(|stmt| !authz::is_read_only(stmt))
         };
         // Reads pass.
         assert!(!writes("SELECT * FROM demo.trips"));
@@ -2860,12 +2855,26 @@ mod tests {
         assert!(!writes(
             "SELECT city, count(*) FROM demo.trips GROUP BY city"
         ));
-        // Writes are caught — including INSERT, which executes through the
-        // DoGet query flow and so is NOT covered by reject_if_read_only.
+        assert!(!writes("EXPLAIN SELECT * FROM demo.trips"));
+        assert!(!writes("SHOW search_path"));
+        // DML is caught — including INSERT, which executes through the DoGet
+        // query flow and so is NOT covered by reject_if_read_only.
         assert!(writes("INSERT INTO demo.trips (trip_id) VALUES (1)"));
         assert!(writes("UPDATE demo.trips SET city = 'x' WHERE trip_id = 1"));
         assert!(writes("DELETE FROM demo.trips WHERE trip_id = 1"));
         assert!(writes("DROP TABLE demo.trips"));
+        // DDL is caught too — required_checks emits no data-plane check for
+        // these, so they would slip past a WriteData/DropTable-only test.
+        assert!(writes("CREATE TABLE demo.evil AS SELECT * FROM demo.trips"));
+        assert!(writes("CREATE TABLE demo.evil (x INT)"));
+        assert!(writes("TRUNCATE TABLE demo.trips"));
+        assert!(writes("ALTER TABLE demo.trips ADD COLUMN x INT"));
+        // EXPLAIN ANALYZE executes its inner statement: read-only only when
+        // that statement is.
+        assert!(!writes("EXPLAIN ANALYZE SELECT * FROM demo.trips"));
+        assert!(writes(
+            "EXPLAIN ANALYZE INSERT INTO demo.trips (trip_id) VALUES (1)"
+        ));
     }
 
     #[test]
