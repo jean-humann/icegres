@@ -63,3 +63,48 @@ export declare function describeRegistry(
 ): Record<string, { description: string | null; params: Record<string, ParamSpec> }>;
 
 export declare class ParamError extends Error {}
+
+// --- SQL-explorer gateway (arbitrary user SQL, sandboxed per user) ----------
+
+export interface SqlGatewayConfig {
+  /** HMAC secret for the short-lived session tokens. */
+  sessionSecret: string;
+  /** Verify the browser's app session (your SSO) -> the icegres principal to
+   *  run queries as, or null to reject. Called only on POST /session. */
+  authenticate: (req: import("node:http").IncomingMessage) =>
+    Promise<{ principal: string; readOnly?: boolean } | null> |
+    { principal: string; readOnly?: boolean } | null;
+  flight?: FlightConnectionOptions;
+  /** Map a session principal to the icegres credential to present, so each
+   *  query runs authorized as that user. Defaults to flight.credentials. */
+  credentialFor?: (principal: string) => { username: string; password: string } | undefined;
+  sessionTtlSec?: number;
+  corsOrigin?: string;
+  /** Reject non-read SQL at the gateway (defense in depth; the authoritative
+   *  read-only control is icegres authz granting the principal only
+   *  CanReadData). Default true. */
+  enforceReadOnly?: boolean;
+}
+
+/** Build a SQL-explorer gateway handler: POST /session (token broker) and
+ *  POST /sql (arbitrary SQL under the token, streamed as Arrow). */
+export declare function createSqlGateway(
+  config: SqlGatewayConfig,
+): (req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse) => Promise<void>;
+
+export declare function serveGateway(
+  config: SqlGatewayConfig,
+  opts?: { port?: number; host?: string },
+): Promise<import("node:http").Server>;
+
+/** Mint / verify a session token (exported for tests and custom brokers). */
+export declare function issueToken(
+  secret: string,
+  claims: { principal: string; readOnly?: boolean; ttlSec?: number },
+  nowSec?: number,
+): string;
+export declare function verifyToken(
+  secret: string,
+  token: string,
+  nowSec?: number,
+): { principal: string; readOnly: boolean };

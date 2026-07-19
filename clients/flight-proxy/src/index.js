@@ -7,4 +7,5 @@
 // browser (point the client at this proxy) or plain `fetch` +
 // `tableFromIPC`.
 export { createHandler, serve } from "./server.js";
+export { createSqlGateway, serveGateway, issueToken, verifyToken } from "./gateway.js";
 export { resolveQuery, describeRegistry, ParamError } from "./allowlist.js";

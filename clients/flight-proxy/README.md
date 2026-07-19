@@ -104,3 +104,47 @@ unauthorized for that query, `404` unknown query name.
 - Pair with icegres's resource limits (`--flight-statement-timeout-ms`,
   `--flight-max-result-bytes`, `--flight-max-concurrent-rpcs`) so a costly
   allowed query is still bounded.
+
+## SQL explorer (arbitrary user queries)
+
+A dashboard should never send raw SQL — but a **SQL explorer** is the opposite:
+user-written queries are the feature. Use `createSqlGateway` (not the
+allowlist). It is safe by *sandboxing the user*, not restricting the SQL:
+
+```js
+import { createSqlGateway } from "@icegres/flight-proxy";
+
+const gateway = createSqlGateway({
+  sessionSecret: process.env.SESSION_SECRET,
+  // Your SSO: verify the app session -> the icegres principal to run as.
+  authenticate: async (req) => {
+    const user = await verifyAppSession(req);         // → null rejects (401)
+    return user && { principal: user.dbRole, readOnly: true };
+  },
+  flight: { address: "lakehouse:50051", tls: true },
+  // Optional: present each user's own icegres credential so authz scopes them.
+  credentialFor: (principal) => lookupCred(principal),
+  corsOrigin: "https://studio.example",
+});
+```
+
+Flow: the browser `POST /session` (once) → a short-lived token; then
+`POST /sql` `{ sql }` with `Authorization: Bearer <token>` → the Arrow result
+streams back. The browser never holds a database credential.
+
+**The safety model — four controls, none of which restrict the SQL text:**
+
+1. **Per-user identity + authz.** Every query runs as the session's icegres
+   principal; `--authz-file` scopes it to the tables that principal may read.
+   **This is also the authoritative read-only control**: grant the principal
+   only `CanReadData` and any write fails at the engine with SQLSTATE `42501`.
+2. **Resource limits** — run icegres with `--flight-statement-timeout-ms`,
+   `--flight-max-result-bytes`, and `--flight-max-concurrent-rpcs` so a
+   runaway query is bounded, not fatal.
+3. **Short-lived tokens** — the gateway brokers them; the browser holds no
+   standing credential.
+4. **Read-only guard** — the gateway also rejects obvious non-read statements
+   (`enforceReadOnly`, default on) as defense in depth.
+
+A runnable browser explorer (editor + Run/Stop with `AbortController` +
+streamed Arrow results) is in `bench/clients/js/web/explorer.{html,js}`.
