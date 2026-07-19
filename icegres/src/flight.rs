@@ -150,6 +150,13 @@ struct Prepared {
 /// token map cannot grow without bound across a long-lived server.
 const TOKEN_TTL: Duration = Duration::from_secs(3600);
 
+/// TTL for the per-RPC `Basic` verification cache. Deliberately much shorter
+/// than handshake bearer tokens: this cache is the only thing standing
+/// between an auth-file edit and a still-connecting browser, so a revoked
+/// password stops working within a minute (one KDF per credential per
+/// minute is noise; a one-hour revocation lag is not).
+const BASIC_CACHE_TTL: Duration = Duration::from_secs(60);
+
 /// A minted bearer token's bound identity and issue time.
 struct TokenEntry {
     /// The authenticated principal (empty string when auth is disabled).
@@ -186,18 +193,31 @@ async fn verify_basic_cached(
     peer: Option<std::net::IpAddr>,
 ) -> Result<String, Status> {
     {
-        let mut store = cache.lock().expect("basic token lock");
-        let now = Instant::now();
-        store.retain(|_, e| now.duration_since(e.issued) < TOKEN_TTL);
+        // Hot path: one lock + one lookup. TTL is enforced on the fetched
+        // entry only; expired strangers are pruned on the (rare) insert path
+        // below, so per-RPC cost never grows with the number of principals.
+        let store = cache.lock().expect("basic token lock");
         if let Some(entry) = store.get(b64) {
-            return Ok(entry.user.clone());
+            if entry.issued.elapsed() < BASIC_CACHE_TTL {
+                return Ok(entry.user.clone());
+            }
         }
     }
     if let Some(delay) = peer.and_then(|ip| throttle.penalty(ip)) {
         tokio::time::sleep(delay).await;
     }
     let (user, password) = decode_basic_credentials(b64)?;
-    if !auth.verify_password(&user, &password) {
+    // The 4096-iteration PBKDF2 is milliseconds of pure CPU: run it on the
+    // blocking pool so a burst of cache misses cannot stall the executor
+    // threads that are streaming everyone else's DoGet batches.
+    let verified = {
+        let auth = auth.clone();
+        let user = user.clone();
+        tokio::task::spawn_blocking(move || auth.verify_password(&user, &password))
+            .await
+            .map_err(|e| Status::internal(format!("auth verification task failed: {e}")))?
+    };
+    if !verified {
         if let Some(ip) = peer {
             throttle.record_failure(ip);
         }
@@ -206,11 +226,18 @@ async fn verify_basic_cached(
             "password authentication failed for user \"{user}\""
         )));
     }
-    cache.lock().expect("basic token lock").insert(
+    // The insert path doubles as the success audit trail: exactly one line
+    // per credential per cache window, never per RPC (a grep can still tie
+    // a session's queries to its principal without log flooding).
+    info!(user, "flight basic auth verified");
+    let mut store = cache.lock().expect("basic token lock");
+    let now = Instant::now();
+    store.retain(|_, e| now.duration_since(e.issued) < BASIC_CACHE_TTL);
+    store.insert(
         b64.to_string(),
         TokenEntry {
             user: user.clone(),
-            issued: Instant::now(),
+            issued: now,
         },
     );
     Ok(user)
@@ -936,21 +963,13 @@ impl FlightSqlService for FlightSqlServiceImpl {
             let b64 = header.strip_prefix("Basic ").ok_or_else(|| {
                 Status::unauthenticated(format!("only Basic auth is implemented, got {header:?}"))
             })?;
-            let (user, password) = decode_basic_credentials(b64)?;
-            // Same per-peer backoff as a pgwire SASL exchange (audit #4).
+            // Same verification seam as the per-RPC Basic path: identical
+            // per-peer backoff (audit #4), KDF off the executor, and a
+            // shared success cache — the two credential surfaces cannot
+            // drift in throttle or error behavior.
             let peer = request.remote_addr().map(|a| a.ip());
-            if let Some(delay) = peer.and_then(|ip| self.throttle.penalty(ip)) {
-                tokio::time::sleep(delay).await;
-            }
-            if !source.verify_password(&user, &password) {
-                if let Some(ip) = peer {
-                    self.throttle.record_failure(ip);
-                }
-                warn!(user, "flight handshake rejected (bad credentials)");
-                return Err(Status::unauthenticated(format!(
-                    "password authentication failed for user \"{user}\""
-                )));
-            }
+            let user =
+                verify_basic_cached(b64, source, &self.basic_tokens, &self.throttle, peer).await?;
             info!(user, "flight handshake authenticated");
             authenticated_user = user;
         }
@@ -1719,6 +1738,11 @@ pub async fn spawn_tail_api(
         write_buffer: Some(buffer),
         read_only: true,
         basic_tokens: Mutex::new(HashMap::new()),
+        // Fixed ZSTD, NOT --result-compression: the tail-api's only consumers
+        // are icegres peer replicas (--peer-tail) and the pyarrow tail reader,
+        // both of which always support zstd. The flag exists for browser
+        // clients on the main flight listener; gRPC-web is likewise never
+        // enabled here (this listener serves no browsers).
         ipc_compression: Some(arrow::ipc::CompressionType::ZSTD),
         throttle: Arc::new(crate::ops::AuthThrottle::default()),
         plans: PlanCache::from_env(),
@@ -1817,6 +1841,13 @@ pub async fn run(
         warn!(
             "--grpc-web with --auth-file but WITHOUT --tls-cert/--tls-key: browser clients send \
              Basic credentials in CLEARTEXT on every RPC; terminate TLS here or in front"
+        );
+    }
+    if auth.is_some() && grpc_web && cors_origin == http::HeaderValue::from_static("*") {
+        warn!(
+            "--grpc-web with --auth-file but --cors-origin '*': every web origin may drive this \
+             authenticated SQL surface from a visitor's browser; pin --cors-origin to the \
+             dashboard origin"
         );
     }
 
@@ -1957,7 +1988,8 @@ pub async fn run(
 /// Headers a browser is allowed to send on gRPC-web calls. `authorization`
 /// is present because per-RPC Basic credentials are the only auth flow the
 /// protocol can carry (no Handshake stream).
-const CORS_ALLOW_HEADERS: &str = "content-type, x-grpc-web, x-user-agent, authorization";
+const CORS_ALLOW_HEADERS: &str =
+    "content-type, x-grpc-web, x-user-agent, authorization, grpc-timeout";
 /// Trailer-carried gRPC status surfaced as headers by the grpc-web protocol —
 /// the browser client cannot read them unless they are exposed.
 const CORS_EXPOSE_HEADERS: &str =
@@ -2030,6 +2062,8 @@ where
                 "access-control-expose-headers",
                 http::HeaderValue::from_static(CORS_EXPOSE_HEADERS),
             );
+            // Responses differ per Origin: keep shared caches honest.
+            headers.insert("vary", http::HeaderValue::from_static("Origin"));
             Ok(resp)
         })
     }
@@ -2099,19 +2133,28 @@ use datafusion_postgres::pgwire::tokio::TlsAcceptor;
 use std::net::SocketAddr;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tonic::transport::server::Connected;
+use tonic::transport::server::{Connected, TcpConnectInfo};
 
 /// A TLS-terminated connection presented to tonic. Delegates all IO to the
 /// inner `TlsStream` and exposes the peer address as its `ConnectInfo`.
+///
+/// The ConnectInfo type MUST be `TcpConnectInfo`: `Request::remote_addr()`
+/// only reads that extension (or `TlsConnectInfo<TcpConnectInfo>`), so a
+/// bespoke type here silently returns `None` for every TLS peer — which
+/// would disarm the per-peer failed-auth throttle on exactly the
+/// TLS-terminated listeners production runs.
 struct TlsConn {
     inner: TlsStream<tokio::net::TcpStream>,
     remote: Option<SocketAddr>,
 }
 
 impl Connected for TlsConn {
-    type ConnectInfo = Option<SocketAddr>;
+    type ConnectInfo = TcpConnectInfo;
     fn connect_info(&self) -> Self::ConnectInfo {
-        self.remote
+        TcpConnectInfo {
+            local_addr: None,
+            remote_addr: self.remote,
+        }
     }
 }
 
@@ -2440,6 +2483,9 @@ mod tests {
             .to_str()
             .unwrap()
             .contains("grpc-status"));
+        // A per-origin ACAO response must carry Vary: Origin so shared caches
+        // do not serve one origin's allow header to another.
+        assert_eq!(resp.headers().get("vary").unwrap(), "Origin");
     }
 
     #[test]

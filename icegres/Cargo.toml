@@ -69,8 +69,10 @@ base64 = "0.22"
 # speak native gRPC, so tonic-web translates the fetch()-compatible gRPC-web
 # framing in-process — no Envoy sidecar needed for browser dashboards. http and
 # tower are already in the graph via tonic; named directly so flight.rs can
-# implement the small CORS layer around it (kept hand-rolled instead of
-# pulling tower-http into the supply chain for three headers).
+# implement the small CORS layer around it. tower-http (already transitive via
+# reqwest) has a cors feature that would also work; the ~80-line hand-rolled
+# layer is kept because it pins exactly the gRPC-web header set and stays
+# unit-tested in-tree — revisit if CORS needs grow past that.
 tonic-web = "0.14"
 http = "1"
 tower = "0.5"
