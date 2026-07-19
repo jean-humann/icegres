@@ -19,12 +19,13 @@
 
 import crypto from "node:crypto";
 import { connect, queryToIpc } from "./flight.js";
-
-const CORS_BASE = {
-  "access-control-allow-methods": "POST, OPTIONS",
-  "access-control-allow-headers": "content-type, authorization",
-  vary: "Origin",
-};
+import {
+  corsHeaders,
+  sendJson,
+  readJson,
+  streamArrow,
+  serveHandler,
+} from "./http.js";
 
 const b64url = (buf) =>
   Buffer.from(buf).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -70,22 +71,6 @@ function isReadOnlySql(sql) {
   return true;
 }
 
-function sendJson(res, status, body, cors) {
-  res.writeHead(status, { "content-type": "application/json", ...cors });
-  res.end(JSON.stringify(body));
-}
-
-async function readJson(req, limit = 256 * 1024) {
-  const chunks = [];
-  let n = 0;
-  for await (const c of req) {
-    n += c.length;
-    if (n > limit) throw new Error("request body too large");
-    chunks.push(c);
-  }
-  return chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {};
-}
-
 /**
  * Build a SQL-explorer gateway handler.
  * @param {object} config
@@ -129,8 +114,9 @@ export function createSqlGateway(config) {
     return connCache.get(key);
   }
 
+  const cors = corsHeaders("POST, OPTIONS", corsOrigin);
+
   return async function handler(req, res) {
-    const cors = { ...CORS_BASE, "access-control-allow-origin": corsOrigin };
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     if (req.method === "OPTIONS") return void res.writeHead(204, cors).end();
 
@@ -167,7 +153,7 @@ export function createSqlGateway(config) {
 
     let body;
     try {
-      body = await readJson(req);
+      body = await readJson(req, 256 * 1024);
     } catch (e) {
       return sendJson(res, 400, { error: e.message }, cors);
     }
@@ -181,34 +167,19 @@ export function createSqlGateway(config) {
       return sendJson(res, 403, { error: "read-only session: only SELECT/WITH/EXPLAIN/SHOW are allowed" }, cors);
     }
 
-    res.writeHead(200, {
-      "content-type": "application/vnd.apache.arrow.stream",
-      "cache-control": "no-store",
-      ...cors,
-    });
-    try {
-      await queryToIpc(connFor(session.principal), sql, (chunk) => res.write(chunk));
-      res.end();
-    } catch (e) {
+    await streamArrow(
+      res,
+      cors,
+      (write) => queryToIpc(connFor(session.principal), sql, write),
       // Headers already sent: signal an incomplete stream. The explorer client
       // surfaces this as a query error.
       // eslint-disable-next-line no-console
-      console.error(`explorer query failed (${session.principal}):`, e.message);
-      res.destroy(e);
-    }
+      (e) => console.error(`explorer query failed (${session.principal}):`, e.message),
+    );
   };
 }
 
 /** Convenience standalone server, mirroring server.js#serve. */
-export async function serveGateway(config, { port = 8091, host = "127.0.0.1" } = {}) {
-  const http = await import("node:http");
-  const handler = createSqlGateway(config);
-  const server = http.createServer((req, res) =>
-    handler(req, res).catch((e) => {
-      if (!res.headersSent) sendJson(res, 500, { error: String(e) }, {});
-      else res.destroy(e);
-    }),
-  );
-  await new Promise((r) => server.listen(port, host, r));
-  return server;
+export function serveGateway(config, { port = 8091, host = "127.0.0.1" } = {}) {
+  return serveHandler(createSqlGateway(config), { port, host });
 }
