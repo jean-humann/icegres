@@ -484,6 +484,34 @@ enum Command {
         #[arg(long, env = "ICEGRES_RESULT_COMPRESSION", value_enum,
               default_value_t = ResultCompression::Zstd)]
         result_compression: ResultCompression,
+
+        /// Wall-clock ceiling per DoGet query stream, in milliseconds
+        /// (0 = unbounded). A query running past it is aborted with
+        /// DEADLINE_EXCEEDED instead of holding an executor thread — the
+        /// guard against a runaway dashboard `SELECT`. Applies to the Flight
+        /// data path only (metadata RPCs are exempt).
+        #[arg(long, env = "ICEGRES_FLIGHT_STATEMENT_TIMEOUT_MS", default_value_t = 0)]
+        flight_statement_timeout_ms: u64,
+
+        /// Byte ceiling per DoGet result (0 = unbounded), counted over the
+        /// Arrow IPC body streamed. A result past it is cut with
+        /// RESOURCE_EXHAUSTED — stops a `SELECT *` on a huge table from
+        /// streaming gigabytes into a browser tab.
+        #[arg(long, env = "ICEGRES_FLIGHT_MAX_RESULT_BYTES", default_value_t = 0)]
+        flight_max_result_bytes: u64,
+
+        /// Cap on concurrent in-flight DoGet query streams (0 = uncapped) —
+        /// the Flight analogue of pgwire `--max-connections`. Excess RPCs
+        /// wait at the choke point rather than spawning unbounded scans.
+        #[arg(long, env = "ICEGRES_FLIGHT_MAX_CONCURRENT_RPCS", default_value_t = 0)]
+        flight_max_concurrent_rpcs: usize,
+
+        /// Serve the HTTP liveness/metrics endpoint (`/health`, `/ready`,
+        /// `/metrics`) on this port, as `icegres serve --health-port` does —
+        /// so a standalone flight-serve is scrapeable (the Flight per-RPC
+        /// metrics live here). Off when unset.
+        #[arg(long, env = "ICEGRES_HEALTH_PORT")]
+        flight_health_port: Option<u16>,
     },
     /// Create and populate the demo namespace/tables (idempotent).
     Seed {
@@ -897,6 +925,10 @@ async fn main() -> Result<()> {
             grpc_web,
             cors_origin,
             result_compression,
+            flight_statement_timeout_ms,
+            flight_max_result_bytes,
+            flight_max_concurrent_rpcs,
+            flight_health_port,
         } => {
             // Flight authorization needs an authenticated principal: reject
             // --authz-file without --auth-file rather than trusting an
@@ -923,6 +955,13 @@ async fn main() -> Result<()> {
                     grpc_web,
                     cors_origin,
                     ipc_compression: result_compression.to_ipc(),
+                    statement_timeout: (flight_statement_timeout_ms > 0)
+                        .then(|| std::time::Duration::from_millis(flight_statement_timeout_ms)),
+                    max_result_bytes: (flight_max_result_bytes > 0)
+                        .then_some(flight_max_result_bytes),
+                    max_concurrent_rpcs: (flight_max_concurrent_rpcs > 0)
+                        .then_some(flight_max_concurrent_rpcs),
+                    health_port: flight_health_port,
                 },
             )
             .await
