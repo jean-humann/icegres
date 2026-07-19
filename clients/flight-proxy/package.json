@@ -1,0 +1,33 @@
+{
+  "name": "@icegres/flight-proxy",
+  "version": "0.1.0",
+  "description": "Backend-for-frontend for icegres dashboards: a named-query allowlist (no raw SQL from the browser) that streams Arrow end-to-end over Flight SQL. The production-safe companion to @icegres/flight-web.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "main": "src/index.js",
+  "types": "index.d.ts",
+  "bin": {
+    "icegres-flight-proxy": "bin/flight-proxy.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./src/index.js"
+    }
+  },
+  "files": [
+    "src",
+    "proto",
+    "bin",
+    "index.d.ts",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.12.5",
+    "@grpc/proto-loader": "^0.7.13",
+    "@icegres/flight-web": "^0.1.0"
+  }
+}
