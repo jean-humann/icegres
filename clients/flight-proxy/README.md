@@ -136,8 +136,9 @@ streams back. The browser never holds a database credential.
 
 1. **Per-user identity + authz.** Every query runs as the session's icegres
    principal; `--authz-file` scopes it to the tables that principal may read.
-   **This is also the authoritative read-only control**: grant the principal
-   only `CanReadData` and any write fails at the engine with SQLSTATE `42501`.
+   **The authoritative read-only control** is the engine: run
+   `flight-serve --read-only` (rejects all writes, no authz file needed), or
+   grant the principal only `CanReadData` (a write fails with `42501`).
 2. **Resource limits** — run icegres with `--flight-statement-timeout-ms`,
    `--flight-max-result-bytes`, and `--flight-max-concurrent-rpcs` so a
    runaway query is bounded, not fatal.
