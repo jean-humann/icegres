@@ -93,3 +93,16 @@ test("describeRegistry exposes names + params but never SQL", () => {
   assert.ok(desc.trips_by_city.params.since);
   assert.equal(JSON.stringify(desc).includes("SELECT"), false, "SQL must not leak");
 });
+
+test("inherited property names are unknown queries, not 500s", () => {
+  // registry[name] would find Object.prototype members (constructor, toString)
+  // as truthy entries; Object.hasOwn makes them a clean UNKNOWN_QUERY (404).
+  for (const name of ["constructor", "toString", "hasOwnProperty", "__proto__"]) {
+    try {
+      resolveQuery(REGISTRY, name, {});
+      assert.fail(`expected "${name}" to be rejected`);
+    } catch (e) {
+      assert.equal(e.code, "UNKNOWN_QUERY", `"${name}" must be UNKNOWN_QUERY`);
+    }
+  }
+});

@@ -53,19 +53,10 @@ export function createHandler(config) {
       return;
     }
 
-    // GET /queries — the allowlist schema, so a frontend can discover the
-    // available queries and their parameters. Never exposes SQL.
-    if (req.method === "GET" && url.pathname === "/queries") {
-      sendJson(res, 200, describeRegistry(queries), cors);
-      return;
-    }
-
-    if (req.method !== "POST" || url.pathname !== "/query") {
-      sendJson(res, 404, { error: "not found" }, cors);
-      return;
-    }
-
-    // Auth (optional hook). A thrown/false result is a hard reject.
+    // Auth (optional hook) runs BEFORE routing, so it gates the query
+    // catalogue (GET /queries) as well as execution (POST /query) — a
+    // configured authenticate should not leak the allowlist to anonymous
+    // callers. A thrown/null result is a hard reject.
     let principal = null;
     if (authenticate) {
       try {
@@ -77,6 +68,18 @@ export function createHandler(config) {
         sendJson(res, 401, { error: "unauthorized" }, cors);
         return;
       }
+    }
+
+    // GET /queries — the allowlist schema, so a frontend can discover the
+    // available queries and their parameters. Never exposes SQL.
+    if (req.method === "GET" && url.pathname === "/queries") {
+      sendJson(res, 200, describeRegistry(queries), cors);
+      return;
+    }
+
+    if (req.method !== "POST" || url.pathname !== "/query") {
+      sendJson(res, 404, { error: "not found" }, cors);
+      return;
     }
 
     let body;
@@ -118,7 +121,7 @@ export function createHandler(config) {
       cors,
       (write) => queryToIpc(conn, sql, write),
       // eslint-disable-next-line no-console
-      (e) => console.error(`query "${name}" failed mid-stream:`, e.message),
+      (e) => console.error(`query "${name}" failed:`, e.message),
     );
   };
 }

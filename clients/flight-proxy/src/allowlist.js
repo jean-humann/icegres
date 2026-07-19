@@ -80,12 +80,15 @@ function literalFor(name, spec, raw) {
  * @param {Record<string, unknown>} rawParams
  */
 export function resolveQuery(registry, name, rawParams = {}) {
-  const entry = registry[name];
-  if (!entry) {
+  // Object.hasOwn, not `registry[name]`, so an inherited property name
+  // ("constructor", "toString", …) is a clean 404 rather than a truthy
+  // prototype entry that later throws a 500.
+  if (typeof name !== "string" || !Object.hasOwn(registry, name)) {
     const e = new Error(`unknown query "${name}"`);
     e.code = "UNKNOWN_QUERY";
     throw e;
   }
+  const entry = registry[name];
   const specs = entry.params ?? {};
   // Reject any parameter the query does not declare (fail closed).
   for (const key of Object.keys(rawParams)) {
