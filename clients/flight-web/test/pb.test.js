@@ -91,6 +91,117 @@ test("Basic credentials are UTF-8 encoded, not Latin-1", () => {
   assert.ok(decoded.length > "café:pä€ss".length);
 });
 
+// --- gRPC-web frame reassembly ---------------------------------------------
+
+const te = (s) => new TextEncoder().encode(s);
+
+/** A gRPC-web frame: [flags, big-endian u32 length, payload]. */
+function frame(flags, payload) {
+  const head = new Uint8Array(5);
+  head[0] = flags;
+  new DataView(head.buffer).setUint32(1, payload.length, false);
+  return concatBytes([head, payload]);
+}
+
+/** A length-delimited protobuf field (field no < 16, len < 128). */
+function ld(no, bytes) {
+  return concatBytes([new Uint8Array([(no << 3) | 2, bytes.length]), bytes]);
+}
+
+function chunkify(bytes, size) {
+  const out = [];
+  for (let i = 0; i < bytes.length; i += size) out.push(bytes.subarray(i, i + size));
+  return out;
+}
+
+/** A fetch-Response stand-in whose body yields `chunks` one read at a time;
+ *  `onCancel` fires if the consumer cancels before draining. */
+function fakeResp(chunks, onCancel = () => {}) {
+  let i = 0;
+  return {
+    ok: true,
+    headers: { get: () => null },
+    body: {
+      getReader: () => ({
+        read: async () =>
+          i < chunks.length
+            ? { done: false, value: chunks[i++] }
+            : { done: true, value: undefined },
+        cancel: async () => onCancel(),
+        releaseLock() {},
+      }),
+    },
+  };
+}
+
+const OK_TRAILER = frame(0x80, te("grpc-status:0\r\n"));
+// FlightInfo { endpoint(3) { ticket(1) { ticket(1) = bytes } } }.
+const flightInfo = (t) => ld(3, ld(1, ld(1, t)));
+
+test("gRPC-web frames reassemble across chunk boundaries", async () => {
+  const headerA = te("HEADER-A-spanning-several-tiny-chunks");
+  const dataFrame = ld(2, headerA); // FlightData { data_header }
+  const metaOnly = new Uint8Array(0); // metadata-only FlightData: no IPC
+  const doGet = concatBytes([frame(0, dataFrame), frame(0, metaOnly), OK_TRAILER]);
+  const client = new FlightWebClient({
+    baseUrl: "http://x",
+    fetch: async (url) =>
+      String(url).endsWith("/GetFlightInfo")
+        ? fakeResp(chunkify(concatBytes([frame(0, flightInfo(Uint8Array.of(1, 2, 3))), OK_TRAILER]), 2))
+        : fakeResp(chunkify(doGet, 3)), // 3-byte reads force cross-boundary frames
+  });
+  const ipc = await client.queryIpc("SELECT 1");
+  // The header frame decodes to its IPC chunk; the metadata-only frame adds
+  // nothing; then the synthesized end-of-stream marker.
+  const expected = concatBytes([
+    flightDataToIpc(headerA, new Uint8Array(0)),
+    ipcEos(),
+  ]);
+  assert.deepEqual([...ipc], [...expected]);
+});
+
+test("a DoGet body without a trailer frame throws (truncation)", async () => {
+  const client = new FlightWebClient({
+    baseUrl: "http://x",
+    fetch: async (url) =>
+      String(url).endsWith("/GetFlightInfo")
+        ? fakeResp(chunkify(concatBytes([frame(0, flightInfo(Uint8Array.of(1))), OK_TRAILER]), 2))
+        : fakeResp(chunkify(frame(0, ld(2, te("H"))), 3)), // no trailer
+  });
+  await assert.rejects(() => client.queryIpc("SELECT 1"), /trailers frame|truncated/);
+});
+
+test("abandoning the stream early cancels the DoGet body", async () => {
+  let cancelled = false;
+  const doGet = concatBytes([
+    frame(0, ld(2, te("AAAA"))),
+    frame(0, ld(2, te("BBBB"))),
+    OK_TRAILER,
+  ]);
+  const client = new FlightWebClient({
+    baseUrl: "http://x",
+    fetch: async (url) =>
+      String(url).endsWith("/GetFlightInfo")
+        ? fakeResp(chunkify(concatBytes([frame(0, flightInfo(Uint8Array.of(1))), OK_TRAILER]), 2))
+        : fakeResp(chunkify(doGet, 4), () => {
+            cancelled = true;
+          }),
+  });
+  // Take one chunk, then abandon — the finally must cancel the body so the
+  // browser stops downloading and the server RPC slot frees.
+  for await (const _chunk of client.ipcChunks("SELECT 1")) break;
+  assert.equal(cancelled, true);
+});
+
+test("flightDataToIpc with an empty header emits nothing (not EOS)", () => {
+  const out = flightDataToIpc(new Uint8Array(0), new Uint8Array(0));
+  assert.equal(
+    out.length,
+    0,
+    "a metadata-only FlightData must not emit the IPC end-of-stream marker",
+  );
+});
+
 test("onTiming fires with latency, bytes, rows on success", async () => {
   // A fake fetch that returns one data frame + a clean trailer, so query()
   // resolves without a live server and the RUM hook is observable.

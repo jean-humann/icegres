@@ -31,6 +31,17 @@ function bytesToBase64(bytes) {
   return btoa(bin);
 }
 
+/** The byte at logical index `idx` across a list of chunks, without
+ *  concatenating them — used to peek a gRPC-web frame prefix cheaply. The
+ *  caller guarantees `idx` is within the buffered length. */
+function byteAt(chunks, idx) {
+  for (const c of chunks) {
+    if (idx < c.length) return c[idx];
+    idx -= c.length;
+  }
+  return 0;
+}
+
 /** Wrap one protobuf message in a gRPC-web request body (5-byte frame). */
 function grpcWebBody(message) {
   const head = new Uint8Array(5);
@@ -123,14 +134,25 @@ export class FlightWebClient {
           buffered += value.length;
         }
         while (buffered >= 5) {
+          // Peek the 5-byte frame prefix WITHOUT collapsing the buffer: read
+          // the flag byte and big-endian length across chunk boundaries, so
+          // an incomplete frame does not trigger a full-buffer copy on every
+          // network read (the O(n^2) the design above is meant to avoid).
+          const flags = byteAt(chunks, 0);
+          const len =
+            ((byteAt(chunks, 1) << 24) |
+              (byteAt(chunks, 2) << 16) |
+              (byteAt(chunks, 3) << 8) |
+              byteAt(chunks, 4)) >>>
+            0;
+          const frameLen = 5 + len;
+          if (buffered < frameLen) break;
+          // The whole frame is buffered: NOW collapse once and slice it out.
           if (chunks.length > 1) chunks = [concatBytes(chunks)];
           const buf = chunks[0];
-          const flags = buf[0];
-          const len = new DataView(buf.buffer, buf.byteOffset).getUint32(1, false);
-          if (buffered < 5 + len) break;
-          const payload = buf.subarray(5, 5 + len);
-          chunks = [buf.subarray(5 + len)];
-          buffered -= 5 + len;
+          const payload = buf.subarray(5, frameLen);
+          chunks = [buf.subarray(frameLen)];
+          buffered -= frameLen;
           if (flags & 0x80) {
             sawTrailers = true;
             const trailers = new TextDecoder().decode(payload);
@@ -156,7 +178,14 @@ export class FlightWebClient {
         }
       }
     } finally {
-      reader.releaseLock();
+      // Cancel the body rather than just releasing the lock: if the consumer
+      // abandoned iteration early (broke out of progressive rendering, or an
+      // onBatch callback threw), releasing alone leaves the HTTP/2 stream
+      // open and the browser keeps downloading the rest of the result — and
+      // the server's --flight-max-concurrent-rpcs slot stays held. cancel()
+      // tears the stream down and releases the lock; on an already-drained
+      // stream it is a no-op.
+      await reader.cancel().catch(() => {});
     }
   }
 
