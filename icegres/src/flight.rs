@@ -528,12 +528,39 @@ impl FlightSqlServiceImpl {
     /// enforcement `AuthzHook` applies on pgwire, so neither wire protocol can
     /// reach a table the principal is not granted.
     fn check_sql(&self, principal: &Option<String>, sql: &str) -> Result<(), Status> {
+        // Skip the parse entirely when nothing gates SQL (the common
+        // permissive, read-write path).
+        if !self.read_only && self.authorizer.is_none() {
+            return Ok(());
+        }
+        let stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql)
+            .map_err(|e| Status::invalid_argument(format!("sql parse error: {e}")))?;
+
+        // Read-only enforcement (--read-only): reject any write BEFORE authz
+        // and independently of whether authz is configured. This is the single
+        // choke point every SQL entry funnels through (query flow, prepared
+        // statements, DML-via-DoGet), so an INSERT that executes through the
+        // DoGet path — not just execute_update/DoPut — is caught here too.
+        // Write classification reuses the authz analyzer, so it is
+        // statement-form based, never string matching.
+        if self.read_only {
+            for stmt in &stmts {
+                let writes = authz::required_checks(stmt, &self.default_namespace)
+                    .iter()
+                    .any(|(a, _)| matches!(a, authz::Action::WriteData | authz::Action::DropTable));
+                if writes {
+                    return Err(Status::permission_denied(
+                        "this Flight endpoint is read-only (--read-only): \
+                         INSERT/UPDATE/DELETE/DROP are not permitted",
+                    ));
+                }
+            }
+        }
+
         let Some(authorizer) = &self.authorizer else {
             return Ok(());
         };
         let user = principal.as_deref().unwrap_or("");
-        let stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql)
-            .map_err(|e| Status::invalid_argument(format!("sql parse error: {e}")))?;
         for stmt in &stmts {
             if let authz::Decision::Deny { action, target } =
                 authorizer.authorize_sql(user, stmt, &self.default_namespace)
@@ -776,14 +803,16 @@ impl FlightSqlServiceImpl {
         Ok(self.guard(Box::pin(flight)).await)
     }
 
-    /// Reject writes on a read-only listener (the tail-api port inside
-    /// `icegres serve`): a Flight write executed in the serve process would
-    /// bypass the pgwire BufferHook ordering fences.
+    /// Reject writes on a read-only listener. Two listeners set `read_only`:
+    /// the tail-api port inside `icegres serve` (a Flight write there would
+    /// bypass the pgwire BufferHook ordering fences), and any `flight-serve
+    /// --read-only`. SQL-bearing writes are already caught earlier by
+    /// `check_sql`; this guards the no-SQL bulk-ingest path (`DoPut` ingest).
     fn reject_if_read_only(&self) -> Result<(), Status> {
         if self.read_only {
             return Err(Status::permission_denied(
-                "this Flight endpoint is read-only (icegres serve --tail-api-port); \
-                 send writes through the pgwire listener",
+                "this Flight endpoint is read-only; INSERT/UPDATE/DELETE and \
+                 bulk ingest are not permitted here",
             ));
         }
         Ok(())
@@ -1945,6 +1974,8 @@ pub struct ListenerOpts {
     pub max_concurrent_rpcs: Option<usize>,
     /// HTTP liveness/metrics port (`--health-port`); `None` = not served.
     pub health_port: Option<u16>,
+    /// Reject every write on this listener (`--read-only`).
+    pub read_only: bool,
 }
 
 /// Run the Flight SQL endpoint (blocks until SIGINT).
@@ -1966,6 +1997,7 @@ pub async fn run(
         max_result_bytes,
         max_concurrent_rpcs,
         health_port,
+        read_only,
     } = listener_opts;
     let start = std::time::Instant::now();
     // Validate the CORS origin up front: it is inserted into response headers
@@ -2058,7 +2090,7 @@ pub async fn run(
         prepared: Mutex::new(HashMap::new()),
         sql_info: build_sql_info(),
         write_buffer: None,
-        read_only: false,
+        read_only,
         basic_tokens: Mutex::new(HashMap::new()),
         ipc_compression,
         throttle: Arc::new(crate::ops::AuthThrottle::default()),
@@ -2080,6 +2112,7 @@ pub async fn run(
         %addr,
         tls = tls_acceptor.is_some(),
         grpc_web,
+        read_only,
         statement_timeout_ms = statement_timeout.map(|d| d.as_millis() as u64),
         max_result_bytes,
         max_concurrent_rpcs,
@@ -2805,6 +2838,34 @@ mod tests {
         let mut tables = vec![ident("visible"), ident("secret")];
         tables.retain(|t| check_read_with(&None, &principal, t).is_ok());
         assert_eq!(tables.len(), 2);
+    }
+
+    #[test]
+    fn read_only_write_classification() {
+        // The exact predicate check_sql uses under --read-only: a statement
+        // "writes" iff its authz checks require WriteData or DropTable. This
+        // is statement-form based (never string matching), so it catches an
+        // INSERT no matter which RPC path executes it.
+        let writes = |sql: &str| {
+            let stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
+            stmts.iter().any(|stmt| {
+                authz::required_checks(stmt, "demo")
+                    .iter()
+                    .any(|(a, _)| matches!(a, authz::Action::WriteData | authz::Action::DropTable))
+            })
+        };
+        // Reads pass.
+        assert!(!writes("SELECT * FROM demo.trips"));
+        assert!(!writes("WITH t AS (SELECT 1) SELECT * FROM t"));
+        assert!(!writes(
+            "SELECT city, count(*) FROM demo.trips GROUP BY city"
+        ));
+        // Writes are caught — including INSERT, which executes through the
+        // DoGet query flow and so is NOT covered by reject_if_read_only.
+        assert!(writes("INSERT INTO demo.trips (trip_id) VALUES (1)"));
+        assert!(writes("UPDATE demo.trips SET city = 'x' WHERE trip_id = 1"));
+        assert!(writes("DELETE FROM demo.trips WHERE trip_id = 1"));
+        assert!(writes("DROP TABLE demo.trips"));
     }
 
     #[test]
