@@ -156,6 +156,7 @@ docker run --rm -p 5439:5439 -p 8080:8080 \
 ## Testing
 
 - `icegres/tests/e2e.sh` — end-to-end suite against the live stack (130+ assertions across every feature and both wire protocols).
+- `tests/browser-flight.sh` — the browser-direct Flight SQL gate: `@icegres/flight-web`'s tests plus a headless-Chromium smoke run that drives every data lane and asserts the decoded rows (skips when node/Chromium/stack absent).
 - `cargo test` — unit tests (buffer union-read state machine, PK checks, transactions, auth parsing, …).
 - `bench/parity.sh` — feature-parity probes vs the Lakebase/Neon/Moonlink bar.
 - `bench/bench.sh` + `bench/gate.sh` — the performance harness and no-regression gate.

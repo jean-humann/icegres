@@ -8,7 +8,11 @@ import { tableFromIPC } from "apache-arrow";
 import { FlightWebClient } from "@icegres/flight-web";
 
 // Native gRPC-web on the Flight port itself (flight-serve --grpc-web).
-const GRPCWEB_BASE = `http://${location.hostname}:50051`;
+// The port is overridable via ?grpcwebPort= so the CI smoke gate can point
+// the browser at its own test listener (defaults to the dev-stack 50051).
+const GRPCWEB_PORT =
+  new URLSearchParams(location.search).get("grpcwebPort") || "50051";
+const GRPCWEB_BASE = `http://${location.hostname}:${GRPCWEB_PORT}`;
 const flightWeb = new FlightWebClient({ baseUrl: GRPCWEB_BASE });
 
 function tableToRows(table) {

@@ -133,6 +133,24 @@ else
 fi
 
 echo
+
+# --- browser-direct Flight gate ----------------------------------------------
+# The frontend data path in a real browser (SKIPs itself when node/Chromium/
+# the stack are absent, exit 0). Gated with e2e since it needs the live stack.
+if [[ "$SKIP_E2E" == 1 ]]; then
+  echo "=== browser-flight: SKIPPED (--skip-e2e) ==="
+else
+  echo "=== browser-flight: running tests/browser-flight.sh ==="
+  if bash "$REPO_DIR/tests/browser-flight.sh" >"$SCRIPT_DIR/.run/gate-browser.log" 2>&1; then
+    tail -n 1 "$SCRIPT_DIR/.run/gate-browser.log"
+  else
+    echo "browser-flight FAILED — tail of bench/.run/gate-browser.log:"
+    tail -n 15 "$SCRIPT_DIR/.run/gate-browser.log"
+    note_fail
+  fi
+fi
+
+echo
 if [[ "$FAILURES" -eq 0 ]]; then
   echo "GATE: PASS"
   exit 0
