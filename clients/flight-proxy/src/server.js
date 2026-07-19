@@ -10,29 +10,13 @@
 
 import { connect, queryToIpc } from "./flight.js";
 import { resolveQuery, describeRegistry, ParamError } from "./allowlist.js";
-
-const CORS_BASE = {
-  "access-control-allow-methods": "GET, POST, OPTIONS",
-  "access-control-allow-headers": "content-type, authorization",
-  vary: "Origin",
-};
-
-function sendJson(res, status, body, cors) {
-  res.writeHead(status, { "content-type": "application/json", ...cors });
-  res.end(JSON.stringify(body));
-}
-
-async function readJson(req, limitBytes = 64 * 1024) {
-  const chunks = [];
-  let size = 0;
-  for await (const c of req) {
-    size += c.length;
-    if (size > limitBytes) throw new Error("request body too large");
-    chunks.push(c);
-  }
-  if (!chunks.length) return {};
-  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
-}
+import {
+  corsHeaders,
+  sendJson,
+  readJson,
+  streamArrow,
+  serveHandler,
+} from "./http.js";
 
 /**
  * Build an (req, res) handler.
@@ -58,9 +42,9 @@ export function createHandler(config) {
     throw new Error("createHandler requires a { queries } registry");
   }
   const conn = connect(flight);
+  const cors = corsHeaders("GET, POST, OPTIONS", corsOrigin);
 
   return async function handler(req, res) {
-    const cors = { ...CORS_BASE, "access-control-allow-origin": corsOrigin };
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
 
     if (req.method === "OPTIONS") {
@@ -129,39 +113,17 @@ export function createHandler(config) {
 
     // Stream the Arrow IPC result straight to the browser, untouched — the
     // whole point: Arrow end to end, no JSON re-encode.
-    res.writeHead(200, {
-      "content-type": "application/vnd.apache.arrow.stream",
-      "cache-control": "no-store",
-      ...cors,
-    });
-    try {
-      await queryToIpc(conn, sql, (chunk) => res.write(chunk));
-      res.end();
-    } catch (e) {
-      // Headers are already sent (streaming): the browser will see a
-      // truncated Arrow stream; also log server-side. We cannot change the
-      // status now, so destroy the socket to signal an incomplete response.
+    await streamArrow(
+      res,
+      cors,
+      (write) => queryToIpc(conn, sql, write),
       // eslint-disable-next-line no-console
-      console.error(`query "${name}" failed mid-stream:`, e.message);
-      res.destroy(e);
-    }
+      (e) => console.error(`query "${name}" failed mid-stream:`, e.message),
+    );
   };
 }
 
 /** Convenience: start a standalone http server with the handler. */
-export async function serve(config, { port = 8090, host = "127.0.0.1" } = {}) {
-  const http = await import("node:http");
-  const handler = createHandler(config);
-  const server = http.createServer((req, res) => {
-    handler(req, res).catch((e) => {
-      if (!res.headersSent) {
-        res.writeHead(500, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: String(e) }));
-      } else {
-        res.destroy(e);
-      }
-    });
-  });
-  await new Promise((resolve) => server.listen(port, host, resolve));
-  return server;
+export function serve(config, { port = 8090, host = "127.0.0.1" } = {}) {
+  return serveHandler(createHandler(config), { port, host });
 }
