@@ -182,6 +182,38 @@ untrusted.
 - **CI**: `tests/browser-flight.sh` exercises the whole path in real
   Chromium (skips when deps absent); it runs in `bench/gate.sh` with e2e.
 
+## When users write the SQL — the explorer case
+
+A dashboard and a **SQL explorer** are opposite problems. A dashboard must
+never send raw SQL from the browser (→ the allowlist BFF). An explorer's
+whole point is arbitrary user queries, so raw SQL from the browser is the
+feature — and safety comes from *sandboxing the user*, not restricting the
+SQL text. This flips the recommendation:
+
+| | dashboard | SQL explorer |
+|---|---|---|
+| SQL author | server (named queries) | the user |
+| Client | `@icegres/flight-proxy` (allowlist) | direct `@icegres/flight-web`, or the gateway below |
+| Safety | no SQL reaches the browser | per-user authz + limits + read-only |
+
+The controls for a safe explorer (none restrict the SQL text):
+
+1. **Per-user identity + authz.** Every query runs as the user's icegres
+   principal; `--authz-file` scopes it to their tables. This is also the
+   authoritative **read-only** control — grant only `CanReadData` and a
+   write fails at the engine with SQLSTATE `42501` (icegres authz already
+   distinguishes read from write per statement).
+2. **Resource limits** (`--flight-statement-timeout-ms`,
+   `--flight-max-result-bytes`, `--flight-max-concurrent-rpcs`) — an
+   explorer's queries are adversarial-by-accident; these bound a runaway.
+3. **Short-lived tokens** — the browser holds no standing DB credential.
+4. **Cancel** — the client's `AbortController` stops a running query.
+
+`@icegres/flight-proxy` ships `createSqlGateway` for this: a token broker
+(`POST /session`) + a raw-SQL endpoint (`POST /sql`, streamed as Arrow) with
+a defense-in-depth read-only guard. A runnable browser explorer (editor +
+Run/Stop + streamed results) is in `bench/clients/js/web/explorer.{html,js}`.
+
 ## Bench-environment notes
 
 Run in a sandbox where Lakekeeper/RustFS binaries could not be fetched: the
