@@ -7,7 +7,8 @@
   "scripts": {
     "bundle": "node build.mjs",
     "proxy": "node proxy/server.js",
-    "bench": "node bench/run.mjs"
+    "bench": "node bench/run.mjs",
+    "smoke": "node bench/smoke.mjs"
   },
   "dependencies": {
     "@grpc/grpc-js": "^1.12.5",
