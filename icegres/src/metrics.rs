@@ -84,6 +84,28 @@ pub struct Metrics {
     /// absence of events is reported as growing age, never as a healthy 0.
     /// Empty (no series exported) without `--peer-tail`.
     pub peer_tail_ages_ms: Mutex<HashMap<String, u64>>,
+
+    // --- Arrow Flight SQL listener (flight.rs) -----------------------------
+    /// Data-producing Flight RPCs handled (DoGet query streams; metadata
+    /// RPCs are not counted). Counter.
+    pub flight_rpcs_total: AtomicU64,
+    /// Flight query streams currently in flight (gauge): rises with load and
+    /// is bounded by `--flight-max-concurrent-rpcs` when set.
+    pub flight_rpcs_in_flight: AtomicU64,
+    /// Summed wall-clock of completed Flight query streams (ms). Divide by
+    /// `flight_rpcs_total` for a rolling average.
+    pub flight_rpc_duration_ms_total: AtomicU64,
+    /// Result bytes streamed to Flight clients (Arrow IPC body bytes, i.e.
+    /// post-compression on the wire). Counter.
+    pub flight_bytes_out_total: AtomicU64,
+    /// Flight query streams aborted by a resource guard — statement timeout
+    /// (`--flight-statement-timeout-ms`) or result cap
+    /// (`--flight-max-result-bytes`). Counter; a spike means dashboards are
+    /// issuing queries the limits are built to stop.
+    pub flight_rpcs_aborted_total: AtomicU64,
+    /// Failed Flight authentications (handshake + per-RPC Basic; bad
+    /// credentials only, not missing-header). Counter.
+    pub flight_auth_failures_total: AtomicU64,
 }
 
 /// The process-global metrics registry.
@@ -118,6 +140,12 @@ impl Metrics {
         let rch = self.result_cache_hits_total.load(Ordering::Relaxed);
         let rcm = self.result_cache_misses_total.load(Ordering::Relaxed);
         let pta = self.peer_tail_age_ms.load(Ordering::Relaxed);
+        let frt = self.flight_rpcs_total.load(Ordering::Relaxed);
+        let frif = self.flight_rpcs_in_flight.load(Ordering::Relaxed);
+        let frd = self.flight_rpc_duration_ms_total.load(Ordering::Relaxed);
+        let fbo = self.flight_bytes_out_total.load(Ordering::Relaxed);
+        let fra = self.flight_rpcs_aborted_total.load(Ordering::Relaxed);
+        let faf = self.flight_auth_failures_total.load(Ordering::Relaxed);
         // Per-peer tail-age series (one line per configured peer, sorted for
         // stable output; empty without --peer-tail).
         let per_peer = {
@@ -191,6 +219,24 @@ impl Metrics {
              mirrors fall back to commit cadence).\n\
              # TYPE icegres_peer_tail_age_max_ms gauge\n\
              icegres_peer_tail_age_max_ms {pta}\n\
+             # HELP icegres_flight_rpcs_total Data-producing Flight query streams handled.\n\
+             # TYPE icegres_flight_rpcs_total counter\n\
+             icegres_flight_rpcs_total {frt}\n\
+             # HELP icegres_flight_rpcs_in_flight Flight query streams currently executing.\n\
+             # TYPE icegres_flight_rpcs_in_flight gauge\n\
+             icegres_flight_rpcs_in_flight {frif}\n\
+             # HELP icegres_flight_rpc_duration_ms_total Summed Flight query stream wall-clock (ms).\n\
+             # TYPE icegres_flight_rpc_duration_ms_total counter\n\
+             icegres_flight_rpc_duration_ms_total {frd}\n\
+             # HELP icegres_flight_bytes_out_total Arrow IPC result body bytes streamed to Flight clients.\n\
+             # TYPE icegres_flight_bytes_out_total counter\n\
+             icegres_flight_bytes_out_total {fbo}\n\
+             # HELP icegres_flight_rpcs_aborted_total Flight query streams stopped by the statement timeout or result cap.\n\
+             # TYPE icegres_flight_rpcs_aborted_total counter\n\
+             icegres_flight_rpcs_aborted_total {fra}\n\
+             # HELP icegres_flight_auth_failures_total Failed Flight authentications (bad credentials).\n\
+             # TYPE icegres_flight_auth_failures_total counter\n\
+             icegres_flight_auth_failures_total {faf}\n\
              {per_peer}"
         )
     }

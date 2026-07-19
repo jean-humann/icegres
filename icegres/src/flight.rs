@@ -54,9 +54,12 @@
 //! accepted) and logs the same startup WARN as pgwire.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
@@ -120,6 +123,92 @@ const BASE64_ANY_PAD: GeneralPurpose = GeneralPurpose::new(
 
 type DoGetStream = Pin<Box<dyn Stream<Item = Result<arrow_flight::FlightData, Status>> + Send>>;
 type HandshakeStream = Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Status>> + Send>>;
+
+/// Resource guard wrapping a data DoGet stream: enforces the statement
+/// timeout and result-byte cap, holds the concurrency permit for the
+/// stream's lifetime, and accounts the per-RPC metrics on completion.
+///
+/// The deadline is checked against a live timer registered on every poll, so
+/// it fires even if the inner stream stalls mid-scan (not only between
+/// items) — a genuinely hung query still returns DEADLINE_EXCEEDED. Drop
+/// releases the permit, decrements the in-flight gauge, and records the
+/// stream's wall-clock, whether it ended cleanly, by error, or by client
+/// cancel (tonic drops the stream).
+struct GuardedStream {
+    inner: DoGetStream,
+    deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+    byte_budget: Option<u64>,
+    bytes_seen: u64,
+    started: Instant,
+    done: bool,
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl Stream for GuardedStream {
+    type Item = Result<arrow_flight::FlightData, Status>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        if self.done {
+            return Poll::Ready(None);
+        }
+        // Deadline first: a hung inner poll must not outlive the budget.
+        if let Some(deadline) = self.deadline.as_mut() {
+            if deadline.as_mut().poll(cx).is_ready() {
+                self.done = true;
+                crate::metrics::metrics()
+                    .flight_rpcs_aborted_total
+                    .fetch_add(1, Ordering::Relaxed);
+                return Poll::Ready(Some(Err(Status::deadline_exceeded(
+                    "query exceeded the Flight statement timeout \
+                     (--flight-statement-timeout-ms)",
+                ))));
+            }
+        }
+        match self.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(fd))) => {
+                let n = fd.data_body.len() as u64;
+                self.bytes_seen += n;
+                crate::metrics::metrics()
+                    .flight_bytes_out_total
+                    .fetch_add(n, Ordering::Relaxed);
+                if let Some(budget) = self.byte_budget {
+                    if self.bytes_seen > budget {
+                        self.done = true;
+                        crate::metrics::metrics()
+                            .flight_rpcs_aborted_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Poll::Ready(Some(Err(Status::resource_exhausted(format!(
+                            "query result exceeded the Flight result cap of {budget} bytes \
+                             (--flight-max-result-bytes); narrow the query or raise the limit"
+                        )))));
+                    }
+                }
+                Poll::Ready(Some(Ok(fd)))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                self.done = true;
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Ready(None) => {
+                self.done = true;
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for GuardedStream {
+    fn drop(&mut self) {
+        let m = crate::metrics::metrics();
+        m.flight_rpcs_in_flight.fetch_sub(1, Ordering::Relaxed);
+        m.flight_rpc_duration_ms_total
+            .fetch_add(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+}
 
 /// A prepared statement: the SQL text plus the last bound parameter rows
 /// (`DoPut(CommandPreparedStatementQuery)` replaces them on every bind).
@@ -221,6 +310,9 @@ async fn verify_basic_cached(
         if let Some(ip) = peer {
             throttle.record_failure(ip);
         }
+        crate::metrics::metrics()
+            .flight_auth_failures_total
+            .fetch_add(1, Ordering::Relaxed);
         warn!(user, "flight per-RPC basic auth rejected (bad credentials)");
         return Err(Status::unauthenticated(format!(
             "password authentication failed for user \"{user}\""
@@ -272,6 +364,21 @@ struct FlightSqlServiceImpl {
     /// before handshake and per-RPC `Basic` verification so all three
     /// credential-guessing surfaces slow a brute-forcer identically.
     throttle: Arc<crate::ops::AuthThrottle>,
+    /// Wall-clock ceiling on a single DoGet query stream
+    /// (`--flight-statement-timeout-ms`; `None` = unbounded). A dashboard
+    /// query that runs past it is aborted with DEADLINE_EXCEEDED rather than
+    /// tying up an executor thread indefinitely.
+    statement_timeout: Option<Duration>,
+    /// Byte ceiling on a single DoGet result (`--flight-max-result-bytes`;
+    /// `None` = unbounded), counted over the Arrow IPC body bytes actually
+    /// streamed. A `SELECT *` on a huge table is cut with RESOURCE_EXHAUSTED
+    /// instead of streaming gigabytes into a browser tab.
+    max_result_bytes: Option<u64>,
+    /// Concurrency cap on in-flight DoGet query streams
+    /// (`--flight-max-concurrent-rpcs`; `None` = uncapped) — the Flight
+    /// analogue of the pgwire `--max-connections` accept-loop limit, so a
+    /// dashboard fleet cannot open unbounded parallel scans.
+    rpc_limiter: Option<Arc<tokio::sync::Semaphore>>,
     prepared: Mutex<HashMap<String, Prepared>>,
     sql_info: SqlInfoData,
     /// Buffered-write overlay source. `Some` only on the tail-api listener
@@ -657,7 +764,7 @@ impl FlightSqlServiceImpl {
                     .collect::<Vec<_>>()
                     .await;
             crate::timing::record("flight_encode", t.elapsed());
-            return Ok(Box::pin(stream::iter(data)));
+            return Ok(self.guard(Box::pin(stream::iter(data))).await);
         }
         let stream = datafusion::physical_plan::execute_stream(plan, task_ctx)
             .map_err(|e| Status::internal(format!("execution failed: {e}")))?;
@@ -666,7 +773,7 @@ impl FlightSqlServiceImpl {
             .with_schema(schema)
             .build(stream.map_err(|e| FlightError::ExternalError(Box::new(e))))
             .map_err(Status::from);
-        Ok(Box::pin(flight))
+        Ok(self.guard(Box::pin(flight)).await)
     }
 
     /// Reject writes on a read-only listener (the tail-api port inside
@@ -715,7 +822,39 @@ impl FlightSqlServiceImpl {
             .with_schema(schema)
             .build(stream.map_err(|e| FlightError::ExternalError(Box::new(e))))
             .map_err(Status::from);
-        Ok(Box::pin(flight))
+        Ok(self.guard(Box::pin(flight)).await)
+    }
+
+    /// Wrap a data DoGet stream with the resource guards (statement timeout,
+    /// result-byte cap, concurrency permit) and the per-RPC metrics. Applied
+    /// to every query stream (`plan_to_stream`/`df_to_stream`); metadata
+    /// streams are cheap and bypass it. Acquires the concurrency permit here
+    /// (await), so an over-cap fleet waits at the choke point rather than
+    /// spawning unbounded scans.
+    async fn guard(&self, inner: DoGetStream) -> DoGetStream {
+        let permit = match &self.rpc_limiter {
+            Some(sem) => Some(
+                sem.clone()
+                    .acquire_owned()
+                    .await
+                    .expect("flight rpc semaphore closed"),
+            ),
+            None => None,
+        };
+        let m = crate::metrics::metrics();
+        m.flight_rpcs_total.fetch_add(1, Ordering::Relaxed);
+        m.flight_rpcs_in_flight.fetch_add(1, Ordering::Relaxed);
+        Box::pin(GuardedStream {
+            inner,
+            deadline: self
+                .statement_timeout
+                .map(|d| Box::pin(tokio::time::sleep(d))),
+            byte_budget: self.max_result_bytes,
+            bytes_seen: 0,
+            started: Instant::now(),
+            done: false,
+            _permit: permit,
+        })
     }
 
     /// One-batch DoGet stream (metadata responses).
@@ -970,6 +1109,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
             let peer = request.remote_addr().map(|a| a.ip());
             let user =
                 verify_basic_cached(b64, source, &self.basic_tokens, &self.throttle, peer).await?;
+            // (verify_basic_cached already counts the failure metric + throttle.)
             info!(user, "flight handshake authenticated");
             authenticated_user = user;
         }
@@ -1745,6 +1885,11 @@ pub async fn spawn_tail_api(
         // enabled here (this listener serves no browsers).
         ipc_compression: Some(arrow::ipc::CompressionType::ZSTD),
         throttle: Arc::new(crate::ops::AuthThrottle::default()),
+        // The tail-api serves only icegres peers; the browser-oriented
+        // resource guards do not apply.
+        statement_timeout: None,
+        max_result_bytes: None,
+        rpc_limiter: None,
         plans: PlanCache::from_env(),
         stash: Mutex::new(HashMap::new()),
     };
@@ -1792,6 +1937,14 @@ pub struct ListenerOpts {
     pub cors_origin: String,
     /// Result-batch IPC compression (`--result-compression`).
     pub ipc_compression: Option<arrow::ipc::CompressionType>,
+    /// Per-query wall-clock ceiling (`--flight-statement-timeout-ms`).
+    pub statement_timeout: Option<Duration>,
+    /// Per-result byte ceiling (`--flight-max-result-bytes`).
+    pub max_result_bytes: Option<u64>,
+    /// In-flight DoGet concurrency cap (`--flight-max-concurrent-rpcs`).
+    pub max_concurrent_rpcs: Option<usize>,
+    /// HTTP liveness/metrics port (`--health-port`); `None` = not served.
+    pub health_port: Option<u16>,
 }
 
 /// Run the Flight SQL endpoint (blocks until SIGINT).
@@ -1809,6 +1962,10 @@ pub async fn run(
         grpc_web,
         cors_origin,
         ipc_compression,
+        statement_timeout,
+        max_result_bytes,
+        max_concurrent_rpcs,
+        health_port,
     } = listener_opts;
     let start = std::time::Instant::now();
     // Validate the CORS origin up front: it is inserted into response headers
@@ -1858,6 +2015,12 @@ pub async fn run(
         "connecting to Iceberg REST catalog"
     );
     let catalog = context::connect_catalog(opts).await?;
+    // Optional HTTP liveness/metrics listener so a standalone flight-serve is
+    // scrapeable (the Flight per-RPC metrics render on the same /metrics as
+    // pgwire's). No write buffer here — flight-serve does not buffer.
+    if let Some(hp) = health_port {
+        crate::ops::spawn_health_listener(host, hp, catalog.clone(), None).await?;
+    }
     // Same copy-on-write engine as `icegres serve` for UPDATE/DELETE (main
     // branch, PK enforcement off — the pgwire listener owns that posture).
     let engine = Arc::new(OverwriteEngine::connect(catalog.clone(), opts, false, None).await?);
@@ -1899,6 +2062,9 @@ pub async fn run(
         basic_tokens: Mutex::new(HashMap::new()),
         ipc_compression,
         throttle: Arc::new(crate::ops::AuthThrottle::default()),
+        statement_timeout,
+        max_result_bytes,
+        rpc_limiter: max_concurrent_rpcs.map(|n| Arc::new(tokio::sync::Semaphore::new(n))),
         plans: PlanCache::from_env(),
         stash: Mutex::new(HashMap::new()),
     };
@@ -1914,6 +2080,9 @@ pub async fn run(
         %addr,
         tls = tls_acceptor.is_some(),
         grpc_web,
+        statement_timeout_ms = statement_timeout.map(|d| d.as_millis() as u64),
+        max_result_bytes,
+        max_concurrent_rpcs,
         startup_ms = start.elapsed().as_millis() as u64,
         "flight-serve ready (Arrow Flight SQL)"
     );
@@ -2131,7 +2300,7 @@ fn tcp_incoming(
 use datafusion_postgres::pgwire::tokio::tokio_rustls::server::TlsStream;
 use datafusion_postgres::pgwire::tokio::TlsAcceptor;
 use std::net::SocketAddr;
-use std::task::{Context, Poll};
+use std::task::Context;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tonic::transport::server::{Connected, TcpConnectInfo};
 
@@ -2359,6 +2528,62 @@ mod tests {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             user == "bench" && password == "secret"
         }
+    }
+
+    /// Build a GuardedStream over `items` with the given guards (no permit).
+    fn guarded(
+        items: Vec<Result<arrow_flight::FlightData, Status>>,
+        timeout: Option<Duration>,
+        byte_budget: Option<u64>,
+    ) -> GuardedStream {
+        GuardedStream {
+            inner: Box::pin(stream::iter(items)),
+            deadline: timeout.map(|d| Box::pin(tokio::time::sleep(d))),
+            byte_budget,
+            bytes_seen: 0,
+            started: Instant::now(),
+            done: false,
+            _permit: None,
+        }
+    }
+
+    fn fd(body_len: usize) -> arrow_flight::FlightData {
+        arrow_flight::FlightData {
+            data_body: vec![0u8; body_len].into(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn guarded_stream_enforces_result_byte_cap() {
+        // Budget 100 bytes: the first 60-byte batch passes, the second (total
+        // 120 > 100) is replaced by RESOURCE_EXHAUSTED and the stream ends.
+        let mut s = guarded(vec![Ok(fd(60)), Ok(fd(60)), Ok(fd(60))], None, Some(100));
+        assert!(s.next().await.unwrap().is_ok());
+        let err = s.next().await.unwrap().unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert!(s.next().await.is_none(), "stream fuses after the cap");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn guarded_stream_enforces_statement_timeout() {
+        use futures::stream::StreamExt as _;
+        // A stream that never yields, guarded by a 50 ms deadline: advancing
+        // the paused clock past it makes poll_next return DEADLINE_EXCEEDED
+        // even though the inner stream is still pending.
+        let inner: DoGetStream = Box::pin(stream::pending());
+        let mut s = GuardedStream {
+            inner,
+            deadline: Some(Box::pin(tokio::time::sleep(Duration::from_millis(50)))),
+            byte_budget: None,
+            bytes_seen: 0,
+            started: Instant::now(),
+            done: false,
+            _permit: None,
+        };
+        tokio::time::advance(Duration::from_millis(60)).await;
+        let err = s.next().await.unwrap().unwrap_err();
+        assert_eq!(err.code(), tonic::Code::DeadlineExceeded);
     }
 
     #[tokio::test(start_paused = true)]
