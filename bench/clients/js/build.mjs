@@ -4,7 +4,7 @@ import { build } from "esbuild";
 import path from "node:path";
 
 await build({
-  entryPoints: ["web/dashboard.js", "web/bench-page.js"],
+  entryPoints: ["web/dashboard.js", "web/bench-page.js", "web/explorer.js"],
   bundle: true,
   format: "esm",
   outdir: "dist",

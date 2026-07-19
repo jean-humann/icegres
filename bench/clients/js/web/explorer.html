@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>icegres — SQL explorer (hardened)</title>
+<style>
+  :root {
+    --bg: #fcfcfb; --panel: #f4f3f0; --ink: #14161a; --ink2: #55585f;
+    --line: #e4e3de; --accent: #2a78d6; --err: #d64545;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #1a1a19; --panel: #232322; --ink: #f2f3f5; --ink2: #b7bcc4;
+            --line: #35352f; --accent: #4b93e6; --err: #e06b6b; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.5 system-ui, sans-serif; padding: 22px; }
+  h1 { font: 600 16px ui-monospace, Menlo, monospace; margin: 0 0 3px; }
+  .sub { color: var(--ink2); margin: 0 0 16px; font-size: 13px; }
+  textarea {
+    width: 100%; min-height: 120px; resize: vertical; padding: 12px;
+    font: 13px/1.5 ui-monospace, Menlo, monospace; color: var(--ink);
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  }
+  .bar { display: flex; gap: 10px; align-items: center; margin: 10px 0; flex-wrap: wrap; }
+  button {
+    font: 600 13px ui-monospace, Menlo, monospace; color: #fff; background: var(--accent);
+    border: none; border-radius: 7px; padding: 8px 16px; cursor: pointer;
+  }
+  button.ghost { background: transparent; color: var(--ink); border: 1px solid var(--line); }
+  button:disabled { opacity: 0.45; cursor: default; }
+  #status { color: var(--ink2); font-size: 13px; }
+  #timing { color: var(--ink2); font-size: 12px; margin-left: auto; font-family: ui-monospace, Menlo, monospace; }
+  .err { color: var(--err); }
+  .out { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; margin-top: 12px; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 6px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { font: 600 12px ui-monospace, Menlo, monospace; color: var(--ink2); position: sticky; top: 0; background: var(--bg); }
+</style>
+</head>
+<body>
+  <h1>icegres SQL explorer</h1>
+  <p class="sub">Arbitrary SQL, sandboxed per user: a short-lived session token, an authz-scoped read-only principal, and server-side resource limits. Results stream as Arrow. Try a write to see the read-only guard.</p>
+  <textarea id="sql" spellcheck="false">SELECT city, count(*) AS trips FROM demo.trips GROUP BY city ORDER BY trips DESC</textarea>
+  <div class="bar">
+    <button id="run">Run</button>
+    <button id="stop" class="ghost" disabled>Stop</button>
+    <span id="status">loading…</span>
+    <span id="timing"></span>
+  </div>
+  <div class="out"><div id="out"></div></div>
+  <script type="module" src="/dist/explorer.js"></script>
+</body>
+</html>
