@@ -199,10 +199,13 @@ SQL text. This flips the recommendation:
 The controls for a safe explorer (none restrict the SQL text):
 
 1. **Per-user identity + authz.** Every query runs as the user's icegres
-   principal; `--authz-file` scopes it to their tables. This is also the
-   authoritative **read-only** control — grant only `CanReadData` and a
-   write fails at the engine with SQLSTATE `42501` (icegres authz already
-   distinguishes read from write per statement).
+   principal; `--authz-file` scopes it to their tables. **Read-only** has an
+   authoritative engine control, two ways: run the listener with
+   `flight-serve --read-only` (rejects every write with `PERMISSION_DENIED`,
+   no authz file needed), or grant the principal only `CanReadData` so a
+   write fails with SQLSTATE `42501`. Both are statement-form based — an
+   `INSERT` is caught no matter which RPC path runs it (including the DoGet
+   query flow, which `reject_if_read_only` alone would miss).
 2. **Resource limits** (`--flight-statement-timeout-ms`,
    `--flight-max-result-bytes`, `--flight-max-concurrent-rpcs`) — an
    explorer's queries are adversarial-by-accident; these bound a runaway.
