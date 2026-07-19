@@ -40,12 +40,12 @@ async function arrowProxy(sql) {
 async function flightJson(sql) {
   const resp = await fetch(`/api/flight-json?sql=${encodeURIComponent(sql)}`);
   if (!resp.ok) throw new Error(await resp.text());
-  const text = await resp.text();
-  const rows = JSON.parse(text);
+  const buf = await resp.arrayBuffer();
+  const rows = JSON.parse(new TextDecoder().decode(buf));
   return {
     rows,
     cols: rows.length ? Object.keys(rows[0]) : [],
-    bytes: text.length,
+    bytes: buf.byteLength,
     rowCount: rows.length,
   };
 }
@@ -54,12 +54,12 @@ async function flightJson(sql) {
 async function pgJson(sql) {
   const resp = await fetch(`/api/pg-json?sql=${encodeURIComponent(sql)}`);
   if (!resp.ok) throw new Error(await resp.text());
-  const text = await resp.text();
-  const rows = JSON.parse(text);
+  const buf = await resp.arrayBuffer();
+  const rows = JSON.parse(new TextDecoder().decode(buf));
   return {
     rows,
     cols: rows.length ? Object.keys(rows[0]) : [],
-    bytes: text.length,
+    bytes: buf.byteLength,
     rowCount: rows.length,
   };
 }
