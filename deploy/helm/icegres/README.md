@@ -134,6 +134,34 @@ compose:
 | `computes.resources` | 250m/512Mi req, 2Gi lim | — |
 | `computes.extraEnv` | `[]` | — |
 
+### Arrow Flight SQL (`flight`)
+
+Optional stateless read listener speaking Arrow Flight SQL — the ADBC fast
+lane and, with `grpcWeb`, the browser-dashboard endpoint (see
+`docs/frontend-dashboards.md`). Rendered without any tail/buffer env (a
+Flight process opening the writer's tail would fence it).
+
+| Key | Default | Meaning |
+|---|---|---|
+| `flight.enabled` | `false` | Render the Flight Deployment + Service (+ NetworkPolicy / Ingress when enabled) |
+| `flight.replicas` | `1` | Stateless — scale freely |
+| `flight.port` | `50051` | Flight gRPC port |
+| `flight.grpcWeb` | `false` | Also answer gRPC-web on the port (browsers); native gRPC unaffected |
+| `flight.corsOrigin` | `"*"` | CORS origin for gRPC-web — **pin to the dashboard origin when `auth.enabled`** |
+| `flight.resultCompression` | `zstd` | `zstd` (~5× wire) · `none` (zstd-less clients) |
+| `flight.readOnly` | `false` | Reject every write (DML + DDL) — the posture for a browser SQL explorer |
+| `flight.freshnessMs` | `0` | Bounded-staleness reads + plan cache (`0` = exact) |
+| `flight.statementTimeoutMs` / `flight.maxResultBytes` / `flight.maxConcurrentRpcs` | `0` (off) | Resource guards — **set before exposing the port to untrusted browsers** |
+| `flight.healthPort` | `8080` | Plain-HTTP `/ready` + `/metrics` (the `icegres_flight_*` series); opened in the NetworkPolicy for probes + scrapes |
+| `flight.ingress.enabled` | `false` | Expose the port outside the cluster; **refused with `auth.enabled=false` unless `flight.ingress.allowInsecure=true`** |
+| `flight.ingress.className` / `.host` / `.annotations` | `""` / `""` / `{}` | Ingress controller, host, extra annotations (merged last, so overrides win) |
+| `flight.ingress.tlsSecret` | `""` | `kubernetes.io/tls` Secret for the host; edge TLS |
+| `flight.resources` | 250m/512Mi req, 2Gi lim | — |
+| `flight.extraEnv` | `[]` | — |
+
+Backend protocol is set automatically: `GRPCS` when `tls.enabled` (the pod
+terminates TLS), else `GRPC`.
+
 ### Acceptor trios (`keeper` = data, `lease` = icegresd HA)
 
 Tiny fsync-only processes; **must** land on different nodes.

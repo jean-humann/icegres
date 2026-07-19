@@ -247,6 +247,11 @@ flight:
     host: ""
     # TLS: names a kubernetes.io/tls secret for the host (edge termination).
     tlsSecret: ""
+    # Exposing the Flight port via Ingress with auth.enabled=false publishes
+    # an UNAUTHENTICATED SQL endpoint. The chart refuses that combination
+    # unless you acknowledge it here (e.g. TLS + auth are terminated by a
+    # gateway in front of this Ingress).
+    allowInsecure: false
   resources:
     requests: { cpu: 250m, memory: 512Mi }
     limits: { memory: 2Gi }

@@ -113,4 +113,7 @@ subset of objects renders.
 {{- fail "readReplicas with a durable tail and auth.enabled need auth.peerTailPassword (or an auth.existingSecret carrying key peer-tail-password)" -}}
 {{- end -}}
 {{- end -}}
+{{- if and .Values.flight.enabled .Values.flight.ingress.enabled (not .Values.auth.enabled) (not .Values.flight.ingress.allowInsecure) -}}
+{{- fail "flight.ingress.enabled with auth.enabled=false exposes an UNAUTHENTICATED SQL endpoint outside the cluster; set auth.enabled=true (recommended), or if TLS+auth are terminated by a gateway in front, acknowledge with flight.ingress.allowInsecure=true" -}}
+{{- end -}}
 {{- end }}
