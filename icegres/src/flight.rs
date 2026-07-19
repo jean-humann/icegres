@@ -144,6 +144,32 @@ struct GuardedStream {
     _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
+impl GuardedStream {
+    /// Construct a guarded stream and register it in the in-flight gauge. The
+    /// paired decrement lives in `Drop`, so every `GuardedStream` — including
+    /// those built directly in tests — balances the gauge regardless of how it
+    /// ends (clean, error, timeout, or client cancel).
+    fn new(
+        inner: DoGetStream,
+        timeout: Option<Duration>,
+        byte_budget: Option<u64>,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Self {
+        crate::metrics::metrics()
+            .flight_rpcs_in_flight
+            .fetch_add(1, Ordering::Relaxed);
+        Self {
+            inner,
+            deadline: timeout.map(|d| Box::pin(tokio::time::sleep(d))),
+            byte_budget,
+            bytes_seen: 0,
+            started: Instant::now(),
+            done: false,
+            _permit: permit,
+        }
+    }
+}
+
 impl Stream for GuardedStream {
     type Item = Result<arrow_flight::FlightData, Status>;
 
@@ -170,12 +196,12 @@ impl Stream for GuardedStream {
         match self.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(fd))) => {
                 let n = fd.data_body.len() as u64;
-                self.bytes_seen += n;
-                crate::metrics::metrics()
-                    .flight_bytes_out_total
-                    .fetch_add(n, Ordering::Relaxed);
+                // Enforce the cap BEFORE counting: a batch that pushes past the
+                // budget is dropped (replaced by RESOURCE_EXHAUSTED) and never
+                // reaches the client, so its bytes must not land in
+                // flight_bytes_out_total ("bytes streamed to clients").
                 if let Some(budget) = self.byte_budget {
-                    if self.bytes_seen > budget {
+                    if self.bytes_seen.saturating_add(n) > budget {
                         self.done = true;
                         crate::metrics::metrics()
                             .flight_rpcs_aborted_total
@@ -186,6 +212,10 @@ impl Stream for GuardedStream {
                         )))));
                     }
                 }
+                self.bytes_seen += n;
+                crate::metrics::metrics()
+                    .flight_bytes_out_total
+                    .fetch_add(n, Ordering::Relaxed);
                 Poll::Ready(Some(Ok(fd)))
             }
             Poll::Ready(Some(Err(e))) => {
@@ -295,7 +325,22 @@ async fn verify_basic_cached(
     if let Some(delay) = peer.and_then(|ip| throttle.penalty(ip)) {
         tokio::time::sleep(delay).await;
     }
-    let (user, password) = decode_basic_credentials(b64)?;
+    // Account a malformed header (bad base64/UTF-8/no colon) as an auth
+    // failure too: otherwise a flood of garbage `Basic` headers from a fresh
+    // IP neither escalates the per-peer backoff nor shows in the failure
+    // metric, since it returns before the KDF path that records both.
+    let (user, password) = match decode_basic_credentials(b64) {
+        Ok(creds) => creds,
+        Err(e) => {
+            if let Some(ip) = peer {
+                throttle.record_failure(ip);
+            }
+            crate::metrics::metrics()
+                .flight_auth_failures_total
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(e);
+        }
+    };
     // The 4096-iteration PBKDF2 is milliseconds of pure CPU: run it on the
     // blocking pool so a burst of cache misses cannot stall the executor
     // threads that are streaming everyone else's DoGet batches.
@@ -699,6 +744,12 @@ impl FlightSqlServiceImpl {
             };
             return Ok((schema, Some(pinned)));
         }
+        // Bound the expensive planning work under the same concurrency cap as
+        // DoGet streaming: create_logical_plan/create_physical_plan read
+        // Iceberg manifests, so an unbounded fleet of GetFlightInfo /
+        // CreatePreparedStatement calls could exhaust catalog IO while never
+        // touching the cap. Cache hits above return before this and never wait.
+        let _permit = self.acquire_permit().await;
         let logical = state
             .create_logical_plan(sql)
             .await
@@ -853,14 +904,12 @@ impl FlightSqlServiceImpl {
         Ok(self.guard(Box::pin(flight)).await)
     }
 
-    /// Wrap a data DoGet stream with the resource guards (statement timeout,
-    /// result-byte cap, concurrency permit) and the per-RPC metrics. Applied
-    /// to every query stream (`plan_to_stream`/`df_to_stream`); metadata
-    /// streams are cheap and bypass it. Acquires the concurrency permit here
-    /// (await), so an over-cap fleet waits at the choke point rather than
-    /// spawning unbounded scans.
-    async fn guard(&self, inner: DoGetStream) -> DoGetStream {
-        let permit = match &self.rpc_limiter {
+    /// Acquire a concurrency permit when `--flight-max-concurrent-rpcs` is
+    /// set; `None` when uncapped. The permit is held for the lifetime of the
+    /// returned guard — a DoGet stream (via [`Self::guard`]) or a planning
+    /// region (via [`Self::plan_for_schema`]).
+    async fn acquire_permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        match &self.rpc_limiter {
             Some(sem) => Some(
                 sem.clone()
                     .acquire_owned()
@@ -868,21 +917,26 @@ impl FlightSqlServiceImpl {
                     .expect("flight rpc semaphore closed"),
             ),
             None => None,
-        };
-        let m = crate::metrics::metrics();
-        m.flight_rpcs_total.fetch_add(1, Ordering::Relaxed);
-        m.flight_rpcs_in_flight.fetch_add(1, Ordering::Relaxed);
-        Box::pin(GuardedStream {
+        }
+    }
+
+    /// Wrap a data DoGet stream with the resource guards (statement timeout,
+    /// result-byte cap, concurrency permit) and the per-RPC metrics. Applied
+    /// to every query stream (`plan_to_stream`/`df_to_stream`); metadata
+    /// streams are cheap and bypass it. Acquires the concurrency permit here
+    /// (await), so an over-cap fleet waits at the choke point rather than
+    /// spawning unbounded scans.
+    async fn guard(&self, inner: DoGetStream) -> DoGetStream {
+        let permit = self.acquire_permit().await;
+        crate::metrics::metrics()
+            .flight_rpcs_total
+            .fetch_add(1, Ordering::Relaxed);
+        Box::pin(GuardedStream::new(
             inner,
-            deadline: self
-                .statement_timeout
-                .map(|d| Box::pin(tokio::time::sleep(d))),
-            byte_budget: self.max_result_bytes,
-            bytes_seen: 0,
-            started: Instant::now(),
-            done: false,
-            _permit: permit,
-        })
+            self.statement_timeout,
+            self.max_result_bytes,
+            permit,
+        ))
     }
 
     /// One-batch DoGet stream (metadata responses).
@@ -2189,8 +2243,8 @@ pub async fn run(
 /// Headers a browser is allowed to send on gRPC-web calls. `authorization`
 /// is present because per-RPC Basic credentials are the only auth flow the
 /// protocol can carry (no Handshake stream).
-const CORS_ALLOW_HEADERS: &str =
-    "content-type, x-grpc-web, x-user-agent, authorization, grpc-timeout";
+const CORS_ALLOW_HEADERS: &str = "content-type, x-grpc-web, x-user-agent, authorization, \
+     grpc-timeout, grpc-accept-encoding, connect-protocol-version, connect-timeout-ms";
 /// Trailer-carried gRPC status surfaced as headers by the grpc-web protocol —
 /// the browser client cannot read them unless they are exposed.
 const CORS_EXPOSE_HEADERS: &str =
@@ -2249,6 +2303,9 @@ where
                 .header("access-control-allow-methods", "POST, OPTIONS")
                 .header("access-control-allow-headers", CORS_ALLOW_HEADERS)
                 .header("access-control-max-age", "86400")
+                // The preflight answer is origin-specific too: a shared cache
+                // must not replay it for a different Origin.
+                .header("vary", "Origin")
                 .body(tonic::body::Body::empty())
                 .expect("static preflight response");
             return Box::pin(futures::future::ok(resp));
@@ -2568,15 +2625,7 @@ mod tests {
         timeout: Option<Duration>,
         byte_budget: Option<u64>,
     ) -> GuardedStream {
-        GuardedStream {
-            inner: Box::pin(stream::iter(items)),
-            deadline: timeout.map(|d| Box::pin(tokio::time::sleep(d))),
-            byte_budget,
-            bytes_seen: 0,
-            started: Instant::now(),
-            done: false,
-            _permit: None,
-        }
+        GuardedStream::new(Box::pin(stream::iter(items)), timeout, byte_budget, None)
     }
 
     fn fd(body_len: usize) -> arrow_flight::FlightData {
@@ -2604,15 +2653,7 @@ mod tests {
         // the paused clock past it makes poll_next return DEADLINE_EXCEEDED
         // even though the inner stream is still pending.
         let inner: DoGetStream = Box::pin(stream::pending());
-        let mut s = GuardedStream {
-            inner,
-            deadline: Some(Box::pin(tokio::time::sleep(Duration::from_millis(50)))),
-            byte_budget: None,
-            bytes_seen: 0,
-            started: Instant::now(),
-            done: false,
-            _permit: None,
-        };
+        let mut s = GuardedStream::new(inner, Some(Duration::from_millis(50)), None, None);
         tokio::time::advance(Duration::from_millis(60)).await;
         let err = s.next().await.unwrap().unwrap_err();
         assert_eq!(err.code(), tonic::Code::DeadlineExceeded);
@@ -2718,6 +2759,11 @@ mod tests {
         assert!(
             allowed.contains("authorization"),
             "Basic auth header must be allowed"
+        );
+        assert_eq!(
+            resp.headers().get("vary").unwrap(),
+            "Origin",
+            "preflight is origin-specific: shared caches must not replay it"
         );
 
         // A normal call passes through and gets origin + exposed trailers.
