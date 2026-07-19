@@ -512,6 +512,17 @@ enum Command {
         /// metrics live here). Off when unset.
         #[arg(long, env = "ICEGRES_HEALTH_PORT")]
         flight_health_port: Option<u16>,
+
+        /// Refuse every write on this listener: INSERT / UPDATE / DELETE /
+        /// DROP (query flow, prepared statements, and bulk ingest alike) are
+        /// rejected with PERMISSION_DENIED before execution. The right posture
+        /// for a browser SQL explorer, where users author arbitrary SELECTs
+        /// but must never mutate. Independent of --authz-file (works with auth
+        /// off); pair with resource limits to also bound read cost.
+        #[arg(long = "read-only", env = "ICEGRES_FLIGHT_READ_ONLY", num_args = 0..=1,
+              default_missing_value = "true", default_value = "false",
+              value_parser = clap::builder::BoolishValueParser::new())]
+        read_only: bool,
     },
     /// Create and populate the demo namespace/tables (idempotent).
     Seed {
@@ -929,6 +940,7 @@ async fn main() -> Result<()> {
             flight_max_result_bytes,
             flight_max_concurrent_rpcs,
             flight_health_port,
+            read_only,
         } => {
             // Flight authorization needs an authenticated principal: reject
             // --authz-file without --auth-file rather than trusting an
@@ -962,6 +974,7 @@ async fn main() -> Result<()> {
                     max_concurrent_rpcs: (flight_max_concurrent_rpcs > 0)
                         .then_some(flight_max_concurrent_rpcs),
                     health_port: flight_health_port,
+                    read_only,
                 },
             )
             .await
