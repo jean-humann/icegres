@@ -40,31 +40,22 @@ async function arrowProxy(sql) {
   return { rows, cols, bytes: buf.byteLength, rowCount: table.numRows };
 }
 
-/** Flight SQL at the proxy, but flattened to JSON before the browser. */
-async function flightJson(sql) {
-  const resp = await fetch(`/api/flight-json?sql=${encodeURIComponent(sql)}`);
-  if (!resp.ok) throw new Error(await resp.text());
-  const buf = await resp.arrayBuffer();
-  const rows = JSON.parse(new TextDecoder().decode(buf));
-  return {
-    rows,
-    cols: rows.length ? Object.keys(rows[0]) : [],
-    bytes: buf.byteLength,
-    rowCount: rows.length,
-  };
-}
-
-/** pgwire (node-postgres) at the proxy, JSON on the browser wire. */
-async function pgJson(sql) {
-  const resp = await fetch(`/api/pg-json?sql=${encodeURIComponent(sql)}`);
-  if (!resp.ok) throw new Error(await resp.text());
-  const buf = await resp.arrayBuffer();
-  const rows = JSON.parse(new TextDecoder().decode(buf));
-  return {
-    rows,
-    cols: rows.length ? Object.keys(rows[0]) : [],
-    bytes: buf.byteLength,
-    rowCount: rows.length,
+/**
+ * A JSON-over-fetch path: the proxy flattens the result (Flight or pgwire) to
+ * JSON before the browser. Both such paths differ only by their endpoint.
+ */
+function jsonPath(endpoint) {
+  return async function (sql) {
+    const resp = await fetch(`${endpoint}?sql=${encodeURIComponent(sql)}`);
+    if (!resp.ok) throw new Error(await resp.text());
+    const buf = await resp.arrayBuffer();
+    const rows = JSON.parse(new TextDecoder().decode(buf));
+    return {
+      rows,
+      cols: rows.length ? Object.keys(rows[0]) : [],
+      bytes: buf.byteLength,
+      rowCount: rows.length,
+    };
   };
 }
 
@@ -78,7 +69,7 @@ async function grpcWebDirect(sql) {
 
 export const PATHS = {
   "arrow-proxy": arrowProxy,
-  "flight-json": flightJson,
-  "pg-json": pgJson,
+  "flight-json": jsonPath("/api/flight-json"),
+  "pg-json": jsonPath("/api/pg-json"),
   "grpcweb-direct": grpcWebDirect,
 };
