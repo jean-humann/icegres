@@ -9,9 +9,28 @@
 import "./zstd-web.js";
 import { tableFromIPC } from "apache-arrow";
 
-const GATEWAY =
-  new URLSearchParams(location.search).get("gateway") ||
-  `http://${location.hostname}:8093`;
+// The ?gateway= override may only change the scheme/port of the SAME host (or
+// localhost): a shared link must not repoint the explorer — and the SQL and
+// results that flow through it — at an arbitrary attacker origin.
+function resolveGateway() {
+  const fallback = `http://${location.hostname}:8093`;
+  const raw = new URLSearchParams(location.search).get("gateway");
+  if (!raw) return fallback;
+  try {
+    const u = new URL(raw);
+    const sameHost =
+      u.hostname === location.hostname ||
+      u.hostname === "127.0.0.1" ||
+      u.hostname === "localhost";
+    if ((u.protocol === "http:" || u.protocol === "https:") && sameHost) {
+      return u.origin;
+    }
+  } catch {
+    /* malformed — fall back */
+  }
+  return fallback;
+}
+const GATEWAY = resolveGateway();
 
 const $ = (id) => document.getElementById(id);
 let token = null;
