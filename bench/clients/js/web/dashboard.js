@@ -102,6 +102,12 @@ function renderLine(rows) {
   });
 }
 
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c],
+  );
+}
+
 function fmtCell(col, v) {
   if (col === "ts") {
     // Arrow lanes yield epoch millis; the pg-json lane an ISO string.
@@ -113,11 +119,11 @@ function fmtCell(col, v) {
 }
 
 function renderTable(rows, cols) {
-  const head = cols.map((c) => `<th>${c}</th>`).join("");
+  const head = cols.map((c) => `<th>${esc(c)}</th>`).join("");
   const body = rows
     .map(
       (r) =>
-        `<tr>${cols.map((c) => `<td>${fmtCell(c, r[c])}</td>`).join("")}</tr>`,
+        `<tr>${cols.map((c) => `<td>${esc(fmtCell(c, r[c]))}</td>`).join("")}</tr>`,
     )
     .join("");
   $("tbl").innerHTML = `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
@@ -141,7 +147,7 @@ async function refresh() {
       performance.now() - t0,
     )} ms, ${fmt.format(bytes / 1024)} KiB over the wire`;
   } catch (e) {
-    $("status").innerHTML = `<span class="err">${String(e)}</span>`;
+    $("status").innerHTML = `<span class="err">${esc(e)}</span>`;
   }
 }
 
