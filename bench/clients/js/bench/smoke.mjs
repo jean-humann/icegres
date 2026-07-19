@@ -59,7 +59,11 @@ for (const c of CASES) {
     const r = rows.find((x) => x.path === path);
     if (!r) { fail(`${c.name}/${path}: no result`); continue; }
     if (r.error) {
-      if (path === "pg-json" && /ECONNREFUSED|5439/.test(r.error)) {
+      // Skip the optional pg-json lane ONLY on a genuine connection failure
+      // (no listener). A bare port match would swallow unrelated errors that
+      // merely echo the port; a real pg error (bad creds, missing db) should
+      // still fail the gate rather than be silently skipped.
+      if (path === "pg-json" && /ECONNREFUSED|ENOTFOUND|ETIMEDOUT/i.test(r.error)) {
         console.log(`skip ${c.name}/pg-json: no pgwire listener`);
         continue;
       }

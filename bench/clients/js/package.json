@@ -14,10 +14,13 @@
     "@grpc/grpc-js": "^1.12.5",
     "@grpc/proto-loader": "^0.7.13",
     "@icegres/flight-web": "file:../../../clients/flight-web",
-    "@lakehouse-rs/flight-sql-client": "^0.0.10",
     "apache-arrow": "^21.0.0",
     "fzstd": "^0.1.1",
     "pg": "^8.13.1"
+  },
+  "comment:optionalDependencies": "@lakehouse-rs/flight-sql-client is a native (napi) binary used only by node-bench.mjs's opt-in BENCH_NATIVE lane; kept optional so its platform-specific install cannot fail the whole install (and the browser gate) on an unsupported platform.",
+  "optionalDependencies": {
+    "@lakehouse-rs/flight-sql-client": "^0.0.10"
   },
   "devDependencies": {
     "esbuild": "^0.25.0",

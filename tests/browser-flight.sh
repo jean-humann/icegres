@@ -32,6 +32,9 @@ export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-rustfssecret}"
 export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
 
 skip() { echo "SKIP tests/browser-flight.sh: $1 (runs where node + Chromium + the stack are present)"; exit 0; }
+# A hard failure (exit 1), distinct from a SKIP: used once the prerequisites
+# are all present, so a real regression cannot masquerade as a loud SKIP.
+die()  { echo "FAIL tests/browser-flight.sh: $1"; exit 1; }
 
 command -v node >/dev/null 2>&1 || skip "node not on PATH"
 [ -x "$CHROMIUM" ] || skip "no Chromium at $CHROMIUM (set CHROMIUM_PATH)"
@@ -65,10 +68,13 @@ for _ in $(seq 1 50); do
 done
 
 echo "==> npm install (client package + bench harness)"
+# A hard FAIL, not a SKIP: node/Chromium/stack are all present by here, so an
+# install failure is a real regression (broken lockfile, a bad file: link, a
+# native-addon build breaking) — exactly what this gate must catch, not mask.
 (cd "$PKG_DIR" && npm install --no-audit --no-fund --ignore-scripts) >/dev/null 2>&1 \
-  || skip "npm install failed in $PKG_DIR"
+  || die "npm install failed in $PKG_DIR"
 (cd "$JS_DIR" && npm install --no-audit --no-fund --ignore-scripts) >/dev/null 2>&1 \
-  || skip "npm install failed in $JS_DIR"
+  || die "npm install failed in $JS_DIR"
 
 FAIL=0
 

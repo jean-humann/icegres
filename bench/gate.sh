@@ -20,6 +20,10 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
+# The e2e / browser-flight blocks below redirect their logs here; create it
+# up front so a standalone run on a fresh checkout does not misreport a
+# redirection failure as the gate itself failing.
+mkdir -p "$SCRIPT_DIR/.run"
 
 SKIP_E2E=0
 args=()
