@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "icegres-bi-extract"
+version = "0.1.0"
+description = "Columnar BI extracts from icegres over ADBC/Arrow Flight SQL: stream a query to a Tableau .hyper file or a Parquet file (Power BI), with optional Tableau Server publish."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.9"
+dependencies = [
+    "adbc-driver-flightsql>=1.0",
+    "adbc-driver-manager>=1.0",
+    "pyarrow>=14",
+]
+
+[project.optional-dependencies]
+# Tableau .hyper output (pantab bundles the Tableau Hyper engine).
+hyper = ["pantab>=4.0"]
+# Publish the produced .hyper to Tableau Server / Tableau Cloud.
+publish = ["tableauserverclient>=0.30"]
+
+[project.scripts]
+icegres-extract = "icegres_bi_extract.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["icegres_bi_extract*"]
