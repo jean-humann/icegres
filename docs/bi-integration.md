@@ -303,7 +303,9 @@ DataFrame/extract → ADBC Flight; embedded on the lake files → DuckDB.**
   dialect for Flight SQL, written to ease Superset connections, and its
   primary dialect targets **DataFusion** — which is exactly the engine
   icegres runs. The natural Superset fast lane; SQLAlchemy URI
-  `datafusion+flightsql://user:pass@host:50051`.
+  `datafusion+flightsql://user:pass@host:50051`. **Proven-live against
+  icegres** (probe A12: connect, reflection, SQL Lab-shaped queries, and
+  basic-auth against a secured listener).
 - **Grafana's FlightSQL datasource plugin exists but is archived**
   (InfluxData, v1.1.1, April 2024, "not under active development"). Still
   installable/signed; treat as best-effort and keep the Postgres
@@ -355,7 +357,15 @@ auth, per-RPC authz, timeouts, and result-size caps all exist on the
 Flight listener. No server work is on the critical path for BI; the work
 is packaging and validation.
 
-## 7. Validation & hardening plan (ranked)
+## 7. What ships in this repo, and the validation plan (ranked)
+
+Shipped connection kits live under [`clients/bi/`](../clients/bi/README.md):
+the ADBC→`.hyper`/Parquet extract tool (the §6 Hyper pattern, runnable),
+per-tool kits for Superset (`flightsql-dbapi` lane + probe A12,
+`bench/clients/a12_flightsql_dbapi_probe.py`), Grafana (provisioning for
+both lanes), Tableau (properties file + Flight JDBC bridge + extract
+lane), and DigDash (driver-registry recipes). Remaining validation,
+ranked:
 
 1. **Npgsql probe** (`bench/clients/`, .NET or a recorded-traffic replay):
    connect (type-loading query), reflection, binary-format extended-
@@ -364,19 +374,22 @@ is packaging and validation.
    architecture (rewrite-only-pg_catalog-statements) is built for it.
 2. **Live smoke: Superset + Metabase + Grafana + Redash** against the dev
    stack via docker-compose — cheapest conversion of by-construction to
-   proven-live, and the resulting recipes go straight into `clients.md`.
+   proven-live (the driver stack under Superset is now probe A12; the
+   products themselves remain unproven), and the resulting settings go
+   straight into the `clients/bi/` kits.
 3. **Tableau Desktop run** (Extract first, then Live): capture the actual
    query/settings traffic, pin down whether extract streaming trips the
-   in-txn `0A000`, and publish the known-good properties
-   (`preferQueryMode`, fetch settings) as a documented recipe. TDVT for
-   systematic Live-mode dialect coverage if Live matters.
+   in-txn `0A000`, and confirm the shipped
+   `clients/bi/tableau/postgresql.properties` recipe. TDVT for systematic
+   Live-mode dialect coverage if Live matters. Plus one refresh cycle of
+   the `clients/bi/extract` publish leg against a dev Tableau Server.
 4. **Power BI Desktop run** (Import, then DirectQuery, then via gateway),
    with the ODBC fallback documented alongside (`UseDeclareFetch=0`).
 5. **pgwire per-statement timeout** — the one server-side hardening item BI
    genuinely needs (Flight already has it); currently queued in
    `limitations.md` §Timeouts.
-6. **Docs**: fold the verified recipes and per-tool settings into
-   `clients.md` §BI as they are proven.
+6. **Wire probe A12 into the e2e client-probe sections** alongside
+   A8–A11 so the Superset stack stays continuously exercised.
 
 ## Bottom line
 
