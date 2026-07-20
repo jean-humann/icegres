@@ -2921,6 +2921,14 @@ mod tests {
         assert!(writes(
             "EXPLAIN ANALYZE INSERT INTO demo.trips (trip_id) VALUES (1)"
         ));
+        // A write wrapped in a top-level query (parses as Statement::Query with
+        // a write body) must NOT slip past the Query arm.
+        assert!(writes(
+            "WITH t AS (SELECT 1) INSERT INTO demo.trips SELECT * FROM t"
+        ));
+        // Benign metadata reads stay allowed (not denied by the tightening).
+        assert!(!writes("SHOW TABLES"));
+        assert!(!writes("DESCRIBE demo.trips"));
     }
 
     #[test]

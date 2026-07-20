@@ -444,10 +444,26 @@ pub fn required_checks(stmt: &Statement, default_ns: &str) -> Vec<(Action, Table
 /// comments or whitespace cannot disguise a write.
 pub fn is_read_only(stmt: &Statement) -> bool {
     match stmt {
-        // Pure reads plus read-only metadata/session forms.
-        Statement::Query(_)
-        | Statement::ShowVariable { .. }
+        // A top-level query is read-only only if its body and every CTE are
+        // reads: sqlparser wraps a data-modifying statement in `Statement::Query`
+        // when it is written as `WITH t AS (…) INSERT … SELECT …`, and a CTE can
+        // itself be a `DELETE … RETURNING`. Inspect the tree rather than trust
+        // the outer form, so the guard does not lean on the engine rejecting
+        // these at planning.
+        Statement::Query(q) => query_is_read_only(q),
+        // Read-only session and metadata forms.
+        Statement::ShowVariable { .. }
+        | Statement::ShowVariables { .. }
         | Statement::ShowStatus { .. }
+        | Statement::ShowTables { .. }
+        | Statement::ShowColumns { .. }
+        | Statement::ShowDatabases { .. }
+        | Statement::ShowSchemas { .. }
+        | Statement::ShowViews { .. }
+        | Statement::ShowFunctions { .. }
+        | Statement::ShowCreate { .. }
+        | Statement::ShowCollation { .. }
+        | Statement::ExplainTable { .. }
         | Statement::Set { .. }
         | Statement::StartTransaction { .. }
         | Statement::Commit { .. }
@@ -457,9 +473,37 @@ pub fn is_read_only(stmt: &Statement) -> bool {
         Statement::Explain {
             analyze, statement, ..
         } => !*analyze || is_read_only(statement),
-        // COPY … TO is a read; COPY … FROM writes.
-        Statement::Copy { to, .. } => *to,
-        // DML, DDL, and any unrecognized form: refuse.
+        // DML, DDL, COPY, and any unrecognized form: refuse.
+        _ => false,
+    }
+}
+
+/// Whether a (possibly CTE-bearing) query only reads — no data-modifying CTE
+/// and no write in the body's set-expression tree.
+fn query_is_read_only(query: &sqlparser::ast::Query) -> bool {
+    if let Some(with) = &query.with {
+        if with
+            .cte_tables
+            .iter()
+            .any(|cte| !query_is_read_only(&cte.query))
+        {
+            return false;
+        }
+    }
+    set_expr_is_read_only(&query.body)
+}
+
+/// Whether a query body's set-expression is a pure read. `Insert`/`Update`/
+/// `Delete`/`Merge` embedded in a query body are writes; fail closed on any
+/// unrecognized future variant.
+fn set_expr_is_read_only(body: &sqlparser::ast::SetExpr) -> bool {
+    use sqlparser::ast::SetExpr;
+    match body {
+        SetExpr::Select(_) | SetExpr::Values(_) | SetExpr::Table(_) => true,
+        SetExpr::Query(q) => query_is_read_only(q),
+        SetExpr::SetOperation { left, right, .. } => {
+            set_expr_is_read_only(left) && set_expr_is_read_only(right)
+        }
         _ => false,
     }
 }
