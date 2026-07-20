@@ -149,6 +149,9 @@ backends can use the same package (`@icegres/flight-web/zstd-node`), plain
 Anything that speaks the Postgres wire protocol connects like a stock
 Postgres 16: host, port `5439`, database `icegres`. The `pg_catalog` /
 `information_schema` shims answer the introspection queries ORMs and BI tools
-issue (`icegres/src/compat.rs`). Time travel is plain SQL:
+issue (`icegres/src/compat.rs`). The tool-by-tool assessment (Tableau,
+Power BI, Superset, Metabase, …), the per-driver caveats that matter to BI,
+and the ranked validation plan are in
+[`bi-integration.md`](bi-integration.md). Time travel is plain SQL:
 `SELECT … FROM "demo"."trips@1234567890" ` or
 `SELECT … FROM demo.trips AS OF TIMESTAMP '2026-07-01 00:00:00'`.
