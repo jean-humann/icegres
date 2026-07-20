@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A12 — flightsql-dbapi probe (the Superset stack) against live flight-serve.
+"""A13 — flightsql-dbapi probe (the Superset stack) against live flight-serve.
 
 Exercises InfluxData's `flightsql-dbapi` (DB-API 2 + SQLAlchemy dialect for
 Flight SQL — the library Superset connects through, and whose primary
@@ -32,7 +32,7 @@ Exit: 0 = all non-XFAIL/SKIP steps passed, 2 = failures,
 flightsql-dbapi's cursor materializes results through pandas without
 declaring it as a dependency; Superset ships pandas, so requiring it here
 matches the stack under test).
-Prints one line per step and a final "A12 RESULT: pass=N fail=N xfail=N skip=N".
+Prints one line per step and a final "A13 RESULT: pass=N fail=N xfail=N skip=N".
 """
 
 import os
@@ -68,9 +68,9 @@ try:
     import flightsql.sqlalchemy  # noqa: F401  (registers datafusion+flightsql)
     import pandas  # noqa: F401  (undeclared runtime dep of flightsql's cursor)
 except ModuleNotFoundError as exc:
-    print(f"A12 SKIP: flightsql-dbapi stack not available ({exc}) "
+    print(f"A13 SKIP: flightsql-dbapi stack not available ({exc}) "
           "(pip install flightsql-dbapi sqlalchemy pandas)", file=sys.stderr)
-    print("A12 RESULT: pass=0 fail=0 xfail=0 skip=1")
+    print("A13 RESULT: pass=0 fail=0 xfail=0 skip=1")
     sys.exit(3)
 
 
@@ -193,6 +193,6 @@ if conn is not None:
     except Exception:
         pass
 
-print(f"A12 RESULT: pass={len(passes)} fail={len(fails)} "
+print(f"A13 RESULT: pass={len(passes)} fail={len(fails)} "
       f"xfail={len(xfails)} skip={len(skips)}")
 sys.exit(0 if not fails else 2)
