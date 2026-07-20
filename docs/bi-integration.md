@@ -4,24 +4,29 @@
 Tableau, Power BI, Superset, Metabase, Grafana, Excel — and what stands
 between "speaks the Postgres wire protocol" and "works in anger"?
 
-**Answer.** Yes, by design: every mainstream BI tool ships a PostgreSQL
-connector, and icegres presents itself as a stock Postgres 16 (`version()`
-reports `PostgreSQL 16.6`, `pg_catalog`/`information_schema` shims answer
-driver introspection — `icegres/src/compat.rs`). The **driver stacks** those
-tools are built on are largely probe-verified today (pgjdbc, psqlODBC,
-SQLAlchemy/psycopg2 — `bench/clients/`), so SQLAlchemy-based and JDBC-based
-tools are the low-risk path. The two honest gaps are: **no end-to-end run of
-any actual BI product has been performed**, and **Npgsql — the driver inside
-Power BI's native connector — is the one major Postgres driver with no probe
-at all**. This document maps each tool to its driver stack, calls out the
-icegres limitations that specifically bite BI workloads (with workarounds),
-and ranks the validation work that would turn "by-construction" into
-"proven-live".
+**Answer.** Yes, by design and now by evidence: every mainstream BI tool
+ships a PostgreSQL connector, and icegres presents itself as a stock
+Postgres 16 (`version()` reports `PostgreSQL 16.6`,
+`pg_catalog`/`information_schema` shims answer driver introspection —
+`icegres/src/compat.rs`). **Every major Postgres driver family a BI tool
+rides is probe-verified** (pgjdbc, psqlODBC, SQLAlchemy/psycopg2, ADBC,
+flightsql-dbapi, and — via probe A14 — Npgsql, the driver inside Power
+BI's native connector), and **two products have been run end to end
+against live icegres** (Superset over Flight SQL; Grafana over both
+lanes — §7). The honest remaining gaps are the desktop products no Linux
+CI can run (Tableau Desktop, Power BI Desktop — their driver stacks are
+proven; the product runs are not) and one narrow introspection gap
+(`information_schema.columns.udt_schema`, §7). This document maps each
+tool to its driver stack, calls out the icegres limitations that
+specifically bite BI workloads (with workarounds), and ranks what
+remains.
 
 Every claim below is labeled like `docs/catalog-support.md`:
-**proven-live** (a committed probe exercises it), **by-construction** (the
-tool rides a driver stack a probe verifies, but the tool itself was not
-run), or **unverified** (no probe covers the stack).
+**proven-live** (a committed probe exercises it), **product-smoked** (the
+packaged product itself was run against live icegres),
+**by-construction** (the tool rides a driver stack a probe verifies, but
+the tool itself was not run), or **unverified** (no probe covers the
+stack).
 
 Companion docs: [`clients.md`](clients.md) (connection recipes),
 [`limitations.md`](limitations.md) (the caveats referenced throughout),
@@ -76,12 +81,12 @@ result cache / read replicas exist precisely for dashboard-shaped fleets
 | Tableau (Desktop/Server/Cloud) | built-in PostgreSQL | pgjdbc (JDBC since ~2020.4) | A9 JDBC | **by-construction** |
 | Metabase | built-in PostgreSQL | pgjdbc | A9 JDBC | **by-construction** |
 | DBeaver / DataGrip | PostgreSQL | pgjdbc | A9 JDBC | **by-construction** |
-| Apache Superset | PostgreSQL | SQLAlchemy + psycopg2 | A8 ORM | **by-construction** (closest to proven) |
+| Apache Superset | PostgreSQL or Flight SQL (`datafusion://`) | SQLAlchemy + psycopg2 / flightsql-dbapi | A8 ORM / A13 | **product-smoked** (Flight lane, §7) |
 | Redash | PostgreSQL | psycopg2 | A8 ORM | **by-construction** |
-| Power BI (Import + DirectQuery) | built-in PostgreSQL | **Npgsql** (.NET) | — | **unverified** |
+| Power BI (Import + DirectQuery) | built-in PostgreSQL | **Npgsql** (.NET) | A14 Npgsql | **by-construction** (driver proven; Windows-only product) |
 | Power BI / Excel via ODBC | generic ODBC | psqlODBC | A10 ODBC | **by-construction** |
-| Excel Get Data → PostgreSQL | Power Query | Npgsql | — | **unverified** |
-| Grafana | built-in PostgreSQL | Go pgx | — | **unverified** (low risk: simple-protocol-ish, plain SELECTs) |
+| Excel Get Data → PostgreSQL | Power Query | Npgsql | A14 Npgsql | **by-construction** (driver proven) |
+| Grafana | built-in PostgreSQL + FlightSQL plugin | Go pgx / plugin's Go Flight SQL | — | **product-smoked** (both lanes, §7) |
 | Looker | PostgreSQL dialect | pgjdbc | A9 JDBC | **by-construction** |
 | DigDash Enterprise | registered JDBC driver | pgjdbc or Flight SQL JDBC | A9 / A9F | **by-construction** |
 
@@ -196,7 +201,7 @@ The full catalog is `limitations.md`; this is the BI-shaped cut.
 | No server-side (named) cursors | psqlODBC declare/fetch mode; anything issuing `DECLARE CURSOR` | High if enabled, zero if not | `UseDeclareFetch=0` (ODBC); default client-side fetch elsewhere |
 | Extended-protocol `SELECT` in explicit txn → `0A000` | pgjdbc streaming fetch (Tableau extracts?), any tool wrapping reads in `BEGIN` | The top compatibility risk for JDBC tools | autocommit reads; `preferQueryMode=simple`; document per-tool settings |
 | No per-statement timeout on pgwire | Runaway DirectQuery/Live viz queries | Medium — BI is *the* workload that needs it | Memory pool spills-then-errors bounds RAM, not wall-clock; front with Flight (`--flight-statement-timeout-ms`) or add pgwire timeout (§7) |
-| pg_catalog emulation breadth | Npgsql type loading; exotic tool introspection | Unknown until probed | Extend `compat.rs` on evidence — the shim architecture is built for exactly this |
+| pg_catalog emulation breadth | Npgsql type loading (probed, fixed — §2); remaining known gap: `information_schema.columns.udt_schema`/`udt_name` (§7) | Was the top unknown; now one narrow gap | Extend `compat.rs` on evidence — the coherent `pg_type` patch is the template |
 | Single database, namespaces-as-schemas | Multi-database pickers | Cosmetic | none needed |
 | `$snapshots`/`$manifests` projection quirk | Only dashboards querying Iceberg metadata tables | Low | add `ORDER BY` (`limitations.md`) |
 | `AS OF` sugar absent on Flight SQL | Only the Flight JDBC path | Low | use `"t@<snapshot_id>"` |
@@ -283,7 +288,8 @@ From the recorded driver benchmark
 | psycopg2 (pgwire rows) | 11,519 ms | 26,222 ms |
 | ODBC (psqlODBC) | 19,042 ms | 38,769 ms |
 
-That is **10–16× on full extracts** — the row drivers spend the time
+That is **10–16× on full extracts** (recorded per-pair range: 11.1× to
+19.9×) — the row drivers spend the time
 materializing one Python object per cell; ADBC never leaves Arrow. Two
 qualifiers that matter for BI routing: below ~50k rows the advantage
 *inverts* (Flight's ~3-round-trip gRPC floor loses to the row drivers'
@@ -326,7 +332,9 @@ DataFrame/extract → ADBC Flight; embedded on the lake files → DuckDB.**
   dialect for Flight SQL, written to ease Superset connections, and its
   primary dialect targets **DataFusion** — which is exactly the engine
   icegres runs. The natural Superset fast lane; SQLAlchemy URI
-  `datafusion+flightsql://user:pass@host:50051`. **Proven-live against
+  `datafusion://user:pass@host:50051` (the package entry point registers
+  the dialect as `datafusion`; the `+flightsql` spelling needs a manual
+  import Superset never performs). **Proven-live against
   icegres** (probe A13: connect, reflection, SQL Lab-shaped queries, and
   basic-auth against a secured listener).
 - **Grafana's FlightSQL datasource plugin exists but is archived**
@@ -390,7 +398,7 @@ Superset, Grafana, Tableau, and DigDash. Verification landed so far:
 - **Probe A13** (`a13_flightsql_dbapi_probe.py`, the Superset stack) and
   **probe A14** (`a14-npgsql-probe/`, the Power BI driver) — both green
   against live servers and wired into the e2e client-probe sections
-  (`tests/e2e.sh` §p2b/§r2) alongside A8–A11.
+  (`icegres/tests/e2e.sh` §p2b/§r2) alongside A8–A11.
 - **The A14-found `pg_type` oid-drift bug is fixed** (`compat.rs`
   coherent snapshot now covers `pg_type.typnamespace` — §2 Power BI).
 - **Product smokes recorded**: Superset over the Flight lane (Test
