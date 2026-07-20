@@ -298,10 +298,23 @@ DataFrame/extract → ADBC Flight; embedded on the lake files → DuckDB.**
 
 - **No packaged BI tool ships a generic ADBC/Flight SQL connector yet.**
   Everything below is a bridge or a platform signal.
-- **Power BI is adopting ADBC as driver technology**: Microsoft's
-  Databricks connector switches to ADBC in **August 2026** (Desktop ≥
-  2.145.1105.0). Connector-specific, not a generic Flight SQL target — but
-  it makes a future first-party ADBC path plausible and is worth tracking.
+- **Power BI is migrating its embedded connectors to ADBC wholesale.**
+  The Power Query transition plan replaces the embedded Simba ODBC
+  drivers with ADBC drivers per connector (Databricks→Databricks ADBC,
+  Snowflake→Snowflake ADBC, BigQuery→BigQuery ADBC, Spark/Impala→
+  HiveServer2 ADBC, **Dremio→FlightSQL ADBC**), opt-in today via
+  `Implementation="2.0"`, tenant default planned August 2026, embedded
+  ODBC removed from the service late 2026 and from Desktop/gateway spring
+  2027. Still no generic "bring your own ADBC driver" data source — but
+  the **Dremio Software connector's Flight SQL ADBC lane is
+  protocol-generic** (an `adbc://host:port` server field driving the
+  arrow-adbc C# FlightSql driver over standard Flight SQL RPCs), which
+  makes it the Power BI analogue of the Tableau Flight-JDBC bridge for
+  icegres — recipe and honest caveats in
+  [`clients/bi/powerbi/`](../clients/bi/powerbi/README.md), unverified
+  until a Windows-side run. Separately-installed ODBC drivers through the
+  generic ODBC connector are explicitly outside the retirement scope, so
+  the psqlODBC fallback lane survives the transition.
 - **Flight SQL JDBC driver** — **proven against icegres**
   (`bench/clients/A9FlightJdbcProbe.java`). The bridge for every tool with
   a generic/custom JDBC slot: Tableau "Other Databases (JDBC)", DBeaver,
