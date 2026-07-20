@@ -153,8 +153,8 @@ issue (`icegres/src/compat.rs`). The tool-by-tool assessment (Tableau,
 Power BI, Superset, Metabase, …), the per-driver caveats that matter to BI,
 and the ranked validation plan are in
 [`bi-integration.md`](bi-integration.md); ready-made per-tool connection
-kits (Superset, Grafana, Tableau, DigDash, and the ADBC→`.hyper`/Parquet
-extract tool) live in [`clients/bi/`](../clients/bi/README.md). Time
-travel is plain SQL:
+kits (Superset, Grafana, Tableau, Power BI, DigDash, and the
+ADBC→`.hyper`/Parquet extract tool) live in
+[`clients/bi/`](../clients/bi/README.md). Time travel is plain SQL:
 `SELECT … FROM "demo"."trips@1234567890" ` or
 `SELECT … FROM demo.trips AS OF TIMESTAMP '2026-07-01 00:00:00'`.

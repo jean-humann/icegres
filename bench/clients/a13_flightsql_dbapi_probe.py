@@ -102,6 +102,10 @@ except Exception as e:
 # -- 3..8 SQLAlchemy: exactly what Superset does -----------------------------
 engine = None
 try:
+    # The datafusion+flightsql:// form resolves here ONLY because this probe
+    # imports flightsql.sqlalchemy above (which registers that name). The
+    # package's entry point registers plain `datafusion` — Superset performs
+    # no such import, so its URI must be datafusion:// (clients/bi/superset).
     engine = sa.create_engine(
         f"datafusion+flightsql://{HOST}:{PORT}?insecure=True")
     with engine.connect() as c:
