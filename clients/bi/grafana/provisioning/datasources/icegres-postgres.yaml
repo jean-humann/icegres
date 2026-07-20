@@ -1,0 +1,19 @@
+# Grafana datasource provisioning — icegres over the Postgres wire (the
+# supported fallback lane; Grafana's built-in postgres datasource).
+apiVersion: 1
+
+datasources:
+  - name: icegres (Postgres wire)
+    type: postgres
+    access: proxy
+    url: icegres.example.internal:5439
+    user: bi
+    jsonData:
+      database: icegres
+      # require/verify-full when serve runs --tls-cert/--tls-key.
+      sslmode: require
+      # icegres reports server_version 16.x (compat.rs).
+      postgresVersion: 1600
+      timescaledb: false
+    secureJsonData:
+      password: $ICEGRES_BI_PASSWORD

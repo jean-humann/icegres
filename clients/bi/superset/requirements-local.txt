@@ -1,0 +1,3 @@
+# Superset extra requirements for the icegres Flight SQL lane.
+# Copy to <superset-repo>/docker/requirements-local.txt and rebuild the image.
+flightsql-dbapi
