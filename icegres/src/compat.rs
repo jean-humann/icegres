@@ -25,6 +25,12 @@
 //!    already NULLed upstream by `RemoveSubqueryFromProjection`.
 //! 5. `pg_class.reloptions` is missing from the static table; projection
 //!    references are replaced with `CAST(NULL AS TEXT) AS reloptions`.
+//! 6. The static `pg_type.typnamespace` carries stock Postgres namespace
+//!    oids that never match the dynamic `pg_namespace`'s minted oids, so
+//!    `JOIN pg_namespace` over types returns zero rows — which is Npgsql's
+//!    connect-time type-loading query (Power BI / Excel). The coherent
+//!    snapshot re-materializes `pg_type` with `typnamespace` rewritten to
+//!    the snapshot's real `pg_catalog` namespace oid.
 //!
 //! The hook intercepts ONLY plain `SELECT` statements whose table references
 //! all live in `pg_catalog` AND that one of the rewrites actually changed —
@@ -40,7 +46,8 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
+use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::catalog::{CatalogProviderList, SchemaProvider, Session, TableProvider};
 use datafusion::common::{ParamValues, ScalarValue};
@@ -161,6 +168,22 @@ impl datafusion::logical_expr::ScalarUDFImpl for ConstStub {
 /// join every ORM's reflection queries perform.
 const COHERENT_TABLES: [&str; 3] = ["pg_attribute", "pg_class", "pg_namespace"];
 
+/// Static-table oid patch riding the same snapshot: upstream's `pg_type` is a
+/// static table whose `typnamespace` column carries STOCK Postgres namespace
+/// oids (11, 13283, …), while the dynamic `pg_namespace` mints its own oids —
+/// so `pg_type JOIN pg_namespace ON ns.oid = typnamespace` silently returns
+/// zero rows. That join is exactly Npgsql's connect-time type-loading query
+/// (the driver under Power BI / Excel): with zero types loaded, every typed
+/// read and every parameter bind fails. Each generation therefore also
+/// re-materializes `pg_type` with `typnamespace` rewritten to the snapshot's
+/// actual `pg_catalog` namespace oid (every emulated type row is a catalog
+/// type, so one oid is correct for all rows).
+const PATCHED_PG_TYPE: &str = "pg_type";
+
+/// All tables served from the coherent snapshot: the trio plus the patched
+/// static `pg_type`.
+const SERVED_TABLES: [&str; 4] = ["pg_attribute", "pg_class", "pg_namespace", "pg_type"];
+
 #[derive(Debug)]
 struct Generation {
     fingerprint: String,
@@ -215,6 +238,18 @@ impl TrioCache {
                     datafusion::physical_plan::collect(plan, session.task_ctx()).await?;
                 batches.insert(t, collected);
             }
+            let ns_oid = pg_catalog_namespace_oid(
+                batches
+                    .get("pg_namespace")
+                    .expect("pg_namespace just built"),
+            )?;
+            let provider = self
+                .upstream
+                .get(PATCHED_PG_TYPE)
+                .expect("pg_type provider present");
+            let plan = provider.scan(session, None, &[], None).await?;
+            let collected = datafusion::physical_plan::collect(plan, session.task_ctx()).await?;
+            batches.insert(PATCHED_PG_TYPE, patch_typnamespace(collected, ns_oid)?);
             *guard = Some(Generation {
                 fingerprint: fp,
                 batches,
@@ -228,6 +263,60 @@ impl TrioCache {
             .expect("trio table present")
             .clone())
     }
+}
+
+/// Find the `pg_catalog` namespace oid inside the freshly built
+/// `pg_namespace` batches (oid column read via cast so the emulation's
+/// concrete integer type never matters).
+fn pg_catalog_namespace_oid(batches: &[RecordBatch]) -> Result<i64, DataFusionError> {
+    for batch in batches {
+        let (Ok(name_idx), Ok(oid_idx)) = (
+            batch.schema().index_of("nspname"),
+            batch.schema().index_of("oid"),
+        ) else {
+            continue;
+        };
+        let names = cast(batch.column(name_idx), &DataType::Utf8)?;
+        let names = names
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("just cast to Utf8");
+        let oids = cast(batch.column(oid_idx), &DataType::Int64)?;
+        let oids = oids
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("just cast to Int64");
+        for i in 0..batch.num_rows() {
+            if !names.is_null(i) && names.value(i) == "pg_catalog" && !oids.is_null(i) {
+                return Ok(oids.value(i));
+            }
+        }
+    }
+    Err(DataFusionError::Internal(
+        "pg_namespace has no pg_catalog row to anchor pg_type.typnamespace".into(),
+    ))
+}
+
+/// Rewrite every `typnamespace` value in the pg_type batches to `ns_oid`,
+/// preserving the column's original arrow type.
+fn patch_typnamespace(
+    batches: Vec<RecordBatch>,
+    ns_oid: i64,
+) -> Result<Vec<RecordBatch>, DataFusionError> {
+    batches
+        .into_iter()
+        .map(|batch| {
+            let Ok(idx) = batch.schema().index_of("typnamespace") else {
+                return Ok(batch);
+            };
+            let original_type = batch.column(idx).data_type().clone();
+            let filled = Int64Array::from(vec![ns_oid; batch.num_rows()]);
+            let column = cast(&(Arc::new(filled) as Arc<dyn Array>), &original_type)?;
+            let mut columns = batch.columns().to_vec();
+            columns[idx] = column;
+            RecordBatch::try_new(batch.schema(), columns).map_err(DataFusionError::from)
+        })
+        .collect()
 }
 
 /// One of the trio tables, served from the coherent snapshot.
@@ -264,7 +353,8 @@ impl TableProvider for CoherentPgTable {
 }
 
 /// `pg_catalog` schema wrapper: delegates everything to the upstream
-/// emulation except the trio, which serve the coherent snapshot.
+/// emulation except the trio and the patched `pg_type`, which serve the
+/// coherent snapshot.
 #[derive(Debug)]
 struct CoherentPgCatalog {
     upstream: Arc<dyn SchemaProvider>,
@@ -303,7 +393,7 @@ pub async fn install_coherent_pg_catalog(
         .schema("pg_catalog")
         .ok_or_else(|| anyhow::anyhow!("pg_catalog schema not registered"))?;
     let mut upstream_trio: HashMap<&'static str, Arc<dyn TableProvider>> = HashMap::new();
-    for name in COHERENT_TABLES {
+    for name in SERVED_TABLES {
         let provider = upstream
             .table(name)
             .await
@@ -316,7 +406,7 @@ pub async fn install_coherent_pg_catalog(
         upstream: upstream_trio.clone(),
         generation: tokio::sync::Mutex::new(None),
     });
-    let trio = COHERENT_TABLES
+    let trio = SERVED_TABLES
         .into_iter()
         .map(|name| {
             (
