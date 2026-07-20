@@ -405,7 +405,8 @@ Superset, Grafana, Tableau, and DigDash. Verification landed so far:
   Connection, SQL Lab, schema browser — via Superset's REST API) and
   Grafana over both lanes (`/api/ds/query` aggregates), with the two
   operational findings folded into the kits: Superset's working URI
-  scheme is `datafusion://` + `cachetools` must be added to the image,
+  scheme is `datafusion://` + a bare pip-installed Superset also needed
+  `cachetools` (imported by Superset's own engine-spec machinery),
   and the archived Grafana FlightSQL plugin requires a
   `--result-compression none` listener (silent empty panels otherwise).
 

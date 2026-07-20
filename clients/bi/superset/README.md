@@ -22,10 +22,14 @@ Two stack notes found during that run:
   package's SQLAlchemy entry point registers the dialect under the name
   `datafusion`; the `+flightsql` form resolves only after a manual
   `import flightsql.sqlalchemy`, which Superset never performs.
-- `flightsql-dbapi` has two **undeclared runtime dependencies**:
-  `pandas` (its cursor materializes through it — Superset ships pandas)
-  and `cachetools` (imported by its client; NOT in a default Superset
-  image). Both are in [`requirements-local.txt`](requirements-local.txt).
+- `flightsql-dbapi` has one **undeclared runtime dependency**: `pandas`
+  (its cursor materializes through it — every Superset image ships
+  pandas). The recorded smoke also had to add `cachetools` — imported by
+  **Superset's own** engine-spec machinery during Test Connection and
+  missing from that bare pip install — so
+  [`requirements-local.txt`](requirements-local.txt) carries it too.
+  (`flightsql-dbapi` also pins `sqlalchemy<2.0`, matching Superset's own
+  pin.)
 
 1. Add the driver to your Superset image — with the standard
    docker-compose setup, copy [`requirements-local.txt`](requirements-local.txt)

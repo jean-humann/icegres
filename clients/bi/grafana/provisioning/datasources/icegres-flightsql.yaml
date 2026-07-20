@@ -18,6 +18,9 @@ datasources:
     isDefault: false
     jsonData:
       host: icegres.example.internal:50051
+      # UI hint only (the backend keys off username/password presence);
+      # without it the config page can render the wrong auth dropdown.
+      selectedAuthType: username/password
       # true when flight-serve runs --tls-cert/--tls-key (recommended).
       secure: true
       # Basic auth against the server's --auth-file principals; use a
