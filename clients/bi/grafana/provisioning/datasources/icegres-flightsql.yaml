@@ -1,0 +1,26 @@
+# Grafana datasource provisioning — icegres over Flight SQL.
+# Plugin: influxdata-flightsql-datasource (community, signed; upstream
+# archived at v1.1.1 — see ../../README.md for the honest status).
+# Install first:  grafana-cli plugins install influxdata-flightsql-datasource
+#
+# Field names match the plugin's config struct (jsonData: host, secure,
+# username, metadata; secureJsonData: password | token).
+apiVersion: 1
+
+datasources:
+  - name: icegres (Flight SQL)
+    type: influxdata-flightsql-datasource
+    access: proxy
+    isDefault: false
+    jsonData:
+      host: icegres.example.internal:50051
+      # true when flight-serve runs --tls-cert/--tls-key (recommended).
+      secure: true
+      # Basic auth against the server's --auth-file principals; use a
+      # read-only principal (CanReadData). For token auth instead, drop
+      # username here and set secureJsonData.token.
+      username: bi
+      # Optional extra gRPC metadata pairs sent with every request.
+      metadata: []
+    secureJsonData:
+      password: $ICEGRES_BI_PASSWORD
