@@ -122,6 +122,7 @@ class PublishHyperMockTest(unittest.TestCase):
         finally:
             server.shutdown()
             thread.join(timeout=5)
+            server.server_close()
             if path is not None:
                 os.unlink(path)
 

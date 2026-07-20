@@ -84,6 +84,7 @@ def main(argv=None) -> int:
         print("warning: --tls-skip-verify disables server certificate "
               "verification; dev only", file=sys.stderr)
     password = args.password or os.environ.get("ICEGRES_PASSWORD")
+    token = args.token or os.environ.get("TABLEAU_TOKEN")
     if args.publish:
         missing = [
             flag
@@ -99,6 +100,11 @@ def main(argv=None) -> int:
             return 2
         if not args.out.endswith(".hyper"):
             print("--publish applies to .hyper outputs only", file=sys.stderr)
+            return 2
+        # Preflight the token too — a cron job missing TABLEAU_TOKEN must
+        # fail here, not after running the whole (possibly long) extract.
+        if not token:
+            print("no token: set TABLEAU_TOKEN or pass --token", file=sys.stderr)
             return 2
 
     try:
@@ -120,10 +126,6 @@ def main(argv=None) -> int:
     print(report.line())
 
     if args.publish:
-        token = args.token or os.environ.get("TABLEAU_TOKEN")
-        if not token:
-            print("no token: set TABLEAU_TOKEN or pass --token", file=sys.stderr)
-            return 2
         try:
             ds_id = publish_hyper(
                 hyper_path=args.out,

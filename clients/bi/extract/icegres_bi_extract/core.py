@@ -91,15 +91,10 @@ def _counting_reader(reader: pa.RecordBatchReader, counter: dict) -> pa.RecordBa
     return pa.RecordBatchReader.from_batches(reader.schema, gen())
 
 
-def _write_parquet(reader: pa.RecordBatchReader, out_path: str, compression: str) -> None:
-    import pyarrow.parquet as pq
-
-    with pq.ParquetWriter(out_path, reader.schema, compression=compression) as writer:
-        for batch in reader:
-            writer.write_batch(batch)
-
-
-def _write_hyper(reader: pa.RecordBatchReader, out_path: str, table_name: str) -> None:
+def _require_pantab():
+    """Import pantab, with the install hint. Called BEFORE connecting so a
+    minimal install pointed at .hyper fails fast, not after the server has
+    already executed the query."""
     try:
         import pantab
     except ImportError as exc:  # pragma: no cover - environment-dependent
@@ -107,8 +102,34 @@ def _write_hyper(reader: pa.RecordBatchReader, out_path: str, table_name: str) -
             ".hyper output needs pantab (Tableau Hyper engine): "
             "pip install 'icegres-bi-extract[hyper]'"
         ) from exc
+    return pantab
+
+
+def _write_parquet(reader: pa.RecordBatchReader, out_path: str, compression: str) -> None:
+    import pyarrow.parquet as pq
+
+    # Atomic like the Hyper lane (pantab defaults to temp+rename): a
+    # mid-stream failure must neither destroy last night's extract nor
+    # leave a truncated file behind for the BI tool to trip on.
+    tmp_path = out_path + ".tmp"
+    try:
+        with pq.ParquetWriter(tmp_path, reader.schema, compression=compression) as writer:
+            for batch in reader:
+                writer.write_batch(batch)
+        os.replace(tmp_path, out_path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _write_hyper(reader: pa.RecordBatchReader, out_path: str, table_name: str) -> None:
+    pantab = _require_pantab()
     # pantab >= 4 accepts any Arrow C-stream capsule producer, a
-    # RecordBatchReader included, and writes through the Hyper API.
+    # RecordBatchReader included, and writes through the Hyper API
+    # (atomically: temp file + rename by default).
     pantab.frame_to_hyper(reader, out_path, table=table_name)
 
 
@@ -134,6 +155,8 @@ def run_extract(
         fmt = "hyper"
     else:
         raise ValueError(f"unsupported output suffix (want .parquet or .hyper): {out_path}")
+    if fmt == "hyper":
+        _require_pantab()  # fail fast, before the server runs the query
 
     sql = build_query(table=table, query=query, snapshot=snapshot)
     started = time.monotonic()
