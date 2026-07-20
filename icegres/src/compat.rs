@@ -1293,6 +1293,26 @@ mod tests {
     }
 
     #[test]
+    fn namespace_oid_reads_large_utf8_names() {
+        // The helper's cast-based reads must absorb alternate string/int
+        // widths, not just the Int32/Utf8 the pinned emulation uses today.
+        use datafusion::arrow::array::LargeStringArray;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("oid", DataType::Int64, false),
+            Field::new("nspname", DataType::LargeUtf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![7, 42])),
+                Arc::new(LargeStringArray::from(vec!["demo", "pg_catalog"])),
+            ],
+        )
+        .unwrap();
+        assert_eq!(pg_catalog_namespace_oid(&[batch]).unwrap(), 42);
+    }
+
+    #[test]
     fn patch_rewrites_typnamespace_and_preserves_type() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("typname", DataType::Utf8, false),
