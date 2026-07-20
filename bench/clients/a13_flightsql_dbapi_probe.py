@@ -171,16 +171,28 @@ if SEC_PORT and SEC_USER and SEC_PASS:
         finally:
             c.close()
 
+    def _auth_shaped(e):
+        # A rejection must look like an auth rejection — a dead port or a
+        # network error also raises, and must not pass a negative step.
+        text = str(e).lower()
+        return any(w in text for w in ("unauthenticated", "credential", "auth", "denied"))
+
     try:
         _sec_query()
         bad("secured: no credentials rejected", "query unexpectedly succeeded")
-    except Exception:
-        ok("secured: no credentials rejected")
+    except Exception as e:
+        if _auth_shaped(e):
+            ok("secured: no credentials rejected")
+        else:
+            bad("secured: no credentials rejected (non-auth error)", e)
     try:
         _sec_query(user=SEC_USER, password="definitely-wrong")
         bad("secured: wrong password rejected", "query unexpectedly succeeded")
-    except Exception:
-        ok("secured: wrong password rejected")
+    except Exception as e:
+        if _auth_shaped(e):
+            ok("secured: wrong password rejected")
+        else:
+            bad("secured: wrong password rejected (non-auth error)", e)
     try:
         rows = _sec_query(user=SEC_USER, password=SEC_PASS)
         assert int(rows[0][0]) == 1
