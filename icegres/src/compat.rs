@@ -176,8 +176,12 @@ const COHERENT_TABLES: [&str; 3] = ["pg_attribute", "pg_class", "pg_namespace"];
 /// (the driver under Power BI / Excel): with zero types loaded, every typed
 /// read and every parameter bind fails. Each generation therefore also
 /// re-materializes `pg_type` with `typnamespace` rewritten to the snapshot's
-/// actual `pg_catalog` namespace oid (every emulated type row is a catalog
-/// type, so one oid is correct for all rows).
+/// actual `pg_catalog` namespace oid. Honest scope: the static export also
+/// carries information_schema helper types (typnamespace 13283), which this
+/// collapses into `pg_catalog` alongside the real catalog types — correct
+/// for oid-keyed type loaders (Npgsql's is) and for the oid-equality joins
+/// reflection performs; a name+namespace-keyed lookup would now see those
+/// helper types under `pg_catalog` too, which no probed client does.
 const PATCHED_PG_TYPE: &str = "pg_type";
 
 /// All tables served from the coherent snapshot: the trio plus the patched
@@ -240,17 +244,31 @@ impl TrioCache {
             }
             // pg_type is optional in the snapshot: when the upstream
             // emulation lacks it (a future matrix bump), the wrapper never
-            // serves it and the WARN at install time already fired.
+            // serves it and the WARN at install time already fired. A patch
+            // FAILURE must not poison the generation either — the trio is
+            // load-bearing for every ORM's reflection, and a shim for one
+            // driver family degrading it to a total pg_catalog outage would
+            // invert the priority. Serve pg_type unpatched instead, loudly.
             if let Some(provider) = self.upstream.get(PATCHED_PG_TYPE) {
-                let ns_oid = pg_catalog_namespace_oid(
-                    batches
-                        .get("pg_namespace")
-                        .expect("pg_namespace just built"),
-                )?;
                 let plan = provider.scan(session, None, &[], None).await?;
                 let collected =
                     datafusion::physical_plan::collect(plan, session.task_ctx()).await?;
-                batches.insert(PATCHED_PG_TYPE, patch_typnamespace(collected, ns_oid)?);
+                let ns_batches = batches
+                    .get("pg_namespace")
+                    .expect("pg_namespace just built");
+                let patched = match pg_catalog_namespace_oid(ns_batches)
+                    .and_then(|ns_oid| patch_typnamespace(collected.clone(), ns_oid))
+                {
+                    Ok(patched) => patched,
+                    Err(e) => {
+                        tracing::warn!(
+                            "pg_type namespace-oid patch failed ({e}); serving pg_type \
+                             unpatched — Npgsql-family type loading will see stock oids"
+                        );
+                        collected
+                    }
+                };
+                batches.insert(PATCHED_PG_TYPE, patched);
             }
             *guard = Some(Generation {
                 fingerprint: fp,
@@ -269,7 +287,9 @@ impl TrioCache {
 
 /// Find the `pg_catalog` namespace oid inside the freshly built
 /// `pg_namespace` batches (oid column read via cast so the emulation's
-/// concrete integer type never matters).
+/// concrete integer type never matters). Takes the FIRST matching row —
+/// correct while the server registers exactly one catalog (`context.rs`
+/// builds a single `icegres` catalog, so one pg_catalog schema exists).
 fn pg_catalog_namespace_oid(batches: &[RecordBatch]) -> Result<i64, DataFusionError> {
     for batch in batches {
         let (Ok(name_idx), Ok(oid_idx)) = (
@@ -412,8 +432,12 @@ pub async fn install_coherent_pg_catalog(
         Ok(Some(provider)) => {
             upstream_trio.insert(PATCHED_PG_TYPE, provider);
         }
-        _ => tracing::warn!(
+        Ok(None) => tracing::warn!(
             "pg_catalog.{PATCHED_PG_TYPE} missing from the emulation — serving it \
+             unpatched; Npgsql-family type loading will see stock namespace oids"
+        ),
+        Err(e) => tracing::warn!(
+            "failed to fetch pg_catalog.{PATCHED_PG_TYPE} ({e}) — serving it \
              unpatched; Npgsql-family type loading will see stock namespace oids"
         ),
     }
