@@ -80,7 +80,10 @@ Schedule it with cron / your orchestrator; the single stdout line
   `.parquet` and `.hyper` (pantab 5.3, Hyper engine), both read back with
   full row/column counts, plus the `--query` variant. The underlying ADBC
   Flight fetch path is probe-proven (`bench/clients/a11_adbc_probe.py`).
-- The **publish leg is by-construction**: `tableauserverclient` is the
-  standard library for exactly this job, but no Tableau Server run is
-  recorded in this repo — run one refresh cycle against a dev site before
-  trusting it in production.
+- The **publish leg is mock-verified**: `tests/test_publish_mock.py`
+  drives `publish_hyper()` against a local mock of the Tableau REST API
+  and asserts the full request flow (version negotiation, PAT sign-in,
+  project resolution by name, the `.hyper` payload + overwrite mode
+  reaching the publish endpoint). A real Tableau Server/Cloud refresh
+  cycle remains the final by-construction leg — run one against a dev
+  site before trusting it in production.
