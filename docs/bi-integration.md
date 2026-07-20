@@ -83,6 +83,7 @@ result cache / read replicas exist precisely for dashboard-shaped fleets
 | Excel Get Data → PostgreSQL | Power Query | Npgsql | — | **unverified** |
 | Grafana | built-in PostgreSQL | Go pgx | — | **unverified** (low risk: simple-protocol-ish, plain SELECTs) |
 | Looker | PostgreSQL dialect | pgjdbc | A9 JDBC | **by-construction** |
+| DigDash Enterprise | registered JDBC driver | pgjdbc or Flight SQL JDBC | A9 / A9F | **by-construction** |
 
 ### Tableau — by-construction, two known sharp edges
 
@@ -146,6 +147,20 @@ connect through **generic ODBC**, and stock psqlODBC is probe-verified —
 with one mandatory setting: `UseDeclareFetch=0` (the probe's own connection
 string does this), because declare/fetch mode uses server-side named
 cursors, which icegres does not implement.
+
+### DigDash Enterprise — by-construction, JDBC both lanes
+
+DigDash (Java-based) takes any JDBC driver registered in its
+`sqldriverrepository.xml`, so both icegres lanes apply: stock pgjdbc against
+pgwire, or the Flight SQL JDBC driver against `flight-serve` — the latter
+being the recommended one, for two reasons. First, the columnar transport
+(the DigDash data-model refresh is an extract-shaped bulk read, exactly
+where ADBC/Flight wins 10×+, §6). Second, DigDash's own documentation
+steers Postgres sources toward `DEFAULT_FETCH_SIZE` streaming — which on
+pgjdbc means `autocommit=false` + `setFetchSize`, i.e. the extended-
+protocol-SELECT-in-transaction shape icegres rejects with `0A000` (§3). On
+the pgwire lane, leave fetch-size streaming off or set
+`preferQueryMode=simple`; on the Flight JDBC lane the issue does not exist.
 
 ### Superset / Metabase / Redash / Grafana — the quick wins
 
@@ -237,28 +252,108 @@ Two deployment-posture notes worth stating for BI fleets specifically:
   endpoint failover and writer failover (`limitations.md` §icegresd-ha) sit
   well under typical dashboard retry behavior.
 
-## 6. The Arrow Flight SQL angle — today and later
+## 6. The ADBC / Arrow Flight SQL angle
 
-Today, the pragmatic Flight/BI intersections:
+ADBC is icegres's best-proven client surface (probe A11 exercises both the
+Flight SQL driver and the ADBC postgres driver end to end, introspection
+and bulk ingest included), and the measured payoff is large enough to
+shape the whole BI recommendation. This section carries the numbers, the
+ecosystem status, and the extract patterns they justify.
 
-- **Flight SQL JDBC driver** (proven against icegres, A9FlightJdbcProbe):
-  tools with a generic JDBC connector (Tableau "Other Databases (JDBC)",
-  DBeaver, Metabase driver plugins) can ride it for columnar-speed reads.
-  Expect rough edges: generic-JDBC connectors skip the tool's
-  Postgres-specific SQL generation and metadata niceties; `AS OF` sugar is
-  pgwire-only (use `t@snapshot`).
-- **ADBC** (proven, A11) covers notebook/Python BI (pandas, Polars,
-  plotly/dash-style apps) at full columnar speed.
-- **Custom dashboards** are already fully served by the gRPC-web /
-  `@icegres/flight-web` path (`frontend-dashboards.md`).
+### Measured: what ADBC buys against icegres
 
-Later: if the ecosystem's nascent Flight-SQL-native BI connectors mature
-(Superset ADBC dialects, Tableau/Power BI custom connectors), icegres is
-already protocol-complete on the server side — queries, catalog metadata
-(`GetTables`/`GetDbSchemas`), prepared statements, TLS, auth, per-RPC
-authz, timeouts, and result-size caps all exist on the Flight listener. No
-server work is on the critical path for BI; the work is packaging and
-validation.
+From the recorded driver benchmark
+([`bench/results/fetch-compare-summary.md`](../bench/results/fetch-compare-summary.md)
+— five clients, same live stack, fetch-to-pandas medians):
+
+| 5M rows → pandas | 5 cols | 15 cols |
+|---|--:|--:|
+| **ADBC (Flight SQL)** | **959 ms** | **2,367 ms** |
+| ADBC (postgres/COPY) | 3,185 ms | 6,082 ms |
+| psycopg2 (pgwire rows) | 11,519 ms | 26,222 ms |
+| ODBC (psqlODBC) | 19,042 ms | 38,769 ms |
+
+That is **10–16× on full extracts** — the row drivers spend the time
+materializing one Python object per cell; ADBC never leaves Arrow. Two
+qualifiers that matter for BI routing: below ~50k rows the advantage
+*inverts* (Flight's ~3-round-trip gRPC floor loses to the row drivers'
+lower per-query floor — keep small interactive dashboard queries on the
+tool's native connector), and the ADBC **postgres** driver is the
+all-rounder when only the pgwire port is exposed: row-driver floor on
+small queries, 4–6× row-driver speed at 5M via `COPY … BINARY`. Rule of
+thumb: **interactive → native connector; ≥ ~100k rows to a
+DataFrame/extract → ADBC Flight; embedded on the lake files → DuckDB.**
+
+### Ecosystem status (July 2026, labeled)
+
+- **No packaged BI tool ships a generic ADBC/Flight SQL connector yet.**
+  Everything below is a bridge or a platform signal.
+- **Power BI is adopting ADBC as driver technology**: Microsoft's
+  Databricks connector switches to ADBC in **August 2026** (Desktop ≥
+  2.145.1105.0). Connector-specific, not a generic Flight SQL target — but
+  it makes a future first-party ADBC path plausible and is worth tracking.
+- **Flight SQL JDBC driver** — **proven against icegres**
+  (`bench/clients/A9FlightJdbcProbe.java`). The bridge for every tool with
+  a generic/custom JDBC slot: Tableau "Other Databases (JDBC)", DBeaver,
+  Metabase driver plugins, DigDash's driver registry.
+- **Flight SQL ODBC driver** (Dremio-built, free download) — the same
+  bridge for ODBC-only surfaces; documented by Dremio for Tableau.
+  Unverified against icegres.
+- **`flightsql-dbapi`** (InfluxData) — Python DB-API 2 + SQLAlchemy
+  dialect for Flight SQL, written to ease Superset connections, and its
+  primary dialect targets **DataFusion** — which is exactly the engine
+  icegres runs. The natural Superset fast lane; SQLAlchemy URI
+  `datafusion+flightsql://user:pass@host:50051`.
+- **Grafana's FlightSQL datasource plugin exists but is archived**
+  (InfluxData, v1.1.1, April 2024, "not under active development"). Still
+  installable/signed; treat as best-effort and keep the Postgres
+  datasource as the supported lane.
+- **Caveat on every Flight bridge**: generic drivers skip the tool's
+  Postgres-specific SQL generation and metadata niceties, and `AS OF`
+  sugar is pgwire-only — use `"t@<snapshot_id>"` on Flight.
+
+### The Hyper extract pattern (Tableau without waiting for ADBC-in-Tableau)
+
+**Hyper is Tableau's embedded columnar database engine** — every extract
+is a `.hyper` file, and in Extract mode Desktop/Server/Cloud run all viz
+queries against Hyper, never against icegres. icegres is touched only by
+the *refresh*: one bulk pull, which through Tableau's native PostgreSQL
+connector rides pgjdbc — the row path that loses 10–16× above.
+
+Nothing requires Tableau's connector to build the file. Tableau publishes
+the **Hyper API** for writing `.hyper` directly, and `pantab` wraps it
+with Arrow input. So a small scheduled job replaces the refresh:
+
+```
+icegres ── Flight SQL/ADBC (2.4 s per 5M×15) ──▶ pyarrow
+       └─ native connector (26–39 s, rows) ─┐      │ pantab / Hyper API
+                                            ▼      ▼
+                                     .hyper extract ──▶ publish (REST) ──▶ Tableau Server
+```
+
+Users see identical dashboards, refreshed at a 10–16× lower icegres cost;
+time travel composes (`AS OF` on pgwire / `t@snapshot` on Flight) so an
+extract can be a reproducible point-in-time artifact. The **Power BI
+analogue** is Parquet: the same ADBC pull written as a Parquet file/folder
+consumed by Power BI's Parquet connector (or lake-side shortcuts).
+Honest label: every piece is standard and the icegres side is proven
+(A11 + the recorded bench); the assembled pipelines are **by-construction**
+until a live Tableau/Power BI smoke run lands.
+
+### Custom dashboards
+
+Already fully served by the gRPC-web / `@icegres/flight-web` path
+([`frontend-dashboards.md`](frontend-dashboards.md)) — that document is
+the packaged-BI counterpart of this one.
+
+### Server-side readiness
+
+If/when first-party ADBC or Flight SQL connectors land in the packaged
+tools, icegres is already protocol-complete on the server side — queries,
+catalog metadata (`GetTables`/`GetDbSchemas`), prepared statements, TLS,
+auth, per-RPC authz, timeouts, and result-size caps all exist on the
+Flight listener. No server work is on the critical path for BI; the work
+is packaging and validation.
 
 ## 7. Validation & hardening plan (ranked)
 
