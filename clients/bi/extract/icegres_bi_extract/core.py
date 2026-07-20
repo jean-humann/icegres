@@ -56,7 +56,8 @@ def build_query(
     parts = table.split(".")
     if snapshot is not None:
         parts[-1] = f"{parts[-1]}@{snapshot}"
-    return "SELECT * FROM " + ".".join(f'"{p}"' for p in parts)
+    quoted = ".".join('"' + p.replace('"', '""') + '"' for p in parts)
+    return f"SELECT * FROM {quoted}"
 
 
 def _connect(

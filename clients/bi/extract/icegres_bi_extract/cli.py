@@ -74,6 +74,12 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = _parser().parse_args(argv)
 
+    if args.password:
+        print("warning: --password is visible in argv/shell history; "
+              "prefer ICEGRES_PASSWORD", file=sys.stderr)
+    if args.token:
+        print("warning: --token is visible in argv/shell history; "
+              "prefer TABLEAU_TOKEN", file=sys.stderr)
     password = args.password or os.environ.get("ICEGRES_PASSWORD")
     if args.publish:
         missing = [
