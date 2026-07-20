@@ -1,3 +1,6 @@
 # Superset extra requirements for the icegres Flight SQL lane.
 # Copy to <superset-repo>/docker/requirements-local.txt and rebuild the image.
+# cachetools is an undeclared runtime dependency of flightsql-dbapi's client
+# (pandas is too, but every Superset image already ships pandas).
 flightsql-dbapi
+cachetools

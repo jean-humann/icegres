@@ -3,6 +3,10 @@
 # archived at v1.1.1 — see ../../README.md for the honest status).
 # Install first:  grafana-cli plugins install influxdata-flightsql-datasource
 #
+# REQUIRED server pairing: a listener with `--result-compression none` —
+# the plugin's Arrow build cannot decode zstd IPC batches and renders
+# silently empty panels against the default listener (../../README.md).
+#
 # Field names match the plugin's config struct (jsonData: host, secure,
 # username, metadata; secureJsonData: password | token).
 apiVersion: 1
