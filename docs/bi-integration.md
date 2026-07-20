@@ -116,18 +116,28 @@ Tableau's on-connect `SET` statements ride the existing SetShow hook (the
 JDBC probe's startup traffic already exercises the same path). Initial-SQL
 is a plain statement — usable for `AS OF` time-travel pins (§5).
 
-### Power BI — the real unknown, with a verified fallback
+### Power BI — driver now probe-proven (A14), product run pending
 
-Power BI's native PostgreSQL connector is built on **Npgsql**, the one
-major driver with **no icegres probe**. Npgsql is also the most demanding
+Power BI's native PostgreSQL connector is built on **Npgsql** — until
+probe A14 (`bench/clients/a14-npgsql-probe/`, .NET) it was the one major
+driver with no icegres coverage, and it is the most demanding
 introspection client of the lot: on first connect it runs a large
-type-loading query joining `pg_type` / `pg_namespace` / `pg_enum` /
-`pg_range` and expects a coherent answer *before any user query runs* — if
-the emulated catalog can't plan it, the connection fails outright, not
-degraded. Npgsql also defaults to the extended protocol with **binary**
-result formats everywhere. None of this is known-broken; all of it is
-unknown, and it gates both Power BI and Excel's Power Query. This is the
-single highest-value probe to add (§7).
+type-loading query joining `pg_type` / `pg_namespace` / `pg_range` /
+`pg_proc` and loads **zero types** if that join returns nothing — every
+typed read and every parameter bind then fails, even though untyped scans
+work. Exactly that happened on the first probe run: the static
+`pg_type.typnamespace` carried stock Postgres namespace oids that never
+matched the emulated `pg_namespace`'s minted oids. The coherent-snapshot
+machinery in `compat.rs` now re-materializes `pg_type` with
+`typnamespace` anchored to the real `pg_catalog` namespace oid, and A14
+runs green: connect + type loading, typed binary reads, `SELECT *`
+Import-shaped scans, parameter binds, prepared reuse,
+`GetSchema(Tables)`, aggregates — 8 pass / 0 fail, with two documented
+XFAILs: the shared in-transaction `0A000` limit, and
+`GetSchema(Columns)`, which projects `information_schema.columns.
+udt_schema`/`udt_name` — columns the upstream emulation does not carry
+(§7 follow-up; the failing statement also drops the connection). The
+Power BI *product* itself (Windows-only) remains by-construction.
 
 Mode-by-mode, once the driver connects:
 
@@ -304,7 +314,7 @@ DataFrame/extract → ADBC Flight; embedded on the lake files → DuckDB.**
   primary dialect targets **DataFusion** — which is exactly the engine
   icegres runs. The natural Superset fast lane; SQLAlchemy URI
   `datafusion+flightsql://user:pass@host:50051`. **Proven-live against
-  icegres** (probe A12: connect, reflection, SQL Lab-shaped queries, and
+  icegres** (probe A13: connect, reflection, SQL Lab-shaped queries, and
   basic-auth against a secured listener).
 - **Grafana's FlightSQL datasource plugin exists but is archived**
   (InfluxData, v1.1.1, April 2024, "not under active development"). Still
@@ -360,47 +370,61 @@ is packaging and validation.
 ## 7. What ships in this repo, and the validation plan (ranked)
 
 Shipped connection kits live under [`clients/bi/`](../clients/bi/README.md):
-the ADBC→`.hyper`/Parquet extract tool (the §6 Hyper pattern, runnable),
-per-tool kits for Superset (`flightsql-dbapi` lane + probe A12,
-`bench/clients/a12_flightsql_dbapi_probe.py`), Grafana (provisioning for
-both lanes), Tableau (properties file + Flight JDBC bridge + extract
-lane), and DigDash (driver-registry recipes). Remaining validation,
-ranked:
+the ADBC→`.hyper`/Parquet extract tool (the §6 Hyper pattern, runnable,
+with a mock-Tableau-REST test for the publish leg), per-tool kits for
+Superset, Grafana, Tableau, and DigDash. Verification landed so far:
 
-1. **Npgsql probe** (`bench/clients/`, .NET or a recorded-traffic replay):
-   connect (type-loading query), reflection, binary-format extended-
-   protocol reads, parameterized SELECT. Unlocks confidence for Power BI
-   *and* Excel. Any planning failure lands in `compat.rs`, whose shim
-   architecture (rewrite-only-pg_catalog-statements) is built for it.
-2. **Live smoke: Superset + Metabase + Grafana + Redash** against the dev
-   stack via docker-compose — cheapest conversion of by-construction to
-   proven-live (the driver stack under Superset is now probe A12; the
-   products themselves remain unproven), and the resulting settings go
-   straight into the `clients/bi/` kits.
-3. **Tableau Desktop run** (Extract first, then Live): capture the actual
-   query/settings traffic, pin down whether extract streaming trips the
-   in-txn `0A000`, and confirm the shipped
-   `clients/bi/tableau/postgresql.properties` recipe. TDVT for systematic
-   Live-mode dialect coverage if Live matters. Plus one refresh cycle of
-   the `clients/bi/extract` publish leg against a dev Tableau Server.
-4. **Power BI Desktop run** (Import, then DirectQuery, then via gateway),
-   with the ODBC fallback documented alongside (`UseDeclareFetch=0`).
-5. **pgwire per-statement timeout** — the one server-side hardening item BI
-   genuinely needs (Flight already has it); currently queued in
+- **Probe A13** (`a13_flightsql_dbapi_probe.py`, the Superset stack) and
+  **probe A14** (`a14-npgsql-probe/`, the Power BI driver) — both green
+  against live servers and wired into the e2e client-probe sections
+  (`tests/e2e.sh` §p2b/§r2) alongside A8–A11.
+- **The A14-found `pg_type` oid-drift bug is fixed** (`compat.rs`
+  coherent snapshot now covers `pg_type.typnamespace` — §2 Power BI).
+- **Product smokes recorded**: Superset over the Flight lane (Test
+  Connection, SQL Lab, schema browser — via Superset's REST API) and
+  Grafana over both lanes (`/api/ds/query` aggregates), with the two
+  operational findings folded into the kits: Superset's working URI
+  scheme is `datafusion://` + `cachetools` must be added to the image,
+  and the archived Grafana FlightSQL plugin requires a
+  `--result-compression none` listener (silent empty panels otherwise).
+
+Remaining validation, ranked:
+
+1. **`information_schema.columns.udt_schema`/`udt_name`** — the one gap
+   A14 left open (XFAIL): Npgsql's `GetSchema(Columns)` projects columns
+   the upstream emulation lacks, and the failing statement drops the
+   connection. Candidate `compat.rs` shim or upstream
+   datafusion-postgres addition; low urgency (Power BI's navigator does
+   not depend on .NET `GetSchema`).
+2. **Tableau Desktop run** (Extract first, then Live): confirm the
+   shipped `postgresql.properties` recipe against real traffic; TDVT for
+   systematic Live-mode dialect coverage if Live matters. Plus one
+   refresh cycle of the `clients/bi/extract` publish leg against a real
+   dev Tableau Server (the REST flow is mock-verified in-repo).
+3. **Power BI Desktop run** (Import, then DirectQuery, then via gateway)
+   — Windows-only, so outside this repo's CI reach; the driver
+   underneath is now A14-proven and the ODBC fallback documented
+   (`UseDeclareFetch=0`).
+4. **Metabase + Redash product smokes** — same shape as the recorded
+   Superset/Grafana runs; their pgjdbc/psycopg2 stacks are already
+   probe-proven.
+5. **pgwire per-statement timeout** — the one server-side hardening item
+   BI genuinely needs (Flight already has it); queued in
    `limitations.md` §Timeouts.
-6. **Wire probe A12 into the e2e client-probe sections** alongside
-   A8–A11 so the Superset stack stays continuously exercised.
 
 ## Bottom line
 
-icegres does not need a "BI connector" — it needs *validation runs*. The
-architecture bet (be a convincing Postgres 16 on the wire, with engineered
-`pg_catalog` shims and probe-enforced driver coverage) is exactly the right
-one for BI, and the read path's streaming/freshness/replica story fits
-dashboard workloads well. The JDBC- and psycopg2-based tools (Tableau,
-Metabase, Superset, Redash, DBeaver, Looker) should connect today with two
-documented caveats (no named cursors; keep reads autocommit or
-simple-protocol). The material unknown is **Npgsql**, which gates Power
-BI's native path — probe it first; ODBC is the verified interim answer.
-Nothing found in this analysis requires engine or protocol redesign; the
-gaps are a probe, a timeout, and per-tool settings documentation.
+icegres does not need a "BI connector" — it needs *validation runs*, and
+the first round of them is now recorded. The architecture bet (be a
+convincing Postgres 16 on the wire, with engineered `pg_catalog` shims and
+probe-enforced driver coverage) is exactly the right one for BI, and it
+just proved itself the intended way: the new Npgsql probe found a real
+oid-drift bug in the emulated `pg_type`, the coherent-snapshot machinery
+absorbed the fix, and every major Postgres driver family a BI tool can
+ride — pgjdbc, psqlODBC, psycopg2/SQLAlchemy, ADBC, flightsql-dbapi, and
+now Npgsql — is probe-green. Superset and Grafana are product-smoked
+against live icegres on their columnar lanes. What remains is desktop
+products this environment cannot run (Tableau, Power BI — their driver
+stacks are proven; the recipes ship), one narrow introspection gap
+(`udt_schema`), and the pgwire statement timeout. Nothing found in this
+analysis requires engine or protocol redesign.

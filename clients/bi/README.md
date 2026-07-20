@@ -19,7 +19,11 @@ Every claim in these kits carries the repo's verification labels:
 
 - **proven-live** — a committed probe exercises the exact path
   (`bench/clients/`: A8 SQLAlchemy/psycopg2, A9 pgjdbc, A9F Flight SQL
-  JDBC, A10 psqlODBC, A11 ADBC both lanes, A12 flightsql-dbapi).
+  JDBC, A10 psqlODBC, A11 ADBC both lanes, A13 flightsql-dbapi,
+  A14 Npgsql).
+- **product-smoked** — the packaged product itself was run against a live
+  icegres and exercised end to end (currently: Superset over the Flight
+  lane; Grafana over both lanes).
 - **by-construction** — the driver stack under the tool is probe-verified;
   the packaged product itself has not been run against icegres here.
 - **unverified** — no probe coverage; treat as a recipe to validate.
