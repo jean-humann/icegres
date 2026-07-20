@@ -140,4 +140,7 @@ Icegres.Publish = [
     ButtonText = { "icegres", "Connect to an icegres lakehouse over Arrow Flight SQL" },
     LearnMoreUrl = "https://github.com/jean-humann/icegres",
     SupportsDirectQuery = Config_EnableDirectQuery
+    // TODO before certification: add SourceImage/SourceTypeImage records
+    // (16/20/24/32px PNGs embedded via Extension.Contents) — without them
+    // Power BI Desktop shows a generic connector icon.
 ];
