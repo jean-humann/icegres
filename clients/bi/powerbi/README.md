@@ -42,8 +42,9 @@ target, and report findings back into `docs/bi-integration.md` §7.
 The supported interactive lane. Npgsql is probed green against icegres
 (A14, `bench/clients/a14-npgsql-probe/` — including the connect-time
 type-loading step the coherent `pg_type` patch keeps honest), and
-measured fast for a row driver (1M narrow rows in 552 ms vs psycopg2's
-1,937 ms; the Arrow lane's 316 ms is ~1.7× quicker). Connect as
+measured fast for a row driver — 1M narrow rows in 552 ms vs psycopg2's
+1,937 ms, with the Arrow lane's 316 ms ~1.7× quicker (recorded run:
+`bench/results/bi-stack-fetch-2026-07-20-sandbox.md`). Connect as
 PostgreSQL: host, port `5439`, database `icegres`, TLS on. Known edges:
 `docs/bi-integration.md` §2 (Power BI section).
 
