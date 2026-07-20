@@ -80,6 +80,9 @@ def main(argv=None) -> int:
     if args.token:
         print("warning: --token is visible in argv/shell history; "
               "prefer TABLEAU_TOKEN", file=sys.stderr)
+    if args.tls_skip_verify:
+        print("warning: --tls-skip-verify disables server certificate "
+              "verification; dev only", file=sys.stderr)
     password = args.password or os.environ.get("ICEGRES_PASSWORD")
     if args.publish:
         missing = [

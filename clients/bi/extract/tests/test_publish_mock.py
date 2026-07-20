@@ -105,6 +105,7 @@ class PublishHyperMockTest(unittest.TestCase):
         server = HTTPServer(("127.0.0.1", 0), MockTableauHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
+        path = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".hyper", delete=False) as f:
                 f.write(b"HYPERBYTES-not-a-real-extract")
@@ -121,6 +122,8 @@ class PublishHyperMockTest(unittest.TestCase):
         finally:
             server.shutdown()
             thread.join(timeout=5)
+            if path is not None:
+                os.unlink(path)
 
         self.assertEqual(ds_id, DS_ID)
         methods_paths = [(m, p) for m, p, _ in MockTableauHandler.requests_seen]
