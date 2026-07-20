@@ -10,6 +10,7 @@ each tool's native connector).
 | Kit | Tool | Fast lane | Fallback lane |
 |---|---|---|---|
 | [`extract/`](extract/) | Tableau (.hyper) · Power BI (Parquet) | ADBC Flight → native file | tool-native connector refresh |
+| [`powerbi/`](powerbi/) | Power BI | Dremio-connector Flight SQL ADBC bridge · Parquet sideload | native PostgreSQL connector (Npgsql, probe A14) |
 | [`superset/`](superset/) | Apache Superset | `datafusion+flightsql://` SQLAlchemy dialect | `postgresql+psycopg2://` (probe A8) |
 | [`grafana/`](grafana/) | Grafana | FlightSQL datasource plugin (archived upstream) | built-in PostgreSQL datasource |
 | [`tableau/`](tableau/) | Tableau live/extract | Flight SQL JDBC via "Other Databases (JDBC)" | native PostgreSQL connector + properties file |
