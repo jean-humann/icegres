@@ -132,7 +132,16 @@ try
     var a = Convert.ToInt64(cmd.ExecuteScalar()!);
     cmd.Parameters["city"].Value = "Paris";
     var b = Convert.ToInt64(cmd.ExecuteScalar()!);
-    Pass("prepared statement reuse", $"London={a} Paris={b}");
+    // Cross-check the rebound execution against a fresh unprepared query,
+    // so a silently ignored rebind (returning London's count again) or an
+    // all-zeros table cannot false-pass this step.
+    using var check = new NpgsqlCommand(
+        "SELECT count(*) FROM demo.trips WHERE city = 'Paris'", conn);
+    var expected = Convert.ToInt64(check.ExecuteScalar()!);
+    if (a <= 0) throw new Exception($"London count {a} not positive");
+    if (b != expected)
+        throw new Exception($"rebound Paris count {b} != fresh count {expected}");
+    Pass("prepared statement reuse", $"London={a} Paris={b} (rebind cross-checked)");
 }
 catch (Exception e) { Fail("prepared statement reuse", e); }
 
@@ -169,7 +178,15 @@ catch (Exception e)
     else Fail("GetSchema(Columns demo.trips)", e);
     try { conn.Dispose(); } catch { /* already broken */ }
     conn = new NpgsqlConnection(connString);
-    conn.Open();
+    try { conn.Open(); }
+    catch (Exception reopen)
+    {
+        // Without the reconnect the remaining steps cannot run; report and
+        // exit through the normal summary path instead of an unhandled throw.
+        Fail("reconnect after GetSchema(Columns)", reopen);
+        Console.WriteLine($"A14 RESULT: pass={pass} fail={fail} xfail={xfail} skip={skip}");
+        Environment.Exit(2);
+    }
 }
 
 // -- 8. aggregate (DirectQuery-shaped) ---------------------------------------
