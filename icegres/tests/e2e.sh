@@ -1828,6 +1828,31 @@ PYEOF
   pass "Flight-native authorization enforced (granted read allowed; ungranted table SELECT + write denied 42501)"
   stop_pidfile_generic "$E2E_DIR/flight-authz.pid"
 
+  # (p2b) flightsql-dbapi — SPEC A13 (bench/clients/a13_flightsql_dbapi_probe.py)
+  # The Superset connection stack (DB-API 2 + the datafusion+flightsql://
+  # SQLAlchemy dialect): connect, schema/table/column reflection (Superset's
+  # schema browser and SQL Lab panels), aggregate + preview shapes, and
+  # basic-auth variants against the secured listener already running above.
+  # pandas rides the guard because flightsql-dbapi's cursor materializes
+  # through it without declaring it (Superset ships pandas).
+  if ! python3 -c 'import flightsql, sqlalchemy, pandas' 2>/dev/null; then
+    log "    A13 SKIPPED: flightsql-dbapi stack not available (pip install flightsql-dbapi sqlalchemy pandas)"
+  else
+    A13_OUT=$(env ICEGRES_PROBE_FLIGHT_HOST=127.0.0.1 \
+        ICEGRES_PROBE_FLIGHT_PORT="$FLIGHT_PORT" \
+        ICEGRES_PROBE_FLIGHT_SECURE_PORT="$FLIGHT_SECURE_PORT" \
+        ICEGRES_PROBE_FLIGHT_SECURE_USER=e2e_flight_user \
+        ICEGRES_PROBE_FLIGHT_SECURE_PASSWORD=e2e-flight-pw \
+        python3 "$REPO_DIR/bench/clients/a13_flightsql_dbapi_probe.py" 2>&1) \
+      || { echo "$A13_OUT" | tail -n 15 >&2; fail "A13 flightsql-dbapi probe reported failures"; }
+    echo "$A13_OUT" | sed 's/^/    /'
+    echo "$A13_OUT" | grep -q '^A13 RESULT: .*fail=0' \
+      || fail "A13 flightsql-dbapi probe summary is not fail=0"
+    echo "$A13_OUT" | grep -q '^PASS secured: correct credentials query' \
+      || fail "A13 secured-listener steps did not run/pass (secure env was set)"
+    pass "flightsql-dbapi (Superset stack) green ($(echo "$A13_OUT" | grep '^A13 RESULT:'))"
+  fi
+
   stop_pidfile_generic "$FLIGHT_PID_FILE"
   stop_pidfile_generic "$FLIGHT_SECURE_PID_FILE"
   pass "flight-serve servers stopped"
@@ -1887,6 +1912,33 @@ else
       || fail "A10 ODBC probe summary is not fail=0"
     pass "ODBC client green ($(echo "$A10_OUT" | grep '^A10 RESULT:'))"
   fi
+fi
+
+# ---------------------------------------------------------------------------
+# (r2) Npgsql client — SPEC A14 (bench/clients/a14-npgsql-probe/)
+# ---------------------------------------------------------------------------
+# Runs the Npgsql (.NET) probe against the main server — the driver inside
+# Power BI's native PostgreSQL connector and Excel's Power Query. The
+# connect step alone is the load-bearing one: Npgsql's connect-time
+# type-loading query joins pg_type to pg_namespace and loads ZERO types if
+# their oids drift (the failure mode the coherent pg_type patch in
+# compat.rs closes); the rest is the Power BI Import surface (typed binary
+# reads, SELECT * scans, parameter binds, prepared reuse, GetSchema
+# metadata) plus the documented in-transaction 0A000 as an XFAIL. Read-only.
+# Skips when the dotnet SDK is absent; first run restores Npgsql from NuGet.
+log "(r2) Npgsql client probe (bench/clients/a14-npgsql-probe)"
+if ! command -v dotnet >/dev/null 2>&1; then
+  log "    SKIPPED: dotnet SDK not available (apt install dotnet-sdk-8.0)"
+else
+  A14_OUT=$(cd "$REPO_DIR/bench/clients/a14-npgsql-probe" \
+      && env ICEGRES_PROBE_PG_HOST="$PG_HOST" ICEGRES_PROBE_PG_PORT="$PG_PORT" \
+        dotnet run 2>&1)
+  A14_RC=$?
+  echo "$A14_OUT" | grep -E '^(PASS|FAIL|XFAIL|SKIP|A14 RESULT)' | sed 's/^/    /'
+  [[ $A14_RC -eq 0 ]] || fail "A14 Npgsql probe reported failures (exit $A14_RC)"
+  echo "$A14_OUT" | grep -q '^A14 RESULT: .*fail=0' \
+    || fail "A14 Npgsql probe summary is not fail=0"
+  pass "Npgsql client green ($(echo "$A14_OUT" | grep '^A14 RESULT:'))"
 fi
 
 # ---------------------------------------------------------------------------
