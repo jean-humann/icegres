@@ -1848,7 +1848,7 @@ PYEOF
         python3 "$REPO_DIR/bench/clients/a13_flightsql_dbapi_probe.py" 2>&1) \
       || { echo "$A13_OUT" | tail -n 15 >&2; fail "A13 flightsql-dbapi probe reported failures"; }
     echo "$A13_OUT" | sed 's/^/    /'
-    echo "$A13_OUT" | grep -q '^A13 RESULT: .*fail=0' \
+    echo "$A13_OUT" | grep -qE '^A13 RESULT: pass=[0-9]+ fail=0 ' \
       || fail "A13 flightsql-dbapi probe summary is not fail=0"
     echo "$A13_OUT" | grep -q '^PASS secured: correct credentials query' \
       || fail "A13 secured-listener steps did not run/pass (secure env was set)"
@@ -1932,21 +1932,26 @@ log "(r2) Npgsql client probe (bench/clients/a14-npgsql-probe)"
 if ! command -v dotnet >/dev/null 2>&1; then
   log "    SKIPPED: dotnet SDK not available (apt install dotnet-sdk-8.0)"
 else
-  # Build first, separately: `dotnet run` performs an implicit NuGet restore,
-  # and a box with the SDK but no package-feed access must SKIP loudly like
-  # every other probe whose dependencies are absent — not fail the gate.
-  if ! A14_BUILD=$(cd "$REPO_DIR/bench/clients/a14-npgsql-probe" \
-      && dotnet build -v q --nologo 2>&1); then
-    log "    SKIPPED: dotnet build/restore failed (no NuGet access?); tail:"
-    echo "$A14_BUILD" | tail -n 3 | sed 's/^/      /'
+  # Restore first, separately: `dotnet run` performs an implicit NuGet
+  # restore, and a box with the SDK but no package-feed access must SKIP
+  # loudly like every other probe whose dependencies are absent — not fail
+  # the gate. Only the RESTORE is skippable (genuinely environmental); a
+  # compile error in the probe itself must still fail the gate, or a broken
+  # probe would skip green forever.
+  if ! A14_RESTORE=$(cd "$REPO_DIR/bench/clients/a14-npgsql-probe" \
+      && dotnet restore -v q 2>&1); then
+    log "    SKIPPED: dotnet restore failed (no NuGet access?); tail:"
+    echo "$A14_RESTORE" | tail -n 3 | sed 's/^/      /'
   else
+    A14_BUILD=$(cd "$REPO_DIR/bench/clients/a14-npgsql-probe" \
+        && dotnet build --no-restore -v q --nologo 2>&1) \
+      || { echo "$A14_BUILD" | tail -n 10 >&2; fail "A14 Npgsql probe does not compile"; }
     A14_OUT=$(cd "$REPO_DIR/bench/clients/a14-npgsql-probe" \
         && env ICEGRES_PROBE_PG_HOST="$PG_HOST" ICEGRES_PROBE_PG_PORT="$PG_PORT" \
-          dotnet run --no-build 2>&1)
-    A14_RC=$?
+          dotnet run --no-build 2>&1) \
+      || { echo "$A14_OUT" | tail -n 15 >&2; fail "A14 Npgsql probe reported failures"; }
     echo "$A14_OUT" | grep -E '^(PASS|FAIL|XFAIL|SKIP|A14 RESULT)' | sed 's/^/    /'
-    [[ $A14_RC -eq 0 ]] || fail "A14 Npgsql probe reported failures (exit $A14_RC)"
-    echo "$A14_OUT" | grep -q '^A14 RESULT: .*fail=0' \
+    echo "$A14_OUT" | grep -qE '^A14 RESULT: pass=[0-9]+ fail=0 ' \
       || fail "A14 Npgsql probe summary is not fail=0"
     pass "Npgsql client green ($(echo "$A14_OUT" | grep '^A14 RESULT:'))"
   fi
