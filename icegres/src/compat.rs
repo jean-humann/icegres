@@ -1234,4 +1234,80 @@ mod tests {
         let v = version_string();
         assert!(v.starts_with("PostgreSQL 16.6 "), "got: {v}");
     }
+
+    // -- pg_type oid patch helpers ------------------------------------------
+
+    use datafusion::arrow::array::Int32Array;
+    use datafusion::arrow::datatypes::{Field, Schema};
+
+    fn ns_batch(names: &[&str], oids: &[i32]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("oid", DataType::Int32, false),
+            Field::new("nspname", DataType::Utf8, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(oids.to_vec())),
+                Arc::new(StringArray::from(names.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn namespace_oid_found_via_cast() {
+        // oid stored as Int32 upstream; the helper reads it type-agnostically.
+        let oid =
+            pg_catalog_namespace_oid(&[ns_batch(&["demo", "pg_catalog"], &[101, 202])]).unwrap();
+        assert_eq!(oid, 202);
+    }
+
+    #[test]
+    fn namespace_oid_missing_pg_catalog_errors() {
+        assert!(pg_catalog_namespace_oid(&[ns_batch(&["demo"], &[101])]).is_err());
+    }
+
+    #[test]
+    fn patch_rewrites_typnamespace_and_preserves_type() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("typname", DataType::Utf8, false),
+            Field::new("typnamespace", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["int8", "text"])),
+                Arc::new(Int32Array::from(vec![11, 13283])),
+            ],
+        )
+        .unwrap();
+        let patched = patch_typnamespace(vec![batch], 202).unwrap();
+        let col = patched[0].column(1);
+        // Type preserved (Int32, not the helper's Int64 working type)...
+        assert_eq!(col.data_type(), &DataType::Int32);
+        // ...every row rewritten to the coherent namespace oid...
+        let col = col.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(col.values(), &[202, 202]);
+        // ...and other columns untouched.
+        let names = patched[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "int8");
+    }
+
+    #[test]
+    fn patch_passes_through_batches_without_typnamespace() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "unrelated",
+            DataType::Int32,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![7]))]).unwrap();
+        let out = patch_typnamespace(vec![batch.clone()], 202).unwrap();
+        assert_eq!(out[0], batch);
+    }
 }
