@@ -1833,6 +1833,8 @@ PYEOF
   # SQLAlchemy dialect): connect, schema/table/column reflection (Superset's
   # schema browser and SQL Lab panels), aggregate + preview shapes, and
   # basic-auth variants against the secured listener already running above.
+  # Nested inside section (p) deliberately, to reuse its plain+auth listener
+  # pair — when the ADBC guard skips the whole section, A13 skips with it.
   # pandas rides the guard because flightsql-dbapi's cursor materializes
   # through it without declaring it (Superset ships pandas).
   if ! python3 -c 'import flightsql, sqlalchemy, pandas' 2>/dev/null; then
@@ -1930,15 +1932,24 @@ log "(r2) Npgsql client probe (bench/clients/a14-npgsql-probe)"
 if ! command -v dotnet >/dev/null 2>&1; then
   log "    SKIPPED: dotnet SDK not available (apt install dotnet-sdk-8.0)"
 else
-  A14_OUT=$(cd "$REPO_DIR/bench/clients/a14-npgsql-probe" \
-      && env ICEGRES_PROBE_PG_HOST="$PG_HOST" ICEGRES_PROBE_PG_PORT="$PG_PORT" \
-        dotnet run 2>&1)
-  A14_RC=$?
-  echo "$A14_OUT" | grep -E '^(PASS|FAIL|XFAIL|SKIP|A14 RESULT)' | sed 's/^/    /'
-  [[ $A14_RC -eq 0 ]] || fail "A14 Npgsql probe reported failures (exit $A14_RC)"
-  echo "$A14_OUT" | grep -q '^A14 RESULT: .*fail=0' \
-    || fail "A14 Npgsql probe summary is not fail=0"
-  pass "Npgsql client green ($(echo "$A14_OUT" | grep '^A14 RESULT:'))"
+  # Build first, separately: `dotnet run` performs an implicit NuGet restore,
+  # and a box with the SDK but no package-feed access must SKIP loudly like
+  # every other probe whose dependencies are absent — not fail the gate.
+  if ! A14_BUILD=$(cd "$REPO_DIR/bench/clients/a14-npgsql-probe" \
+      && dotnet build -v q --nologo 2>&1); then
+    log "    SKIPPED: dotnet build/restore failed (no NuGet access?); tail:"
+    echo "$A14_BUILD" | tail -n 3 | sed 's/^/      /'
+  else
+    A14_OUT=$(cd "$REPO_DIR/bench/clients/a14-npgsql-probe" \
+        && env ICEGRES_PROBE_PG_HOST="$PG_HOST" ICEGRES_PROBE_PG_PORT="$PG_PORT" \
+          dotnet run --no-build 2>&1)
+    A14_RC=$?
+    echo "$A14_OUT" | grep -E '^(PASS|FAIL|XFAIL|SKIP|A14 RESULT)' | sed 's/^/    /'
+    [[ $A14_RC -eq 0 ]] || fail "A14 Npgsql probe reported failures (exit $A14_RC)"
+    echo "$A14_OUT" | grep -q '^A14 RESULT: .*fail=0' \
+      || fail "A14 Npgsql probe summary is not fail=0"
+    pass "Npgsql client green ($(echo "$A14_OUT" | grep '^A14 RESULT:'))"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
