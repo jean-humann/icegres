@@ -32,16 +32,17 @@ Config_EnableDirectQuery = true;
 [DataSource.Kind = "Icegres", Publish = "Icegres.Publish"]
 shared Icegres.Database = Value.ReplaceType(IcegresImpl, IcegresType);
 
+// One REQUIRED "host[:port]" parameter, deliberately: optional parameters
+// are not part of the data source path, so a separate optional port would
+// (a) make gateway TestConnection always dial the default port and
+// (b) key stored credentials by host alone — two listeners on one host
+// would share credentials. Folding the port into the server string (the
+// official ODBC samples' shape) fixes both.
 IcegresType = type function (
-    host as (type text meta [
+    server as (type text meta [
         Documentation.FieldCaption = "Server",
-        Documentation.FieldDescription = "icegres Flight SQL host",
-        Documentation.SampleValues = { "icegres.example.internal" }
-    ]),
-    optional port as (type number meta [
-        Documentation.FieldCaption = "Port",
-        Documentation.FieldDescription = "flight-serve port (default 50051)",
-        Documentation.SampleValues = { 50051 }
+        Documentation.FieldDescription = "icegres Flight SQL endpoint, host or host:port (default port 50051)",
+        Documentation.SampleValues = { "icegres.example.internal:50051" }
     ]),
     optional options as (type [
         optional UseEncryption = logical,
@@ -57,9 +58,11 @@ IcegresType = type function (
             & "ODBC driver."
     ];
 
-IcegresImpl = (host as text, optional port as number, optional options as record) as table =>
+IcegresImpl = (server as text, optional options as record) as table =>
     let
-        Port = if port = null then 50051 else port,
+        Parts = Text.Split(server, ":"),
+        Host = List.First(Parts),
+        Port = if List.Count(Parts) > 1 then Number.FromText(Parts{1}) else 50051,
         Options = if options = null then [] else options,
         // TLS on by default: flight-serve should run --tls-cert/--tls-key
         // in production (docs/bi-integration.md, clients/bi/README.md).
@@ -70,7 +73,7 @@ IcegresImpl = (host as text, optional port as number, optional options as record
 
         ConnectionString = [
             Driver = Config_DriverName,
-            HOST = host,
+            HOST = Host,
             PORT = Number.ToText(Port),
             UseEncryption = if UseEncryption then "true" else "false",
             DisableCertificateVerification = if DisableCertVerify then "true" else "false"
@@ -124,10 +127,9 @@ Icegres = [
     TestConnection = (dataSourcePath) =>
         let
             json = Json.Document(dataSourcePath),
-            host = json[host],
-            port = json[port]?
+            server = json[server]
         in
-            { "Icegres.Database", host, port },
+            { "Icegres.Database", server },
     Authentication = [
         UsernamePassword = []
     ],
