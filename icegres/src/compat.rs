@@ -238,18 +238,20 @@ impl TrioCache {
                     datafusion::physical_plan::collect(plan, session.task_ctx()).await?;
                 batches.insert(t, collected);
             }
-            let ns_oid = pg_catalog_namespace_oid(
-                batches
-                    .get("pg_namespace")
-                    .expect("pg_namespace just built"),
-            )?;
-            let provider = self
-                .upstream
-                .get(PATCHED_PG_TYPE)
-                .expect("pg_type provider present");
-            let plan = provider.scan(session, None, &[], None).await?;
-            let collected = datafusion::physical_plan::collect(plan, session.task_ctx()).await?;
-            batches.insert(PATCHED_PG_TYPE, patch_typnamespace(collected, ns_oid)?);
+            // pg_type is optional in the snapshot: when the upstream
+            // emulation lacks it (a future matrix bump), the wrapper never
+            // serves it and the WARN at install time already fired.
+            if let Some(provider) = self.upstream.get(PATCHED_PG_TYPE) {
+                let ns_oid = pg_catalog_namespace_oid(
+                    batches
+                        .get("pg_namespace")
+                        .expect("pg_namespace just built"),
+                )?;
+                let plan = provider.scan(session, None, &[], None).await?;
+                let collected =
+                    datafusion::physical_plan::collect(plan, session.task_ctx()).await?;
+                batches.insert(PATCHED_PG_TYPE, patch_typnamespace(collected, ns_oid)?);
+            }
             *guard = Some(Generation {
                 fingerprint: fp,
                 batches,
@@ -393,13 +395,27 @@ pub async fn install_coherent_pg_catalog(
         .schema("pg_catalog")
         .ok_or_else(|| anyhow::anyhow!("pg_catalog schema not registered"))?;
     let mut upstream_trio: HashMap<&'static str, Arc<dyn TableProvider>> = HashMap::new();
-    for name in SERVED_TABLES {
+    for name in COHERENT_TABLES {
         let provider = upstream
             .table(name)
             .await
             .map_err(|e| anyhow::anyhow!("failed to fetch pg_catalog.{name}: {e}"))?
             .ok_or_else(|| anyhow::anyhow!("pg_catalog.{name} missing from the emulation"))?;
         upstream_trio.insert(name, provider);
+    }
+    // The trio is load-bearing (ORM reflection breaks without it) and stays a
+    // hard boot requirement; the pg_type patch degrades gracefully — if a
+    // future dependency-matrix bump drops or renames the static table, serve
+    // whatever upstream serves and say so, rather than turning a
+    // compatibility shim into a boot failure.
+    match upstream.table(PATCHED_PG_TYPE).await {
+        Ok(Some(provider)) => {
+            upstream_trio.insert(PATCHED_PG_TYPE, provider);
+        }
+        _ => tracing::warn!(
+            "pg_catalog.{PATCHED_PG_TYPE} missing from the emulation — serving it \
+             unpatched; Npgsql-family type loading will see stock namespace oids"
+        ),
     }
     let cache = Arc::new(TrioCache {
         catalog_list: ctx.state().catalog_list().clone(),
@@ -408,6 +424,7 @@ pub async fn install_coherent_pg_catalog(
     });
     let trio = SERVED_TABLES
         .into_iter()
+        .filter(|name| upstream_trio.contains_key(name))
         .map(|name| {
             (
                 name,
