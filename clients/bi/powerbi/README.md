@@ -63,3 +63,12 @@ connector behavior. The generic **ODBC** connector (psqlODBC, probe A10,
 `UseDeclareFetch=0`) remains the verified fallback — note Microsoft's
 timeline retires only *embedded* ODBC drivers; separately-installed ODBC
 drivers through the ODBC connector are explicitly out of that scope.
+
+## Lane D — a branded icegres custom connector (scaffold shipped)
+
+[`connector/`](connector/) scaffolds a Power Query custom connector on
+the same principle as the Dremio one — an M wrapper over the Arrow
+Flight SQL ODBC driver via `Odbc.DataSource` (there is no public
+`Adbc.DataSource` extensibility yet), with DataFusion dialect
+capabilities and DirectQuery enabled. Windows-only toolchain; build and
+verification steps in its README.
