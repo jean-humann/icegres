@@ -70,6 +70,11 @@ function grpcStatusToHttp(code) {
  */
 export async function streamArrow(res, cors, run, onError) {
   let started = false;
+  const abort = new AbortController();
+  const onClose = () => {
+    if (!res.writableEnded) abort.abort();
+  };
+  res.once("close", onClose);
   const begin = () => {
     if (started) return;
     started = true;
@@ -79,11 +84,43 @@ export async function streamArrow(res, cors, run, onError) {
       ...cors,
     });
   };
-  try {
-    await run((chunk) => {
-      begin();
-      res.write(chunk);
+  const writeChunk = async (chunk) => {
+    if (abort.signal.aborted || res.destroyed) {
+      throw new Error("browser connection closed");
+    }
+    begin();
+    if (res.write(chunk)) return;
+    await new Promise((resolve, reject) => {
+      const cleanup = () => {
+        res.off("drain", onDrain);
+        res.off("close", onClosed);
+        res.off("error", onStreamError);
+        abort.signal.removeEventListener("abort", onAborted);
+      };
+      const onDrain = () => {
+        cleanup();
+        resolve();
+      };
+      const onClosed = () => {
+        cleanup();
+        reject(new Error("browser connection closed"));
+      };
+      const onStreamError = (error) => {
+        cleanup();
+        reject(error);
+      };
+      const onAborted = () => onClosed();
+      res.once("drain", onDrain);
+      res.once("close", onClosed);
+      res.once("error", onStreamError);
+      abort.signal.addEventListener("abort", onAborted, { once: true });
     });
+  };
+  try {
+    await run(async (chunk) => {
+      begin();
+      await writeChunk(chunk);
+    }, abort.signal);
     begin(); // a zero-chunk result still completes as an (empty) 200 stream
     res.end();
   } catch (e) {
@@ -94,6 +131,8 @@ export async function streamArrow(res, cors, run, onError) {
       const status = grpcStatusToHttp(e && e.code);
       sendJson(res, status, { error: (e && e.message) || String(e) }, cors);
     }
+  } finally {
+    res.off("close", onClose);
   }
 }
 

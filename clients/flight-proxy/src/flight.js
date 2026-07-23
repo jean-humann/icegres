@@ -61,24 +61,60 @@ function sqlDescriptor(sql) {
 }
 
 /**
- * Run `sql` and invoke `onChunk(Buffer)` for each Arrow IPC chunk as it
- * streams (schema, batches, EOS). Resolves when the DoGet stream ends.
+ * Run `sql` and await `onChunk(Buffer)` for each Arrow IPC chunk as it
+ * streams (schema, batches, EOS). The gRPC source is paused while the sink is
+ * backpressured, and an optional AbortSignal cancels the upstream DoGet.
  */
-export function queryToIpc({ client, meta }, sql, onChunk) {
+export function queryToIpc({ client, meta }, sql, onChunk, { signal } = {}) {
   return new Promise((resolve, reject) => {
-    client.GetFlightInfo(sqlDescriptor(sql), meta, (err, info) => {
-      if (err) return reject(err);
+    let infoCall;
+    let call;
+    let settled = false;
+    let ended = false;
+    let writes = Promise.resolve();
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", onAbort);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onAbort = () => {
+      infoCall?.cancel();
+      call?.cancel();
+      finish(new Error("query cancelled because the browser connection closed"));
+    };
+    if (signal?.aborted) return onAbort();
+    signal?.addEventListener("abort", onAbort, { once: true });
+
+    infoCall = client.GetFlightInfo(sqlDescriptor(sql), meta, (err, info) => {
+      if (settled) return;
+      if (err) return finish(err);
       const ticket = info.endpoint?.[0]?.ticket;
-      if (!ticket) return reject(new Error("FlightInfo carried no endpoint ticket"));
-      const call = client.DoGet(ticket, meta);
-      call.on("data", (fd) =>
-        onChunk(Buffer.from(flightDataToIpc(fd.data_header, fd.data_body))),
-      );
-      call.on("end", () => {
-        onChunk(Buffer.from(ipcEos()));
-        resolve();
+      if (!ticket) return finish(new Error("FlightInfo carried no endpoint ticket"));
+      call = client.DoGet(ticket, meta);
+      if (signal?.aborted) return onAbort();
+      call.on("data", (fd) => {
+        if (settled) return;
+        call.pause();
+        const chunk = Buffer.from(flightDataToIpc(fd.data_header, fd.data_body));
+        writes = writes
+          .then(() => onChunk(chunk))
+          .then(() => {
+            if (!ended && !settled) call.resume();
+          });
+        writes.catch((error) => {
+          call.cancel();
+          finish(error);
+        });
       });
-      call.on("error", reject);
+      call.on("end", () => {
+        if (settled) return;
+        ended = true;
+        writes = writes.then(() => onChunk(Buffer.from(ipcEos())));
+        writes.then(() => finish(), finish);
+      });
+      call.on("error", finish);
     });
   });
 }

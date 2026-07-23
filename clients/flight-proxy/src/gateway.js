@@ -196,7 +196,7 @@ export function createSqlGateway(config) {
     await streamArrow(
       res,
       cors,
-      (write) => queryToIpc(connFor(session.principal), sql, write),
+      (write, signal) => queryToIpc(connFor(session.principal), sql, write, { signal }),
       // A failure before the first chunk becomes a JSON error; a mid-stream
       // failure destroys the socket. Either way the explorer surfaces it.
       // eslint-disable-next-line no-console
