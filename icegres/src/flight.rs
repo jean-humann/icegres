@@ -243,6 +243,12 @@ impl Drop for GuardedStream {
 /// A prepared statement: the SQL text plus the last bound parameter rows
 /// (`DoPut(CommandPreparedStatementQuery)` replaces them on every bind).
 struct Prepared {
+    /// Principal that created the handle. Prepared handles are capabilities,
+    /// but UUID secrecy is not an authorization boundary: every subsequent
+    /// operation must still match this owner.
+    owner: Option<String>,
+    created: Instant,
+    last_used: Instant,
     sql: String,
     /// Bound parameter rows; each row is one `$1..$n` value set.
     params: Vec<Vec<ScalarValue>>,
@@ -268,6 +274,9 @@ struct Prepared {
 /// must re-handshake; expired tokens are pruned lazily on the next RPC so the
 /// token map cannot grow without bound across a long-lived server.
 const TOKEN_TTL: Duration = Duration::from_secs(3600);
+const DEFAULT_AUTH_CACHE_CAP: usize = 4096;
+const DEFAULT_PREPARED_CAP: usize = 1024;
+const DEFAULT_PREPARED_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// TTL for the per-RPC `Basic` verification cache. Deliberately much shorter
 /// than handshake bearer tokens: this cache is the only thing standing
@@ -281,6 +290,50 @@ struct TokenEntry {
     /// The authenticated principal (empty string when auth is disabled).
     user: String,
     issued: Instant,
+    last_used: Instant,
+}
+
+fn prune_token_store(store: &mut HashMap<String, TokenEntry>, ttl: Duration, cap: usize) {
+    let now = Instant::now();
+    store.retain(|_, entry| now.duration_since(entry.issued) < ttl);
+    while store.len() >= cap.max(1) {
+        let Some(oldest) = store
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        store.remove(&oldest);
+    }
+}
+
+fn prune_prepared_store(store: &mut HashMap<String, Prepared>, ttl: Duration) {
+    store.retain(|_, entry| entry.created.elapsed() < ttl);
+}
+
+fn make_prepared_room(store: &mut HashMap<String, Prepared>, ttl: Duration, cap: usize) {
+    prune_prepared_store(store, ttl);
+    while store.len() >= cap.max(1) {
+        let Some(oldest) = store
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        store.remove(&oldest);
+    }
+}
+
+fn check_prepared_owner(entry: &Prepared, principal: &Option<String>) -> Result<(), Status> {
+    if entry.owner.as_deref() == principal.as_deref() {
+        Ok(())
+    } else {
+        Err(Status::permission_denied(
+            "prepared statement belongs to a different principal",
+        ))
+    }
 }
 
 /// Decode a `Basic` base64 payload into `(user, password)` (shared by the
@@ -310,14 +363,16 @@ async fn verify_basic_cached(
     cache: &Mutex<HashMap<String, TokenEntry>>,
     throttle: &crate::ops::AuthThrottle,
     peer: Option<std::net::IpAddr>,
+    cache_cap: usize,
 ) -> Result<String, Status> {
     {
         // Hot path: one lock + one lookup. TTL is enforced on the fetched
         // entry only; expired strangers are pruned on the (rare) insert path
         // below, so per-RPC cost never grows with the number of principals.
-        let store = cache.lock().expect("basic token lock");
-        if let Some(entry) = store.get(b64) {
+        let mut store = cache.lock().expect("basic token lock");
+        if let Some(entry) = store.get_mut(b64) {
             if entry.issued.elapsed() < BASIC_CACHE_TTL {
+                entry.last_used = Instant::now();
                 return Ok(entry.user.clone());
             }
         }
@@ -368,13 +423,14 @@ async fn verify_basic_cached(
     // a session's queries to its principal without log flooding).
     info!(user, "flight basic auth verified");
     let mut store = cache.lock().expect("basic token lock");
+    prune_token_store(&mut store, BASIC_CACHE_TTL, cache_cap);
     let now = Instant::now();
-    store.retain(|_, e| now.duration_since(e.issued) < BASIC_CACHE_TTL);
     store.insert(
         b64.to_string(),
         TokenEntry {
             user: user.clone(),
             issued: now,
+            last_used: now,
         },
     );
     Ok(user)
@@ -425,6 +481,9 @@ struct FlightSqlServiceImpl {
     /// dashboard fleet cannot open unbounded parallel scans.
     rpc_limiter: Option<Arc<tokio::sync::Semaphore>>,
     prepared: Mutex<HashMap<String, Prepared>>,
+    prepared_cap: usize,
+    prepared_ttl: Duration,
+    auth_cache_cap: usize,
     sql_info: SqlInfoData,
     /// Buffered-write overlay source. `Some` only on the tail-api listener
     /// inside `icegres serve --tail-api-port` (the buffering compute is the
@@ -547,8 +606,11 @@ impl FlightSqlServiceImpl {
             let mut store = self.tokens.lock().expect("token lock");
             let now = Instant::now();
             store.retain(|_, e| now.duration_since(e.issued) < TOKEN_TTL);
-            return match store.get(token) {
-                Some(entry) => Ok(Some(entry.user.clone())),
+            return match store.get_mut(token) {
+                Some(entry) => {
+                    entry.last_used = now;
+                    Ok(Some(entry.user.clone()))
+                }
                 None => Err(Status::unauthenticated("unknown or expired bearer token")),
             };
         }
@@ -558,9 +620,16 @@ impl FlightSqlServiceImpl {
         // behave against other Flight SQL servers.
         if let Some(b64) = header.strip_prefix("Basic ") {
             let ip = request.remote_addr().map(|a| a.ip());
-            return verify_basic_cached(b64, auth, &self.basic_tokens, &self.throttle, ip)
-                .await
-                .map(Some);
+            return verify_basic_cached(
+                b64,
+                auth,
+                &self.basic_tokens,
+                &self.throttle,
+                ip,
+                self.auth_cache_cap,
+            )
+            .await
+            .map(Some);
         }
         Err(Status::unauthenticated(
             "expected 'Bearer <token>' or 'Basic <credentials>' authorization",
@@ -606,12 +675,9 @@ impl FlightSqlServiceImpl {
         };
         let user = principal.as_deref().unwrap_or("");
         for stmt in &stmts {
-            if let authz::Decision::Deny { action, target } =
-                authorizer.authorize_sql(user, stmt, &self.default_namespace)
-            {
-                return Err(Status::permission_denied(authz::deny_message(
-                    user, action, &target,
-                )));
+            let decision = authorizer.authorize_sql(user, stmt, &self.default_namespace);
+            if let Some(message) = authz::decision_denial_message(user, &decision) {
+                return Err(Status::permission_denied(message));
             }
         }
         Ok(())
@@ -643,12 +709,9 @@ impl FlightSqlServiceImpl {
             namespace: namespace.to_string(),
             table: table.to_string(),
         };
-        if let authz::Decision::Deny { action, target } =
-            authorizer.check(user, AuthzAction::WriteData, &target)
-        {
-            return Err(Status::permission_denied(authz::deny_message(
-                user, action, &target,
-            )));
+        let decision = authorizer.check(user, AuthzAction::WriteData, &target);
+        if let Some(message) = authz::decision_denial_message(user, &decision) {
+            return Err(Status::permission_denied(message));
         }
         Ok(())
     }
@@ -1017,12 +1080,9 @@ fn check_read_with(
         namespace: ident.namespace().clone().inner().join("."),
         table: ident.name().to_string(),
     };
-    if let authz::Decision::Deny { action, target } =
-        authorizer.check(user, AuthzAction::ReadData, &target)
-    {
-        return Err(Status::permission_denied(authz::deny_message(
-            user, action, &target,
-        )));
+    let decision = authorizer.check(user, AuthzAction::ReadData, &target);
+    if let Some(message) = authz::decision_denial_message(user, &decision) {
+        return Err(Status::permission_denied(message));
     }
     Ok(())
 }
@@ -1189,20 +1249,32 @@ impl FlightSqlService for FlightSqlServiceImpl {
             // shared success cache — the two credential surfaces cannot
             // drift in throttle or error behavior.
             let peer = request.remote_addr().map(|a| a.ip());
-            let user =
-                verify_basic_cached(b64, source, &self.basic_tokens, &self.throttle, peer).await?;
+            let user = verify_basic_cached(
+                b64,
+                source,
+                &self.basic_tokens,
+                &self.throttle,
+                peer,
+                self.auth_cache_cap,
+            )
+            .await?;
             // (verify_basic_cached already counts the failure metric + throttle.)
             info!(user, "flight handshake authenticated");
             authenticated_user = user;
         }
         let token = uuid::Uuid::new_v4().to_string();
-        self.tokens.lock().expect("token lock").insert(
+        let mut tokens = self.tokens.lock().expect("token lock");
+        prune_token_store(&mut tokens, TOKEN_TTL, self.auth_cache_cap);
+        let now = Instant::now();
+        tokens.insert(
             token.clone(),
             TokenEntry {
                 user: authenticated_user,
-                issued: Instant::now(),
+                issued: now,
+                last_used: now,
             },
         );
+        drop(tokens);
         let output: HandshakeStream = Box::pin(stream::iter([Ok(HandshakeResponse {
             protocol_version: 0,
             payload: token.clone().into_bytes().into(),
@@ -1347,9 +1419,15 @@ impl FlightSqlService for FlightSqlServiceImpl {
         // time); advertise an empty parameter schema.
         let parameter_schema = encode_schema(&Schema::empty())?;
         let handle = uuid::Uuid::new_v4().to_string();
-        self.prepared.lock().expect("prepared lock").insert(
+        let mut prepared = self.prepared.lock().expect("prepared lock");
+        make_prepared_room(&mut prepared, self.prepared_ttl, self.prepared_cap);
+        let now = Instant::now();
+        prepared.insert(
             handle.clone(),
             Prepared {
+                owner: principal,
+                created: now,
+                last_used: now,
                 sql,
                 params: Vec::new(),
                 schema: schema_ref,
@@ -1368,10 +1446,16 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: ActionClosePreparedStatementRequest,
         request: Request<Action>,
     ) -> Result<(), Status> {
-        self.authorize(&request).await?;
+        let principal = self.authorize(&request).await?;
         let handle = String::from_utf8(query.prepared_statement_handle.to_vec())
             .map_err(|_| Status::invalid_argument("invalid prepared statement handle"))?;
-        self.prepared.lock().expect("prepared lock").remove(&handle);
+        let mut prepared = self.prepared.lock().expect("prepared lock");
+        prune_prepared_store(&mut prepared, self.prepared_ttl);
+        let entry = prepared
+            .get(&handle)
+            .ok_or_else(|| Status::not_found(format!("unknown prepared statement {handle}")))?;
+        check_prepared_owner(entry, &principal)?;
+        prepared.remove(&handle);
         Ok(())
     }
 
@@ -1380,15 +1464,18 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandPreparedStatementQuery,
         request: Request<PeekableFlightDataStream>,
     ) -> Result<DoPutPreparedStatementResult, Status> {
-        self.authorize(&request).await?;
+        let principal = self.authorize(&request).await?;
         let handle = String::from_utf8(query.prepared_statement_handle.to_vec())
             .map_err(|_| Status::invalid_argument("invalid prepared statement handle"))?;
         let batches = decode_put_stream(request.into_inner()).await?;
         let rows = batches_to_param_rows(&batches)?;
         let mut prepared = self.prepared.lock().expect("prepared lock");
+        prune_prepared_store(&mut prepared, self.prepared_ttl);
         let entry = prepared
             .get_mut(&handle)
             .ok_or_else(|| Status::not_found(format!("unknown prepared statement {handle}")))?;
+        check_prepared_owner(entry, &principal)?;
+        entry.last_used = Instant::now();
         entry.params = rows;
         Ok(DoPutPreparedStatementResult {
             prepared_statement_handle: Some(query.prepared_statement_handle),
@@ -1400,17 +1487,20 @@ impl FlightSqlService for FlightSqlServiceImpl {
         cmd: CommandPreparedStatementQuery,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        self.authorize(&request).await?;
+        let principal = self.authorize(&request).await?;
         let handle = String::from_utf8(cmd.prepared_statement_handle.to_vec())
             .map_err(|_| Status::invalid_argument("invalid prepared statement handle"))?;
         // Answer from the schema captured at create time — no second plan pass.
         let schema = {
-            let prepared = self.prepared.lock().expect("prepared lock");
-            prepared
+            let mut prepared = self.prepared.lock().expect("prepared lock");
+            prune_prepared_store(&mut prepared, self.prepared_ttl);
+            let entry = prepared
                 .get(&handle)
-                .ok_or_else(|| Status::not_found(format!("unknown prepared statement {handle}")))?
-                .schema
-                .clone()
+                .ok_or_else(|| Status::not_found(format!("unknown prepared statement {handle}")))?;
+            check_prepared_owner(entry, &principal)?;
+            let entry = prepared.get_mut(&handle).expect("checked above");
+            entry.last_used = Instant::now();
+            entry.schema.clone()
         };
         Ok(Response::new(Self::make_info(
             &schema,
@@ -1429,9 +1519,12 @@ impl FlightSqlService for FlightSqlServiceImpl {
             .map_err(|_| Status::invalid_argument("invalid prepared statement handle"))?;
         let (sql, params, stashed) = {
             let mut prepared = self.prepared.lock().expect("prepared lock");
+            prune_prepared_store(&mut prepared, self.prepared_ttl);
             let entry = prepared
                 .get_mut(&handle)
                 .ok_or_else(|| Status::not_found(format!("unknown prepared statement {handle}")))?;
+            check_prepared_owner(entry, &principal)?;
+            entry.last_used = Instant::now();
             // The create-time physical plan is consumed ONE-SHOT (a second
             // execute of the same handle re-plans for a fresh snapshot).
             (entry.sql.clone(), entry.params.clone(), entry.plan.take())
@@ -1494,12 +1587,15 @@ impl FlightSqlService for FlightSqlServiceImpl {
         let handle = String::from_utf8(query.prepared_statement_handle.to_vec())
             .map_err(|_| Status::invalid_argument("invalid prepared statement handle"))?;
         let sql = {
-            let prepared = self.prepared.lock().expect("prepared lock");
-            prepared
+            let mut prepared = self.prepared.lock().expect("prepared lock");
+            prune_prepared_store(&mut prepared, self.prepared_ttl);
+            let entry = prepared
                 .get(&handle)
-                .ok_or_else(|| Status::not_found(format!("unknown prepared statement {handle}")))?
-                .sql
-                .clone()
+                .ok_or_else(|| Status::not_found(format!("unknown prepared statement {handle}")))?;
+            check_prepared_owner(entry, &principal)?;
+            let entry = prepared.get_mut(&handle).expect("checked above");
+            entry.last_used = Instant::now();
+            entry.sql.clone()
         };
         self.check_sql(&principal, &sql)?;
         let batches = decode_put_stream(request.into_inner()).await?;
@@ -1956,6 +2052,9 @@ pub async fn spawn_tail_api(
         default_namespace: DEFAULT_SCHEMA.to_string(),
         tokens: Mutex::new(HashMap::new()),
         prepared: Mutex::new(HashMap::new()),
+        prepared_cap: DEFAULT_PREPARED_CAP,
+        prepared_ttl: DEFAULT_PREPARED_TTL,
+        auth_cache_cap: DEFAULT_AUTH_CACHE_CAP,
         sql_info: build_sql_info(),
         write_buffer: Some(buffer),
         read_only: true,
@@ -2025,6 +2124,12 @@ pub struct ListenerOpts {
     pub max_result_bytes: Option<u64>,
     /// In-flight DoGet concurrency cap (`--flight-max-concurrent-rpcs`).
     pub max_concurrent_rpcs: Option<usize>,
+    /// Bound on retained prepared handles.
+    pub max_prepared_statements: usize,
+    /// Lifetime of an abandoned prepared handle.
+    pub prepared_statement_ttl: Duration,
+    /// Bound shared by bearer-token and successful Basic-auth caches.
+    pub max_auth_cache_entries: usize,
     /// HTTP liveness/metrics port (`--health-port`); `None` = not served.
     pub health_port: Option<u16>,
     /// Reject every write on this listener (`--read-only`).
@@ -2049,6 +2154,9 @@ pub async fn run(
         statement_timeout,
         max_result_bytes,
         max_concurrent_rpcs,
+        max_prepared_statements,
+        prepared_statement_ttl,
+        max_auth_cache_entries,
         health_port,
         read_only,
     } = listener_opts;
@@ -2141,6 +2249,9 @@ pub async fn run(
         default_namespace: DEFAULT_SCHEMA.to_string(),
         tokens: Mutex::new(HashMap::new()),
         prepared: Mutex::new(HashMap::new()),
+        prepared_cap: max_prepared_statements,
+        prepared_ttl: prepared_statement_ttl,
+        auth_cache_cap: max_auth_cache_entries,
         sql_info: build_sql_info(),
         write_buffer: None,
         read_only,
@@ -2169,6 +2280,9 @@ pub async fn run(
         statement_timeout_ms = statement_timeout.map(|d| d.as_millis() as u64),
         max_result_bytes,
         max_concurrent_rpcs,
+        max_prepared_statements,
+        prepared_statement_ttl_secs = prepared_statement_ttl.as_secs(),
+        max_auth_cache_entries,
         startup_ms = start.elapsed().as_millis() as u64,
         "flight-serve ready (Arrow Flight SQL)"
     );
@@ -2672,9 +2786,25 @@ mod tests {
         let bad = base64::engine::general_purpose::STANDARD.encode("bench:wrong");
 
         // First success runs the KDF; the repeat is served from the cache.
-        let got = verify_basic_cached(&good, &auth, &cache, &throttle, peer).await;
+        let got = verify_basic_cached(
+            &good,
+            &auth,
+            &cache,
+            &throttle,
+            peer,
+            DEFAULT_AUTH_CACHE_CAP,
+        )
+        .await;
         assert_eq!(got.unwrap(), "bench");
-        let got = verify_basic_cached(&good, &auth, &cache, &throttle, peer).await;
+        let got = verify_basic_cached(
+            &good,
+            &auth,
+            &cache,
+            &throttle,
+            peer,
+            DEFAULT_AUTH_CACHE_CAP,
+        )
+        .await;
         assert_eq!(got.unwrap(), "bench");
         assert_eq!(verifier.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
@@ -2682,13 +2812,17 @@ mod tests {
         // escalates the same per-peer backoff pgwire applies (visible here as
         // paused-clock time consumed by the pre-verification sleep).
         let t0 = tokio::time::Instant::now();
-        assert!(verify_basic_cached(&bad, &auth, &cache, &throttle, peer)
-            .await
-            .is_err());
+        assert!(
+            verify_basic_cached(&bad, &auth, &cache, &throttle, peer, DEFAULT_AUTH_CACHE_CAP,)
+                .await
+                .is_err()
+        );
         assert_eq!(t0.elapsed(), Duration::ZERO, "first failure pays no delay");
-        assert!(verify_basic_cached(&bad, &auth, &cache, &throttle, peer)
-            .await
-            .is_err());
+        assert!(
+            verify_basic_cached(&bad, &auth, &cache, &throttle, peer, DEFAULT_AUTH_CACHE_CAP,)
+                .await
+                .is_err()
+        );
         assert!(
             t0.elapsed() >= Duration::from_millis(250),
             "second attempt from the throttled peer must back off"
@@ -2698,9 +2832,94 @@ mod tests {
         // A throttled peer does NOT slow already-authenticated traffic: the
         // cached credential still short-circuits before the penalty.
         let t1 = tokio::time::Instant::now();
-        let got = verify_basic_cached(&good, &auth, &cache, &throttle, peer).await;
+        let got = verify_basic_cached(
+            &good,
+            &auth,
+            &cache,
+            &throttle,
+            peer,
+            DEFAULT_AUTH_CACHE_CAP,
+        )
+        .await;
         assert_eq!(got.unwrap(), "bench");
         assert_eq!(t1.elapsed(), Duration::ZERO, "cache hits skip the backoff");
+    }
+
+    fn prepared_for_test(owner: Option<&str>, age: Duration, idle: Duration) -> Prepared {
+        let now = Instant::now();
+        Prepared {
+            owner: owner.map(str::to_string),
+            created: now - age,
+            last_used: now - idle,
+            sql: "select 1".to_string(),
+            params: Vec::new(),
+            schema: Arc::new(Schema::empty()),
+            plan: None,
+        }
+    }
+
+    #[test]
+    fn retained_flight_state_is_ttl_pruned_and_lru_bounded() {
+        let now = Instant::now();
+        let mut tokens = HashMap::from([
+            (
+                "expired".to_string(),
+                TokenEntry {
+                    user: "old".to_string(),
+                    issued: now - Duration::from_secs(120),
+                    last_used: now - Duration::from_secs(120),
+                },
+            ),
+            (
+                "least-recent".to_string(),
+                TokenEntry {
+                    user: "a".to_string(),
+                    issued: now,
+                    last_used: now - Duration::from_secs(2),
+                },
+            ),
+            (
+                "recent".to_string(),
+                TokenEntry {
+                    user: "b".to_string(),
+                    issued: now,
+                    last_used: now - Duration::from_secs(1),
+                },
+            ),
+        ]);
+        prune_token_store(&mut tokens, Duration::from_secs(60), 2);
+        assert_eq!(tokens.len(), 1, "one slot is reserved for the new token");
+        assert!(tokens.contains_key("recent"));
+
+        let mut prepared = HashMap::from([
+            (
+                "expired".to_string(),
+                prepared_for_test(Some("alice"), Duration::from_secs(20), Duration::ZERO),
+            ),
+            (
+                "least-recent".to_string(),
+                prepared_for_test(Some("alice"), Duration::ZERO, Duration::from_secs(2)),
+            ),
+            (
+                "recent".to_string(),
+                prepared_for_test(Some("alice"), Duration::ZERO, Duration::from_secs(1)),
+            ),
+        ]);
+        make_prepared_room(&mut prepared, Duration::from_secs(10), 2);
+        assert_eq!(prepared.len(), 1, "one slot is reserved for the new handle");
+        assert!(prepared.contains_key("recent"));
+    }
+
+    #[test]
+    fn prepared_handles_are_bound_to_the_creating_principal() {
+        let prepared = prepared_for_test(Some("alice"), Duration::ZERO, Duration::ZERO);
+        assert!(check_prepared_owner(&prepared, &Some("alice".to_string())).is_ok());
+        let err = check_prepared_owner(&prepared, &Some("bob".to_string())).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(check_prepared_owner(&prepared, &None).is_err());
+
+        let anonymous = prepared_for_test(None, Duration::ZERO, Duration::ZERO);
+        assert!(check_prepared_owner(&anonymous, &None).is_ok());
     }
 
     /// Inner stub for the CORS layer: answers every request with 200 and a
