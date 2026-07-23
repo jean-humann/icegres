@@ -82,6 +82,9 @@ from pgwire (so both can run in one process), but shares auth/freshness.
 | `ICEGRES_FLIGHT_STATEMENT_TIMEOUT_MS` · `--flight-statement-timeout-ms` | `0` (unbounded) | Wall-clock ceiling per DoGet query stream; a query past it aborts with `DEADLINE_EXCEEDED` rather than holding an executor thread. Fires even mid-scan (live timer). Data path only — metadata RPCs are exempt. |
 | `ICEGRES_FLIGHT_MAX_RESULT_BYTES` · `--flight-max-result-bytes` | `0` (unbounded) | Byte ceiling per DoGet result over the Arrow IPC body streamed; a result past it is cut with `RESOURCE_EXHAUSTED`, so a `SELECT *` on a huge table cannot stream gigabytes into a browser tab. |
 | `ICEGRES_FLIGHT_MAX_CONCURRENT_RPCS` · `--flight-max-concurrent-rpcs` | `0` (uncapped) | Cap on concurrent in-flight DoGet query streams — the Flight analogue of pgwire `--max-connections`; excess RPCs wait at the choke point rather than spawning unbounded scans. |
+| `ICEGRES_FLIGHT_MAX_PREPARED_STATEMENTS` · `--flight-max-prepared-statements` | `1024` | Process-wide cap on retained prepared handles. The least-recently-used handle is evicted before admitting another. |
+| `ICEGRES_FLIGHT_PREPARED_STATEMENT_TTL_SECS` · `--flight-prepared-statement-ttl-secs` | `900` | Maximum retained lifetime of a prepared handle; expired handles are rejected and removed lazily. |
+| `ICEGRES_FLIGHT_MAX_AUTH_CACHE_ENTRIES` · `--flight-max-auth-cache-entries` | `4096` | Cap on successful Basic-auth cache entries and bearer tokens. Expiry and least-recently-used eviction keep both stores bounded. |
 | `ICEGRES_HEALTH_PORT` · `--health-port` (flight-serve) | off | Serve `/health`, `/ready`, and `/metrics` on this port for a **standalone** flight-serve (the Flight per-RPC metrics — `icegres_flight_*` — render here). Shared env var with `serve`; each process binds its own. |
 | `ICEGRES_FLIGHT_READ_ONLY` · `--read-only` (flight-serve) | off | Reject every write on the listener — INSERT/UPDATE/DELETE/DROP (query flow, prepared statements, and bulk ingest) return `PERMISSION_DENIED` before execution. Statement-form based (reuses the authz analyzer), independent of `--authz-file`. The posture for a browser SQL explorer. |
 
@@ -180,6 +183,7 @@ are `ICEGRESD_*` (note the `D`). See [`p3-ha-scope.md`](p3-ha-scope.md) and
 |---|---|---|
 | `ICEGRESD_HOST` · `--host` | `0.0.0.0` | Public listener bind address. |
 | `ICEGRESD_PORT` · `--port` | `5432` | Public port clients connect to. |
+| `ICEGRESD_MAX_CONNECTIONS` · `--max-connections` | `512` (`0` disables the cap) | Hard ceiling on accepted client sessions. Once full, the accept loop waits for a session to end while still responding to shutdown signals. |
 | `ICEGRESD_ICEGRES_BIN` · `--icegres-bin` | sibling `icegres`, else PATH | Path to the `icegres` binary to spawn. |
 | `ICEGRESD_COMPUTE_HOST` · `--compute-host` | `127.0.0.1` | Host computes bind/are dialed on (plain TCP; keep local). |
 | `ICEGRESD_MAIN_PORT` · `--main-port` | `5439` | Fixed port of the main compute. |
