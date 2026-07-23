@@ -247,7 +247,6 @@ struct Prepared {
     /// but UUID secrecy is not an authorization boundary: every subsequent
     /// operation must still match this owner.
     owner: Option<String>,
-    created: Instant,
     last_used: Instant,
     sql: String,
     /// Bound parameter rows; each row is one `$1..$n` value set.
@@ -309,7 +308,7 @@ fn prune_token_store(store: &mut HashMap<String, TokenEntry>, ttl: Duration, cap
 }
 
 fn prune_prepared_store(store: &mut HashMap<String, Prepared>, ttl: Duration) {
-    store.retain(|_, entry| entry.created.elapsed() < ttl);
+    store.retain(|_, entry| entry.last_used.elapsed() < ttl);
 }
 
 fn make_prepared_room(store: &mut HashMap<String, Prepared>, ttl: Duration, cap: usize) {
@@ -1426,7 +1425,6 @@ impl FlightSqlService for FlightSqlServiceImpl {
             handle.clone(),
             Prepared {
                 owner: principal,
-                created: now,
                 last_used: now,
                 sql,
                 params: Vec::new(),
@@ -2845,11 +2843,10 @@ mod tests {
         assert_eq!(t1.elapsed(), Duration::ZERO, "cache hits skip the backoff");
     }
 
-    fn prepared_for_test(owner: Option<&str>, age: Duration, idle: Duration) -> Prepared {
+    fn prepared_for_test(owner: Option<&str>, idle: Duration) -> Prepared {
         let now = Instant::now();
         Prepared {
             owner: owner.map(str::to_string),
-            created: now - age,
             last_used: now - idle,
             sql: "select 1".to_string(),
             params: Vec::new(),
@@ -2894,15 +2891,15 @@ mod tests {
         let mut prepared = HashMap::from([
             (
                 "expired".to_string(),
-                prepared_for_test(Some("alice"), Duration::from_secs(20), Duration::ZERO),
+                prepared_for_test(Some("alice"), Duration::from_secs(20)),
             ),
             (
                 "least-recent".to_string(),
-                prepared_for_test(Some("alice"), Duration::ZERO, Duration::from_secs(2)),
+                prepared_for_test(Some("alice"), Duration::from_secs(2)),
             ),
             (
                 "recent".to_string(),
-                prepared_for_test(Some("alice"), Duration::ZERO, Duration::from_secs(1)),
+                prepared_for_test(Some("alice"), Duration::from_secs(1)),
             ),
         ]);
         make_prepared_room(&mut prepared, Duration::from_secs(10), 2);
@@ -2912,13 +2909,13 @@ mod tests {
 
     #[test]
     fn prepared_handles_are_bound_to_the_creating_principal() {
-        let prepared = prepared_for_test(Some("alice"), Duration::ZERO, Duration::ZERO);
+        let prepared = prepared_for_test(Some("alice"), Duration::ZERO);
         assert!(check_prepared_owner(&prepared, &Some("alice".to_string())).is_ok());
         let err = check_prepared_owner(&prepared, &Some("bob".to_string())).unwrap_err();
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
         assert!(check_prepared_owner(&prepared, &None).is_err());
 
-        let anonymous = prepared_for_test(None, Duration::ZERO, Duration::ZERO);
+        let anonymous = prepared_for_test(None, Duration::ZERO);
         assert!(check_prepared_owner(&anonymous, &None).is_ok());
     }
 
