@@ -146,6 +146,7 @@ use datafusion::common::ParamValues;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::Statement;
+use datafusion_postgres::hooks::HookClient;
 use datafusion_postgres::pgwire::api::results::{Response, Tag};
 use datafusion_postgres::pgwire::api::ClientInfo;
 use datafusion_postgres::pgwire::error::PgWireResult;
@@ -2881,7 +2882,7 @@ impl BufferHook {
             // RMW must not clobber the committed sync write); anything else
             // again (incl. bind parameters, which the DML engine rejects
             // downstream) falls through to the fence below.
-            Statement::Update { .. } | Statement::Delete(_) => {
+            Statement::Update(_) | Statement::Delete(_) => {
                 let has_params = params.is_some_and(|p| match p {
                     ParamValues::List(l) => !l.is_empty(),
                     ParamValues::Map(m) => !m.is_empty(),
@@ -2941,7 +2942,7 @@ impl QueryHook for BufferHook {
         &self,
         statement: &Statement,
         session_context: &SessionContext,
-        client: &mut (dyn ClientInfo + Send + Sync),
+        client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
         self.dispatch(statement, session_context, client, None)
             .await
@@ -2964,7 +2965,7 @@ impl QueryHook for BufferHook {
         _logical_plan: &LogicalPlan,
         params: &ParamValues,
         session_context: &SessionContext,
-        client: &mut (dyn ClientInfo + Send + Sync),
+        client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
         self.dispatch(statement, session_context, client, Some(params))
             .await

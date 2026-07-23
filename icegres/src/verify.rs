@@ -1027,7 +1027,8 @@ impl Harness {
     /// (what this used to issue) would 401 against an auth-guarded catalog and
     /// STRAND the scratch namespace + tables, breaking verify's
     /// create-test-drop contract. The catalog client's `drop_table` does not
-    /// request an object-store purge (iceberg-rust 0.9.1 exposes none), so the
+    /// request an object-store purge (iceberg-rust 0.10.0 gained a purging
+    /// drop, but verify deliberately keeps the non-purging one), so the
     /// dropped tables' data files are left to the store's own lifecycle — like
     /// all object-store cleanup, which is out of verify's reach by
     /// construction (docs/limitations.md).

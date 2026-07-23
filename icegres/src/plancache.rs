@@ -116,6 +116,7 @@ use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::Statement as SqlStatement;
 use datafusion_postgres::arrow_pg::datatypes::{arrow_schema_to_pg_fields, encode_recordbatch};
 use datafusion_postgres::datafusion_pg_catalog::sql::PostgresCompatibilityParser;
+use datafusion_postgres::hooks::HookClient;
 use datafusion_postgres::pgwire::api::portal::Format;
 use datafusion_postgres::pgwire::api::results::{QueryResponse, Response};
 use datafusion_postgres::pgwire::api::ClientInfo;
@@ -567,7 +568,7 @@ impl Stream for CachingTee {
 fn respond_cached(
     batches: Arc<Vec<RecordBatch>>,
     schema: ArrowSchemaRef,
-    client: &mut (dyn ClientInfo + Send + Sync),
+    client: &mut dyn HookClient,
     total: Instant,
     record_stages: bool,
 ) -> PgWireResult<Response> {
@@ -705,7 +706,7 @@ impl PlanCacheHook {
         &self,
         statement: &SqlStatement,
         ctx: &SessionContext,
-        client: &mut (dyn ClientInfo + Send + Sync),
+        client: &mut dyn HookClient,
     ) -> PgWireResult<Response> {
         let total = Instant::now();
         let record_stages = timing::enabled();
@@ -891,7 +892,7 @@ async fn respond(
     plan: Arc<dyn ExecutionPlan>,
     schema: ArrowSchemaRef,
     task_ctx: Arc<TaskContext>,
-    client: &mut (dyn ClientInfo + Send + Sync),
+    client: &mut dyn HookClient,
     record_stages: bool,
     total: Instant,
     populate: Option<PopulateSink>,
@@ -955,7 +956,7 @@ impl QueryHook for PlanCacheHook {
         &self,
         statement: &SqlStatement,
         session_context: &SessionContext,
-        client: &mut (dyn ClientInfo + Send + Sync),
+        client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
         if self.cache.capacity == 0 || !matches!(statement, SqlStatement::Query(_)) {
             return None;
@@ -980,7 +981,7 @@ impl QueryHook for PlanCacheHook {
         _logical_plan: &LogicalPlan,
         _params: &ParamValues,
         _session_context: &SessionContext,
-        _client: &mut (dyn ClientInfo + Send + Sync),
+        _client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
         None
     }

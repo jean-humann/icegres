@@ -34,6 +34,7 @@ use datafusion::sql::sqlparser::ast::{
     self, Delete, Expr, FromTable, ObjectName, ObjectNamePart, Statement, TableFactor,
     TableWithJoins, Visit, Visitor,
 };
+use datafusion_postgres::hooks::HookClient;
 use datafusion_postgres::pgwire::api::results::{Response, Tag};
 use datafusion_postgres::pgwire::api::ClientInfo;
 use datafusion_postgres::pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
@@ -82,7 +83,7 @@ impl QueryHook for DmlHook {
         &self,
         statement: &Statement,
         _session_context: &SessionContext,
-        _client: &mut (dyn ClientInfo + Send + Sync),
+        _client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
         if !is_dml(statement) {
             return None;
@@ -113,7 +114,7 @@ impl QueryHook for DmlHook {
         _logical_plan: &LogicalPlan,
         params: &ParamValues,
         _session_context: &SessionContext,
-        _client: &mut (dyn ClientInfo + Send + Sync),
+        _client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
         if !is_dml(statement) {
             return None;
@@ -133,7 +134,7 @@ impl QueryHook for DmlHook {
 }
 
 fn is_dml(stmt: &Statement) -> bool {
-    matches!(stmt, Statement::Update { .. } | Statement::Delete(_))
+    matches!(stmt, Statement::Update(_) | Statement::Delete(_))
 }
 
 /// Parse `query`; if it is a single UPDATE/DELETE statement, return the
@@ -184,7 +185,7 @@ pub(crate) fn engine_error(e: &anyhow::Error) -> PgWireError {
 /// translation with identical scope checks.
 pub(crate) fn translate(stmt: &Statement) -> anyhow::Result<Option<(DmlStatement, &'static str)>> {
     match stmt {
-        Statement::Update {
+        Statement::Update(ast::Update {
             table,
             assignments,
             from,
@@ -192,7 +193,8 @@ pub(crate) fn translate(stmt: &Statement) -> anyhow::Result<Option<(DmlStatement
             returning,
             or,
             limit,
-        } => {
+            ..
+        }) => {
             anyhow::ensure!(from.is_none(), "UPDATE ... FROM is not supported");
             anyhow::ensure!(returning.is_none(), "UPDATE ... RETURNING is not supported");
             anyhow::ensure!(or.is_none(), "UPDATE OR ... is not supported");
@@ -236,6 +238,7 @@ pub(crate) fn translate(stmt: &Statement) -> anyhow::Result<Option<(DmlStatement
             returning,
             order_by,
             limit,
+            ..
         }) => {
             anyhow::ensure!(tables.is_empty(), "multi-table DELETE is not supported");
             anyhow::ensure!(using.is_none(), "DELETE ... USING is not supported");

@@ -53,17 +53,16 @@ pub async fn connect_catalog(opts: &CatalogOpts) -> Result<Arc<dyn Catalog>> {
     // Iceberg REST catalog authentication (breadth). Inserted ONLY when the
     // operator set the corresponding flag/env, so the default open-Lakekeeper
     // path leaves `props` byte-identical to before (invariant I3). These are
-    // the exact literal string keys iceberg-catalog-rest 0.9.1 reads
+    // the exact literal string keys iceberg-catalog-rest 0.10.0 reads
     // (catalog.rs): `token`, `credential`, `oauth2-server-uri`, `scope`. The
     // crate is not re-exporting them as constants, so they are inserted as
     // literals — the RestCatalog `load()` builder copies every prop except
     // uri/warehouse into the client config, where the OAuth2 client (already
-    // vendored in iceberg-rust 0.9.1) consumes them.
+    // vendored in iceberg-rust 0.10.0) consumes them.
     apply_catalog_auth(&mut props, opts);
 
     let catalog = RestCatalogBuilder::default()
         .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-            configured_scheme: "s3".to_string(),
             customized_credential_load: None,
         }))
         .load("lakekeeper", props)
@@ -77,7 +76,7 @@ pub async fn connect_catalog(opts: &CatalogOpts) -> Result<Arc<dyn Catalog>> {
     Ok(Arc::new(catalog))
 }
 
-/// Literal Iceberg REST prop keys the pinned `iceberg-catalog-rest 0.9.1`
+/// Literal Iceberg REST prop keys the pinned `iceberg-catalog-rest 0.10.0`
 /// client reads for OAuth2 (it exports no constants for them — see
 /// catalog.rs `get_token_endpoint`/`token`/`credential`/`extra_oauth_params`).
 const PROP_TOKEN: &str = "token";

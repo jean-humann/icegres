@@ -622,17 +622,17 @@ async fn live_object_keys(table: &Table, bucket: &str) -> Result<HashSet<String>
 
     for snapshot in metadata.snapshots() {
         live.add(snapshot.manifest_list());
-        let manifest_list = snapshot
-            .load_manifest_list(file_io, &table.metadata_ref())
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "failed to load manifest list {} (snapshot {}): {e} — aborting the whole \
-                     run: an incomplete live set must never drive deletions",
-                    snapshot.manifest_list(),
-                    snapshot.snapshot_id()
-                )
-            })?;
+        let manifest_list =
+            crate::overwrite::load_manifest_list(file_io, snapshot, &table.metadata_ref())
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                        "failed to load manifest list {} (snapshot {}): {e} — aborting the \
+                         whole run: an incomplete live set must never drive deletions",
+                        snapshot.manifest_list(),
+                        snapshot.snapshot_id()
+                    )
+                })?;
         for manifest_file in manifest_list.entries() {
             live.add(&manifest_file.manifest_path);
             let manifest = manifest_file.load_manifest(file_io).await.map_err(|e| {

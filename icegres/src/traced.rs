@@ -204,6 +204,7 @@ impl SimpleQueryHandler for TracedService {
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: Debug,
+        C::PortalStore: PortalStore,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let _guard = QueryGuard::begin(kind_of(query), self.slow_ms);

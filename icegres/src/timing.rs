@@ -76,6 +76,7 @@ use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::Statement as SqlStatement;
 use datafusion_postgres::arrow_pg::datatypes::{arrow_schema_to_pg_fields, encode_recordbatch};
 use datafusion_postgres::datafusion_pg_catalog::sql::PostgresCompatibilityParser;
+use datafusion_postgres::hooks::HookClient;
 use datafusion_postgres::pgwire::api::portal::Format;
 use datafusion_postgres::pgwire::api::results::{QueryResponse, Response};
 use datafusion_postgres::pgwire::api::ClientInfo;
@@ -129,7 +130,7 @@ impl TimingHook {
         &self,
         statement: &SqlStatement,
         ctx: &SessionContext,
-        client: &mut (dyn ClientInfo + Send + Sync),
+        client: &mut dyn HookClient,
     ) -> PgWireResult<Response> {
         let total = Instant::now();
         let sql = statement.to_string();
@@ -197,7 +198,7 @@ impl QueryHook for TimingHook {
         &self,
         statement: &SqlStatement,
         session_context: &SessionContext,
-        client: &mut (dyn ClientInfo + Send + Sync),
+        client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
         if !enabled() || !matches!(statement, SqlStatement::Query(_)) {
             return None;
@@ -220,7 +221,7 @@ impl QueryHook for TimingHook {
         _logical_plan: &LogicalPlan,
         _params: &ParamValues,
         _session_context: &SessionContext,
-        _client: &mut (dyn ClientInfo + Send + Sync),
+        _client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
         None
     }

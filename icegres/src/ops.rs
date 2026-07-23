@@ -76,6 +76,7 @@ use datafusion::sql::sqlparser::ast::{
 };
 use datafusion_postgres::arrow_pg::datatypes::arrow_schema_to_pg_fields;
 use datafusion_postgres::arrow_pg::encoder::{encode_value, Encoder as ArrowPgEncoder};
+use datafusion_postgres::hooks::HookClient;
 use datafusion_postgres::pgwire::api::auth::noop::NoopStartupHandler;
 use datafusion_postgres::pgwire::api::auth::sasl::scram::ScramAuth;
 use datafusion_postgres::pgwire::api::auth::sasl::SASLAuthStartupHandler;
@@ -821,7 +822,7 @@ impl QueryHook for CopyOutHook {
         &self,
         statement: &SqlStatement,
         session_context: &SessionContext,
-        _client: &mut (dyn ClientInfo + Send + Sync),
+        _client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
         let (sql, format) = match translate_copy(statement) {
             Ok(Some(parsed)) => parsed,
@@ -859,7 +860,7 @@ impl QueryHook for CopyOutHook {
         _logical_plan: &LogicalPlan,
         params: &ParamValues,
         session_context: &SessionContext,
-        _client: &mut (dyn ClientInfo + Send + Sync),
+        _client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
         let (sql, format) = match translate_copy(statement) {
             Ok(Some(parsed)) => parsed,

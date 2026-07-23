@@ -23,14 +23,14 @@
 //!
 //! # Why hand-rolled snapshot production
 //!
-//! The pinned iceberg-rust 0.9.1 `Transaction` API exposes only
-//! `fast_append` — there is no overwrite/rewrite-files action, and
+//! The pinned iceberg-rust 0.10.0 `Transaction` API exposes `fast_append`
+//! plus metadata actions — there is no overwrite/rewrite-files action, and
 //! `TableCommit`'s constructor is `pub(crate)`, so `Catalog::update_table`
 //! cannot be fed a hand-built commit. All the *building blocks* are public,
 //! however: `ManifestWriterBuilder` (ADDED/EXISTING/DELETED entries),
 //! `ManifestListWriter`, `Snapshot`/`TableUpdate`/`TableRequirement`, and
 //! the data-file writer stack. This module assembles them exactly the way
-//! `Transaction`'s own `SnapshotProducer` does (see iceberg-0.9.1
+//! `Transaction`'s own `SnapshotProducer` does (see iceberg-0.10.0
 //! `src/transaction/snapshot.rs`) and commits the result through the
 //! Iceberg REST protocol (`POST /v1/{prefix}/namespaces/{ns}/tables/{tbl}`,
 //! which Lakekeeper implements in full, including snapshot refs).
@@ -271,7 +271,7 @@ impl OverwriteEngine {
         // static bearer has the same non-refreshing semantics as the read
         // client's `token` prop, so they stay consistent. The OAuth2
         // client-credentials (`--catalog-credential`) grant is NOT duplicated
-        // here (house rule: no hand-rolled auth; iceberg-rust 0.9.1 does not
+        // here (house rule: no hand-rolled auth; iceberg-rust 0.10.0 does not
         // expose its token provider) — see docs/catalog-support.md for the
         // write-plane-under-pure-client-credentials note. Absent a token this
         // is `reqwest::Client::new()` byte-for-byte (invariant I3).
@@ -1256,7 +1256,7 @@ impl OverwriteEngine {
 
     /// List every snapshot ref (branch/tag) of `ident` as
     /// `(name, snapshot_id, type)` tuples, `main` first then sorted by name.
-    /// Read through the raw REST metadata because iceberg-rust 0.9.1 exposes
+    /// Read through the raw REST metadata because iceberg-rust 0.10.0 exposes
     /// no public accessor for the full refs map.
     pub async fn list_refs(&self, ident: &TableIdent) -> Result<Vec<(String, i64, String)>> {
         let prefix_seg = if self.prefix.is_empty() {
@@ -1961,8 +1961,8 @@ pub async fn prepare_commit(
     // Same, for files removed by this snapshot (recorded as DELETED).
     let mut deleted: Vec<(DataFile, i64, Option<i64>)> = Vec::new();
     // Summary bookkeeping: exact totals recomputed from the final live set
-    // (previous snapshots' summaries are not trusted: iceberg-rust 0.9.1
-    // fast_append itself writes non-cumulative totals).
+    // (previous snapshots' summaries are not trusted: iceberg-rust
+    // fast_append wrote non-cumulative totals through at least 0.9.x).
     let (mut removed_files, mut removed_records, mut removed_bytes) = (0u64, 0u64, 0u64);
     let (mut kept_files, mut kept_records, mut kept_bytes) = (0u64, 0u64, 0u64);
     let mut any_file_changed = false;
@@ -1975,8 +1975,7 @@ pub async fn prepare_commit(
     // rows below (the parallel-stage join). With DML/PK enforcement the
     // list drives the file scan and is loaded here, exactly as before.
     if let Some(current_snapshot) = head.filter(|_| need_file_scan) {
-        let manifest_list = current_snapshot
-            .load_manifest_list(file_io, &table.metadata_ref())
+        let manifest_list = load_manifest_list(file_io, current_snapshot, table.metadata())
             .await
             .map_err(|e| anyhow!("failed to load manifest list: {e}"))?;
         for mf in manifest_list.entries() {
@@ -2172,7 +2171,7 @@ pub async fn prepare_commit(
         check_pk(pk_cols, &pk_rows, table.identifier().name()).await?;
     }
 
-    // ---- Snapshot production (mirrors iceberg-0.9.1 SnapshotProducer). ----
+    // ---- Snapshot production (mirrors iceberg-0.10.0 SnapshotProducer). ----
     let snapshot_id = generate_unique_snapshot_id(table);
     let next_seq = metadata.next_sequence_number();
     let meta_dir = format!("{}/metadata", metadata.location());
@@ -2240,8 +2239,7 @@ pub async fn prepare_commit(
         let Some(current_snapshot) = head.filter(|_| !need_file_scan) else {
             return Ok::<Vec<ManifestFile>, anyhow::Error>(Vec::new());
         };
-        let manifest_list = current_snapshot
-            .load_manifest_list(file_io, &table.metadata_ref())
+        let manifest_list = load_manifest_list(file_io, current_snapshot, table.metadata())
             .await
             .map_err(|e| anyhow!("failed to load manifest list: {e}"))?;
         for mf in manifest_list.entries() {
@@ -2292,7 +2290,10 @@ pub async fn prepare_commit(
     let mut list_writer = ManifestListWriter::v2(
         file_io
             .new_output(&manifest_list_path)
-            .map_err(|e| anyhow!("failed to open manifest list output: {e}"))?,
+            .map_err(|e| anyhow!("failed to open manifest list output: {e}"))?
+            .writer()
+            .await
+            .map_err(|e| anyhow!("failed to open manifest list writer: {e}"))?,
         snapshot_id,
         head_id,
         next_seq,
@@ -2906,7 +2907,7 @@ async fn new_data_writer(
         table.metadata().current_schema().clone(),
         FieldMatchMode::Name,
     );
-    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())
+    let location_generator = DefaultLocationGenerator::new(table.metadata())
         .map_err(|e| anyhow!("failed to build location generator: {e}"))?;
     let file_name_generator =
         DefaultFileNameGenerator::new(format!("dml-{commit_uuid}"), None, DataFileFormat::Parquet);
@@ -2935,7 +2936,7 @@ pub(crate) async fn new_compact_data_writer(
         table.metadata().current_schema().clone(),
         FieldMatchMode::Name,
     );
-    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())
+    let location_generator = DefaultLocationGenerator::new(table.metadata())
         .map_err(|e| anyhow!("failed to build location generator: {e}"))?;
     let file_name_generator = DefaultFileNameGenerator::new(
         format!("compact-{commit_uuid}"),
@@ -2967,11 +2968,25 @@ pub(crate) fn new_manifest_writer(
     Ok(ManifestWriterBuilder::new(
         output,
         Some(snapshot_id),
-        None,
         table.metadata().current_schema().clone(),
         table.metadata().default_partition_spec().as_ref().clone(),
     )
     .build_v2_data())
+}
+
+/// Load and parse a snapshot's manifest list — the unencrypted read path
+/// `Snapshot::load_manifest_list` exposed before iceberg-rust 0.10 moved the
+/// reader behind a crate-private type. Encrypted snapshots
+/// (`encryption_key_id`) are out of scope: icegres commits its own snapshots
+/// unencrypted, and foreign encrypted tables fail here with a parse error
+/// rather than being silently misread.
+pub(crate) async fn load_manifest_list(
+    file_io: &iceberg::io::FileIO,
+    snapshot: &Snapshot,
+    metadata: &iceberg::spec::TableMetadata,
+) -> iceberg::Result<iceberg::spec::ManifestList> {
+    let content = file_io.new_input(snapshot.manifest_list())?.read().await?;
+    iceberg::spec::ManifestList::parse_with_version(&content, metadata.format_version())
 }
 
 /// Random snapshot id not colliding with any existing one (same scheme as

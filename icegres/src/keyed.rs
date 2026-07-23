@@ -205,7 +205,7 @@ pub fn parse_keyed_candidate(stmt: &Statement) -> Option<KeyedCandidate> {
     // the real rejection on the fallback path).
     let (dml, tag) = crate::dml::translate(stmt).ok()??;
     let selection = match stmt {
-        Statement::Update { selection, .. } => selection.as_ref()?,
+        Statement::Update(ast::Update { selection, .. }) => selection.as_ref()?,
         Statement::Delete(Delete { selection, .. }) => selection.as_ref()?,
         _ => return None,
     };
@@ -224,7 +224,7 @@ pub fn parse_keyed_candidate(stmt: &Statement) -> Option<KeyedCandidate> {
         return None;
     }
     let assigned = match stmt {
-        Statement::Update { assignments, .. } => {
+        Statement::Update(ast::Update { assignments, .. }) => {
             let mut cols = Vec::with_capacity(assignments.len());
             for a in assignments {
                 if !is_literal_expr(&a.value) {
@@ -569,7 +569,7 @@ pub struct KeySuppressExec {
     keys: Arc<HashSet<Vec<u8>>>,
     output_indices: Option<Vec<usize>>,
     schema: ArrowSchemaRef,
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
 }
 
 impl KeySuppressExec {
@@ -586,14 +586,14 @@ impl KeySuppressExec {
             Some(idx) => Arc::new(input_schema.project(idx)?),
             None => input_schema,
         };
-        let plan_properties = PlanProperties::new(
+        let plan_properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(
                 input.properties().output_partitioning().partition_count(),
             ),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Ok(Self {
             input,
             pk_indices: pk_idx,
@@ -620,7 +620,7 @@ impl ExecutionPlan for KeySuppressExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 

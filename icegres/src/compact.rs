@@ -15,7 +15,7 @@
 //!     --min-input-files 4 --execute
 //! ```
 //!
-//! iceberg-rust 0.9.1 has no rewrite-files transaction action, so the
+//! iceberg-rust 0.10.0 has no rewrite-files transaction action, so the
 //! snapshot is produced by the same hand-built machinery every icegres
 //! write uses (overwrite.rs): manifests holding a compacted input (or a
 //! stale DELETED entry — spec: those live only in the snapshot that deleted
@@ -252,8 +252,7 @@ pub async fn run(
     let head_id = head.snapshot_id();
     let file_io = tbl.file_io();
 
-    let manifest_list = head
-        .load_manifest_list(file_io, &tbl.metadata_ref())
+    let manifest_list = overwrite::load_manifest_list(file_io, head, &tbl.metadata_ref())
         .await
         .map_err(|e| anyhow!("failed to load manifest list of {ident}: {e}"))?;
     for mf in manifest_list.entries() {
@@ -571,7 +570,10 @@ pub async fn run(
     let mut list_writer = ManifestListWriter::v2(
         file_io
             .new_output(&manifest_list_path)
-            .map_err(|e| anyhow!("failed to open manifest list output: {e}"))?,
+            .map_err(|e| anyhow!("failed to open manifest list output: {e}"))?
+            .writer()
+            .await
+            .map_err(|e| anyhow!("failed to open manifest list writer: {e}"))?,
         snapshot_id,
         Some(head_id),
         next_seq,

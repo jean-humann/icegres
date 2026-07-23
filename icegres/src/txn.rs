@@ -98,6 +98,7 @@ use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::sqlparser::ast::{ObjectName, ObjectNamePart, Statement, TableObject};
 use datafusion::sql::TableReference;
 use datafusion_postgres::arrow_pg::datatypes::df as pgdf;
+use datafusion_postgres::hooks::HookClient;
 use datafusion_postgres::pgwire::api::portal::Format;
 use datafusion_postgres::pgwire::api::results::{Response, Tag};
 use datafusion_postgres::pgwire::api::ClientInfo;
@@ -1061,7 +1062,7 @@ impl TxnHook {
                 .txn_insert(stmt, shared, sess_arc.clone(), params)
                 .await
                 .map_err(|e| dml::engine_error(&e)),
-            Statement::Update { .. } | Statement::Delete(_) => {
+            Statement::Update(_) | Statement::Delete(_) => {
                 let has_params = params.is_some_and(|p| match p {
                     ParamValues::List(l) => !l.is_empty(),
                     ParamValues::Map(m) => !m.is_empty(),
@@ -1132,7 +1133,7 @@ impl QueryHook for TxnHook {
         &self,
         statement: &Statement,
         session_context: &SessionContext,
-        client: &mut (dyn ClientInfo + Send + Sync),
+        client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
         let addr = client.socket_addr();
         self.sync_aborted_from_wire(addr, client).await;
@@ -1203,7 +1204,7 @@ impl QueryHook for TxnHook {
         _logical_plan: &LogicalPlan,
         params: &ParamValues,
         session_context: &SessionContext,
-        client: &mut (dyn ClientInfo + Send + Sync),
+        client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
         let addr = client.socket_addr();
         self.sync_aborted_from_wire(addr, client).await;
