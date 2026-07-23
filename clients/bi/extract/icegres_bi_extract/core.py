@@ -11,6 +11,7 @@ Layering rules kept deliberately simple:
 from __future__ import annotations
 
 import os
+import tempfile
 import time
 from dataclasses import dataclass
 from typing import Iterator, Optional
@@ -111,12 +112,20 @@ def _write_parquet(reader: pa.RecordBatchReader, out_path: str, compression: str
     # Atomic like the Hyper lane (pantab defaults to temp+rename): a
     # mid-stream failure must neither destroy last night's extract nor
     # leave a truncated file behind for the BI tool to trip on.
-    tmp_path = out_path + ".tmp"
+    out_abs = os.path.abspath(out_path)
+    out_dir = os.path.dirname(out_abs)
+    # A unique file prevents overlapping cron/orchestrator runs from
+    # truncating, renaming, or cleaning up each other's work. Keeping it in
+    # the destination directory preserves os.replace() atomicity.
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(out_path)}.", suffix=".tmp", dir=out_dir
+    )
+    os.close(fd)
     try:
         with pq.ParquetWriter(tmp_path, reader.schema, compression=compression) as writer:
             for batch in reader:
                 writer.write_batch(batch)
-        os.replace(tmp_path, out_path)
+        os.replace(tmp_path, out_abs)
     except BaseException:
         try:
             os.unlink(tmp_path)
