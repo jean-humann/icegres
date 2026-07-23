@@ -94,6 +94,7 @@ compose:
 |---|---|---|
 | `icegresd.replicas` | `1` | Forced ≥2 when `ha.enabled` |
 | `icegresd.port` / `icegresd.service.port` | `5432` | Client endpoint |
+| `icegresd.maxConnections` | `512` | Hard ceiling on accepted client sessions (`0` disables it) |
 | `icegresd.service.type` | `ClusterIP` | `LoadBalancer` to expose externally |
 | `icegresd.wakeTimeoutMs` | `120000` | Cold-connect budget (pod scheduling + image pull) |
 | `icegresd.idleShutdownSecs` | `300` | With `k8sScaling`: idle window before the writer parks to 0 |
@@ -152,8 +153,9 @@ Flight process opening the writer's tail would fence it).
 | `flight.readOnly` | `false` | Reject every write (DML + DDL) — the posture for a browser SQL explorer |
 | `flight.freshnessMs` | `0` | Bounded-staleness reads + plan cache (`0` = exact) |
 | `flight.statementTimeoutMs` / `flight.maxResultBytes` / `flight.maxConcurrentRpcs` | `0` (off) | Resource guards — **set before exposing the port to untrusted browsers** |
+| `flight.maxPreparedStatements` / `flight.preparedStatementTtlSecs` / `flight.maxAuthCacheEntries` | `1024` / `900` / `4096` | Hard bounds for prepared handles and successful authentication caches |
 | `flight.healthPort` | `8080` | Plain-HTTP `/ready` + `/metrics` (the `icegres_flight_*` series); opened in the NetworkPolicy for probes + scrapes |
-| `flight.ingress.enabled` | `false` | Expose the port outside the cluster; **refused with `auth.enabled=false` unless `flight.ingress.allowInsecure=true`** |
+| `flight.ingress.enabled` | `false` | Expose the port outside the cluster; authentication and edge TLS are both required unless `flight.ingress.allowInsecure=true` acknowledges an external gateway |
 | `flight.ingress.className` / `.host` / `.annotations` | `""` / `""` / `{}` | Ingress controller, host, extra annotations (merged last, so overrides win) |
 | `flight.ingress.tlsSecret` | `""` | `kubernetes.io/tls` Secret for the host; edge TLS |
 | `flight.resources` | 250m/512Mi req, 2Gi lim | — |
