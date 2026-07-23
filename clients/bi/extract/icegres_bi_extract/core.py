@@ -11,7 +11,8 @@ Layering rules kept deliberately simple:
 from __future__ import annotations
 
 import os
-import tempfile
+import secrets
+import stat
 import time
 from dataclasses import dataclass
 from typing import Iterator, Optional
@@ -117,16 +118,42 @@ def _write_parquet(reader: pa.RecordBatchReader, out_path: str, compression: str
     # A unique file prevents overlapping cron/orchestrator runs from
     # truncating, renaming, or cleaning up each other's work. Keeping it in
     # the destination directory preserves os.replace() atomicity.
-    fd, tmp_path = tempfile.mkstemp(
-        prefix=f".{os.path.basename(out_path)}.", suffix=".tmp", dir=out_dir
-    )
-    os.close(fd)
+    # Create with open(2)'s conventional 0666 mode so the process umask is
+    # applied without a process-global os.umask round trip. O_EXCL retains
+    # mkstemp's symlink/collision safety, and the random name isolates
+    # overlapping cron/orchestrator runs.
+    while True:
+        tmp_path = os.path.join(
+            out_dir,
+            f".{os.path.basename(out_path)}.{secrets.token_hex(16)}.tmp",
+        )
+        try:
+            fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+            break
+        except FileExistsError:  # pragma: no cover - cryptographically improbable
+            continue
     try:
+        # Preserve an existing extract's access bits across the atomic
+        # replacement. A new target already has umask-derived permissions.
+        try:
+            output_mode = stat.S_IMODE(os.stat(out_abs).st_mode) & 0o777
+        except FileNotFoundError:
+            pass
+        else:
+            os.fchmod(fd, output_mode)
+        os.close(fd)
+        fd = -1
+
         with pq.ParquetWriter(tmp_path, reader.schema, compression=compression) as writer:
             for batch in reader:
                 writer.write_batch(batch)
         os.replace(tmp_path, out_abs)
     except BaseException:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
             os.unlink(tmp_path)
         except OSError:

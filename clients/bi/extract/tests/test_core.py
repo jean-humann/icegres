@@ -1,4 +1,5 @@
 import os
+import stat
 import tempfile
 import threading
 import unittest
@@ -41,6 +42,28 @@ class CoreExtractTest(unittest.TestCase):
             with open(output, "rb") as current_file:
                 self.assertEqual(current_file.read(), previous)
             self.assertEqual(os.listdir(directory), ["extract.parquet"])
+
+    def test_replacement_preserves_existing_permissions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = os.path.join(directory, "extract.parquet")
+            _write_parquet(reader([1]), output, "zstd")
+            os.chmod(output, 0o640)
+
+            _write_parquet(reader([2]), output, "zstd")
+
+            self.assertEqual(stat.S_IMODE(os.stat(output).st_mode), 0o640)
+
+    def test_new_extract_uses_umask_derived_permissions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = os.path.join(directory, "extract.parquet")
+            previous_umask = os.umask(0o027)
+            try:
+                _write_parquet(reader([1]), output, "zstd")
+            finally:
+                observed_umask = os.umask(previous_umask)
+
+            self.assertEqual(stat.S_IMODE(os.stat(output).st_mode), 0o640)
+            self.assertEqual(observed_umask, 0o027)
 
     def test_concurrent_writers_never_share_or_mix_temporary_files(self):
         with tempfile.TemporaryDirectory() as directory:
