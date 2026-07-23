@@ -1,7 +1,7 @@
 # Catalog support: serving any Iceberg REST catalog
 
 icegres talks to its lakehouse through a **stock Iceberg REST catalog client**
-(`iceberg-catalog-rest 0.9.1`, driven by `RestCatalogBuilder` in
+(`iceberg-catalog-rest 0.10.0`, driven by `RestCatalogBuilder` in
 `icegres/src/context.rs`). Nothing in the read path is Lakekeeper-specific: the
 `.load("lakekeeper", …)` string is a cosmetic name label, not a coupling. This
 document is the honest, endpoint-by-endpoint account of **which REST surface
@@ -54,7 +54,7 @@ Auth was the one real coupling to an **open** (unauthenticated) Lakekeeper. P6
 threaded the Iceberg REST client's existing auth props through `CatalogOpts`
 (`icegres/src/main.rs`) into the catalog props map (`context.rs
 apply_catalog_auth`). **Zero new dependencies** — OAuth2 is already vendored in
-`iceberg-catalog-rest 0.9.1`; the props are plain strings. When **no** auth flag
+`iceberg-catalog-rest 0.10.0`; the props are plain strings. When **no** auth flag
 is set the props map is **byte-identical** to before, so the default open
 Lakekeeper path is untouched (invariant I3).
 
@@ -85,7 +85,7 @@ prop only. Under `--catalog-token` it carries the bearer on config discovery
 and every commit, so **reads and writes are both authenticated** — this is the
 path the end-to-end CRUD proof uses. The OAuth2 **client-credentials** grant is
 **not** duplicated into the commit client (house rule: no hand-rolled auth; and
-iceberg-rust 0.9.1 does not expose its internal token provider to reuse). So
+iceberg-rust 0.10.0 does not expose its internal token provider to reuse). So
 under a *pure* `--catalog-credential` deployment the read/metadata/DDL/
 time-travel plane is fully authenticated, but the copy-on-write **data commit**
 plane is not. Two honest options today:
@@ -131,7 +131,7 @@ version that first exposes it.
 
 ### AWS SigV4 / AWS Glue REST — blocked
 AWS Glue's Iceberg REST endpoint is IAM-signed (AWS SigV4), not bearer-token.
-The pinned `iceberg-catalog-rest 0.9.1` has **no SigV4 support**: a full-crate
+The pinned `iceberg-catalog-rest 0.10.0` has **no SigV4 support**: a full-crate
 grep for `sigv4 | signing-region | signing-name | signing_region | aws` over
 `catalog.rs`, `client.rs`, `lib.rs`, `types.rs` returns **nothing** — there are
 no `rest.sigv4-enabled` / `signing-region` / `signing-name` prop constants and
@@ -139,10 +139,11 @@ no request-signing code path. The crate's only auth mechanisms are OAuth2 bearer
 (§2) plus static `header.<name>` injection, none of which produce a valid SigV4
 signature. **We do not hand-roll SigV4** (house rule).
 
-**Verdict:** Glue-via-REST is **unreachable at `=0.9.1`**.
+**Verdict:** Glue-via-REST is **unreachable at `=0.10.0`** (re-checked on the
+0.9.1 → 0.10.0 bump: the grep still returns nothing).
 
 **Re-check trigger** (same shape as the P2 DV finding): whenever the pinned
-`iceberg-catalog-rest` is bumped past 0.9.1, re-run the grep for
+`iceberg-catalog-rest` is bumped past 0.10.0, re-run the grep for
 `sigv4|signing-region|signing-name`. If those constants / code appear upstream,
 Glue becomes reachable — B1 can then add the SigV4 props (`rest.sigv4-enabled`,
 `rest.signing-region`, `rest.signing-name`) exactly as it added the OAuth2 props.
@@ -175,7 +176,7 @@ supports, but not stood up here.
 | **Lakekeeper** | yes (incl. `transactions/commit`) | open, or OAuth2 / bearer | **proven-live** — the entire e2e suite, tail-durability, HA, and the scale bench run against it |
 | **OAuth2 gateway harness** (`bench/clients/catalog-gateway`) | yes (proxies Lakekeeper) | OAuth2 client-credentials + bearer, **enforced** | **proven-live (by-construction)** — a spec-conformant OAuth2 front door that genuinely 401s unauthenticated calls; proves both B1 auth props end to end (§6). NOT a second Iceberg engine. |
 | **Apache Polaris** | yes | OAuth2 client-credentials | **by-construction, UNTESTED here** — Polaris cannot be built on this box: its wrapper pins **Gradle 9.6.1**, whose distribution download is **denied by the agent proxy** (`downloads.gradle.org:443` CONNECT rejected); system Gradle 8.14.3 fails Polaris's Kotlin build-logic, and there is no docker daemon for its integration path. Its OAuth2 client-credentials flow is exactly the `credential` path proven against the gateway. |
-| **AWS Glue REST** | yes | **AWS SigV4** | **BLOCKED-AT-PIN** — no SigV4 in `iceberg-catalog-rest 0.9.1` (§3). Re-check on any pin bump. |
+| **AWS Glue REST** | yes | **AWS SigV4** | **BLOCKED-AT-PIN** — no SigV4 in `iceberg-catalog-rest 0.10.0` (§3). Re-check on any pin bump. |
 | **Nessie (Iceberg REST)** | yes | bearer / OAuth2 | **by-construction, untested** — supported via `--catalog-token` / `--catalog-credential`. |
 | **Databricks Unity Catalog (Iceberg REST)** | yes (read-centric) | bearer (PAT / OAuth) | **by-construction, untested** — bearer via `--catalog-token`. Write surface varies by Unity tier. |
 | **Tabular / R2 Data Catalog / Gravitino / other REST** | yes | bearer / OAuth2 | **by-construction, untested** — any REST-spec catalog with bearer or client-credentials auth. |

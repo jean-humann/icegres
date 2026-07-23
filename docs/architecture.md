@@ -85,7 +85,7 @@ flowchart LR
 
 **Write layer**
 - `overwrite.rs` — `OverwriteEngine`: hand-rolled copy-on-write commits
-  (iceberg-rust 0.9.1 has no overwrite action), optimistic concurrency, and
+  (iceberg-rust 0.10.0 has no overwrite action), optimistic concurrency, and
   PK enforcement. All writes bound to: format v2, unpartitioned, Parquet,
   no delete manifests.
 - `dml.rs` / `txn.rs` — UPDATE/DELETE interception and the
