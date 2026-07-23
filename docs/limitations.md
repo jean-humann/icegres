@@ -5,7 +5,7 @@ this before adopting it for a workload — every item here is a conscious
 trade-off of the "Postgres wire + Arrow Flight SQL over an Iceberg lakehouse"
 design, not a bug. Each notes the workaround and, where relevant, why it is not
 yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
-0.9.1, datafusion 52, arrow 57, tonic 0.14).
+0.10.0, datafusion 53, arrow 58, tonic 0.14).
 
 ---
 
@@ -78,15 +78,15 @@ caveats:
   only.** The write plane (`overwrite.rs`) sends the static bearer on config
   discovery and every commit, so `--catalog-token` authenticates reads AND
   writes. The OAuth2 **client-credentials** grant is not duplicated into the
-  commit client (no hand-rolled auth; iceberg-rust 0.9.1 does not expose its
+  commit client (no hand-rolled auth; iceberg-rust 0.10.0 does not expose its
   token provider). So under a *pure* `--catalog-credential` deployment the
   read/metadata/DDL/time-travel plane is authenticated but the data-commit
   plane is not — serve read-mostly on the credential flow, or pass a
   long-lived `--catalog-token` alongside for writes. Re-check trigger: wire the
   provider into `overwrite.rs` once a pin exposes it.
 - **AWS Glue REST is blocked at the pin.** Glue's REST endpoint is AWS
-  SigV4-signed; `iceberg-catalog-rest 0.9.1` has no SigV4 support (verified by
-  grep) and we do not hand-roll it. Re-check on any pin bump past 0.9.1.
+  SigV4-signed; `iceberg-catalog-rest 0.10.0` has no SigV4 support (verified by
+  grep) and we do not hand-roll it. Re-check on any pin bump past 0.10.0.
 - **Apache Polaris is not stood up on this box.** It is spec-compatible by
   construction (same REST spec + the OAuth2 client-credentials flow now
   supported) but un-buildable here: its wrapper pins Gradle 9.6.1, whose
@@ -142,8 +142,8 @@ caveats:
   INSERT — so compaction is mostly for tables fed by per-statement commits
   or foreign micro-batchers.
 - **Upstream deletion-vector support does not exist yet, and that keeps two
-  gaps open.** As of iceberg-rust 0.9.1 — and verified against v0.10.0-rc.3
-  and main (2026-07) — the library can neither WRITE puffin deletion
+  gaps open.** As of iceberg-rust 0.10.0 — verified against the 0.10.0
+  release and main (2026-07) — the library can neither WRITE puffin deletion
   vectors (no DV/position-delete writer; `fast_append` rejects delete
   content; `PuffinWriter` hides the per-blob offsets the manifest needs)
   nor APPLY them on READ (`caching_delete_file_loader.rs`: "TODO: Delete
@@ -181,7 +181,7 @@ caveats:
 ## Timeouts
 
 - **No object-store (S3) request timeout/retry configuration.** The pinned
-  `iceberg-storage-opendal` 0.9.1 exposes no timeout/retry keys (only
+  `iceberg-storage-opendal` 0.10.0 exposes no timeout/retry keys (only
   endpoint/keys/region/path-style/SSE/assume-role). A hung object store relies
   on the OS/TCP timeouts. Closing this needs a custom OpenDAL storage factory
   wrapping timeout+retry layers — its own hardening round. The *catalog* path
@@ -223,7 +223,7 @@ their hard limits.
   is streamed. **Hard limit:** peak ≈ the largest single data file's decoded
   size — keep the target data-file size (and any pre-existing large files)
   within RAM. Streaming this per-file read is upstream-gated by
-  `iceberg-rust` 0.9.1's eager whole-file reader.
+  `iceberg-rust` 0.10.0's eager whole-file reader.
 - **Buffered mode grows unbounded during a catalog outage — operational
   limit.** See the write-buffer section below: in health the in-memory buffer
   is capped at `ICEGRES_WRITE_BUFFER_MAX_ROWS` (default 50k), but while the
@@ -842,15 +842,16 @@ bump, tracked with the rest of the pinned-matrix re-check.
 
 ## Build / dependency matrix
 
-- **The dependency matrix is pinned and must move as a unit.** iceberg* 0.9.1,
-  datafusion 52.5.0, arrow 57.3.1, datafusion-postgres 0.15.0 (pgwire 0.38.3),
-  sqlparser 0.62.0, tonic 0.14, prost 0.14, and the toolchain (1.96.1, in
+- **The dependency matrix is pinned and must move as a unit.** iceberg* 0.10.0,
+  datafusion 53.1.0, arrow 58.4.0, datafusion-postgres 0.17.0 (pgwire 0.40.4),
+  sqlparser 0.61.0, tonic 0.14, prost 0.14, and the toolchain (1.96.1, in
   `rust-toolchain.toml`) are chosen to interlock. Bump them together, behind a
-  full gate run — never independently. The P2 recon (2026-07) verified there
-  is currently nothing to gain from a bump: no iceberg-rust rev up to main
-  ships DV writes, DV read application, a rewrite-files action, or
-  multi-table commit — the pins stay until the re-check trigger in
-  `docs/roadmap-v2-beyond-lakebase.md` §P2 fires.
+  full gate run — never independently. The 0.10.0 bump (2026-07) brought scan
+  I/O metrics, `FileIO::delete_stream`/`delete_prefix`, table encryption
+  scaffolding, and the datafusion 53 / arrow 58 engine line — but still no DV
+  writes, DV read application, rewrite-files action, or multi-table commit;
+  those stay behind the re-check trigger in
+  `docs/roadmap-v2-beyond-lakebase.md` §P2.
 
 ---
 

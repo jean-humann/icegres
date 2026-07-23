@@ -670,7 +670,7 @@ pub(crate) fn plan_cache_eligible(freshness_enabled: bool, has_overlay_source: b
 struct MarkStaleExec {
     inner: Arc<dyn ExecutionPlan>,
     freshness: Arc<TableFreshness>,
-    properties: datafusion::physical_plan::PlanProperties,
+    properties: Arc<datafusion::physical_plan::PlanProperties>,
 }
 
 impl MarkStaleExec {
@@ -709,7 +709,7 @@ impl ExecutionPlan for MarkStaleExec {
         self
     }
 
-    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+    fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
         &self.properties
     }
 

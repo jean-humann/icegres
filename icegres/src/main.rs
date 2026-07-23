@@ -118,7 +118,7 @@ pub struct CatalogOpts {
     // catalog, not just an open Lakekeeper). All four are OPTIONAL and,
     // when unset, are NOT inserted into the catalog props map — so the
     // default (open Lakekeeper) connection is byte-identical to before
-    // (invariant I3). iceberg-catalog-rest 0.9.1 reads these as plain
+    // (invariant I3). iceberg-catalog-rest 0.10.0 reads these as plain
     // string props (catalog.rs: `token`, `credential`, `oauth2-server-uri`,
     // `scope`); no new dependency, no hand-rolled auth. ---
     /// Pre-minted OAuth2 bearer token presented on every catalog request

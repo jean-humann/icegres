@@ -176,10 +176,10 @@ async fn snapshot_row_count(table: &Table, snapshot_id: Option<i64>) -> Option<u
     {
         return cached;
     }
-    let manifest_list = snapshot
-        .load_manifest_list(table.file_io(), &table.metadata_ref())
-        .await
-        .ok()?; // transient read failure: report unknown, do not cache
+    let manifest_list =
+        crate::overwrite::load_manifest_list(table.file_io(), snapshot, &table.metadata_ref())
+            .await
+            .ok()?; // transient read failure: report unknown, do not cache
     let count = sum_live_rows(manifest_list.entries());
     let mut cache = crate::freshness::recover("scan stats cache", stats_cache().lock());
     if cache.len() >= STATS_CACHE_CAP {
@@ -230,17 +230,17 @@ pub struct TunedIcebergScan {
     /// known. Feeds `partition_statistics` so `JoinSelection` can pick the
     /// smaller build side instead of planning blind.
     row_count: Option<u64>,
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
 }
 
 impl TunedIcebergScan {
     fn from_upstream(scan: &IcebergTableScan, concurrency: usize, row_count: Option<u64>) -> Self {
-        let plan_properties = PlanProperties::new(
+        let plan_properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(scan.schema()),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             table: scan.table().clone(),
             snapshot_id: scan.snapshot_id(),
@@ -329,7 +329,7 @@ impl ExecutionPlan for TunedIcebergScan {
         Ok(self)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 

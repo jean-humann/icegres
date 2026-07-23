@@ -19,8 +19,8 @@
 //!
 //! No `icegres compact` subcommand exists — deliberately. Rewriting existing
 //! small files into one needs a replace-files snapshot (add rewritten file +
-//! remove source files atomically); the pinned iceberg-rust 0.9.1
-//! `Transaction` API only exposes `fast_append`, and while the copy-on-write
+//! remove source files atomically); the pinned iceberg-rust 0.10.0
+//! `Transaction` API still has no such action, and while the copy-on-write
 //! snapshot machinery in `overwrite.rs` (UPDATE/DELETE) could carry a
 //! `replace`-operation compaction, that is future work. Recovering a compact
 //! layout is done by dropping the demo tables (Lakekeeper REST,

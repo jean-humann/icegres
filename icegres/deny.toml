@@ -23,9 +23,8 @@ ignore = [
   "RUSTSEC-2025-0134", # rustls-pemfile 2.2.0 unmaintained — thin wrapper over rustls-pki-types (direct dep + via datafusion-postgres)
   "RUSTSEC-2024-0436", # paste unmaintained — proc-macro, build-time only (via datafusion/arrow)
   # Vulnerabilities (DoS-class, reachable only on semi-trusted paths):
-  "RUSTSEC-2026-0194", # quick-xml 0.38.4 quadratic attr-check DoS — via opendal 0.55.0 S3 XML (semi-trusted object store); see docs/limitations.md
+  "RUSTSEC-2026-0194", # quick-xml 0.38.4 quadratic attr-check DoS — via opendal 0.57.0 S3 XML (semi-trusted object store); see docs/limitations.md
   "RUSTSEC-2026-0195", # quick-xml 0.38.4 unbounded namespace-decl alloc DoS — same opendal S3 XML path
-  "RUSTSEC-2026-0204", # crossbeam invalid-ptr deref in the Debug/fmt::Pointer impl — transitive via moka/dashmap (crossbeam-channel); not on a normal reachable path
 ]
 
 [licenses]

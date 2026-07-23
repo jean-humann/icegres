@@ -39,29 +39,29 @@ name = "icekeeperd"
 path = "src/bin/icekeeperd.rs"
 
 [dependencies]
-# Iceberg stack (all pinned to the same 0.9.1 — do not bump independently)
-iceberg = "=0.9.1"
-iceberg-catalog-rest = "=0.9.1"
-iceberg-datafusion = "=0.9.1"
-iceberg-storage-opendal = "=0.9.1"
+# Iceberg stack (all pinned to the same 0.10.0 — do not bump independently)
+iceberg = "=0.10.0"
+iceberg-catalog-rest = "=0.10.0"
+iceberg-datafusion = "=0.10.0"
+iceberg-storage-opendal = "=0.10.0"
 
-# Query engine — 52.5.0 satisfies iceberg-datafusion (^52.2) AND datafusion-postgres (^52)
-datafusion = "=52.5.0"
+# Query engine — 53.1.0 satisfies iceberg-datafusion (^53.1) AND datafusion-postgres (^53)
+datafusion = "=53.1.0"
 
 # Postgres wire front-end (re-exports pgwire, arrow_pg, datafusion_pg_catalog)
-datafusion-postgres = "=0.15.0"
+datafusion-postgres = "=0.17.0"
 
-# Arrow — must stay on 57.x to match datafusion 52 / iceberg 0.9.1
+# Arrow — must stay on 58.x to match datafusion 53 / iceberg 0.10.0
 # `ipc_compression` turns on arrow-ipc's lz4/zstd codecs (reusing the `zstd`
 # and `lz4_flex` crates already in the graph via opendal/object_store) so Flight
 # result IPC buffers can be ZSTD-compressed on the wire — no new dependencies.
-arrow = { version = "=57.3.1", features = ["ipc_compression"] }
+arrow = { version = "=58.4.0", features = ["ipc_compression"] }
 
 # Arrow Flight SQL endpoint (`icegres flight-serve`, SPEC A11): the ADBC
-# first-class surface. arrow-flight 57.3.1 matches arrow 57.3.1 and pulls
+# first-class surface. arrow-flight 58.4.0 matches arrow 58.4.0 and pulls
 # tonic 0.14 / prost 0.14 (gRPC transport; both listed so flight.rs can name
 # their types). base64 decodes the Basic auth handshake header.
-arrow-flight = { version = "=57.3.1", features = ["flight-sql"] }
+arrow-flight = { version = "=58.4.0", features = ["flight-sql"] }
 tonic = "0.14"
 prost = "0.14"
 base64 = "0.22"
@@ -94,20 +94,23 @@ futures = "0.3"
 # UPDATE/DELETE (overwrite.rs) commits hand-built snapshots through the
 # Iceberg REST protocol. All three crates are ALREADY in the dependency graph
 # (reqwest+serde_json via iceberg-catalog-rest, uuid via iceberg), so these
-# direct deps add no new code to the binary.
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# direct deps add no new code to the binary. "rustls-tls" restores the rustls
+# HTTPS stack that iceberg-catalog-rest enabled itself through 0.9.1 but
+# stopped enabling in 0.10.0 — without it reqwest cannot speak https at all
+# (catalog TLS, and the k8s API client's Certificate type in k8s.rs).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
 # Orphan-file GC (`icegres maintain remove-orphans`, src/maintain.rs) needs an
-# object-store LISTING, which the pinned iceberg-rust 0.9.1 FileIO does not
-# expose (delete/exists/read/write only). opendal 0.55.0 with services-s3 is
+# object-store LISTING, which the pinned iceberg-rust 0.10.0 FileIO does not
+# expose (delete/exists/read/write only). opendal 0.57.0 with services-s3 is
 # ALREADY compiled into the binary at exactly this version (dependency of
-# iceberg-storage-opendal 0.9.1, which enables services-s3 itself), so this
+# iceberg-storage-opendal 0.10.0, which enables services-s3 itself), so this
 # direct dep adds no new code and changes nothing in Cargo.lock beyond listing
 # it as a dependency of icegres. The S3 operator is built from the same
 # CatalogOpts S3 settings context.rs feeds to FileIO (path-style forced,
 # config-load/EC2-metadata disabled).
-opendal = { version = "=0.55.0", features = ["services-s3"] }
+opendal = { version = "=0.57.0", features = ["services-s3"] }
 # PEM parsing for --tls-cert/--tls-key. Already in the tree transitively via
 # datafusion-postgres; rustls itself is reached through pgwire's re-export of
 # tokio_rustls so no second rustls version can drift in.
@@ -141,11 +144,12 @@ async-trait = "0.1"
 # binary-size gate). No secure-mode overhead (default features only).
 mimalloc = { version = "0.1", default-features = false }
 # HashDoS-resistant fast hasher for the keyed upsert map, whose keys are
-# client-supplied PK bytes hashed on every keyed write. ahash 0.7.8 is ALREADY
-# in the dependency graph at exactly this version, so this direct dep reuses it
-# and adds no new code; its randomized seed keeps the map collision-attack
-# resistant, unlike a fixed-seed hasher (FxHash) which a server must not expose.
-ahash = "0.7"
+# client-supplied PK bytes hashed on every keyed write. ahash 0.8.12 is ALREADY
+# in the dependency graph at exactly this version (datafusion/hashbrown), so
+# this direct dep reuses it and adds no new code; its randomized seed keeps the
+# map collision-attack resistant, unlike a fixed-seed hasher (FxHash) which a
+# server must not expose.
+ahash = "0.8"
 
 # Test-only: tokio's paused clock (`#[tokio::test(start_paused = true)]`) so
 # the freshness refresher supervisor's respawn window (60 s) is testable in

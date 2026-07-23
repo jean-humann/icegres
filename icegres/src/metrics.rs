@@ -17,6 +17,7 @@ use datafusion::common::ParamValues;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::Statement;
+use datafusion_postgres::hooks::HookClient;
 use datafusion_postgres::pgwire::api::results::Response;
 use datafusion_postgres::pgwire::api::ClientInfo;
 use datafusion_postgres::pgwire::error::PgWireResult;
@@ -253,7 +254,7 @@ impl QueryHook for MetricsHook {
         &self,
         _statement: &Statement,
         _session_context: &SessionContext,
-        _client: &mut (dyn ClientInfo + Send + Sync),
+        _client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
         metrics().queries_total.fetch_add(1, Ordering::Relaxed);
         None
@@ -275,7 +276,7 @@ impl QueryHook for MetricsHook {
         _logical_plan: &LogicalPlan,
         _params: &ParamValues,
         _session_context: &SessionContext,
-        _client: &mut (dyn ClientInfo + Send + Sync),
+        _client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
         metrics().queries_total.fetch_add(1, Ordering::Relaxed);
         None

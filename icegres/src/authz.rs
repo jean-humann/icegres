@@ -372,9 +372,9 @@ pub fn required_checks(stmt: &Statement, default_ns: &str) -> Vec<(Action, Table
                 collect_query_reads(src, default_ns, &mut checks);
             }
         }
-        Statement::Update {
+        Statement::Update(sqlparser::ast::Update {
             table, selection, ..
-        } => {
+        }) => {
             if let Some(t) = table_factor_to_ref(&table.relation, default_ns) {
                 checks.push((Action::WriteData, t));
             }
@@ -624,6 +624,7 @@ use async_trait::async_trait;
 use datafusion::common::ParamValues;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::LogicalPlan;
+use datafusion_postgres::hooks::HookClient;
 use datafusion_postgres::pgwire::api::results::Response;
 use datafusion_postgres::QueryHook;
 
@@ -633,7 +634,7 @@ impl QueryHook for AuthzHook {
         &self,
         statement: &Statement,
         _ctx: &SessionContext,
-        client: &mut (dyn ClientInfo + Send + Sync),
+        client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
         self.gate(statement, client).map(Err)
     }
@@ -653,7 +654,7 @@ impl QueryHook for AuthzHook {
         _plan: &LogicalPlan,
         _params: &ParamValues,
         _ctx: &SessionContext,
-        client: &mut (dyn ClientInfo + Send + Sync),
+        client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
         self.gate(statement, client).map(Err)
     }

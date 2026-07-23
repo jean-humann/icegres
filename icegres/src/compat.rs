@@ -63,6 +63,7 @@ use datafusion::sql::sqlparser::ast::{
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 use datafusion_postgres::arrow_pg::datatypes::df as pgdf;
+use datafusion_postgres::hooks::HookClient;
 use datafusion_postgres::pgwire::api::portal::Format;
 use datafusion_postgres::pgwire::api::results::{Response, Tag};
 use datafusion_postgres::pgwire::api::ClientInfo;
@@ -901,7 +902,7 @@ impl QueryHook for CompatHook {
         &self,
         statement: &Statement,
         session_context: &SessionContext,
-        client: &mut (dyn ClientInfo + Send + Sync),
+        client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
         let rewritten = rewrite(statement)?;
         tracing::debug!(sql = %rewritten, "compat: rewrote pg_catalog query (simple)");
@@ -933,7 +934,7 @@ impl QueryHook for CompatHook {
         _logical_plan: &LogicalPlan,
         params: &ParamValues,
         session_context: &SessionContext,
-        client: &mut (dyn ClientInfo + Send + Sync),
+        client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
         // Re-derive the rewrite (statements are cheap to clone-rewrite);
         // the plan passed in is the one this hook produced at parse time,
@@ -1065,7 +1066,7 @@ impl QueryHook for InsertTagHook {
         &self,
         _statement: &Statement,
         _session_context: &SessionContext,
-        _client: &mut (dyn ClientInfo + Send + Sync),
+        _client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
         // The upstream simple-query path already answers `INSERT 0 n`.
         None
@@ -1105,7 +1106,7 @@ impl QueryHook for InsertTagHook {
         _logical_plan: &LogicalPlan,
         params: &ParamValues,
         session_context: &SessionContext,
-        _client: &mut (dyn ClientInfo + Send + Sync),
+        _client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
         if !matches!(statement, Statement::Insert(_)) {
             return None;
