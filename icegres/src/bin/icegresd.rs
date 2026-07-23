@@ -254,6 +254,13 @@ struct ServeArgs {
     #[arg(long, env = "ICEGRESD_PORT", default_value_t = 5432)]
     port: u16,
 
+    /// Maximum concurrent public client connections. The permit is acquired
+    /// before accept, so excess clients remain in the kernel backlog instead
+    /// of creating unbounded tasks and per-session buffers. 0 explicitly
+    /// disables the cap.
+    #[arg(long, env = "ICEGRESD_MAX_CONNECTIONS", default_value_t = 512)]
+    max_connections: usize,
+
     /// Path to the `icegres` binary (default: next to this executable,
     /// falling back to `icegres` on PATH).
     #[arg(long, env = "ICEGRESD_ICEGRES_BIN")]
@@ -997,12 +1004,34 @@ async fn run_serve(mut args: ServeArgs) -> Result<()> {
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("failed to install SIGTERM handler")?;
-    loop {
+    let conn_limiter = (daemon.args.max_connections > 0)
+        .then(|| Arc::new(tokio::sync::Semaphore::new(daemon.args.max_connections)));
+    if let Some(limit) = conn_limiter.as_ref().map(|s| s.available_permits()) {
+        info!(max_connections = limit, "public connection cap enabled");
+    } else {
+        warn!("public connection cap DISABLED (--max-connections=0)");
+    }
+    'accept: loop {
+        // Acquire before accept to put overload backpressure in the OS
+        // backlog. Signal handling remains live while all permits are held.
+        let permit = match &conn_limiter {
+            Some(limiter) => {
+                tokio::select! {
+                    permit = limiter.clone().acquire_owned() => {
+                        Some(permit.expect("connection semaphore closed"))
+                    }
+                    _ = tokio::signal::ctrl_c() => break 'accept,
+                    _ = sigterm.recv() => break 'accept,
+                }
+            }
+            None => None,
+        };
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((client, peer)) => {
                     let daemon = daemon.clone();
                     tokio::spawn(async move {
+                        let _permit = permit;
                         if let Err(e) = handle_client(daemon, client).await {
                             warn!(%peer, "connection failed: {e:#}");
                         }
@@ -2391,6 +2420,21 @@ async fn send_pg_error(client: &mut TcpStream, sqlstate: &str, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_connection_cap_has_a_finite_default_and_explicit_opt_out() {
+        let cli = Cli::try_parse_from(["icegresd", "serve"]).unwrap();
+        let DCommand::Serve(args) = cli.command else {
+            panic!("serve command did not parse");
+        };
+        assert_eq!(args.max_connections, 512);
+
+        let cli = Cli::try_parse_from(["icegresd", "serve", "--max-connections", "0"]).unwrap();
+        let DCommand::Serve(args) = cli.command else {
+            panic!("serve command did not parse");
+        };
+        assert_eq!(args.max_connections, 0);
+    }
 
     // -------- route_database: endpoint identity, never SQL parsing --------
 
