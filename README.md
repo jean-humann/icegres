@@ -128,11 +128,17 @@ Run in a container (multi-stage, non-root):
 ```sh
 docker build -t icegres .
 docker run --rm -p 5439:5439 -p 8080:8080 \
+  -v "$PWD/users.auth:/run/secrets/icegres-users:ro" \
   -e ICEGRES_CATALOG_URI=https://catalog.example.com/catalog \
   -e ICEGRES_S3_ENDPOINT=https://s3.example.com \
   -e ICEGRES_S3_ACCESS_KEY=... -e ICEGRES_S3_SECRET_KEY=... \
-  icegres serve --host 0.0.0.0 --health-port 8080
+  icegres serve --host 0.0.0.0 --health-port 8080 \
+  --auth-file /run/secrets/icegres-users
 ```
+
+For a local-only demonstration where an open published port is intentional,
+replace the auth-file mount/flag with `--insecure`. The explicit flag is
+required because an unauthenticated `0.0.0.0` listener is never a safe default.
 
 ---
 

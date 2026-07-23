@@ -74,6 +74,17 @@ use tracing::{info, warn};
 use crate::overwrite::OverwriteEngine;
 use crate::txn::{TxnHook, TxnRegistry};
 
+fn parse_nonzero_usize(value: &str) -> std::result::Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|e| format!("invalid positive integer {value:?}: {e}"))?;
+    if parsed == 0 {
+        Err("value must be at least 1".to_string())
+    } else {
+        Ok(parsed)
+    }
+}
+
 /// Connection options for the Iceberg REST catalog and its object store.
 ///
 /// `Debug` is hand-written (below) so the two secret-bearing fields
@@ -505,6 +516,24 @@ enum Command {
         /// wait at the choke point rather than spawning unbounded scans.
         #[arg(long, env = "ICEGRES_FLIGHT_MAX_CONCURRENT_RPCS", default_value_t = 0)]
         flight_max_concurrent_rpcs: usize,
+
+        /// Maximum retained Flight prepared-statement handles. Abandoned
+        /// handles are TTL-pruned and least-recently-used entries are evicted
+        /// at this bound.
+        #[arg(long, env = "ICEGRES_FLIGHT_MAX_PREPARED_STATEMENTS", default_value_t = 1024,
+              value_parser = parse_nonzero_usize)]
+        flight_max_prepared_statements: usize,
+
+        /// Lifetime of an abandoned Flight prepared statement in seconds.
+        #[arg(long, env = "ICEGRES_FLIGHT_PREPARED_STATEMENT_TTL_SECS", default_value_t = 900,
+              value_parser = clap::value_parser!(u64).range(1..))]
+        flight_prepared_statement_ttl_secs: u64,
+
+        /// Maximum entries retained in each Flight authentication cache
+        /// (handshake bearer tokens and successful per-RPC Basic checks).
+        #[arg(long, env = "ICEGRES_FLIGHT_MAX_AUTH_CACHE_ENTRIES", default_value_t = 4096,
+              value_parser = parse_nonzero_usize)]
+        flight_max_auth_cache_entries: usize,
 
         /// Serve the HTTP liveness/metrics endpoint (`/health`, `/ready`,
         /// `/metrics`) on this port, as `icegres serve --health-port` does —
@@ -939,6 +968,9 @@ async fn main() -> Result<()> {
             flight_statement_timeout_ms,
             flight_max_result_bytes,
             flight_max_concurrent_rpcs,
+            flight_max_prepared_statements,
+            flight_prepared_statement_ttl_secs,
+            flight_max_auth_cache_entries,
             flight_health_port,
             read_only,
         } => {
@@ -973,6 +1005,11 @@ async fn main() -> Result<()> {
                         .then_some(flight_max_result_bytes),
                     max_concurrent_rpcs: (flight_max_concurrent_rpcs > 0)
                         .then_some(flight_max_concurrent_rpcs),
+                    max_prepared_statements: flight_max_prepared_statements,
+                    prepared_statement_ttl: std::time::Duration::from_secs(
+                        flight_prepared_statement_ttl_secs,
+                    ),
+                    max_auth_cache_entries: flight_max_auth_cache_entries,
                     health_port: flight_health_port,
                     read_only,
                 },

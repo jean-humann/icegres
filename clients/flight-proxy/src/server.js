@@ -119,7 +119,7 @@ export function createHandler(config) {
     await streamArrow(
       res,
       cors,
-      (write) => queryToIpc(conn, sql, write),
+      (write, signal) => queryToIpc(conn, sql, write, { signal }),
       // eslint-disable-next-line no-console
       (e) => console.error(`query "${name}" failed:`, e.message),
     );

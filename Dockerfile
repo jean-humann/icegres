@@ -80,4 +80,8 @@ EXPOSE 5439 50051 8080
 # `serve --health-port 8080` and point your platform's probes at it.
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/icegres"]
-CMD ["serve", "--host", "0.0.0.0"]
+# There is no universally safe runnable server default: a container must
+# either receive an auth file or explicitly acknowledge an open listener.
+# Show the contract instead of shipping a command the secure bind guard
+# immediately rejects.
+CMD ["--help"]

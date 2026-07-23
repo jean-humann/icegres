@@ -116,4 +116,16 @@ subset of objects renders.
 {{- if and .Values.flight.enabled .Values.flight.ingress.enabled (not .Values.auth.enabled) (not .Values.flight.ingress.allowInsecure) -}}
 {{- fail "flight.ingress.enabled with auth.enabled=false exposes an UNAUTHENTICATED SQL endpoint outside the cluster; set auth.enabled=true (recommended), or if TLS+auth are terminated by a gateway in front, acknowledge with flight.ingress.allowInsecure=true" -}}
 {{- end -}}
+{{- if and .Values.flight.enabled .Values.flight.ingress.enabled (not .Values.flight.ingress.tlsSecret) (not .Values.flight.ingress.allowInsecure) -}}
+{{- fail "flight.ingress.enabled without flight.ingress.tlsSecret exposes credentials and SQL over plaintext HTTP; configure edge TLS with flight.ingress.tlsSecret, or acknowledge TLS termination by a trusted gateway in front with flight.ingress.allowInsecure=true" -}}
+{{- end -}}
+{{- if and .Values.flight.enabled (lt (int .Values.flight.maxPreparedStatements) 1) -}}
+{{- fail "flight.maxPreparedStatements must be at least 1" -}}
+{{- end -}}
+{{- if and .Values.flight.enabled (lt (int .Values.flight.preparedStatementTtlSecs) 1) -}}
+{{- fail "flight.preparedStatementTtlSecs must be at least 1" -}}
+{{- end -}}
+{{- if and .Values.flight.enabled (lt (int .Values.flight.maxAuthCacheEntries) 1) -}}
+{{- fail "flight.maxAuthCacheEntries must be at least 1" -}}
+{{- end -}}
 {{- end }}

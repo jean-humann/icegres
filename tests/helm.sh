@@ -455,6 +455,11 @@ if [ -n "${flight_doc:-}" ]; then
         && ok "flight health/metrics port wired" || bad "flight health port env missing"
     echo "$flight_doc" | grep -q 'ICEGRES_FLIGHT_READ_ONLY' \
         && ok "flight read-only wired" || bad "flight read-only env missing"
+    echo "$flight_doc" | grep -q 'ICEGRES_FLIGHT_MAX_PREPARED_STATEMENTS' \
+        && echo "$flight_doc" | grep -q 'ICEGRES_FLIGHT_PREPARED_STATEMENT_TTL_SECS' \
+        && echo "$flight_doc" | grep -q 'ICEGRES_FLIGHT_MAX_AUTH_CACHE_ENTRIES' \
+        && ok "flight retained-state bounds wired" \
+        || bad "flight retained-state bounds missing"
 fi
 ing="$(doc "$fr" Ingress "$RELEASE-flight")"
 [ -n "$ing" ] && ok "flight Ingress rendered" || bad "flight Ingress missing"
@@ -464,9 +469,42 @@ echo "$ing" | grep -q 'backend-protocol: GRPCS' \
     && ok "flight Ingress speaks GRPCS to the TLS backend" || bad "flight Ingress backend-protocol wrong"
 echo "$ing" | grep -q 'host: "dash.example"' \
     && ok "flight Ingress host pinned" || bad "flight Ingress host missing"
+if "$HELM" template insecure "$CHART" \
+        --set flight.enabled=true \
+        --set flight.ingress.enabled=true \
+        --set flight.ingress.host=flight.example \
+        --set auth.enabled=true \
+        --set auth.existingSecret=icegres-auth > /dev/null 2> "$TMP/plaintext-ingress.err"; then
+    bad "authenticated Flight ingress without edge TLS was accepted"
+elif grep -q 'without flight.ingress.tlsSecret' "$TMP/plaintext-ingress.err"; then
+    ok "authenticated Flight ingress without edge TLS is refused"
+else
+    bad "plaintext Flight ingress failed for an unexpected reason"
+fi
+if "$HELM" template acknowledged "$CHART" \
+        --set flight.enabled=true \
+        --set flight.ingress.enabled=true \
+        --set flight.ingress.host=flight.example \
+        --set flight.ingress.allowInsecure=true > /dev/null 2>&1; then
+    ok "external gateway acknowledgement permits Flight ingress"
+else
+    bad "flight.ingress.allowInsecure did not acknowledge the external gateway"
+fi
+if "$HELM" template unbounded "$CHART" \
+        --set flight.enabled=true \
+        --set flight.maxPreparedStatements=0 > /dev/null 2> "$TMP/flight-state-bound.err"; then
+    bad "zero Flight prepared-statement bound was accepted"
+elif grep -q 'flight.maxPreparedStatements must be at least 1' "$TMP/flight-state-bound.err"; then
+    ok "zero Flight retained-state bound is refused at render time"
+else
+    bad "zero Flight retained-state bound failed for an unexpected reason"
+fi
 grep -q "^# Source: icegres/templates/flight-deployment.yaml" "$TMP/render-defaults.yaml" \
     && bad "defaults leaked the flight Deployment" \
     || ok "defaults render no flight objects"
+doc "$TMP/render-defaults.yaml" Deployment "$RELEASE" | grep -A1 'ICEGRESD_MAX_CONNECTIONS' | grep -q 'value: "512"' \
+    && ok "icegresd connection ceiling wired" \
+    || bad "icegresd connection ceiling missing"
 
 echo "---- tests/helm.sh: $PASS passed, $FAIL failed"
 exit $((FAIL > 0))

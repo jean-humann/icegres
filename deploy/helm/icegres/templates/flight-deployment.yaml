@@ -119,6 +119,12 @@ spec:
             - name: ICEGRES_FLIGHT_MAX_CONCURRENT_RPCS
               value: {{ .Values.flight.maxConcurrentRpcs | int64 | quote }}
             {{- end }}
+            - name: ICEGRES_FLIGHT_MAX_PREPARED_STATEMENTS
+              value: {{ .Values.flight.maxPreparedStatements | int64 | quote }}
+            - name: ICEGRES_FLIGHT_PREPARED_STATEMENT_TTL_SECS
+              value: {{ .Values.flight.preparedStatementTtlSecs | int64 | quote }}
+            - name: ICEGRES_FLIGHT_MAX_AUTH_CACHE_ENTRIES
+              value: {{ .Values.flight.maxAuthCacheEntries | int64 | quote }}
             {{- if .Values.flight.healthPort }}
             - name: ICEGRES_HEALTH_PORT
               value: {{ .Values.flight.healthPort | int64 | quote }}

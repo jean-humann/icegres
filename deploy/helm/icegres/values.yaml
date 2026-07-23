@@ -88,6 +88,9 @@ icegresd:
   # Forced to >= 2 when ha.enabled (a lease with one holder is a no-op).
   replicas: 1
   port: 5432
+  # Hard ceiling on accepted client sessions. 0 disables the ceiling; keep
+  # the finite default when the endpoint is reachable by untrusted clients.
+  maxConnections: 512
   service:
     # LoadBalancer to expose the endpoint outside the cluster.
     type: ClusterIP
@@ -228,6 +231,12 @@ flight:
   statementTimeoutMs: 0
   maxResultBytes: 0
   maxConcurrentRpcs: 0
+  # Bounds on retained protocol state (prepared handles and successful auth
+  # cache entries). Prepared-statement TTL is idle time; handle use refreshes
+  # it. These stay finite even when query result guards are off.
+  maxPreparedStatements: 1024
+  preparedStatementTtlSecs: 900
+  maxAuthCacheEntries: 4096
   # HTTP /health + /metrics port for this listener (the icegres_flight_*
   # Prometheus series live here). Scraped by the ServiceMonitor when set.
   healthPort: 8080
@@ -247,10 +256,9 @@ flight:
     host: ""
     # TLS: names a kubernetes.io/tls secret for the host (edge termination).
     tlsSecret: ""
-    # Exposing the Flight port via Ingress with auth.enabled=false publishes
-    # an UNAUTHENTICATED SQL endpoint. The chart refuses that combination
-    # unless you acknowledge it here (e.g. TLS + auth are terminated by a
-    # gateway in front of this Ingress).
+    # The chart refuses either an unauthenticated ingress or an ingress with
+    # no edge tlsSecret unless you acknowledge the external security boundary
+    # here (for example TLS + auth terminated by a trusted gateway in front).
     allowInsecure: false
   resources:
     requests: { cpu: 250m, memory: 512Mi }
