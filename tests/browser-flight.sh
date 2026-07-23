@@ -67,14 +67,14 @@ for _ in $(seq 1 50); do
   sleep 0.2
 done
 
-echo "==> npm install (client package + bench harness)"
+echo "==> npm ci (root client workspace + bench harness)"
 # A hard FAIL, not a SKIP: node/Chromium/stack are all present by here, so an
 # install failure is a real regression (broken lockfile, a bad file: link, a
 # native-addon build breaking) — exactly what this gate must catch, not mask.
-(cd "$PKG_DIR" && npm install --no-audit --no-fund --ignore-scripts) >/dev/null 2>&1 \
-  || die "npm install failed in $PKG_DIR"
-(cd "$JS_DIR" && npm install --no-audit --no-fund --ignore-scripts) >/dev/null 2>&1 \
-  || die "npm install failed in $JS_DIR"
+(cd "$ROOT" && npm ci --no-audit --no-fund --ignore-scripts) >/dev/null 2>&1 \
+  || die "npm ci failed in the root workspace"
+(cd "$JS_DIR" && npm ci --no-audit --no-fund --ignore-scripts) >/dev/null 2>&1 \
+  || die "npm ci failed in $JS_DIR"
 
 FAIL=0
 

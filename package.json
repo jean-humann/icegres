@@ -1,0 +1,11 @@
+{
+  "name": "icegres-workspace",
+  "private": true,
+  "workspaces": [
+    "clients/flight-web",
+    "clients/flight-proxy"
+  ],
+  "scripts": {
+    "test": "npm test --workspaces --if-present"
+  }
+}
