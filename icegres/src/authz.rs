@@ -50,7 +50,9 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use datafusion::sql::sqlparser;
-use datafusion::sql::sqlparser::ast::{CopySource, Statement, TableObject};
+use datafusion::sql::sqlparser::ast::{
+    CopySource, ObjectName, SetExpr, Statement, TableObject, Visit, Visitor,
+};
 use datafusion_postgres::pgwire::api::{ClientInfo, METADATA_USER};
 use datafusion_postgres::pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
@@ -92,7 +94,7 @@ impl Relation {
 }
 
 /// The data-plane action a SQL statement performs on a table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
     /// SELECT / COPY … TO STDOUT.
     ReadData,
@@ -163,7 +165,7 @@ impl fmt::Display for Entity {
 }
 
 /// A table reference in a statement, resolved against the default namespace.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TableRef {
     pub namespace: String,
     pub table: String,
@@ -190,6 +192,11 @@ pub enum Decision {
         action: Action,
         target: TableRef,
     },
+    /// The statement contains a relation-bearing form that the SQL-to-policy
+    /// mapper does not understand. This is deliberately a denial: treating a
+    /// future parser variant as requiring no checks would reopen the exact
+    /// fail-open class this layer exists to prevent.
+    DenyUnsupported,
 }
 
 /// Pluggable authorization backend. The native [`FileAuthorizer`] and a future
@@ -206,7 +213,10 @@ pub trait Authorizer: Send + Sync {
         stmt: &Statement,
         default_namespace: &str,
     ) -> Decision {
-        for (action, target) in required_checks(stmt, default_namespace) {
+        let Ok(checks) = required_checks(stmt, default_namespace) else {
+            return Decision::DenyUnsupported;
+        };
+        for (action, target) in checks {
             let d = self.check(principal, action, &target);
             if d != Decision::Allow {
                 return d;
@@ -353,48 +363,77 @@ fn is_system_schema(ns: &str) -> bool {
     )
 }
 
-/// Map a statement to the (action, table) checks it requires. Session and
-/// metadata statements (SET/SHOW/BEGIN/COMMIT, pg_catalog reads, …) yield no
-/// checks and are therefore allowed.
-pub fn required_checks(stmt: &Statement, default_ns: &str) -> Vec<(Action, TableRef)> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthorizationMappingError;
+
+impl fmt::Display for AuthorizationMappingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("unsupported relation-bearing SQL statement")
+    }
+}
+
+/// Map a statement to the (action, table) checks it requires. The mapper is
+/// recursive and fail-closed: a relation-bearing form that is not explicitly
+/// classified returns an error rather than silently authorizing the query.
+pub fn required_checks(
+    stmt: &Statement,
+    default_ns: &str,
+) -> std::result::Result<Vec<(Action, TableRef)>, AuthorizationMappingError> {
     let mut checks = Vec::new();
+    collect_statement_checks(stmt, default_ns, &mut checks)?;
+    // Metadata-schema reads are deliberately outside the data-plane policy;
+    // writes and drops are never exempted merely because their target name is
+    // pg_catalog-shaped.
+    checks.retain(|(action, t)| *action != Action::ReadData || !is_system_schema(&t.namespace));
+    // A visitor can encounter the same relation in nested shapes and a write
+    // target is intentionally also collected as a read. Keep policy calls
+    // deterministic and minimal without weakening either requirement.
+    let mut seen = HashSet::new();
+    checks.retain(|check| seen.insert(check.clone()));
+    Ok(checks)
+}
+
+fn collect_statement_checks(
+    stmt: &Statement,
+    default_ns: &str,
+    checks: &mut Vec<(Action, TableRef)>,
+) -> std::result::Result<(), AuthorizationMappingError> {
     match stmt {
-        Statement::Query(q) => {
-            collect_query_reads(q, default_ns, &mut checks);
-        }
+        Statement::Query(q) => collect_query_checks(q, default_ns, checks)?,
         Statement::Insert(insert) => {
             if let TableObject::TableName(name) = &insert.table {
-                if let Some(t) = object_name_to_ref(&name.to_string(), default_ns) {
-                    checks.push((Action::WriteData, t));
-                }
+                checks.push((Action::WriteData, object_name_to_ref(name, default_ns)?));
+            } else {
+                return Err(AuthorizationMappingError);
             }
-            if let Some(src) = &insert.source {
-                collect_query_reads(src, default_ns, &mut checks);
-            }
+            collect_relation_reads(stmt, default_ns, checks)?;
         }
-        Statement::Update {
-            table, selection, ..
-        } => {
-            if let Some(t) = table_factor_to_ref(&table.relation, default_ns) {
-                checks.push((Action::WriteData, t));
-            }
-            let _ = selection; // subquery predicates: conservative, not read-gated
+        Statement::Update { table, .. } => {
+            checks.push((
+                Action::WriteData,
+                table_factor_to_ref(&table.relation, default_ns)?,
+            ));
+            collect_relation_reads(stmt, default_ns, checks)?;
         }
         Statement::Delete(del) => {
             for name in &del.tables {
-                if let Some(t) = object_name_to_ref(&name.to_string(), default_ns) {
-                    checks.push((Action::WriteData, t));
-                }
+                checks.push((Action::WriteData, object_name_to_ref(name, default_ns)?));
             }
             let froms = match &del.from {
                 sqlparser::ast::FromTable::WithFromKeyword(f)
                 | sqlparser::ast::FromTable::WithoutKeyword(f) => f,
             };
             for twj in froms {
-                if let Some(t) = table_factor_to_ref(&twj.relation, default_ns) {
-                    checks.push((Action::WriteData, t));
-                }
+                checks.push((
+                    Action::WriteData,
+                    table_factor_to_ref(&twj.relation, default_ns)?,
+                ));
             }
+            collect_relation_reads(stmt, default_ns, checks)?;
+        }
+        Statement::Merge { table, .. } => {
+            checks.push((Action::WriteData, table_factor_to_ref(table, default_ns)?));
+            collect_relation_reads(stmt, default_ns, checks)?;
         }
         Statement::Copy {
             source, to, target, ..
@@ -406,28 +445,71 @@ pub fn required_checks(stmt: &Statement, default_ns: &str) -> Vec<(Action, Table
             };
             match source {
                 CopySource::Table { table_name, .. } => {
-                    if let Some(t) = object_name_to_ref(&table_name.to_string(), default_ns) {
-                        checks.push((action, t));
-                    }
+                    checks.push((action, object_name_to_ref(table_name, default_ns)?));
                 }
-                CopySource::Query(q) => collect_query_reads(q, default_ns, &mut checks),
+                CopySource::Query(q) => collect_query_checks(q, default_ns, checks)?,
             }
             let _ = target; // STDIN/STDOUT/file target does not add a table
         }
         Statement::Drop { names, .. } => {
             for name in names {
-                if let Some(t) = object_name_to_ref(&name.to_string(), default_ns) {
-                    checks.push((Action::DropTable, t));
-                }
+                checks.push((Action::DropTable, object_name_to_ref(name, default_ns)?));
             }
         }
-        // SET / SHOW / BEGIN / COMMIT / ROLLBACK / CREATE / EXPLAIN / … are
-        // session or metadata operations: no data-plane check.
-        _ => {}
+        // EXPLAIN still plans and exposes the referenced relations; ANALYZE
+        // additionally executes them. Both therefore require the inner
+        // statement's exact permissions.
+        Statement::Explain { statement, .. } => {
+            collect_statement_checks(statement, default_ns, checks)?;
+        }
+        Statement::CreateView { query, .. } => {
+            collect_query_checks(query, default_ns, checks)?;
+        }
+        Statement::CreateTable(create) => {
+            if let Some(query) = &create.query {
+                collect_query_checks(query, default_ns, checks)?;
+            }
+            if let Some(clone) = &create.clone {
+                checks.push((Action::ReadData, object_name_to_ref(clone, default_ns)?));
+            }
+            if let Some(like) = &create.like {
+                let name = match like {
+                    sqlparser::ast::CreateTableLikeKind::Parenthesized(like)
+                    | sqlparser::ast::CreateTableLikeKind::Plain(like) => &like.name,
+                };
+                checks.push((Action::ReadData, object_name_to_ref(name, default_ns)?));
+            }
+        }
+        // These are explicitly metadata/session operations. Keeping the list
+        // positive makes a future relation-bearing parser variant hit the
+        // fail-closed fallback below.
+        Statement::ShowVariable { .. }
+        | Statement::ShowVariables { .. }
+        | Statement::ShowStatus { .. }
+        | Statement::ShowTables { .. }
+        | Statement::ShowColumns { .. }
+        | Statement::ShowDatabases { .. }
+        | Statement::ShowSchemas { .. }
+        | Statement::ShowViews { .. }
+        | Statement::ShowFunctions { .. }
+        | Statement::ShowCreate { .. }
+        | Statement::ShowCollation { .. }
+        | Statement::ExplainTable { .. }
+        | Statement::Set { .. }
+        | Statement::StartTransaction { .. }
+        | Statement::Commit { .. }
+        | Statement::Rollback { .. }
+        | Statement::Savepoint { .. }
+        | Statement::ReleaseSavepoint { .. } => {}
+        _ => {
+            let mut relations = Vec::new();
+            collect_relation_reads(stmt, default_ns, &mut relations)?;
+            if !relations.is_empty() {
+                return Err(AuthorizationMappingError);
+            }
+        }
     }
-    // Drop metadata-schema reads (pg_catalog / information_schema).
-    checks.retain(|(_, t)| !is_system_schema(&t.namespace));
-    checks
+    Ok(())
 }
 
 /// Whether `stmt` is side-effect-free and therefore admissible on a
@@ -508,63 +590,230 @@ fn set_expr_is_read_only(body: &sqlparser::ast::SetExpr) -> bool {
     }
 }
 
-/// Recursively collect ReadData checks for every base table referenced by a
-/// query (FROM, JOINs, subqueries, CTEs, set operations).
-fn collect_query_reads(
+fn collect_query_checks(
     query: &sqlparser::ast::Query,
     default_ns: &str,
     out: &mut Vec<(Action, TableRef)>,
-) {
-    use sqlparser::ast::visit_relations;
-    // visit_relations walks every ObjectName used as a table relation,
-    // including inside JOINs, subqueries, CTEs and set operations.
-    let _ = visit_relations(query, |name| {
-        if let Some(t) = object_name_to_ref(&name.to_string(), default_ns) {
-            out.push((Action::ReadData, t));
+) -> std::result::Result<(), AuthorizationMappingError> {
+    collect_relation_reads(query, default_ns, out)?;
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            collect_query_writes(&cte.query, default_ns, out)?;
         }
-        std::ops::ControlFlow::<()>::Continue(())
-    });
+    }
+    collect_set_expr_writes(&query.body, default_ns, out)
 }
 
-fn table_factor_to_ref(factor: &sqlparser::ast::TableFactor, default_ns: &str) -> Option<TableRef> {
+fn collect_query_writes(
+    query: &sqlparser::ast::Query,
+    default_ns: &str,
+    out: &mut Vec<(Action, TableRef)>,
+) -> std::result::Result<(), AuthorizationMappingError> {
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            collect_query_writes(&cte.query, default_ns, out)?;
+        }
+    }
+    collect_set_expr_writes(&query.body, default_ns, out)
+}
+
+fn collect_set_expr_writes(
+    body: &SetExpr,
+    default_ns: &str,
+    out: &mut Vec<(Action, TableRef)>,
+) -> std::result::Result<(), AuthorizationMappingError> {
+    match body {
+        SetExpr::Query(q) => collect_query_writes(q, default_ns, out),
+        SetExpr::SetOperation { left, right, .. } => {
+            collect_set_expr_writes(left, default_ns, out)?;
+            collect_set_expr_writes(right, default_ns, out)
+        }
+        SetExpr::Insert(stmt)
+        | SetExpr::Update(stmt)
+        | SetExpr::Delete(stmt)
+        | SetExpr::Merge(stmt) => collect_statement_checks(stmt, default_ns, out),
+        SetExpr::Select(_) | SetExpr::Values(_) | SetExpr::Table(_) => Ok(()),
+    }
+}
+
+fn collect_relation_reads<V: Visit>(
+    value: &V,
+    default_ns: &str,
+    out: &mut Vec<(Action, TableRef)>,
+) -> std::result::Result<(), AuthorizationMappingError> {
+    struct RelationReadVisitor<'a> {
+        default_ns: &'a str,
+        out: &'a mut Vec<(Action, TableRef)>,
+        cte_scopes: Vec<CteScope>,
+    }
+
+    struct CteScope {
+        /// CTE aliases visible at the current traversal position. For a
+        /// non-recursive WITH this grows after each definition; WITH
+        /// RECURSIVE makes all aliases visible inside every definition.
+        visible: HashSet<String>,
+        /// Child-query address -> alias to expose once that CTE definition
+        /// has been traversed. Addresses are only compared during this
+        /// synchronous AST walk; they are never dereferenced or retained.
+        definitions: Vec<(usize, String)>,
+        activate_in_parent: Option<String>,
+    }
+
+    impl Visitor for RelationReadVisitor<'_> {
+        type Break = AuthorizationMappingError;
+
+        fn pre_visit_query(
+            &mut self,
+            query: &sqlparser::ast::Query,
+        ) -> std::ops::ControlFlow<Self::Break> {
+            let address = query as *const sqlparser::ast::Query as usize;
+            let activate_in_parent = self.cte_scopes.last().and_then(|scope| {
+                scope
+                    .definitions
+                    .iter()
+                    .find(|(child, _)| *child == address)
+                    .map(|(_, name)| name.clone())
+            });
+            let (visible, definitions) = query
+                .with
+                .as_ref()
+                .map(|with| {
+                    let definitions: Vec<_> = with
+                        .cte_tables
+                        .iter()
+                        .map(|cte| {
+                            (
+                                cte.query.as_ref() as *const sqlparser::ast::Query as usize,
+                                normalize_ident(&cte.alias.name),
+                            )
+                        })
+                        .collect();
+                    let visible = if with.recursive {
+                        definitions.iter().map(|(_, name)| name.clone()).collect()
+                    } else {
+                        HashSet::new()
+                    };
+                    (visible, definitions)
+                })
+                .unwrap_or_default();
+            self.cte_scopes.push(CteScope {
+                visible,
+                definitions,
+                activate_in_parent,
+            });
+            std::ops::ControlFlow::Continue(())
+        }
+
+        fn post_visit_query(
+            &mut self,
+            _query: &sqlparser::ast::Query,
+        ) -> std::ops::ControlFlow<Self::Break> {
+            let completed = self.cte_scopes.pop().expect("query scope pushed");
+            if let (Some(parent), Some(alias)) =
+                (self.cte_scopes.last_mut(), completed.activate_in_parent)
+            {
+                parent.visible.insert(alias);
+            }
+            std::ops::ControlFlow::Continue(())
+        }
+
+        fn pre_visit_relation(&mut self, name: &ObjectName) -> std::ops::ControlFlow<Self::Break> {
+            let parts = match normalized_object_parts(name) {
+                Ok(parts) => parts,
+                Err(err) => return std::ops::ControlFlow::Break(err),
+            };
+            if let [name] = parts.as_slice() {
+                if self
+                    .cte_scopes
+                    .iter()
+                    .rev()
+                    .any(|scope| scope.visible.contains(name))
+                {
+                    return std::ops::ControlFlow::Continue(());
+                }
+            }
+            let target = match object_name_to_ref(name, self.default_ns) {
+                Ok(target) => target,
+                Err(err) => return std::ops::ControlFlow::Break(err),
+            };
+            self.out.push((Action::ReadData, target));
+            std::ops::ControlFlow::Continue(())
+        }
+    }
+
+    let mut visitor = RelationReadVisitor {
+        default_ns,
+        out,
+        cte_scopes: Vec::new(),
+    };
+    match value.visit(&mut visitor) {
+        std::ops::ControlFlow::Continue(()) => Ok(()),
+        std::ops::ControlFlow::Break(err) => Err(err),
+    }
+}
+
+fn table_factor_to_ref(
+    factor: &sqlparser::ast::TableFactor,
+    default_ns: &str,
+) -> std::result::Result<TableRef, AuthorizationMappingError> {
     if let sqlparser::ast::TableFactor::Table { name, .. } = factor {
-        object_name_to_ref(&name.to_string(), default_ns)
+        object_name_to_ref(name, default_ns)
     } else {
-        None
+        Err(AuthorizationMappingError)
     }
 }
 
 /// Resolve a possibly-qualified object name (`trips`, `demo.trips`,
 /// `icegres.demo.trips`) to a `namespace.table`, defaulting the namespace.
-/// Strips the leading catalog component and quotes; metadata-table suffixes
-/// like `trips$snapshots` keep the base table for the check.
-fn object_name_to_ref(name: &str, default_ns: &str) -> Option<TableRef> {
-    let clean = name.replace('"', "");
-    let parts: Vec<&str> = clean.split('.').collect();
+/// Drops the optional catalog component while preserving quoted identifier
+/// boundaries and matching DataFusion's lowercase normalization for unquoted
+/// identifiers.
+fn object_name_to_ref(
+    name: &ObjectName,
+    default_ns: &str,
+) -> std::result::Result<TableRef, AuthorizationMappingError> {
+    let parts = normalized_object_parts(name)?;
     let (ns, table) = match parts.as_slice() {
-        [t] => (default_ns.to_string(), (*t).to_string()),
-        [ns, t] => ((*ns).to_string(), (*t).to_string()),
+        [t] => (default_ns.to_string(), t.clone()),
+        [ns, t] => (ns.clone(), t.clone()),
         // catalog.namespace.table — drop the catalog component.
-        [_cat, ns, t] => ((*ns).to_string(), (*t).to_string()),
-        _ => return None,
+        [_cat, ns, t] => (ns.clone(), t.clone()),
+        _ => return Err(AuthorizationMappingError),
     };
     if table.is_empty() {
-        return None;
+        return Err(AuthorizationMappingError);
     }
-    Some(TableRef {
+    Ok(TableRef {
         namespace: ns,
         table,
     })
 }
 
+fn normalized_object_parts(
+    name: &ObjectName,
+) -> std::result::Result<Vec<String>, AuthorizationMappingError> {
+    name.0
+        .iter()
+        .map(|part| {
+            let ident = part.as_ident().ok_or(AuthorizationMappingError)?;
+            Ok(normalize_ident(ident))
+        })
+        .collect()
+}
+
+fn normalize_ident(ident: &sqlparser::ast::Ident) -> String {
+    match ident.quote_style {
+        Some(_) => ident.value.clone(),
+        None => ident.value.to_ascii_lowercase(),
+    }
+}
+
 /// Shared authorizer handle used by the hook and the Flight SQL path.
 pub type SharedAuthorizer = Arc<dyn Authorizer>;
 
-/// Build the SQLSTATE 42501 (insufficient_privilege) error for a denied
-/// statement, in the shape Postgres clients expect.
 /// Human-readable permission-denied message, shared by the pgwire error
-/// (`deny_error`) and the Flight SQL `Status::permission_denied` so both wire
-/// protocols report a denial identically.
+/// and the Flight SQL `Status::permission_denied` so both wire protocols
+/// report a denial identically.
 pub fn deny_message(principal: &str, action: Action, target: &TableRef) -> String {
     let verb = match action {
         Action::ReadData => "SELECT",
@@ -574,12 +823,18 @@ pub fn deny_message(principal: &str, action: Action, target: &TableRef) -> Strin
     format!("permission denied: role \"{principal}\" cannot {verb} on {target}")
 }
 
-pub fn deny_error(principal: &str, action: Action, target: &TableRef) -> PgWireError {
-    PgWireError::UserError(Box::new(ErrorInfo::new(
-        "ERROR".to_string(),
-        "42501".to_string(),
-        deny_message(principal, action, target),
-    )))
+/// Return the wire-safe message for a denial, or `None` for an allowed
+/// decision. Shared by pgwire and Flight so the fail-closed mapping path is
+/// enforced identically on both protocols.
+pub fn decision_denial_message(principal: &str, decision: &Decision) -> Option<String> {
+    match decision {
+        Decision::Allow => None,
+        Decision::Deny { action, target } => Some(deny_message(principal, *action, target)),
+        Decision::DenyUnsupported => Some(format!(
+            "permission denied: role \"{principal}\" cannot execute an unsupported \
+             relation-bearing SQL statement"
+        )),
+    }
 }
 
 /// Query hook that enforces authorization before any other hook or planning.
@@ -610,13 +865,16 @@ impl AuthzHook {
             .get(METADATA_USER)
             .map(String::as_str)
             .unwrap_or("");
-        match self
+        let decision = self
             .authorizer
-            .authorize_sql(principal, stmt, &self.default_namespace)
-        {
-            Decision::Allow => None,
-            Decision::Deny { action, target } => Some(deny_error(principal, action, &target)),
-        }
+            .authorize_sql(principal, stmt, &self.default_namespace);
+        decision_denial_message(principal, &decision).map(|message| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_string(),
+                "42501".to_string(),
+                message,
+            )))
+        })
     }
 }
 
@@ -792,5 +1050,169 @@ mod tests {
         let a = authz("grant u read demo.trips\n");
         let stmt = parse1("select * from trips");
         assert_eq!(a.authorize_sql("u", &stmt, "demo"), Decision::Allow);
+    }
+
+    #[test]
+    fn explain_analyze_recurses_into_writes() {
+        let a = authz("grant u read demo\n");
+        let stmt = parse1("explain analyze insert into demo.trips values (1)");
+        assert!(matches!(
+            a.authorize_sql("u", &stmt, "demo"),
+            Decision::Deny {
+                action: Action::WriteData,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn explain_without_analyze_still_requires_source_read() {
+        let a = authz("");
+        let stmt = parse1("explain select * from secret.data");
+        assert!(matches!(
+            a.authorize_sql("u", &stmt, "demo"),
+            Decision::Deny {
+                action: Action::ReadData,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn data_modifying_cte_requires_write() {
+        let a = authz("grant u read demo.trips\n");
+        let stmt =
+            parse1("with deleted as (delete from demo.trips returning *) select * from deleted");
+        assert!(matches!(
+            a.authorize_sql("u", &stmt, "demo"),
+            Decision::Deny {
+                action: Action::WriteData,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn nonrecursive_cte_alias_only_enters_scope_after_its_definition() {
+        // Inside its own non-recursive definition, `shadow` still resolves to
+        // the base table. The outer reference resolves to the CTE and must not
+        // add a second (or, critically, suppress the only) policy check.
+        let stmt = parse1("with shadow as (select * from shadow) select * from shadow");
+        assert_eq!(
+            required_checks(&stmt, "demo").unwrap(),
+            vec![(
+                Action::ReadData,
+                TableRef {
+                    namespace: "demo".into(),
+                    table: "shadow".into(),
+                }
+            )]
+        );
+
+        // Earlier aliases are visible to later definitions.
+        let chained = parse1(
+            "with first as (select * from source), \
+             second as (select * from first) select * from second",
+        );
+        assert_eq!(
+            required_checks(&chained, "demo").unwrap(),
+            vec![(
+                Action::ReadData,
+                TableRef {
+                    namespace: "demo".into(),
+                    table: "source".into(),
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn recursive_cte_alias_is_visible_inside_its_definition() {
+        let stmt = parse1(
+            "with recursive nums(n) as \
+             (values (1) union all select n + 1 from nums where n < 3) \
+             select * from nums",
+        );
+        assert!(required_checks(&stmt, "demo").unwrap().is_empty());
+    }
+
+    #[test]
+    fn update_subquery_requires_source_read() {
+        let a = authz("grant u write demo.public\n");
+        let stmt = parse1("update demo.public set value = (select value from secret.data limit 1)");
+        assert!(matches!(
+            a.authorize_sql("u", &stmt, "demo"),
+            Decision::Deny {
+                action: Action::ReadData,
+                target: TableRef { namespace, table },
+            } if namespace == "secret" && table == "data"
+        ));
+    }
+
+    #[test]
+    fn ctas_and_view_require_source_read() {
+        let a = authz("");
+        for sql in [
+            "create table demo.copy as select * from secret.data",
+            "create view demo.copy as select * from secret.data",
+        ] {
+            let stmt = parse1(sql);
+            assert!(matches!(
+                a.authorize_sql("u", &stmt, "demo"),
+                Decision::Deny {
+                    action: Action::ReadData,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn quoted_dots_and_case_match_engine_resolution() {
+        let dotted = parse1("select * from \"secret.table\"");
+        assert_eq!(
+            required_checks(&dotted, "demo").unwrap(),
+            vec![(
+                Action::ReadData,
+                TableRef {
+                    namespace: "demo".into(),
+                    table: "secret.table".into(),
+                }
+            )]
+        );
+
+        let dotted_ns = parse1("select * from \"a.b\".\"Mixed.Table\"");
+        assert_eq!(
+            required_checks(&dotted_ns, "demo").unwrap(),
+            vec![(
+                Action::ReadData,
+                TableRef {
+                    namespace: "a.b".into(),
+                    table: "Mixed.Table".into(),
+                }
+            )]
+        );
+
+        let folded = parse1("select * from DEMO.Trips");
+        assert_eq!(
+            required_checks(&folded, "ignored").unwrap(),
+            vec![(
+                Action::ReadData,
+                TableRef {
+                    namespace: "demo".into(),
+                    table: "trips".into(),
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn unknown_relation_bearing_statement_fails_closed() {
+        let a = authz("grant u read demo.trips\n");
+        let stmt = parse1("truncate table demo.trips");
+        assert_eq!(
+            a.authorize_sql("u", &stmt, "demo"),
+            Decision::DenyUnsupported
+        );
     }
 }
