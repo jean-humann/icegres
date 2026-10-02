@@ -79,6 +79,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
+use crate::retention::{self, Reservation, RetainedPool, RetentionBudget};
 use anyhow::{anyhow, bail, Context as _, Result};
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef as ArrowSchemaRef;
@@ -89,6 +90,7 @@ use datafusion::catalog::{
 use datafusion::common::ParamValues;
 use datafusion::datasource::{MemTable, TableType};
 use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, LogicalPlan, TableProviderFilterPushDown, WriteOp};
@@ -104,6 +106,7 @@ use datafusion_postgres::pgwire::api::ClientInfo;
 use datafusion_postgres::pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use datafusion_postgres::pgwire::types::format::FormatOptions;
 use datafusion_postgres::QueryHook;
+use futures::StreamExt;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::spec::MAIN_BRANCH;
 use iceberg::table::Table;
@@ -113,8 +116,8 @@ use iceberg_datafusion::IcebergStaticTableProvider;
 use crate::context::{CATALOG_NAME, DEFAULT_SCHEMA};
 use crate::dml;
 use crate::overwrite::{
-    align_batch, apply_dml_to_batches, check_pk, pk_columns_of, quote_ident, DmlKind,
-    MultiTableCommit, OverwriteEngine, TableOp,
+    align_batch, apply_dml_to_batches_bounded, check_pk_in_runtime, pk_columns_of, quote_ident,
+    DmlKind, MultiTableCommit, OverwriteEngine, TableOp,
 };
 
 // ---------------------------------------------------------------------------
@@ -125,8 +128,9 @@ use crate::overwrite::{
 /// loop (ops.rs) removes a connection's entry when its socket closes, so an
 /// abandoned transaction can never leak or bleed into a later connection
 /// that reuses the same peer address.
-#[derive(Default)]
 pub struct TxnRegistry {
+    session_bytes: usize,
+    total_retained: Arc<RetainedPool>,
     sessions: StdMutex<HashMap<SocketAddr, Arc<tokio::sync::Mutex<TxnSession>>>>,
     /// Count of open sessions, kept in step with `sessions` (only ever mutated
     /// while the map lock is held). Lets the per-statement `active`/`get`
@@ -138,7 +142,28 @@ pub struct TxnRegistry {
 
 impl TxnRegistry {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            sessions: StdMutex::new(HashMap::new()),
+            open: AtomicUsize::new(0),
+            session_bytes: retention::DEFAULT_SESSION_BYTES,
+            total_retained: RetainedPool::new(retention::DEFAULT_TOTAL_BYTES, "all transactions"),
+        }
+    }
+
+    pub fn from_env() -> Result<Self> {
+        let mut registry = Self::new();
+        registry.session_bytes = retention::env_positive_bytes(
+            "ICEGRES_TXN_MAX_BYTES",
+            retention::DEFAULT_SESSION_BYTES,
+        )?;
+        registry.total_retained = RetainedPool::new(
+            retention::env_positive_bytes(
+                "ICEGRES_TXN_TOTAL_MAX_BYTES",
+                retention::DEFAULT_TOTAL_BYTES,
+            )?,
+            "all transactions",
+        );
+        Ok(registry)
     }
 
     /// Whether `addr` has an open transaction (used by the write-buffer
@@ -171,7 +196,12 @@ impl TxnRegistry {
         if map.contains_key(&addr) {
             return false;
         }
-        map.insert(addr, Arc::new(tokio::sync::Mutex::new(TxnSession::new())));
+        map.insert(
+            addr,
+            Arc::new(tokio::sync::Mutex::new(TxnSession::new(
+                RetentionBudget::new(self.session_bytes, self.total_retained.clone()),
+            ))),
+        );
         self.open.store(map.len(), Ordering::Release);
         true
     }
@@ -194,6 +224,7 @@ impl TxnRegistry {
 
 /// One open transaction.
 struct TxnSession {
+    retained: Arc<RetentionBudget>,
     /// A statement failed: everything except COMMIT/ROLLBACK answers 25P01,
     /// and COMMIT rolls back.
     aborted: bool,
@@ -201,8 +232,9 @@ struct TxnSession {
 }
 
 impl TxnSession {
-    fn new() -> Self {
+    fn new(retained: Arc<RetentionBudget>) -> Self {
         Self {
+            retained,
             aborted: false,
             tables: HashMap::new(),
         }
@@ -211,6 +243,8 @@ impl TxnSession {
 
 /// Per-table transaction state: the pinned snapshot plus buffered ops.
 struct TxnTable {
+    append_reservations: Vec<Reservation>,
+    materialized_reservation: Option<Reservation>,
     /// Table as loaded at first touch.
     pinned: Table,
     /// The pinned snapshot id: the head of the serving branch (`--branch`;
@@ -277,6 +311,8 @@ impl TxnTable {
             columns,
             ops: Vec::new(),
             materialized: None,
+            append_reservations: Vec::new(),
+            materialized_reservation: None,
         })
     }
 
@@ -319,7 +355,11 @@ impl TxnTable {
     /// Materialize effective rows (pinned snapshot + buffered appends).
     /// Only called before applying the first UPDATE/DELETE; afterwards the
     /// state is maintained eagerly by `txn_dml`.
-    async fn materialize(&mut self) -> Result<()> {
+    async fn materialize(
+        &mut self,
+        budget: Arc<RetentionBudget>,
+        runtime: Arc<RuntimeEnv>,
+    ) -> Result<()> {
         if self.materialized.is_some() {
             return Ok(());
         }
@@ -327,21 +367,14 @@ impl TxnTable {
             self.ops.iter().all(|op| matches!(op, TableOp::Append(_))),
             "materialize must run before the first DML op is buffered"
         );
-        let ctx = SessionContext::new();
+        let ctx = SessionContext::new_with_config_rt(Default::default(), runtime);
         ctx.register_table("__icegres_pin", self.pinned_provider.clone())
             .map_err(|e| anyhow!("failed to register pinned table: {e}"))?;
-        let batches = ctx
-            .sql("SELECT * FROM __icegres_pin")
-            .await
-            .map_err(|e| anyhow!("failed to plan pinned scan: {e}"))?
-            .collect()
-            .await
-            .map_err(|e| anyhow!("failed to materialize pinned rows: {e}"))?;
-        let mut rows: Vec<RecordBatch> = batches
-            .iter()
-            .map(|b| align_batch(b, &self.schema))
-            .collect::<Result<_>>()?;
+        let df = ctx.sql("SELECT * FROM __icegres_pin").await?;
+        let (mut rows, reservation) =
+            retention::collect(df, Some(budget), Some(&self.schema)).await?;
         rows.extend(self.append_batches());
+        self.materialized_reservation = reservation;
         self.materialized = Some(rows);
         Ok(())
     }
@@ -878,7 +911,9 @@ impl TxnHook {
         params: Option<&ParamValues>,
     ) -> Result<Response> {
         let ctx = self.txn_ctx(shared, sess_arc.clone());
-        let (ident, batches) = plan_insert_rows(&ctx, stmt, params).await?;
+        let budget = sess_arc.lock().await.retained.clone();
+        let (ident, batches, reservation) =
+            plan_insert_rows_inner(&ctx, stmt, params, Some(budget)).await?;
         // Planning pinned the target table (provider resolution); align the
         // rows to its pinned schema so every later consumer agrees.
         let mut sess = sess_arc.lock().await;
@@ -899,13 +934,16 @@ impl TxnHook {
         // Statement-time PK feedback (the COMMIT-time check inside the
         // anchored commit is the authoritative one).
         if let Some(pk_cols) = self.engine.pk_columns(&entry.pinned)? {
-            check_insert_pk(entry, &aligned, &pk_cols).await?;
+            check_insert_pk(entry, &aligned, &pk_cols, shared.runtime_env()).await?;
         }
 
         if let Some(m) = entry.materialized.as_mut() {
             m.extend(aligned.iter().cloned());
         }
         entry.ops.push(TableOp::Append(aligned));
+        if let Some(reservation) = reservation {
+            entry.append_reservations.push(reservation);
+        }
         Ok(Response::Execution(
             Tag::new("INSERT").with_oid(0).with_rows(rows),
         ))
@@ -917,6 +955,7 @@ impl TxnHook {
     async fn txn_dml(
         &self,
         stmt: &Statement,
+        shared: &SessionContext,
         sess_arc: Arc<tokio::sync::Mutex<TxnSession>>,
     ) -> Result<Response> {
         let (dml_stmt, tag) =
@@ -928,14 +967,24 @@ impl TxnHook {
             let pinned = TxnTable::pin(&self.catalog, &ident, self.engine.branch()).await?;
             sess.tables.insert(ident.clone(), pinned);
         }
+        let budget = sess.retained.clone();
         let entry = sess.tables.get_mut(&ident).expect("just pinned");
-        entry.materialize().await?;
+        entry
+            .materialize(budget.clone(), shared.runtime_env())
+            .await?;
         let rows_in = entry
             .materialized
             .as_ref()
             .expect("materialized above")
             .clone();
-        let (matched, out) = apply_dml_to_batches(&dml_stmt, &entry.columns, rows_in).await?;
+        let (matched, out, reservation) = apply_dml_to_batches_bounded(
+            &dml_stmt,
+            &entry.columns,
+            rows_in,
+            budget,
+            shared.runtime_env(),
+        )
+        .await?;
         let aligned: Vec<RecordBatch> = out
             .iter()
             .map(|b| align_batch(b, &entry.schema))
@@ -950,12 +999,16 @@ impl TxnHook {
                     .any(|(c, _)| pk_cols.iter().any(|p| p == c));
                 if touches_pk && !aligned.is_empty() {
                     let keys = project_pk(&aligned, &pk_cols)?;
-                    check_pk(&pk_cols, &keys, ident.name()).await?;
+                    check_pk_in_runtime(&pk_cols, &keys, ident.name(), shared.runtime_env())
+                        .await?;
                 }
             }
         }
 
         entry.materialized = Some(aligned);
+        if let Some(reservation) = reservation {
+            entry.materialized_reservation = Some(reservation);
+        }
         entry.ops.push(TableOp::Dml(dml_stmt));
         Ok(Response::Execution(
             Tag::new(tag).with_rows(matched as usize),
@@ -969,8 +1022,8 @@ impl TxnHook {
     /// execution into the response stream, where a runtime error (e.g.
     /// divide by zero) would surface only while pgwire streams rows — after
     /// this hook returned Ok — and the session would miss its
-    /// transaction-aborting failure. Result-set memory is bounded by what
-    /// the client asked for.
+    /// transaction-aborting failure. The incremental collector enforces the
+    /// session and shared retained-Arrow limits before storing each batch.
     async fn txn_select(
         &self,
         stmt: &Statement,
@@ -978,16 +1031,16 @@ impl TxnHook {
         sess_arc: Arc<tokio::sync::Mutex<TxnSession>>,
         client: &(dyn ClientInfo + Send + Sync),
     ) -> PgWireResult<Response> {
+        let budget = sess_arc.lock().await.retained.clone();
         let ctx = self.txn_ctx(shared, sess_arc);
         let df = ctx
             .sql(&stmt.to_string())
             .await
             .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
         let arrow_schema = Arc::new(df.schema().as_arrow().clone());
-        let mut batches = df
-            .collect()
+        let (mut batches, reservation) = retention::collect(df, Some(budget), None)
             .await
-            .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+            .map_err(|e| txn_error(&e))?;
         if batches.is_empty() {
             // Zero-batch result: keep the schema so RowDescription is right.
             batches.push(RecordBatch::new_empty(arrow_schema));
@@ -996,8 +1049,12 @@ impl TxnHook {
             .read_batches(batches)
             .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
         let format_options = Arc::new(FormatOptions::from_client_metadata(client.metadata()));
-        let resp =
+        let mut resp =
             pgdf::encode_dataframe(mem_df, &Format::UnifiedText, Some(format_options)).await?;
+        resp.data_rows = Box::pin(resp.data_rows.map(move |row| {
+            let _keep_reservation = &reservation;
+            row
+        }));
         Ok(Response::Query(resp))
     }
 
@@ -1074,7 +1131,7 @@ impl TxnHook {
             ))
         }
         .await;
-        Some(result.map_err(|e| dml::engine_error(&e)))
+        Some(result.map_err(|e| txn_error(&e)))
     }
 
     /// Dispatch a statement while a transaction is active. `Err` marks the
@@ -1100,7 +1157,7 @@ impl TxnHook {
             Statement::Insert(_) => self
                 .txn_insert(stmt, shared, sess_arc.clone(), params)
                 .await
-                .map_err(|e| dml::engine_error(&e)),
+                .map_err(|e| txn_error(&e)),
             Statement::Update { .. } | Statement::Delete(_) => {
                 let has_params = params.is_some_and(|p| match p {
                     ParamValues::List(l) => !l.is_empty(),
@@ -1113,9 +1170,9 @@ impl TxnHook {
                          inline the values",
                     ))
                 } else {
-                    self.txn_dml(stmt, sess_arc.clone())
+                    self.txn_dml(stmt, shared, sess_arc.clone())
                         .await
-                        .map_err(|e| dml::engine_error(&e))
+                        .map_err(|e| txn_error(&e))
                 }
             }
             Statement::Query(_) | Statement::Explain { .. } => {
@@ -1305,6 +1362,16 @@ pub(crate) async fn plan_insert_rows(
     stmt: &Statement,
     params: Option<&ParamValues>,
 ) -> Result<(TableIdent, Vec<RecordBatch>)> {
+    let (ident, batches, _) = plan_insert_rows_inner(ctx, stmt, params, None).await?;
+    Ok((ident, batches))
+}
+
+async fn plan_insert_rows_inner(
+    ctx: &SessionContext,
+    stmt: &Statement,
+    params: Option<&ParamValues>,
+    budget: Option<Arc<RetentionBudget>>,
+) -> Result<(TableIdent, Vec<RecordBatch>, Option<Reservation>)> {
     let df_stmt = datafusion::sql::parser::Statement::Statement(Box::new(stmt.clone()));
     let mut plan = ctx
         .state()
@@ -1325,19 +1392,10 @@ pub(crate) async fn plan_insert_rows(
     }
     let ident = table_ref_to_ident(&dml_plan.table_name)?;
     let df = DataFrame::new(ctx.state(), dml_plan.input.as_ref().clone());
-    let batches = df
-        .collect()
-        .await
-        .map_err(|e| anyhow!("failed to evaluate INSERT rows: {e}"))?;
-    // The INSERT input can inherit source-column metadata. Stamp the planned
-    // target identity only after DataFusion has applied INSERT column mapping,
-    // so buffered rows retain the schema they were actually planned against.
+    // Stamp planned target field IDs after DataFusion's column mapping.
     let target = dml_plan.target.schema();
-    let batches = batches
-        .iter()
-        .map(|batch| align_batch(batch, &target))
-        .collect::<Result<Vec<_>>>()?;
-    Ok((ident, batches))
+    let (batches, reservation) = retention::collect(df, budget, Some(&target)).await?;
+    Ok((ident, batches, reservation))
 }
 
 /// Resolve a planner table reference to an Iceberg table identity, applying
@@ -1406,15 +1464,25 @@ async fn check_insert_pk(
     entry: &TxnTable,
     new_rows: &[RecordBatch],
     pk_cols: &[String],
+    runtime: Arc<RuntimeEnv>,
 ) -> Result<()> {
     // NULLs + duplicates WITHIN the new rows.
     let new_keys = project_pk(new_rows, pk_cols)?;
-    check_pk(pk_cols, &new_keys, entry.pinned.identifier().name()).await?;
+    if new_keys.is_empty() {
+        return Ok(());
+    }
+    check_pk_in_runtime(
+        pk_cols,
+        &new_keys,
+        entry.pinned.identifier().name(),
+        runtime.clone(),
+    )
+    .await?;
 
     // Collision with the effective (pin + buffer) view: key-columns-only
     // anti-join through DataFusion, so the pinned side reads only the key
     // columns from Parquet.
-    let ctx = SessionContext::new();
+    let ctx = SessionContext::new_with_config_rt(Default::default(), runtime);
     ctx.register_table("__icegres_cur", entry.effective_provider()?)
         .map_err(|e| anyhow!("failed to register effective table: {e}"))?;
     let mem = MemTable::try_new(new_keys[0].schema(), vec![new_keys.clone()])
@@ -1480,6 +1548,14 @@ fn project_pk(batches: &[RecordBatch], pk_cols: &[String]) -> Result<Vec<RecordB
                 .map_err(|e| anyhow!("PK projection failed: {e}"))
         })
         .collect()
+}
+
+fn txn_error(error: &anyhow::Error) -> PgWireError {
+    if error.downcast_ref::<retention::MemoryLimit>().is_some() {
+        user_err("53200", &format!("{error:#}"))
+    } else {
+        dml::engine_error(error)
+    }
 }
 
 fn user_err(code: &str, msg: &str) -> PgWireError {
@@ -1797,6 +1873,64 @@ mod tests {
                 .value(0),
             "value"
         );
+    }
+
+    #[tokio::test]
+    async fn bounded_insert_refuses_rows_before_installing_transaction_state() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::prelude::SessionConfig;
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new().with_default_catalog_and_schema(CATALOG_NAME, DEFAULT_SCHEMA),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]));
+        ctx.register_table(
+            "target",
+            Arc::new(MemTable::try_new(schema.clone(), vec![vec![]]).unwrap()),
+        )
+        .unwrap();
+        let total = RetainedPool::new(1_000_000, "all transactions");
+        let budget = RetentionBudget::new(128, total.clone());
+        let stmt = parse("INSERT INTO target SELECT repeat('x', 4096)");
+        let error = plan_insert_rows_inner(&ctx, &stmt, None, Some(budget))
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<retention::MemoryLimit>().is_some());
+        assert_eq!(total.used(), 0);
+        assert_eq!(
+            ctx.table("target")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap()
+                .iter()
+                .map(|b| b.num_rows())
+                .sum::<usize>(),
+            0
+        );
+        let budget = RetentionBudget::new(10_000, total.clone());
+        let (_, rows, reservation) = plan_insert_rows_inner(
+            &ctx,
+            &parse("INSERT INTO target VALUES ('small')"),
+            None,
+            Some(budget),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rows[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "small"
+        );
+        assert!(total.used() > 0);
+        drop(rows);
+        drop(reservation);
+        assert_eq!(total.used(), 0);
     }
 
     #[test]

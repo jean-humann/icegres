@@ -40,6 +40,7 @@ mod plancache;
 /// Consensus-class durable tail (`--tail-quorum`): the proposer/acceptor
 /// protocol adapted from Neon's safekeeper (see the module docs and NOTICE).
 mod quorum;
+mod retention;
 mod scan;
 mod seed;
 /// Shared low-level segment/frame machinery (factored from `tail.rs`; also
@@ -1518,7 +1519,7 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
     // authenticated principal, all tables); Some = every statement gated.
     let authorizer = build_authorizer(&serve_opts.authz_file, serve_opts.auth_file.is_some())?;
 
-    let txn_registry = Arc::new(TxnRegistry::new());
+    let txn_registry = Arc::new(TxnRegistry::from_env()?);
     // Keep a handle for the graceful-shutdown flush before the buffer is moved
     // into the hook chain.
     let shutdown_buffer = write_buffer.clone();

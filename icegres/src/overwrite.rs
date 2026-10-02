@@ -1957,25 +1957,65 @@ pub async fn apply_dml_to_batches(
     columns: &[String],
     batches: Vec<RecordBatch>,
 ) -> Result<(u64, Vec<RecordBatch>)> {
+    let (matched, output, _) =
+        apply_dml_to_batches_inner(stmt, columns, batches, None, None).await?;
+    Ok((matched, output))
+}
+
+pub(crate) async fn apply_dml_to_batches_bounded(
+    stmt: &DmlStatement,
+    columns: &[String],
+    batches: Vec<RecordBatch>,
+    budget: Arc<crate::retention::RetentionBudget>,
+    runtime: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+) -> Result<(u64, Vec<RecordBatch>, Option<crate::retention::Reservation>)> {
+    apply_dml_to_batches_inner(stmt, columns, batches, Some(budget), Some(runtime)).await
+}
+
+async fn apply_dml_to_batches_inner(
+    stmt: &DmlStatement,
+    columns: &[String],
+    batches: Vec<RecordBatch>,
+    budget: Option<Arc<crate::retention::RetentionBudget>>,
+    runtime: Option<Arc<datafusion::execution::runtime_env::RuntimeEnv>>,
+) -> Result<(u64, Vec<RecordBatch>, Option<crate::retention::Reservation>)> {
     let rows_in: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
     if rows_in == 0 {
-        return Ok((0, batches));
+        return Ok((0, batches, None));
     }
     let sql = DmlSql::new(stmt, columns.iter().map(String::as_str))?;
-    let ctx = SessionContext::new_with_config(
-        SessionConfig::new().with_default_catalog_and_schema(CATALOG_NAME, &stmt.namespace),
-    );
+    let config =
+        SessionConfig::new().with_default_catalog_and_schema(CATALOG_NAME, &stmt.namespace);
+    let ctx = match runtime {
+        Some(runtime) => SessionContext::new_with_config_rt(config, runtime),
+        None => SessionContext::new_with_config(config),
+    };
     let schema = batches[0].schema();
+    let canonical_schema = budget.as_ref().map(|_| schema.clone());
     let table_ref =
         datafusion::sql::TableReference::partial(stmt.namespace.as_str(), stmt.table.as_str());
     let mem = MemTable::try_new(schema, vec![batches.clone()])
         .map_err(|e| anyhow!("failed to build in-memory eval table: {e}"))?;
     ctx.register_table(table_ref, Arc::new(mem))
         .map_err(|e| anyhow!("failed to register eval table: {e}"))?;
-    match evaluate_rows(&ctx, &sql, rows_in).await? {
-        FileFate::Keep => Ok((0, batches)),
-        FileFate::Remove { matched } => Ok((matched, Vec::new())),
-        FileFate::Rewrite { matched, batches } => Ok((matched, batches)),
+    let mut reservation = None;
+    let fate = if budget.is_some() {
+        evaluate_rows_inner(
+            &ctx,
+            &sql,
+            rows_in,
+            budget.clone(),
+            canonical_schema.as_ref(),
+            &mut reservation,
+        )
+        .await?
+    } else {
+        evaluate_rows(&ctx, &sql, rows_in).await?
+    };
+    match fate {
+        FileFate::Keep => Ok((0, batches, None)),
+        FileFate::Remove { matched } => Ok((matched, Vec::new(), budget.map(|b| b.reservation()))),
+        FileFate::Rewrite { matched, batches } => Ok((matched, batches, reservation)),
     }
 }
 
@@ -2830,6 +2870,30 @@ fn project_columns(batches: &[RecordBatch], cols: &[String]) -> Result<RecordBat
 /// Enforce NOT NULL + uniqueness over the assembled final key rows.
 /// Violations return [`ConstraintViolation`] with the standard sqlstate.
 pub async fn check_pk(pk_cols: &[String], pk_rows: &[RecordBatch], table: &str) -> Result<()> {
+    check_pk_with_ctx(pk_cols, pk_rows, table, SessionContext::new()).await
+}
+
+pub(crate) async fn check_pk_in_runtime(
+    pk_cols: &[String],
+    pk_rows: &[RecordBatch],
+    table: &str,
+    runtime: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+) -> Result<()> {
+    check_pk_with_ctx(
+        pk_cols,
+        pk_rows,
+        table,
+        SessionContext::new_with_config_rt(Default::default(), runtime),
+    )
+    .await
+}
+
+async fn check_pk_with_ctx(
+    pk_cols: &[String],
+    pk_rows: &[RecordBatch],
+    table: &str,
+    ctx: SessionContext,
+) -> Result<()> {
     let nonempty: Vec<RecordBatch> = pk_rows
         .iter()
         .filter(|b| b.num_rows() > 0)
@@ -2838,7 +2902,6 @@ pub async fn check_pk(pk_cols: &[String], pk_rows: &[RecordBatch], table: &str) 
     if nonempty.is_empty() {
         return Ok(());
     }
-    let ctx = SessionContext::new();
     let mem = MemTable::try_new(nonempty[0].schema(), vec![nonempty])
         .map_err(|e| anyhow!("failed to build PK check table: {e}"))?;
     ctx.register_table("__icegres_pk", Arc::new(mem))
@@ -2928,6 +2991,17 @@ fn format_first_row(batches: &[RecordBatch], ncols: usize) -> String {
 }
 
 async fn evaluate_rows(ctx: &SessionContext, sql: &DmlSql, rows_in: u64) -> Result<FileFate> {
+    evaluate_rows_inner(ctx, sql, rows_in, None, None, &mut None).await
+}
+
+async fn evaluate_rows_inner(
+    ctx: &SessionContext,
+    sql: &DmlSql,
+    rows_in: u64,
+    budget: Option<Arc<crate::retention::RetentionBudget>>,
+    canonical_schema: Option<&ArrowSchemaRef>,
+    reservation: &mut Option<crate::retention::Reservation>,
+) -> Result<FileFate> {
     let matched = match &sql.count_matched {
         None => rows_in, // no WHERE clause: everything matches
         Some(count_sql) => count_query(ctx, count_sql)
@@ -2946,13 +3020,13 @@ async fn evaluate_rows(ctx: &SessionContext, sql: &DmlSql, rows_in: u64) -> Resu
                 .survivors
                 .as_ref()
                 .expect("survivors SQL exists for predicated DELETE");
-            let batches = ctx
+            let df = ctx
                 .sql(survivors_sql)
                 .await
-                .map_err(|e| anyhow!("failed to plan DELETE survivors ({survivors_sql}): {e}"))?
-                .collect()
-                .await
-                .map_err(|e| anyhow!("failed to compute DELETE survivors: {e}"))?;
+                .map_err(|e| anyhow!("failed to plan DELETE survivors: {e}"))?;
+            let (batches, retained) =
+                crate::retention::collect(df, budget.clone(), canonical_schema).await?;
+            *reservation = retained;
             let survivor_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
             if survivor_rows + matched != rows_in {
                 bail!(
@@ -2967,13 +3041,13 @@ async fn evaluate_rows(ctx: &SessionContext, sql: &DmlSql, rows_in: u64) -> Resu
         }
         Some(rewrite_sql) => {
             // UPDATE: all rows survive; matched ones get new values.
-            let batches = ctx
+            let df = ctx
                 .sql(rewrite_sql)
                 .await
-                .map_err(|e| anyhow!("failed to plan UPDATE rewrite ({rewrite_sql}): {e}"))?
-                .collect()
-                .await
-                .map_err(|e| anyhow!("failed to compute UPDATE rewrite: {e}"))?;
+                .map_err(|e| anyhow!("failed to plan UPDATE rewrite: {e}"))?;
+            let (batches, retained) =
+                crate::retention::collect(df, budget.clone(), canonical_schema).await?;
+            *reservation = retained;
             let rewritten_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
             if rewritten_rows != rows_in {
                 bail!(
@@ -4229,6 +4303,91 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn bounded_dml_accounts_canonical_cast_output_and_releases_deleted_state() {
+        use crate::retention::{MemoryLimit, RetainedPool, RetentionBudget};
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "trip_id",
+            DataType::Int64,
+            true,
+        )]));
+        let input = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..4096))],
+        )
+        .unwrap();
+        let columns = vec!["trip_id".to_string()];
+        let update = stmt(
+            DmlKind::Update {
+                assignments: vec![("trip_id".into(), "trip_id > 0".into())],
+            },
+            None,
+        );
+        let runtime = SessionContext::new().runtime_env();
+        let total = RetainedPool::new(1_000_000, "all transactions");
+        let budget = RetentionBudget::new(1_000_000, total.clone());
+        let (_, output, reservation) = apply_dml_to_batches_bounded(
+            &update,
+            &columns,
+            vec![input.clone()],
+            budget,
+            runtime.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(output[0].schema(), schema);
+        assert_eq!(output[0].column(0).as_primitive::<Int64Type>().value(1), 1);
+        let canonical_bytes: usize = output
+            .iter()
+            .map(|b| b.get_array_memory_size() + std::mem::size_of::<RecordBatch>())
+            .sum();
+        assert_eq!(
+            total.used(),
+            canonical_bytes,
+            "charge the cast Int64 arrays, not the Boolean projection"
+        );
+        drop(reservation);
+        assert_eq!(total.used(), 0);
+        let budget = RetentionBudget::new(4096, total.clone());
+        let error = apply_dml_to_batches_bounded(
+            &update,
+            &columns,
+            vec![input.clone()],
+            budget,
+            runtime.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.downcast_ref::<MemoryLimit>().is_some());
+        assert_eq!(total.used(), 0);
+
+        let budget = RetentionBudget::new(1_000_000, total.clone());
+        let mut previous = Some(budget.reservation());
+        previous
+            .as_mut()
+            .unwrap()
+            .grow(input.get_array_memory_size())
+            .unwrap();
+        let (matched, output, replacement) = apply_dml_to_batches_bounded(
+            &stmt(DmlKind::Delete, None),
+            &columns,
+            vec![input],
+            budget,
+            runtime,
+        )
+        .await
+        .unwrap();
+        assert_eq!(matched, 4096);
+        assert!(output.is_empty());
+        assert!(
+            replacement.is_some(),
+            "empty changed state replaces the old reservation"
+        );
+        previous = replacement;
+        assert_eq!(total.used(), 0);
+        drop(previous);
     }
 
     #[tokio::test]
