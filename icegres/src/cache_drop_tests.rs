@@ -390,12 +390,12 @@ impl Catalog for PausedLoadCatalog {
     }
     async fn load_table(&self, ident: &TableIdent) -> iceberg::Result<Table> {
         let pause = self.pause_next.swap(false, Ordering::AcqRel);
-        let table = self.inner.load_table(ident).await?;
+        let result = self.inner.load_table(ident).await;
         if pause {
             self.started.notify_one();
             self.release.notified().await;
         }
-        Ok(table)
+        result
     }
     async fn drop_table(&self, ident: &TableIdent) -> iceberg::Result<()> {
         self.inner.drop_table(ident).await
@@ -498,4 +498,336 @@ async fn foreign_same_name_recreation_requires_a_new_schema_provider() {
         .collect()
         .await
         .unwrap();
+}
+
+#[derive(Debug)]
+struct PausedSchemaLookup {
+    inner: datafusion::catalog::MemorySchemaProvider,
+    pause_next: AtomicBool,
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl SchemaProvider for PausedSchemaLookup {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn table_names(&self) -> Vec<String> {
+        self.inner.table_names()
+    }
+    fn table_exist(&self, name: &str) -> bool {
+        self.inner.table_exist(name)
+    }
+    async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        let result = if name.ends_with("$snapshots") {
+            Err(to_datafusion_error(iceberg::Error::new(
+                ErrorKind::TableNotFound,
+                "captured old404",
+            )))
+        } else {
+            self.inner.table(name).await
+        };
+        if self.pause_next.swap(false, Ordering::AcqRel) {
+            self.started.notify_one();
+            self.release.notified().await;
+        }
+        result
+    }
+    fn register_table(
+        &self,
+        name: String,
+        table: Arc<dyn TableProvider>,
+    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        self.inner.register_table(name, table)
+    }
+    fn deregister_table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        self.inner.deregister_table(name)
+    }
+}
+
+fn lookup_delegate(field: &str) -> Arc<dyn TableProvider> {
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    Arc::new(
+        MemTable::try_new(
+            Arc::new(Schema::new(vec![Field::new(field, DataType::Int64, true)])),
+            vec![vec![]],
+        )
+        .unwrap(),
+    )
+}
+
+async fn paused_schema_fixture() -> (Arc<PausedSchemaLookup>, Arc<CachingSchemaProvider>) {
+    let (catalog, _, namespace) = two_table_context().await;
+    let inner = Arc::new(PausedSchemaLookup {
+        inner: datafusion::catalog::MemorySchemaProvider::new(),
+        pause_next: AtomicBool::new(false),
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    inner
+        .register_table("removed".to_string(), lookup_delegate("old_id"))
+        .unwrap();
+    let caching = Arc::new(
+        CachingSchemaProvider::try_new(inner.clone(), catalog, namespace, None, None, false, None)
+            .await
+            .unwrap(),
+    );
+    (inner, caching)
+}
+
+#[tokio::test]
+async fn registration_generation_fences_delayed_metadata_absence() {
+    let (inner, caching) = paused_schema_fixture().await;
+    inner.pause_next.store(true, Ordering::Release);
+    let pending = tokio::spawn({
+        let caching = caching.clone();
+        async move { caching.table("removed$snapshots").await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), inner.started.notified())
+        .await
+        .unwrap();
+    caching.deregister_table("removed").unwrap();
+    caching
+        .register_table("removed".to_string(), lookup_delegate("new_id"))
+        .unwrap();
+    let replacement = caching.table("removed").await.unwrap().unwrap();
+    inner.release.notify_one();
+    assert!(pending.await.unwrap().unwrap().is_none());
+    assert!(!caching.was_dropped("removed"));
+    assert!(Arc::ptr_eq(
+        &replacement,
+        &caching.table("removed").await.unwrap().unwrap()
+    ));
+    assert!(!replacement
+        .as_any()
+        .downcast_ref::<CachingTableProvider>()
+        .unwrap()
+        .missing
+        .load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn registration_generation_fences_delayed_plain_provider() {
+    let (inner, caching) = paused_schema_fixture().await;
+    caching.cached.write().unwrap().clear();
+    inner.pause_next.store(true, Ordering::Release);
+    let pending = tokio::spawn({
+        let caching = caching.clone();
+        async move { caching.table("removed").await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), inner.started.notified())
+        .await
+        .unwrap();
+    caching.deregister_table("removed").unwrap();
+    caching
+        .register_table("removed".to_string(), lookup_delegate("new_id"))
+        .unwrap();
+    let replacement = caching.table("removed").await.unwrap().unwrap();
+    inner.release.notify_one();
+    let error = pending
+        .await
+        .unwrap()
+        .expect_err("stale plain provider must require retry");
+    assert!(error.to_string().contains("registration changed"));
+    assert_eq!(replacement.schema().field(0).name(), "new_id");
+    assert!(Arc::ptr_eq(
+        &replacement,
+        &caching.table("removed").await.unwrap().unwrap()
+    ));
+}
+
+async fn paused_time_travel_fixture() -> (
+    Arc<PausedLoadCatalog>,
+    Arc<CachingSchemaProvider>,
+    TableIdent,
+) {
+    let (catalog, _, namespace) = two_table_context().await;
+    let ident = TableIdent::new(namespace.clone(), "removed".to_string());
+    let paused = Arc::new(PausedLoadCatalog {
+        inner: catalog,
+        pause_next: AtomicBool::new(false),
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let inner = Arc::new(datafusion::catalog::MemorySchemaProvider::new());
+    inner
+        .register_table("removed".to_string(), lookup_delegate("old_id"))
+        .unwrap();
+    let caching = Arc::new(
+        CachingSchemaProvider::try_new(inner, paused.clone(), namespace, None, None, false, None)
+            .await
+            .unwrap(),
+    );
+    (paused, caching, ident)
+}
+
+#[tokio::test]
+async fn registration_generation_fences_delayed_time_travel_absence() {
+    let (paused, caching, ident) = paused_time_travel_fixture().await;
+    paused.inner.drop_table(&ident).await.unwrap();
+    paused.pause_next.store(true, Ordering::Release);
+    let pending = tokio::spawn({
+        let caching = caching.clone();
+        async move { caching.table("removed@123").await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), paused.started.notified())
+        .await
+        .unwrap();
+    caching.deregister_table("removed").unwrap();
+    caching
+        .register_table("removed".to_string(), lookup_delegate("new_id"))
+        .unwrap();
+    let replacement = caching.table("removed").await.unwrap().unwrap();
+    paused.release.notify_one();
+    assert!(pending.await.unwrap().unwrap().is_none());
+    assert!(!caching.was_dropped("removed"));
+    assert!(Arc::ptr_eq(
+        &replacement,
+        &caching.table("removed").await.unwrap().unwrap()
+    ));
+}
+
+#[tokio::test]
+async fn registration_generation_fences_delayed_time_travel_provider() {
+    use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
+    use iceberg::transaction::{ApplyTransactionAction, Transaction};
+    let (paused, caching, ident) = paused_time_travel_fixture().await;
+    let table = paused.inner.load_table(&ident).await.unwrap();
+    // Only provider construction is exercised here, so the metadata-only
+    // fixture never scans the referenced empty data file.
+    let file = DataFileBuilder::default()
+        .content(DataContentType::Data)
+        .file_path("memory://warehouse/unused-empty.parquet".to_string())
+        .file_format(DataFileFormat::Parquet)
+        .file_size_in_bytes(0)
+        .record_count(0)
+        .partition_spec_id(table.metadata().default_partition_spec_id())
+        .partition(Struct::empty())
+        .build()
+        .unwrap();
+    let transaction = Transaction::new(&table);
+    let table = transaction
+        .fast_append()
+        .add_data_files([file])
+        .apply(transaction)
+        .unwrap()
+        .commit(paused.inner.as_ref())
+        .await
+        .unwrap();
+    let reference = format!(
+        "removed@{}",
+        table.metadata().current_snapshot_id().unwrap()
+    );
+    paused.pause_next.store(true, Ordering::Release);
+    let pending = tokio::spawn({
+        let caching = caching.clone();
+        let reference = reference.clone();
+        async move { caching.table(&reference).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), paused.started.notified())
+        .await
+        .unwrap();
+    caching.deregister_table("removed").unwrap();
+    caching
+        .register_table("removed".to_string(), lookup_delegate("new_id"))
+        .unwrap();
+    paused.release.notify_one();
+    assert!(pending.await.unwrap().unwrap().is_some());
+    assert!(
+        caching.pinned.get(&reference).is_none(),
+        "old snapshot must stay request-local"
+    );
+}
+
+#[derive(Debug)]
+struct PausedInsertDelegate {
+    calls: AtomicU64,
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl TableProvider for PausedInsertDelegate {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn schema(&self) -> ArrowSchemaRef {
+        Arc::new(datafusion::arrow::datatypes::Schema::empty())
+    }
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        _projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        Err(DataFusionError::NotImplemented(
+            "insert-only fixture".to_string(),
+        ))
+    }
+    async fn insert_into(
+        &self,
+        _state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        _operation: InsertOp,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        self.started.notify_one();
+        self.release.notified().await;
+        Ok(input)
+    }
+}
+
+#[tokio::test]
+async fn missing_provider_rejects_insert_before_and_after_delegate_planning() {
+    let (catalog, _, namespace) = two_table_context().await;
+    let delegate = Arc::new(PausedInsertDelegate {
+        calls: AtomicU64::new(0),
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let provider = Arc::new(CachingTableProvider::new(
+        catalog,
+        TableIdent::new(namespace, "removed".to_string()),
+        delegate.clone(),
+        None,
+        None,
+        None,
+        None,
+    ));
+    let input: Arc<dyn ExecutionPlan> = Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
+        delegate.schema(),
+    ));
+    let pending = tokio::spawn({
+        let provider = provider.clone();
+        let input = input.clone();
+        async move {
+            provider
+                .insert_into(&SessionContext::new().state(), input, InsertOp::Append)
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), delegate.started.notified())
+        .await
+        .unwrap();
+    provider.mark_missing();
+    delegate.release.notify_one();
+    assert!(
+        pending.await.unwrap().is_err(),
+        "invalidated insert plan must not escape"
+    );
+    assert_eq!(delegate.calls.load(Ordering::Acquire), 1);
+    assert!(provider
+        .insert_into(&SessionContext::new().state(), input, InsertOp::Append)
+        .await
+        .is_err());
+    assert_eq!(
+        delegate.calls.load(Ordering::Acquire),
+        1,
+        "known-missing provider must not call its delegate"
+    );
 }
