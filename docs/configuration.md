@@ -48,6 +48,8 @@ Accepted by every subcommand (`serve`, `flight-serve`, `maintain`, `verify`,
 | `ICEGRES_CATALOG_OAUTH2_URI` · `--catalog-oauth2-uri` | none → `{catalog-uri}/v1/oauth/tokens` | OAuth2 token endpoint for the client-credentials grant. |
 | `ICEGRES_CATALOG_SCOPE` · `--catalog-scope` | none → `catalog` | OAuth2 scope requested during the grant. |
 | `ICEGRES_CATALOG_TIMEOUT_MS` | `5000` (`0` = no timeout) | Per-attempt timeout for a catalog `load_table`. |
+| `ICEGRES_CATALOG_WRITE_TIMEOUT_MS` | `10000` | Positive total HTTP deadline for custom catalog writes and metadata/config requests. A timed-out commit can have an unknown outcome, reported as `40003` unless reconciled. |
+| `ICEGRES_CATALOG_CONNECT_TIMEOUT_MS` | `3000` | Positive connection-establishment deadline for the custom catalog client. |
 | `ICEGRES_CATALOG_RETRIES` | `2` | Retries after the first failed `load_table`, with exponential backoff (50 ms · 2^attempt). |
 
 See [`catalog-support.md`](catalog-support.md) for the catalog compatibility matrix.
@@ -58,11 +60,12 @@ See [`catalog-support.md`](catalog-support.md) for the catalog compatibility mat
 |---|---|---|
 | `ICEGRES_HOST` · `--host` | `0.0.0.0` | Bind address for the pgwire listener. |
 | `ICEGRES_PORT` · `--port` | `5439` | Bind port for the pgwire listener. |
+| `ICEGRES_READ_ONLY` · `--read-only` | off | Reject write-capable statements before pgwire hooks or planning. Required by the built-in read replicas; incompatible with writer-tail configuration. |
 | `ICEGRES_MAX_CONNECTIONS` | `512` (`0` disables the cap) | Concurrent-connection cap on the accept loop (excess connections wait rather than spawning unbounded tasks). |
 | `ICEGRES_IDLE_SHUTDOWN_SECS` · `--idle-shutdown-secs` | off | Scale-to-zero: exit cleanly (code 0) after N consecutive seconds with no client connections (countdown also starts at boot). Run under a socket-activating supervisor for scale-from-zero. |
 | `ICEGRES_HEALTH_PORT` · `--health-port` | off | Serve a minimal HTTP `200 OK` liveness endpoint (and `/metrics`) on this port. |
 | `ICEGRES_BRANCH` · `--branch` | `main` | Serve a zero-copy branch: reads pin to the branch head, writes commit to the branch ref with `assert-ref-snapshot-id`. |
-| `ICEGRES_ENFORCE_PK` · `--enforce-pk` | off | Enforce `icegres.primary-key` table properties: NOT NULL (23502) + uniqueness (23505) on INSERT and PK-assigning UPDATE, anchored to the commit snapshot. Also honored by `icegres sql`. |
+| `ICEGRES_ENFORCE_PK` · `--enforce-pk` | off | Enforce `icegres.primary-key` table properties: NOT NULL (23502) + uniqueness (23505) on INSERT and PK-assigning UPDATE, anchored to the commit snapshot. Also honored by `icegres sql` and `flight-serve`. |
 | `ICEGRES_TXN_STRICT` | off | Refuse a multi-table `COMMIT` up front with `0A000` when the catalog cannot apply it atomically (only bites on catalogs lacking the multi-table transactions endpoint; with it — e.g. Lakekeeper — COMMITs are always atomic and this never triggers). |
 
 ## Serving — Arrow Flight SQL (`icegres flight-serve`)
@@ -85,6 +88,12 @@ from pgwire (so both can run in one process), but shares auth/freshness.
 | `ICEGRES_HEALTH_PORT` · `--health-port` (flight-serve) | off | Serve `/health`, `/ready`, and `/metrics` on this port for a **standalone** flight-serve (the Flight per-RPC metrics — `icegres_flight_*` — render here). Shared env var with `serve`; each process binds its own. |
 | `ICEGRES_FLIGHT_READ_ONLY` · `--read-only` (flight-serve) | off | Reject every write on the listener — INSERT/UPDATE/DELETE/DROP (query flow, prepared statements, and bulk ingest) return `PERMISSION_DENIED` before execution. Statement-form based (reuses the authz analyzer), independent of `--authz-file`. The posture for a browser SQL explorer. |
 
+With `ICEGRES_ENFORCE_PK=1` or `--enforce-pk`, standalone Flight SQL checks
+ordinary INSERT and UPDATE/DELETE through the same write engine as pgwire.
+Bulk ingest into a constrained table is rejected before accepting its data;
+use checked SQL inserts until streaming uniqueness validation is supported.
+The setting does not constrain independent foreign Iceberg writers.
+
 ## TLS & auth
 
 | Env var · flag | Default | Meaning |
@@ -101,11 +110,11 @@ See [`deployment.md`](deployment.md) for auth/authz file formats and rollout.
 
 | Env var · flag | Default | Meaning |
 |---|---|---|
-| `ICEGRES_FRESHNESS_MS` · `--freshness-ms` (serve & flight-serve) | `0` (exact freshness) | Bounded-staleness reads: scans serve the cached snapshot with no per-scan catalog round trip; one background task polls the catalog every N ms and swaps changed snapshots. Own writes stay read-your-own-writes exact; foreign commits visible within ~N ms + one refresh round trip. Also activates the physical-plan cache (and, with `ICEGRES_RESULT_CACHE_BYTES` set, the result cache). |
+| `ICEGRES_FRESHNESS_MS` · `--freshness-ms` (serve & flight-serve) | `0` (exact freshness) | Bounded-staleness reads: scans serve the cached snapshot with no per-scan catalog round trip; one background task polls the catalog every N ms and swaps changed snapshots. Own writes stay read-your-own-writes exact; foreign visibility depends on the full pass and catalog availability; N is a polling target, not a maximum stale age. Also activates the physical-plan cache (and, with `ICEGRES_RESULT_CACHE_BYTES` set, the result cache). |
 | `ICEGRES_STALE_READ_ON_CATALOG_ERROR` | mode-dependent (exact mode fails loud; freshness mode serves the last snapshot) | On a catalog `load_table` failure, whether to serve the last cached snapshot (`1`) or error (`0`). Overrides the mode default either way. |
 | `ICEGRES_PLAN_CACHE_ENTRIES` | `256` (`0` disables) | LRU capacity of the physical-plan cache (active only with `--freshness-ms > 0`). |
 | `ICEGRES_RESULT_CACHE_BYTES` | `0` (disabled) | Total decoded-byte budget for the **result** cache: a repeated identical query at an unchanged snapshot is served straight from cached result batches (no planning, execution, or IO). A single result larger than budget/4 is never cached. Active only with `--freshness-ms > 0`. Invalidated by the same version machinery as the plan cache. See [`cqrs-topology.md`](cqrs-topology.md). |
-| `ICEGRES_MEMORY_LIMIT_MB` | 70% of system RAM (`0` = unbounded) | Bound on the DataFusion memory pool (FairSpillPool + disk spill) so heavy queries degrade to spill / `ResourcesExhausted` instead of OOM. If `/proc/meminfo` is unreadable, RAM is assumed to be 1 GiB (pool ≈ 716 MiB). An invalid value WARNs and uses the default. |
+| `ICEGRES_MEMORY_LIMIT_MB` | 70% of the smaller host/cgroup memory limit (`0` = unbounded) | DataFusion operator memory pool with disk spill. Linux cgroup v1/v2 ancestor limits are honored. If host memory is unavailable, use a 1 GiB assumption before applying any cgroup cap. Invalid or overflowing values fail startup. This does not bound all process allocations. |
 | `ICEGRES_DF_OPTS` | none | `;`-separated `datafusion.<section>.<key>=<value>` pairs applied on top of icegres's tuned DataFusion `SessionConfig`. An invalid entry (bad shape or unknown key) fails startup loudly. An escape hatch for tuning execution options without a rebuild. |
 
 ## Scan & query tuning
@@ -118,6 +127,18 @@ See [`deployment.md`](deployment.md) for auth/authz file formats and rollout.
 | `ICEGRES_TABLE_STATS` | on (`0`/`false`/`off`/`no` disables) | Feed each scanned snapshot's live row count to the DataFusion optimizer so hash joins pick the smaller build side. The count comes from the manifest *list* (one small object GET per snapshot, cached per `(table, snapshot)`); tables with delete manifests or missing counts honestly report no statistics. Deliberately advisory-only (reported inexact): statistics can never answer a query — `COUNT(*)` always executes the real scan, so results never depend on metadata. |
 
 ## Write buffer & durable tail (`icegres serve`)
+
+`ICEGRES_WRITE_BUFFER_MAX_BYTES` defaults to 268435456 bytes, or 256 MiB.
+Pending writes reserve bytes before durable staging and acknowledgment.
+Reservations follow in-flight flushes and retained generations. Committed
+generations stay charged for at least 30 seconds while readers can still
+reference them, so sustained admission also depends on that retention window.
+Overload returns a resource error instead of waiting while holding the buffer lock.
+The row threshold remains a flush trigger. Replay refuses to discard
+acknowledged data when the budget is too small; increase the budget to recover
+the retained backlog. This limit does not cover every query, peer mirror,
+decode temporary, or tail-backend disk allocation.
+
 
 Opt-in. The tail options require `--write-buffer-ms > 0` and are mutually
 exclusive with each other. See [`limitations.md`](limitations.md) for the
