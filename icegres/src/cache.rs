@@ -1521,3 +1521,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "cache_drop_tests.rs"]
+mod drop_tests;
