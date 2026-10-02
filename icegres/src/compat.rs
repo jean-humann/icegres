@@ -905,7 +905,7 @@ impl VisitorMut for CompatRewriter {
                         if let Some(normalized) = parse_expr_snippet(&format!(
                             "icegres_catalog_like_pattern(({pattern}), {escape})"
                         )) {
-                            *pattern = Box::new(normalized);
+                        **pattern = normalized;
                             *escape_char = Some(Value::SingleQuotedString("\\".into()));
                             self.changed = true;
                         }
