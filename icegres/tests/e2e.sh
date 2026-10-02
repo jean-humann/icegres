@@ -3120,7 +3120,13 @@ cat = load_catalog("lakekeeper", **{
     "s3.secret-access-key": "$AWS_SECRET_ACCESS_KEY", "s3.region": "us-east-1",
     "s3.path-style-access": "true",
 })
-t = cat.load_table("demo.e2e_compact").scan().to_arrow()
+# This check uses the fixture's explicit S3 credentials. Credential vending
+# and remote signing are separate catalog-service tests.
+from pyiceberg.io.pyarrow import PyArrowFileIO
+table = cat.load_table("demo.e2e_compact")
+table.io = PyArrowFileIO({k: v for k, v in cat.properties.items()
+                         if k.startswith("s3.") and k != "s3.signer"})
+t = table.scan().to_arrow()
 print(f"{len(t)}|{pc.sum(t.column('id')).as_py() or 0}|{pc.sum(pc.utf8_length(t.column('v'))).as_py() or 0}")
 EOF
 )
