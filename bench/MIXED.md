@@ -17,6 +17,19 @@ incomplete result that fails the gate. That result names the run-owned namespace
 if catalog cleanup needs to be completed afterward. REST and S3 requests also
 have finite connection and response timeouts.
 
+The worker writes an atomic progress sidecar beside the result every half
+second during the workload, and when setup/verification/cleanup changes phase.
+Its name includes the run-owned namespace. It retains completed raw samples,
+counts, each worker's current SQL operation, connection port/backend identifier,
+operation age, and the server log directory. Failed results embed the last
+checkpoint, so a query hang can be distinguished from fixture or cleanup work.
+The checkpoint can lag the failure; it does not prove an unfinished mutation
+rolled back. Sidecars and server logs remain available for diagnosis.
+
+The diagnostic instrumentation uses `fixture_version: 2`. The gate rejects a
+comparison with older fixture descriptors; rerun both binaries with the same
+runner. No query is silently retried after a stall.
+
 Install `psycopg2-binary`, `pyarrow` and `pyiceberg` in a Python environment.
 Start the local Lakekeeper and S3-compatible stack. Build both binaries before
 timing and run them sequentially on the same otherwise idle host:

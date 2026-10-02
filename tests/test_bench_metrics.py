@@ -4,6 +4,7 @@ import math
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -11,6 +12,11 @@ import unittest
 spec = importlib.util.spec_from_file_location("metrics", Path(__file__).parents[1] / "bench/check_metrics.py")
 metrics = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(metrics)
+
+
+status_spec = importlib.util.spec_from_file_location("run_status", Path(__file__).parents[1] / "bench/run_status.py")
+run_status = importlib.util.module_from_spec(status_spec)
+status_spec.loader.exec_module(run_status)
 
 
 def fixture():
@@ -65,6 +71,56 @@ class MetricGateTests(unittest.TestCase):
                                     capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             self.assertIn("parity result is invalid", result.stdout)
+
+    def test_whole_run_timeout_preserves_query_checkpoint_and_samples(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "result.json"
+            initial = {"complete": False, "correctness": False, "errors": 1,
+                       "namespace": "test_timeout", "metrics": {}}
+            script = Path(directory) / "worker.py"
+            script.write_text(
+                "import sys, time\n"
+                f"sys.path.insert(0, {str(Path(__file__).parents[1] / 'bench')!r})\n"
+                "from run_status import Progress, write_json\n"
+                f"output = {str(output)!r}\n"
+                "p = Progress(output, 'test_timeout', 'owned-logs', ['transaction_ms', 'analytics_ms'])\n"
+                "p.sample('transaction_ms', 12.5)\n"
+                "p.sample('transaction_ms', 14.0)\n"
+                "p.operation('analytics', 'query', sql='SELECT sum(balance) FROM accounts')\n"
+                "p.phase('concurrent workload')\n"
+                "write_json(output, {'complete': True, 'correctness': True, 'errors': 0, 'metrics': {}})\n"
+                "time.sleep(60)\n"
+            )
+            code = run_status.supervise([sys.executable, str(script)], 1, output, initial)
+            self.assertEqual(code, 1)
+            failed = json.loads(output.read_text())
+            self.assertFalse(failed["complete"])
+            self.assertFalse(failed["correctness"])
+            self.assertGreaterEqual(failed["errors"], 1)
+            self.assertEqual(failed["samples_ms"]["transaction_ms"], [12.5, 14.0])
+            self.assertEqual(failed["progress"]["completed_samples"]["transaction_ms"], 2)
+            self.assertEqual(failed["progress"]["workers"]["analytics"]["sql"],
+                             "SELECT sum(balance) FROM accounts")
+            self.assertIn("deadline", failed["error_details"][-1])
+
+    def test_worker_cleanup_failure_cannot_leave_passing_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "result.json"
+            initial = {"namespace": "test_cleanup"}
+            script = Path(directory) / "worker.py"
+            script.write_text(
+                "import json, sys\n"
+                "from pathlib import Path\n"
+                f"Path({str(output)!r}).write_text(json.dumps({{'complete': True, 'correctness': True, "
+                "'errors': 0, 'samples_ms': {'transaction_ms': [2.0]}, 'metrics': {}}))\n"
+                "raise SystemExit(42)\n"
+            )
+            code = run_status.supervise([sys.executable, str(script)], 5, output, initial)
+            self.assertEqual(code, 42)
+            failed = json.loads(output.read_text())
+            self.assertFalse(failed["complete"])
+            self.assertEqual(failed["samples_ms"]["transaction_ms"], [2.0])
+            self.assertIn("42", failed["error_details"][-1])
 
     def test_mixed_requires_correctness_comparability_and_p99(self):
         baseline = {
