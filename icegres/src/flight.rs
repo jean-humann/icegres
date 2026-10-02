@@ -107,6 +107,7 @@ use crate::overwrite::{CommitConflict, ConstraintViolation, OverwriteEngine};
 use crate::plancache::{self, PlanCache, PlanKey};
 use crate::{dml, CatalogOpts};
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::sql::sqlparser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 
@@ -575,7 +576,7 @@ impl FlightSqlServiceImpl {
     fn check_sql(&self, principal: &Option<String>, sql: &str) -> Result<(), Status> {
         // Skip the parse entirely when nothing gates SQL (the common
         // permissive, read-write path).
-        if !self.read_only && self.authorizer.is_none() {
+        if !self.read_only && self.authorizer.is_none() && !self.engine.enforce_pk() {
             return Ok(());
         }
         let stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql)
@@ -601,17 +602,29 @@ impl FlightSqlServiceImpl {
             }
         }
 
+        if self.engine.enforce_pk() {
+            for stmt in &stmts {
+                authz::check_constraint_statement(stmt, &self.ctx, &self.default_namespace)
+                    .map_err(|e| Status::permission_denied(e.to_string()))?;
+            }
+        }
         let Some(authorizer) = &self.authorizer else {
             return Ok(());
         };
+        authz::check_namespace(&self.ctx, &self.default_namespace)
+            .map_err(|e| Status::permission_denied(e.to_string()))?;
         let user = principal.as_deref().unwrap_or("");
         for stmt in &stmts {
-            if let authz::Decision::Deny { action, target } =
-                authorizer.authorize_sql(user, stmt, &self.default_namespace)
-            {
-                return Err(Status::permission_denied(authz::deny_message(
-                    user, action, &target,
-                )));
+            match authorizer.authorize_sql(user, stmt, &self.default_namespace) {
+                authz::Decision::Allow => {}
+                authz::Decision::Unsupported(reason) => {
+                    return Err(Status::permission_denied(reason))
+                }
+                authz::Decision::Deny { action, target } => {
+                    return Err(Status::permission_denied(authz::deny_message(
+                        user, action, &target,
+                    )))
+                }
             }
         }
         Ok(())
@@ -643,14 +656,10 @@ impl FlightSqlServiceImpl {
             namespace: namespace.to_string(),
             table: table.to_string(),
         };
-        if let authz::Decision::Deny { action, target } =
-            authorizer.check(user, AuthzAction::WriteData, &target)
-        {
-            return Err(Status::permission_denied(authz::deny_message(
-                user, action, &target,
-            )));
-        }
-        Ok(())
+        decision_status(
+            user,
+            authorizer.check(user, AuthzAction::WriteData, &target),
+        )
     }
 
     async fn plan(&self, sql: &str) -> Result<DataFrame, Status> {
@@ -874,6 +883,10 @@ impl FlightSqlServiceImpl {
     /// one-row `count` batch — DataFusion itself plans these but cannot
     /// execute them (its Iceberg providers are append-only).
     async fn dml_via_doget(&self, sql: &str) -> Result<Option<DoGetStream>, Status> {
+        if self.enforced_insert(sql)? {
+            let rows = self.execute_update(sql, None).await?;
+            return self.count_stream(rows).await.map(Some);
+        }
         let parsed =
             dml::parse_single_dml(sql).map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
         let Some((stmt, _tag)) = parsed else {
@@ -966,6 +979,27 @@ impl FlightSqlServiceImpl {
             .with_descriptor(descriptor))
     }
 
+    fn enforced_insert(&self, sql: &str) -> Result<bool, Status> {
+        if !self.engine.enforce_pk() {
+            return Ok(false);
+        }
+        let stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        Ok(matches!(
+            stmts.as_slice(),
+            [sqlparser::ast::Statement::Insert(_)]
+        ))
+    }
+
+    async fn count_stream(&self, rows: i64) -> Result<DoGetStream, Status> {
+        let batch = RecordBatch::try_new(
+            Arc::new(count_schema()),
+            vec![Arc::new(UInt64Array::from(vec![rows as u64]))],
+        )
+        .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(self.guard(Self::batch_to_stream(batch)).await)
+    }
+
     /// Execute a non-query statement (INSERT / UPDATE / DELETE) and return
     /// the affected-row count. UPDATE/DELETE go through the SAME translation
     /// and copy-on-write engine as the pgwire DmlHook (identical scope rules
@@ -983,6 +1017,33 @@ impl FlightSqlServiceImpl {
                 ));
             }
             let outcome = self.engine.execute(&stmt).await.map_err(engine_status)?;
+            return Ok(outcome.rows as i64);
+        }
+        if self.enforced_insert(sql)? {
+            let stmt = Parser::parse_sql(&PostgreSqlDialect {}, sql)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?
+                .remove(0);
+            let ident = crate::txn::insert_target(&stmt).map_err(engine_status)?;
+            let table = self
+                .engine
+                .catalog()
+                .load_table(&ident)
+                .await
+                .map_err(|e| Status::internal(format!("failed to load INSERT target: {e}")))?;
+            let (planned_ident, batches) =
+                crate::txn::plan_insert_rows(&self.ctx, &stmt, params.as_ref())
+                    .await
+                    .map_err(engine_status)?;
+            if planned_ident != ident {
+                return Err(Status::internal(
+                    "INSERT target resolution changed while planning",
+                ));
+            }
+            let outcome = self
+                .engine
+                .insert_enforced(&ident, batches, Some(table))
+                .await
+                .map_err(engine_status)?;
             return Ok(outcome.rows as i64);
         }
         let mut df = self.plan(sql).await?;
@@ -1017,14 +1078,17 @@ fn check_read_with(
         namespace: ident.namespace().clone().inner().join("."),
         table: ident.name().to_string(),
     };
-    if let authz::Decision::Deny { action, target } =
-        authorizer.check(user, AuthzAction::ReadData, &target)
-    {
-        return Err(Status::permission_denied(authz::deny_message(
-            user, action, &target,
-        )));
+    decision_status(user, authorizer.check(user, AuthzAction::ReadData, &target))
+}
+
+fn decision_status(user: &str, decision: authz::Decision) -> Result<(), Status> {
+    match decision {
+        authz::Decision::Allow => Ok(()),
+        authz::Decision::Unsupported(reason) => Err(Status::permission_denied(reason)),
+        authz::Decision::Deny { action, target } => Err(Status::permission_denied(
+            authz::deny_message(user, action, &target),
+        )),
     }
-    Ok(())
 }
 
 /// Map engine errors preserving the DML hook's typed semantics: constraint
@@ -1033,6 +1097,8 @@ fn check_read_with(
 fn engine_status(e: anyhow::Error) -> Status {
     if let Some(v) = e.downcast_ref::<ConstraintViolation>() {
         Status::invalid_argument(format!("{}: {}", v.sqlstate, v.message))
+    } else if let Some(c) = e.downcast_ref::<crate::overwrite::CommitUnknown>() {
+        Status::unknown(format!("40003: {}", c.message))
     } else if let Some(c) = e.downcast_ref::<CommitConflict>() {
         Status::aborted(format!("40001: {}", c.message))
     } else {
@@ -1138,13 +1204,13 @@ fn table_types_schema() -> Schema {
     )])
 }
 
-fn build_sql_info() -> SqlInfoData {
+fn build_sql_info(read_only: bool) -> SqlInfoData {
     let mut builder = SqlInfoDataBuilder::new();
     builder.append(SqlInfo::FlightSqlServerName, "icegres");
     builder.append(SqlInfo::FlightSqlServerVersion, env!("CARGO_PKG_VERSION"));
     // Arrow IPC format version (Schema.fbs MetadataVersion V5).
     builder.append(SqlInfo::FlightSqlServerArrowVersion, "1.5");
-    builder.append(SqlInfo::FlightSqlServerReadOnly, false);
+    builder.append(SqlInfo::FlightSqlServerReadOnly, read_only);
     builder.append(SqlInfo::FlightSqlServerSql, true);
     builder.append(SqlInfo::FlightSqlServerSubstrait, false);
     builder.append(SqlInfo::FlightSqlServerTransaction, 0i32); // none
@@ -1236,6 +1302,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         if dml::parse_single_dml(&sql)
             .map_err(|e| Status::invalid_argument(format!("{e:#}")))?
             .is_some()
+            || self.enforced_insert(&sql)?
         {
             let df = self.plan(&sql).await?;
             let schema = df.schema().as_arrow().clone();
@@ -1325,7 +1392,8 @@ impl FlightSqlService for FlightSqlServiceImpl {
         // they keep the logical-only schema pass.
         let is_dml = dml::parse_single_dml(&sql)
             .map_err(|e| Status::invalid_argument(format!("{e:#}")))?
-            .is_some();
+            .is_some()
+            || self.enforced_insert(&sql)?;
         let (schema_ref, plan): (SchemaRef, Option<StashedPlan>) = if is_dml {
             let df = self.plan(&sql).await?;
             (Arc::new(df.schema().as_arrow().clone()), None)
@@ -1438,6 +1506,22 @@ impl FlightSqlService for FlightSqlServiceImpl {
         };
         self.check_sql(&principal, &sql)?;
         debug!(%sql, bound_rows = params.len(), "DoGet(CommandPreparedStatementQuery)");
+        if self.enforced_insert(&sql)? && !params.is_empty() {
+            if params.len() != 1 {
+                return Err(Status::unimplemented(
+                    "bind one parameter row to a query INSERT",
+                ));
+            }
+            let rows = self
+                .execute_update(
+                    &sql,
+                    Some(ParamValues::from(
+                        params.into_iter().next().expect("one row"),
+                    )),
+                )
+                .await?;
+            return Ok(Response::new(self.count_stream(rows).await?));
+        }
         // ADBC's dbapi prepares EVERY statement, so UPDATE/DELETE arrive
         // here too: same engine routing as the plain-statement flow.
         if params.is_empty() {
@@ -1613,7 +1697,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
             .engine
             .append_stream(&ident, batch_stream)
             .await
-            .map_err(|e| Status::invalid_argument(format!("ingest failed: {e}")))?;
+            .map_err(engine_status)?;
         info!(
             table = %format!("{namespace}.{table}"),
             rows = outcome.rows,
@@ -1956,7 +2040,7 @@ pub async fn spawn_tail_api(
         default_namespace: DEFAULT_SCHEMA.to_string(),
         tokens: Mutex::new(HashMap::new()),
         prepared: Mutex::new(HashMap::new()),
-        sql_info: build_sql_info(),
+        sql_info: build_sql_info(true),
         write_buffer: Some(buffer),
         read_only: true,
         basic_tokens: Mutex::new(HashMap::new()),
@@ -2008,6 +2092,7 @@ pub async fn spawn_tail_api(
 /// struct so the CLI surface can grow without another parameter each time).
 pub struct ListenerOpts {
     pub auth_file: Option<PathBuf>,
+    pub enforce_pk: bool,
     pub authorizer: Option<SharedAuthorizer>,
     pub tls: Option<(String, String)>,
     pub freshness_ms: u64,
@@ -2040,6 +2125,7 @@ pub async fn run(
 ) -> Result<()> {
     let ListenerOpts {
         auth_file,
+        enforce_pk,
         authorizer,
         tls,
         freshness_ms,
@@ -2107,8 +2193,8 @@ pub async fn run(
         crate::ops::spawn_health_listener(host, hp, catalog.clone(), None).await?;
     }
     // Same copy-on-write engine as `icegres serve` for UPDATE/DELETE (main
-    // branch, PK enforcement off — the pgwire listener owns that posture).
-    let engine = Arc::new(OverwriteEngine::connect(catalog.clone(), opts, false, None).await?);
+    // branch, using this listener's explicit constraint policy).
+    let engine = Arc::new(OverwriteEngine::connect(catalog.clone(), opts, enforce_pk, None).await?);
     // Same session wiring as `icegres serve`: snapshot-aware caching schema
     // providers (cache.rs) — reads refresh on snapshot change, so flight
     // clients see pgwire commits and vice versa. `--freshness-ms > 0` rides
@@ -2141,7 +2227,7 @@ pub async fn run(
         default_namespace: DEFAULT_SCHEMA.to_string(),
         tokens: Mutex::new(HashMap::new()),
         prepared: Mutex::new(HashMap::new()),
-        sql_info: build_sql_info(),
+        sql_info: build_sql_info(read_only),
         write_buffer: None,
         read_only,
         basic_tokens: Mutex::new(HashMap::new()),
@@ -2942,5 +3028,13 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(UInt64Array::from(vec![42u64]))]).unwrap();
         assert_eq!(count_from_batches(&[batch]), 42);
+    }
+    #[test]
+    fn unknown_commit_status_preserves_40003_without_retryable_aborted() {
+        let status = engine_status(anyhow::anyhow!(crate::overwrite::CommitUnknown {
+            message: "catalog response lost".into(),
+        }));
+        assert_eq!(status.code(), tonic::Code::Unknown);
+        assert!(status.message().contains("40003"));
     }
 }

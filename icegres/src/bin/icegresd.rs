@@ -1657,6 +1657,7 @@ async fn spawn_compute(
         cmd.arg("--branch").arg(b);
     }
     if slot.replica {
+        cmd.arg("--read-only");
         // A read replica must NEVER inherit the buffered-write/tail
         // environment: a replica opening the writer's --tail-quorum would
         // run a higher-term election and FENCE the writer, and an

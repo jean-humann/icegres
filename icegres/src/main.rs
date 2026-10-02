@@ -259,6 +259,12 @@ enum Command {
         )]
         enforce_pk: bool,
 
+        /// Reject SQL writes on this pgwire listener, including prepared statements.
+        #[arg(long, env = "ICEGRES_READ_ONLY", num_args = 0..=1,
+              default_missing_value = "true", default_value = "false",
+              value_parser = clap::builder::BoolishValueParser::new())]
+        read_only: bool,
+
         /// Serve a zero-copy BRANCH of the lakehouse (Neon's branch-per-
         /// endpoint model, SPEC D6): all reads pin to the head of this
         /// Iceberg snapshot ref and all writes (INSERT/UPDATE/DELETE/
@@ -402,6 +408,13 @@ enum Command {
     /// INSERT/UPDATE/DELETE, and bulk ingest (one Iceberg commit per
     /// `adbc_ingest` stream). See icegres/src/flight.rs for the surface.
     FlightServe {
+        /// Enforce declared primary keys for Flight SQL writes.
+        /// Bulk ingestion into a constrained table is refused.
+        #[arg(long, env = "ICEGRES_ENFORCE_PK", num_args = 0..=1,
+              default_missing_value = "true", default_value = "false",
+              value_parser = clap::builder::BoolishValueParser::new())]
+        enforce_pk: bool,
+
         #[command(flatten)]
         catalog: CatalogOpts,
 
@@ -895,6 +908,7 @@ async fn main() -> Result<()> {
             branch,
             freshness_ms,
             enforce_pk,
+            read_only,
             write_buffer_ms,
             tail_dir,
             tail_url,
@@ -913,6 +927,7 @@ async fn main() -> Result<()> {
                 branch,
                 freshness_ms,
                 enforce_pk,
+                read_only,
                 write_buffer_ms,
                 tail_dir,
                 tail_url,
@@ -924,6 +939,7 @@ async fn main() -> Result<()> {
             run_serve(&catalog, &host, port, serve_opts).await
         }
         Command::FlightServe {
+            enforce_pk,
             catalog,
             host,
             port,
@@ -960,6 +976,7 @@ async fn main() -> Result<()> {
                 &host,
                 port,
                 flight::ListenerOpts {
+                    enforce_pk,
                     auth_file,
                     authorizer,
                     tls,
@@ -1077,6 +1094,7 @@ struct ServeOpts {
     branch: String,
     freshness_ms: u64,
     enforce_pk: bool,
+    read_only: bool,
     write_buffer_ms: u64,
     tail_dir: Option<PathBuf>,
     tail_url: Option<String>,
@@ -1150,6 +1168,14 @@ fn build_authorizer(
 }
 
 async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeOpts) -> Result<()> {
+    anyhow::ensure!(
+        !serve_opts.read_only
+            || (serve_opts.write_buffer_ms == 0
+                && serve_opts.tail_dir.is_none()
+                && serve_opts.tail_url.is_none()
+                && serve_opts.tail_quorum.is_none()),
+        "--read-only cannot open a write buffer or durable writer tail"
+    );
     // Fail fast BEFORE touching the catalog. --tail-dir only means something
     // in buffered mode: with the synchronous default every INSERT already IS
     // an Iceberg commit before its ack, so a durable tail nothing writes to
@@ -1317,7 +1343,7 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
             engine.clone(),
             serve_opts.write_buffer_ms,
             tail_store,
-        ));
+        )?);
         if let Some(dir) = &serve_opts.tail_dir {
             warn!(
                 write_buffer_ms = serve_opts.write_buffer_ms,
@@ -1521,6 +1547,7 @@ async fn run_serve(opts: &CatalogOpts, host: &str, port: u16, serve_opts: ServeO
         catalog.clone(),
         write_buffer,
         serve_opts.enforce_pk,
+        serve_opts.read_only,
         authorizer,
         serve_opts.freshness_ms > 0,
     );
@@ -1589,6 +1616,7 @@ fn query_hooks(
     catalog: Arc<dyn Catalog>,
     write_buffer: Option<Arc<buffer::WriteBuffer>>,
     enforce_pk: bool,
+    read_only: bool,
     authorizer: Option<authz::SharedAuthorizer>,
     plan_cache: bool,
 ) -> Vec<Arc<dyn QueryHook>> {
@@ -1596,8 +1624,14 @@ fn query_hooks(
     // Observe-only: count every wire statement (falls through, never changes
     // behavior). First so it sees all statements including denied ones.
     hooks.push(Arc::new(metrics::MetricsHook));
+    if read_only {
+        hooks.push(Arc::new(authz::ReadOnlyHook));
+    }
     // 0. AuthzHook runs FIRST so an unauthorized statement is rejected (42501)
     //    before any rewrite, buffering, or planning touches it.
+    if enforce_pk {
+        hooks.push(Arc::new(authz::ConstraintHook));
+    }
     if let Some(a) = authorizer {
         hooks.push(Arc::new(authz::AuthzHook::new(
             a,
@@ -1650,7 +1684,29 @@ async fn run_sql(opts: &CatalogOpts, query: &str, enforce_pk: bool) -> Result<()
         println!("{} {}", dml_stmt.1, outcome.rows);
         return Ok(());
     }
-    let ctx = context::build_session_context(catalog).await?;
+    let ctx = context::build_session_context(catalog.clone()).await?;
+    if enforce_pk {
+        use datafusion::sql::sqlparser::{
+            ast::Statement, dialect::PostgreSqlDialect, parser::Parser,
+        };
+        let statements = Parser::parse_sql(&PostgreSqlDialect {}, query)?;
+        anyhow::ensure!(
+            statements.len() == 1,
+            "--enforce-pk requires one SQL statement per invocation"
+        );
+        let stmt = &statements[0];
+        authz::check_constraint_statement(stmt, &ctx, context::DEFAULT_SCHEMA)?;
+        if matches!(stmt, Statement::Insert(_)) {
+            let engine = OverwriteEngine::connect(catalog.clone(), opts, true, None).await?;
+            let ident = txn::insert_target(stmt)?;
+            let table = catalog.load_table(&ident).await?;
+            let (planned, batches) = txn::plan_insert_rows(&ctx, stmt, None).await?;
+            anyhow::ensure!(planned == ident, "INSERT target changed during planning");
+            let outcome = engine.insert_enforced(&ident, batches, Some(table)).await?;
+            println!("INSERT 0 {}", outcome.rows);
+            return Ok(());
+        }
+    }
     let df = ctx
         .sql(query)
         .await

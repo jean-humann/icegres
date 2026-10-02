@@ -58,7 +58,7 @@ spec:
         - name: read
           image: {{ include "icegres.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          args: ["serve", "--host", "0.0.0.0"]
+          args: ["serve", "--host", "0.0.0.0", "--read-only"]
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           envFrom:
