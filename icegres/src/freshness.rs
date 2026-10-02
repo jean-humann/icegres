@@ -707,6 +707,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_refresh_swaps_provider_and_local_writes_stay_exact() {
         if std::env::var("ICEGRES_LIVE_TESTS").as_deref() != Ok("1") {
+            assert!(
+                std::env::var("ICEGRES_REQUIRE_LIVE_TESTS").as_deref() != Ok("1"),
+                "ICEGRES_LIVE_TESTS=1 is required when ICEGRES_REQUIRE_LIVE_TESTS=1"
+            );
             eprintln!(
                 "skipping: ICEGRES_LIVE_TESTS unset (live freshness test; needs the local \
                  Lakekeeper/RustFS stack)"

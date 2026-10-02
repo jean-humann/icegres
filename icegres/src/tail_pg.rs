@@ -884,6 +884,10 @@ mod tests {
         match std::env::var("ICEGRES_TEST_PG_URL") {
             Ok(url) if !url.trim().is_empty() => Some(url),
             _ => {
+                assert!(
+                    std::env::var("ICEGRES_REQUIRE_LIVE_TESTS").as_deref() != Ok("1"),
+                    "ICEGRES_TEST_PG_URL must be configured when ICEGRES_REQUIRE_LIVE_TESTS=1"
+                );
                 eprintln!(
                     "skipping: ICEGRES_TEST_PG_URL unset (live tail-database test; point it \
                      at e.g. postgresql://lakekeeper:lakekeeper@127.0.0.1:5433/icegres_test)"

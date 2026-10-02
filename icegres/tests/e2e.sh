@@ -23,7 +23,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ICEGRES_DIR="$(dirname "$SCRIPT_DIR")"
 REPO_DIR="$(dirname "$ICEGRES_DIR")"
 E2E_DIR="$ICEGRES_DIR/.e2e"
-BIN="$ICEGRES_DIR/target/debug/icegres"
+BUILD_PROFILE="${ICEGRES_E2E_PROFILE:-debug}"
+case "$BUILD_PROFILE" in
+  debug|release) ;;
+  *) echo "ICEGRES_E2E_PROFILE must be debug or release" >&2; exit 1 ;;
+esac
+TARGET_DIR="$ICEGRES_DIR/target/$BUILD_PROFILE"
+BIN="$TARGET_DIR/icegres"
 
 PG_HOST=127.0.0.1
 PG_PORT=5439
@@ -82,6 +88,13 @@ q() { "${PSQL[@]}" -tA -c "$1"; }
 # ---------------------------------------------------------------------------
 # Server lifecycle
 # ---------------------------------------------------------------------------
+# Linux returns a basename; macOS returns the executable path.
+process_is() {
+  local command
+  command=$(ps -o comm= -p "$1" 2>/dev/null) || return 1
+  [[ "${command##*/}" == "$2" ]]
+}
+
 stop_server() {
   if [[ -f "$SERVE_PID_FILE" ]]; then
     local pid
@@ -89,7 +102,7 @@ stop_server() {
     # Only signal the PID if it is actually an icegres process: a pidfile left
     # behind by a crashed run may name a PID recycled by an unrelated process.
     if kill -0 "$pid" 2>/dev/null \
-        && [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == icegres ]]; then
+        && process_is "$pid" icegres; then
       kill "$pid" 2>/dev/null || true
       for _ in $(seq 1 20); do
         kill -0 "$pid" 2>/dev/null || break
@@ -128,7 +141,7 @@ stop_secure_server() {
     local pid
     pid=$(cat "$SECURE_PID_FILE")
     if kill -0 "$pid" 2>/dev/null \
-        && [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == icegres ]]; then
+        && process_is "$pid" icegres; then
       kill "$pid" 2>/dev/null || true
       for _ in $(seq 1 20); do
         kill -0 "$pid" 2>/dev/null || break
@@ -145,7 +158,7 @@ stop_pidfile_generic() { # pidfile — identity-checked kill
   if [[ -f "$pidfile" ]]; then
     pid=$(cat "$pidfile")
     if kill -0 "$pid" 2>/dev/null \
-        && [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == icegres ]]; then
+        && process_is "$pid" icegres; then
       kill "$pid" 2>/dev/null || true
       for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.25; done
       kill -9 "$pid" 2>/dev/null || true
@@ -159,7 +172,7 @@ stop_icegresd_at() { # pidfile — identity-checked kill of a control plane (com
   if [[ -f "$pidfile" ]]; then
     pid=$(cat "$pidfile")
     if kill -0 "$pid" 2>/dev/null \
-        && [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == icegresd ]]; then
+        && process_is "$pid" icegresd; then
       kill "$pid" 2>/dev/null || true # SIGTERM: icegresd terminates its computes
       for _ in $(seq 1 40); do kill -0 "$pid" 2>/dev/null || break; sleep 0.25; done
       kill -9 "$pid" 2>/dev/null || true
@@ -175,7 +188,7 @@ stop_keeper_at() { # pidfile — identity-checked kill of an acceptor (comm=icek
   if [[ -f "$pidfile" ]]; then
     pid=$(cat "$pidfile")
     if kill -0 "$pid" 2>/dev/null \
-        && [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == icekeeperd ]]; then
+        && process_is "$pid" icekeeperd; then
       kill "$pid" 2>/dev/null || true
       for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.25; done
       kill -9 "$pid" 2>/dev/null || true
@@ -229,16 +242,29 @@ trap cleanup EXIT
 # ---------------------------------------------------------------------------
 # 0. Stack up
 # ---------------------------------------------------------------------------
-log "starting lakehouse stack (infra/scripts/up.sh)"
-bash "$REPO_DIR/infra/scripts/up.sh" >"$E2E_DIR/up.log" 2>&1 \
-  || { tail -n 30 "$E2E_DIR/up.log" >&2; fail "infra/scripts/up.sh failed (log: $E2E_DIR/up.log)"; }
+if [[ "${ICEGRES_E2E_EXTERNAL_STACK:-0}" == "1" ]]; then
+  log "checking the externally provisioned test stack"
+  curl -fsS "$CATALOG_URI/v1/config?warehouse=$WAREHOUSE" >/dev/null \
+    || fail "external Iceberg catalog is not ready"
+  PGPASSWORD=lakekeeper psql -h 127.0.0.1 -p 5433 -U lakekeeper -d icegres_test \
+    -v ON_ERROR_STOP=1 -tAc 'SELECT 1' >/dev/null \
+    || fail "external tail database is not ready"
+else
+  log "starting lakehouse stack (infra/scripts/up.sh)"
+  bash "$REPO_DIR/infra/scripts/up.sh" >"$E2E_DIR/up.log" 2>&1 \
+    || { tail -n 30 "$E2E_DIR/up.log" >&2; fail "infra/scripts/up.sh failed (log: $E2E_DIR/up.log)"; }
+fi
 pass "lakehouse stack healthy"
 
 # ---------------------------------------------------------------------------
 # 1. Build (cargo skips work when the binary is fresh)
 # ---------------------------------------------------------------------------
 log "building icegres"
-(cd "$ICEGRES_DIR" && cargo build --quiet) \
+(cd "$ICEGRES_DIR" && if [[ "$BUILD_PROFILE" == release ]]; then
+  cargo build --release --locked --bins --quiet
+else
+  cargo build --locked --bins --quiet
+fi) \
   || fail "cargo build failed"
 [[ -x "$BIN" ]] || fail "binary not found at $BIN"
 pass "cargo build"
@@ -1387,7 +1413,7 @@ for kp in "${VF_KEEPER_PORTS[@]}"; do
     fail "something is already listening on :$kp — stop it first"
   fi
 done
-KBIN="$ICEGRES_DIR/target/debug/icekeeperd"
+KBIN="$TARGET_DIR/icekeeperd"
 [[ -x "$KBIN" ]] || fail "icekeeperd binary not found at $KBIN"
 for n in 1 2 3; do
   rm -rf "$E2E_DIR/vk-$n"
@@ -1444,7 +1470,7 @@ rm -rf "$VF_SAB" "$VF_TAIL"
 # ---------------------------------------------------------------------------
 PXY_PORT=5444
 PXY_MAIN=5445
-DBIN="$ICEGRES_DIR/target/debug/icegresd"
+DBIN="$TARGET_DIR/icegresd"
 PXY_LOG="$E2E_DIR/icegresd.log"
 PXY_STATUS="$E2E_DIR/icegresd-status.json"
 PXY_BRANCH=e2e_pxy
@@ -1487,7 +1513,7 @@ assert_eq "first connection through icegresd wakes the compute and answers" 20 \
   "$("${PXQ[@]}" -c 'select count(*) from demo.cities')"
 main_cpid=$(pxy_status main .pid)
 [[ "$main_cpid" =~ ^[0-9]+$ ]] || fail "status file has no main compute pid: $(cat "$PXY_STATUS" 2>/dev/null)"
-[[ "$(ps -o comm= -p "$main_cpid" 2>/dev/null)" == icegres ]] \
+process_is "$main_cpid" icegres \
   || fail "status pid $main_cpid is not a live icegres process"
 pass "status file reports the main compute (pid $main_cpid on :$(pxy_status main .port))"
 
@@ -3647,7 +3673,7 @@ fi
 #        5487/5488 failover icegresd/main   5490-5493 lease icegresd A/B
 #        5494/5495 fence pair Z/W           5496-5498 autoscale/main/tail-api
 # ---------------------------------------------------------------------------
-HA_KBIN="$ICEGRES_DIR/target/debug/icekeeperd"
+HA_KBIN="$TARGET_DIR/icekeeperd"
 HA_QUORUM="127.0.0.1:5481,127.0.0.1:5482,127.0.0.1:5483"
 HA_LEASE_QUORUM="127.0.0.1:5484,127.0.0.1:5485,127.0.0.1:5486"
 HA_BUF_MS=600000 # 10 min: the flusher never auto-commits; replay is the only path
@@ -3958,7 +3984,7 @@ grep -q "taking over the icegresd lease" "$LSB_LOG" \
 # design on the DATA tail in quorum deployments (proven in ha1z) — here it
 # is just reaped so the harness leaves nothing behind.
 if [[ "$lsa_cpid" =~ ^[0-9]+$ ]] && kill -0 "$lsa_cpid" 2>/dev/null \
-    && [[ "$(ps -o comm= -p "$lsa_cpid" 2>/dev/null)" == icegres ]]; then
+    && process_is "$lsa_cpid" icegres; then
   kill -9 "$lsa_cpid" 2>/dev/null || true
 fi
 stop_icegresd_at "$E2E_DIR/icegresd-lease-b.pid"

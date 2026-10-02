@@ -31,10 +31,17 @@ export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-rustfsadmin}"
 export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-rustfssecret}"
 export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
 
-skip() { echo "SKIP tests/browser-flight.sh: $1 (runs where node + Chromium + the stack are present)"; exit 0; }
+skip() {
+  if [[ "${ICEGRES_REQUIRE_LIVE_TESTS:-0}" == "1" ]]; then
+    echo "FAIL tests/browser-flight.sh: required prerequisite missing: $1" >&2
+    exit 1
+  fi
+  echo "SKIP tests/browser-flight.sh: $1 (runs where node + Chromium + the stack are present)"
+  exit 0
+}
 # A hard failure (exit 1), distinct from a SKIP: used once the prerequisites
 # are all present, so a real regression cannot masquerade as a loud SKIP.
-die()  { echo "FAIL tests/browser-flight.sh: $1"; exit 1; }
+die()  { echo "FAIL tests/browser-flight.sh: $1" >&2; exit 1; }
 
 command -v node >/dev/null 2>&1 || skip "node not on PATH"
 [ -x "$CHROMIUM" ] || skip "no Chromium at $CHROMIUM (set CHROMIUM_PATH)"
@@ -43,7 +50,7 @@ curl -sf -o /dev/null "$CATALOG_URI/v1/config?warehouse=${ICEGRES_WAREHOUSE:-lak
 if [ ! -x "$BIN" ]; then
   command -v cargo >/dev/null 2>&1 || skip "icegres binary missing and no cargo to build it"
   echo "building icegres release binary ..."
-  (cd "$ROOT/icegres" && cargo build --release) || skip "icegres build failed"
+  (cd "$ROOT/icegres" && cargo build --release) || die "icegres build failed"
 fi
 
 PIDS=()
