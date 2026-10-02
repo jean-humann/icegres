@@ -1,0 +1,214 @@
+--- a/src/arrow/caching_delete_file_loader.rs
++++ b/src/arrow/caching_delete_file_loader.rs
+@@ -229,7 +229,7 @@
+                         // Positional deletes are accessed synchronously by ArrowReader.
+                         // We must wait here to ensure the data is ready before returning,
+                         // otherwise ArrowReader might get an empty/partial result.
+-                        notify.notified().await;
++                        notify.await;
+                         Ok(DeleteFileContext::ExistingPosDel)
+                     }
+                     PosDelLoadAction::Load => Ok(DeleteFileContext::PosDels {
+--- a/src/arrow/delete_filter.rs
++++ b/src/arrow/delete_filter.rs
+@@ -19,6 +19,7 @@
+ use std::sync::{Arc, Mutex, RwLock};
+ 
+ use tokio::sync::Notify;
++use tokio::sync::futures::OwnedNotified;
+ use tokio::sync::oneshot::Receiver;
+ 
+ use crate::delete_vector::DeleteVector;
+@@ -65,9 +66,9 @@
+     /// The file is already loaded, nothing to do.
+     AlreadyLoaded,
+     /// The file is currently being loaded by another task.
+-    /// The caller *must* wait for this notifier to ensure data availability
+-    /// before returning, as subsequent access (get_delete_vector) is synchronous.
+-    WaitFor(Arc<Notify>),
++    /// Created under the state lock so publication cannot be missed before
++    /// the caller polls it. The caller must await it before synchronous access.
++    WaitFor(OwnedNotified),
+ }
+ 
+ impl DeleteFilter {
+@@ -117,7 +118,9 @@
+         if let Some(state) = state.positional_deletes.get(file_path) {
+             match state {
+                 PosDelState::Loaded => return PosDelLoadAction::AlreadyLoaded,
+-                PosDelState::Loading(notify) => return PosDelLoadAction::WaitFor(notify.clone()),
++                PosDelState::Loading(notify) => {
++                    return PosDelLoadAction::WaitFor(notify.clone().notified_owned());
++                }
+             }
+         }
+ 
+@@ -153,17 +156,28 @@
+         &self,
+         file_path: &str,
+     ) -> Option<Predicate> {
++        self.get_equality_delete_predicate_with_hook(file_path, || {})
++            .await
++    }
++
++    // Test seam for completion after state inspection but before waiter polling.
++    async fn get_equality_delete_predicate_with_hook(
++        &self,
++        file_path: &str,
++        before_wait: impl FnOnce() + Send,
++    ) -> Option<Predicate> {
+         let notifier = {
+             match self.state.read().unwrap().equality_deletes.get(file_path) {
+                 None => return None,
+-                Some(EqDelState::Loading(notifier)) => notifier.clone(),
++                Some(EqDelState::Loading(notifier)) => notifier.clone().notified_owned(),
+                 Some(EqDelState::Loaded(predicate)) => {
+                     return Some(predicate.clone());
+                 }
+             }
+         };
+ 
+-        notifier.notified().await;
++        before_wait();
++        notifier.await;
+ 
+         match self.state.read().unwrap().equality_deletes.get(file_path) {
+             Some(EqDelState::Loaded(predicate)) => Some(predicate.clone()),
+@@ -287,6 +301,50 @@
+     const FIELD_ID_POSITIONAL_DELETE_POS: u64 = 2147483545;
+ 
+     #[tokio::test]
++    async fn lost_wakeup_equality_publication_before_wait_poll() {
++        let filter = DeleteFilter::default();
++        let file = "equality.parquet";
++        let notify = filter.try_start_eq_del_load(file).unwrap();
++        let result = tokio::time::timeout(
++            std::time::Duration::from_millis(100),
++            filter.get_equality_delete_predicate_with_hook(file, || {
++                filter
++                    .state
++                    .write()
++                    .unwrap()
++                    .equality_deletes
++                    .insert(file.to_string(), EqDelState::Loaded(AlwaysTrue));
++                notify.notify_waiters();
++            }),
++        )
++        .await
++        .expect("equality delete notification was lost before waiter polling");
++        assert_eq!(result, Some(AlwaysTrue));
++    }
++
++    #[tokio::test]
++    async fn lost_wakeup_positional_publication_before_wait_poll() {
++        let filter = DeleteFilter::default();
++        let file = "positions.parquet";
++        assert!(matches!(
++            filter.try_start_pos_del_load(file),
++            PosDelLoadAction::Load
++        ));
++        let PosDelLoadAction::WaitFor(waiter) = filter.try_start_pos_del_load(file) else {
++            panic!("another load must wait for the owner");
++        };
++        // Publish before the returned wait future has ever been polled.
++        filter.finish_pos_del_load(file);
++        tokio::time::timeout(std::time::Duration::from_millis(100), waiter)
++            .await
++            .expect("positional delete notification was lost before waiter polling");
++        assert!(matches!(
++            filter.try_start_pos_del_load(file),
++            PosDelLoadAction::AlreadyLoaded
++        ));
++    }
++
++    #[tokio::test]
+     async fn test_delete_file_filter_load_deletes() {
+         let tmp_dir = TempDir::new().unwrap();
+         let table_location = tmp_dir.path();
+@@ -345,12 +403,11 @@
+             let pos_vals = pos_values.get(n - 1).unwrap();
+             let pos_col = Arc::new(Int64Array::from_iter_values(pos_vals.clone()));
+ 
+-            let positional_deletes_to_write =
+-                RecordBatch::try_new(positional_delete_schema.clone(), vec![
+-                    file_path_col.clone(),
+-                    pos_col.clone(),
+-                ])
+-                .unwrap();
++            let positional_deletes_to_write = RecordBatch::try_new(
++                positional_delete_schema.clone(),
++                vec![file_path_col.clone(), pos_col.clone()],
++            )
++            .unwrap();
+ 
+             let file = File::create(format!(
+                 "{}/pos-del-{}.parquet",
+--- a/src/delete_file_index.rs
++++ b/src/delete_file_index.rs
+@@ -87,17 +87,35 @@
+         data_file: &DataFile,
+         seq_num: Option<i64>,
+     ) -> Vec<FileScanTaskDeleteFile> {
++        self.get_deletes_for_data_file_with_hook(data_file, seq_num, || {})
++            .await
++    }
++
++    // The hook deterministically exercises publication between inspecting the
++    // state and polling the waiter. Production callers pass an inlined no-op.
++    async fn get_deletes_for_data_file_with_hook(
++        &self,
++        data_file: &DataFile,
++        seq_num: Option<i64>,
++        before_wait: impl FnOnce() + Send,
++    ) -> Vec<FileScanTaskDeleteFile> {
+         let notifier = {
+             let guard = self.state.read().unwrap();
+             match *guard {
+-                DeleteFileIndexState::Populating(ref notifier) => notifier.clone(),
++                DeleteFileIndexState::Populating(ref notifier) => {
++                    // Capture notify_waiters' generation while the state lock
++                    // still prevents publication. Cloning only the Notify
++                    // would leave a lost-wakeup gap before notified().
++                    notifier.clone().notified_owned()
++                }
+                 DeleteFileIndexState::Populated(ref index) => {
+                     return index.get_deletes_for_data_file(data_file, seq_num);
+                 }
+             }
+         };
+ 
+-        notifier.notified().await;
++        before_wait();
++        notifier.await;
+ 
+         let guard = self.state.read().unwrap();
+         match guard.deref() {
+@@ -222,6 +240,28 @@
+         Struct,
+     };
+ 
++    #[tokio::test]
++    async fn lost_wakeup_index_publication_before_wait_poll() {
++        let notify = Arc::new(Notify::new());
++        let index = DeleteFileIndex {
++            state: Arc::new(RwLock::new(DeleteFileIndexState::Populating(
++                notify.clone(),
++            ))),
++        };
++        let data_file = build_unpartitioned_data_file();
++        let result = tokio::time::timeout(
++            std::time::Duration::from_millis(100),
++            index.get_deletes_for_data_file_with_hook(&data_file, Some(0), || {
++                *index.state.write().unwrap() =
++                    DeleteFileIndexState::Populated(PopulatedDeleteFileIndex::new(vec![]));
++                notify.notify_waiters();
++            }),
++        )
++        .await
++        .expect("index publication notification was lost before waiter polling");
++        assert!(result.is_empty());
++    }
++
+     #[test]
+     fn test_delete_file_index_unpartitioned() {
+         let deletes: Vec<ManifestEntry> = vec![
