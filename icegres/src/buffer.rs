@@ -3522,7 +3522,7 @@ mod tests {
             .append(
                 &ident(),
                 Some(kschema()),
-                &[wide.clone()],
+                std::slice::from_ref(&wide),
                 Some(&tail),
                 None,
             )
@@ -3539,7 +3539,7 @@ mod tests {
         // An already acknowledged frame must remain available when recovery
         // cannot fit it. Replay never rewrites or truncates that frame.
         let seq = tail
-            .append(&ident(), TailOpKind::Append, &[wide.clone()])
+            .append(&ident(), TailOpKind::Append, std::slice::from_ref(&wide))
             .unwrap();
         assert!(st
             .append(&ident(), Some(kschema()), &[wide], None, Some(seq))
@@ -3576,15 +3576,33 @@ mod tests {
         let rows = batch(&sch, &[1, 2]);
         let measure = BufferState::default();
         measure
-            .append(&ident(), Some(sch.clone()), &[rows.clone()], None, None)
+            .append(
+                &ident(),
+                Some(sch.clone()),
+                std::slice::from_ref(&rows),
+                None,
+                None,
+            )
             .unwrap();
         let limit = measure.budget.used.load(Ordering::Relaxed);
         let st = BufferState::with_limit(limit);
-        st.append(&ident(), Some(sch.clone()), &[rows.clone()], None, None)
-            .unwrap();
+        st.append(
+            &ident(),
+            Some(sch.clone()),
+            std::slice::from_ref(&rows),
+            None,
+            None,
+        )
+        .unwrap();
         let other = TableIdent::from_strs(["demo", "another"]).unwrap();
         assert!(st
-            .append(&other, Some(sch.clone()), &[rows.clone()], None, None)
+            .append(
+                &other,
+                Some(sch.clone()),
+                std::slice::from_ref(&rows),
+                None,
+                None
+            )
             .is_err());
         let snapshot = st.snapshot_pending(&ident());
         st.move_pending_to_flushed(&ident(), snapshot.n_batches, &[], 7);

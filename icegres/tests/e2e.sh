@@ -16,6 +16,13 @@
 
 set -euo pipefail
 
+# Nanosecond timing and UTC epoch conversion require GNU date on macOS.
+DATE_BIN=date
+if [[ "$(uname -s)" == Darwin ]]; then
+  DATE_BIN=gdate
+  command -v "$DATE_BIN" >/dev/null || { echo "install coreutils for gdate" >&2; exit 1; }
+fi
+
 # ---------------------------------------------------------------------------
 # Paths / config
 # ---------------------------------------------------------------------------
@@ -750,7 +757,7 @@ curl -sf -X POST "$(nested_table_url)" -H 'Content-Type: application/json' -d "{
     {\"action\":\"add-snapshot\",\"snapshot\":{
       \"snapshot-id\": $NESTED_SNAP,
       \"sequence-number\": 1,
-      \"timestamp-ms\": $(date +%s%3N),
+      \"timestamp-ms\": $("$DATE_BIN" +%s%3N),
       \"manifest-list\": \"$nested_loc/metadata/snap-$NESTED_SNAP-0-e2e-empty.avro\",
       \"summary\": {\"operation\":\"append\"},
       \"schema-id\": 0
@@ -1297,7 +1304,7 @@ p5_fork_ts=$(curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_p5_a" 
   | jq -r ".metadata.snapshots[] | select(.\"snapshot-id\" == $p5_fork_a) | .\"timestamp-ms\"")
 [[ -n "$p5_fork_ts" && "$p5_fork_ts" != null ]] || fail "could not read the fork snapshot's timestamp"
 p5_ms=$((p5_fork_ts + 1))
-p5_iso="$(date -u -d "@$((p5_ms / 1000))" +'%F %T').$(printf '%03d' $((p5_ms % 1000)))"
+p5_iso="$("$DATE_BIN" -u -d "@$((p5_ms / 1000))" +'%F %T').$(printf '%03d' $((p5_ms % 1000)))"
 assert_eq "AS OF TIMESTAMP (1 ms after the fork commit) resolves just-before" "1" \
   "$(q "select count(*) from demo.e2e_p5_a AS OF TIMESTAMP '$p5_iso'")"
 # Extended protocol (psql \bind): the AsOfParser path.
@@ -1534,9 +1541,9 @@ pass "compute idle-exited (scale-to-zero): process gone, slot marked stopped"
 
 # n3: wake-after-idle — the next connection through icegresd re-spawns the
 #     compute transparently; measure the first-connection-after-idle latency.
-t0=$(($(date +%s%N) / 1000000))
+t0=$(($("$DATE_BIN" +%s%N) / 1000000))
 wake_out=$("${PXQ[@]}" -c 'select 1' 2>&1)
-wake_after_idle_ms=$(( $(date +%s%N) / 1000000 - t0 ))
+wake_after_idle_ms=$(( $("$DATE_BIN" +%s%N) / 1000000 - t0 ))
 assert_eq "reconnect after idle auto-wakes the compute" 1 "$wake_out"
 (( wake_after_idle_ms < 10000 )) || fail "wake-after-idle took ${wake_after_idle_ms}ms (>10s)"
 pass "wake-after-idle latency: ${wake_after_idle_ms}ms (cold start + splice setup, incl. psql overhead)"
@@ -2263,13 +2270,13 @@ done
 # First wrong attempt is ~baseline (no prior failures); after a couple more the
 # escalating backoff makes a later attempt visibly slower.
 # These are expected to FAIL (wrong password) — guard against `set -e`.
-t0=$(date +%s%N)
+t0=$("$DATE_BIN" +%s%N)
 PGPASSWORD=nope psql "host=$PG_HOST port=$THR_PORT user=thruser dbname=icegres connect_timeout=30" -tAc 'select 1' >/dev/null 2>&1 || true
-first_ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+first_ms=$(( ($("$DATE_BIN" +%s%N) - t0) / 1000000 ))
 for _ in 1 2; do PGPASSWORD=nope psql "host=$PG_HOST port=$THR_PORT user=thruser dbname=icegres connect_timeout=30" -tAc 'select 1' >/dev/null 2>&1 || true; done
-t0=$(date +%s%N)
+t0=$("$DATE_BIN" +%s%N)
 PGPASSWORD=nope psql "host=$PG_HOST port=$THR_PORT user=thruser dbname=icegres connect_timeout=30" -tAc 'select 1' >/dev/null 2>&1 || true
-later_ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+later_ms=$(( ($("$DATE_BIN" +%s%N) - t0) / 1000000 ))
 grep -q 'throttling this peer' "$THR_LOG" || fail "failed-auth throttle did not fire (log: $THR_LOG)"
 (( later_ms > first_ms + 100 )) || fail "no backoff escalation: first=${first_ms}ms later=${later_ms}ms"
 pass "per-peer failed-auth backoff escalates (first=${first_ms}ms -> later=${later_ms}ms)"
@@ -2384,13 +2391,13 @@ KY_SNAP1=$(curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_keyed" \
   | jq -r '.metadata."current-snapshot-id"')
 
 # 20 sequential hot-row UPDATEs: each acks UPDATE 1 without a commit.
-ky_t0=$(date +%s%N)
+ky_t0=$("$DATE_BIN" +%s%N)
 for i in $(seq 1 20); do
   ky_tag=$(psql -h "$PG_HOST" -p "$KY_PORT" -U postgres -d icegres -c \
     "update demo.e2e_keyed set val = 'v$i' where id = 1" | tr -d '[:space:]')
   [[ "$ky_tag" == "UPDATE1" ]] || fail "keyed UPDATE $i answered [$ky_tag], expected UPDATE 1"
 done
-ky_ms=$(( ($(date +%s%N) - ky_t0) / 1000000 ))
+ky_ms=$(( ($("$DATE_BIN" +%s%N) - ky_t0) / 1000000 ))
 pass "20 sequential keyed UPDATEs acked (total ${ky_ms} ms ≈ $((ky_ms / 20)) ms/stmt incl. psql startup)"
 assert_eq "mid-window SELECT sees the NEWEST value (union read)" "v20" \
   "$("${KYQ[@]}" -c 'select val from demo.e2e_keyed where id = 1')"
@@ -2589,14 +2596,14 @@ assert_eq "freshness server serves the seeded rows" "280" \
 q "insert into demo.trips (trip_id, city, distance_km, fare, ts)
    values ($fr_base, 'Fresh City', 9.99, 19.99, TIMESTAMP '2026-07-10 00:00:00')" >/dev/null
 fr_seen=""
-fr_t0=$(date +%s%N)
+fr_t0=$("$DATE_BIN" +%s%N)
 for _ in $(seq 1 200); do
   if [[ "$("${FQ[@]}" -c "select count(*) from demo.trips where trip_id = $fr_base")" == "1" ]]; then
     fr_seen=1; break
   fi
   sleep 0.05
 done
-fr_ms=$(( ($(date +%s%N) - fr_t0) / 1000000 ))
+fr_ms=$(( ($("$DATE_BIN" +%s%N) - fr_t0) / 1000000 ))
 [[ "$fr_seen" == 1 ]] || fail "foreign commit not visible on the freshness server within 10 s (bound is ~${FR_MS} ms)"
 pass "foreign commit visible on the freshness server within ${fr_ms} ms (deadline 10000 ms >> ${FR_MS} ms bound)"
 
@@ -2734,7 +2741,7 @@ done
 # --- p3a: INSERT on A visible on B within the event bound (<< flush cadence)
 "${P1AQ[@]}" -c "insert into demo.e2e_p1 (trip_id, city, distance_km, fare, ts)
   values (980500, 'peer-a', 1.0, 2.0, TIMESTAMP '2026-07-11 00:00:00')" >/dev/null
-p1_t0=$(date +%s%N)
+p1_t0=$("$DATE_BIN" +%s%N)
 p1_seen=0
 for _ in $(seq 1 120); do
   if [[ "$("${P1BQ[@]}" -c 'select count(*) from demo.e2e_p1 where trip_id = 980500' 2>/dev/null)" == "1" ]]; then
@@ -2742,7 +2749,7 @@ for _ in $(seq 1 120); do
   fi
   sleep 0.05
 done
-p1_ms=$(( ($(date +%s%N) - p1_t0) / 1000000 ))
+p1_ms=$(( ($("$DATE_BIN" +%s%N) - p1_t0) / 1000000 ))
 [[ "$p1_seen" == 1 ]] || { tail -n 20 "$P1B_LOG" >&2; fail "A's buffered INSERT never became visible on B"; }
 (( p1_ms < P1A_MS )) || fail "peer visibility took ${p1_ms}ms — not faster than the ${P1A_MS}ms flush cadence"
 pass "peer overlay: A's buffered INSERT visible on B in ${p1_ms}ms (flush cadence ${P1A_MS}ms)"
@@ -2752,7 +2759,7 @@ pass "peer overlay: A's buffered INSERT visible on B in ${p1_ms}ms (flush cadenc
 #     flush cadence delivering the committed row while the poll is still
 #     running — hence the same elapsed-time bound p3a asserts.
 "${P1AQ[@]}" -c "update demo.e2e_p1 set city = 'peer-updated' where trip_id = 980500" >/dev/null
-p1_upd_t0=$(date +%s%N)
+p1_upd_t0=$("$DATE_BIN" +%s%N)
 p1_upd=0
 for _ in $(seq 1 120); do
   if [[ "$("${P1BQ[@]}" -c "select city from demo.e2e_p1 where trip_id = 980500" 2>/dev/null)" == "peer-updated" ]]; then
@@ -2760,7 +2767,7 @@ for _ in $(seq 1 120); do
   fi
   sleep 0.05
 done
-p1_upd_ms=$(( ($(date +%s%N) - p1_upd_t0) / 1000000 ))
+p1_upd_ms=$(( ($("$DATE_BIN" +%s%N) - p1_upd_t0) / 1000000 ))
 [[ "$p1_upd" == 1 ]] || fail "A's keyed UPDATE never replaced the row on B"
 (( p1_upd_ms < P1A_MS )) || fail "keyed-update peer visibility took ${p1_upd_ms}ms — not faster than the ${P1A_MS}ms flush cadence (the overlay, not the flush, must deliver it)"
 assert_eq "keyed UPDATE on A replaces (not duplicates) on B, in ${p1_upd_ms}ms" "1" \
@@ -2952,7 +2959,7 @@ done
 [[ "$p1g_ready" == 1 ]] || { tail -n 20 "$P1B2_LOG" "$P1B3_LOG" >&2; fail "P1 auth-leg readers not ready"; }
 "${P1A2Q[@]}" -c "insert into demo.e2e_p1 (trip_id, city, distance_km, fare, ts)
   values (980502, 'peer-authed', 1.0, 2.0, TIMESTAMP '2026-07-11 00:00:03')" >/dev/null
-p1g_t0=$(date +%s%N)
+p1g_t0=$("$DATE_BIN" +%s%N)
 p1g_seen=0
 for _ in $(seq 1 120); do
   if [[ "$("${P1B2Q[@]}" -c 'select count(*) from demo.e2e_p1 where trip_id = 980502' 2>/dev/null)" == "1" ]]; then
@@ -2960,7 +2967,7 @@ for _ in $(seq 1 120); do
   fi
   sleep 0.05
 done
-p1g_ms=$(( ($(date +%s%N) - p1g_t0) / 1000000 ))
+p1g_ms=$(( ($("$DATE_BIN" +%s%N) - p1g_t0) / 1000000 ))
 [[ "$p1g_seen" == 1 ]] || { tail -n 20 "$P1B2_LOG" >&2; fail "authed subscriber never mirrored the row from the authed tail API"; }
 (( p1g_ms < P1A_MS )) || fail "authed peer visibility took ${p1g_ms}ms — not faster than the ${P1A_MS}ms flush cadence"
 grep -q 'peer tail mirror installed' "$P1B2_LOG" \
@@ -3242,7 +3249,7 @@ curl -sf -X POST "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_mor" \
     {\"action\":\"add-snapshot\",\"snapshot\":{
       \"snapshot-id\": $MOR_SNAP,
       \"sequence-number\": 1,
-      \"timestamp-ms\": $(date +%s%3N),
+      \"timestamp-ms\": $("$DATE_BIN" +%s%3N),
       \"manifest-list\": \"$mor_loc/metadata/snap-$MOR_SNAP-0-e2e-mor.avro\",
       \"summary\": {\"operation\":\"append\"},
       \"schema-id\": 0
@@ -3475,7 +3482,7 @@ CATGW_PORT=8182
 CATGW_TOK_PORT=5500
 CATGW_CRED_PORT=5501
 CATGW_NS=catgw
-CATGW_PREMINT="premint-bearer-$$-$(date +%s)"
+CATGW_PREMINT="premint-bearer-$$-$("$DATE_BIN" +%s)"
 CATGW_CLIENT="icegres:supersecret"
 CATGW_BIN="$E2E_DIR/catalog-gateway"
 CATGW_LOG="$E2E_DIR/catalog-gateway.log"
@@ -3766,7 +3773,7 @@ touch "$HA_ACKED"
     i=$((i + 1))
     if psql -h "$PG_HOST" -p "$HA_PORT" -U postgres -d icegres -tA \
          -c "insert into demo.e2e_ha (id, note) values ($i, 'ha-load')" >/dev/null 2>&1; then
-      echo "$i $(($(date +%s%N) / 1000000))" >>"$HA_ACKED"
+      echo "$i $(($("$DATE_BIN" +%s%N) / 1000000))" >>"$HA_ACKED"
     fi
     sleep 0.02
   done
@@ -3781,7 +3788,7 @@ done
 
 ha_cpid=$(ha_status main .pid)
 [[ "$ha_cpid" =~ ^[0-9]+$ ]] || { touch "$HA_STOP"; fail "no compute pid in $HA_STATUS"; }
-ha_kill_ms=$(($(date +%s%N) / 1000000))
+ha_kill_ms=$(($("$DATE_BIN" +%s%N) / 1000000))
 kill -9 "$ha_cpid" || { touch "$HA_STOP"; fail "could not SIGKILL compute $ha_cpid"; }
 # failover_ms = kill -> first ACKED insert on the replacement, as observed
 # by the CLIENT through the unchanged endpoint.
@@ -3963,7 +3970,7 @@ assert_eq "standby B spawned NOTHING (no double-spawn)" "0" \
 pass "one leader serves; the standby refuses clients (57P03) and spawns no computes"
 
 lsa_cpid=$(jq -r '.computes[] | select(.key=="main") | .pid' "$LSA_STATUS")
-lsa_kill_ms=$(($(date +%s%N) / 1000000))
+lsa_kill_ms=$(($("$DATE_BIN" +%s%N) / 1000000))
 kill -9 "$(cat "$E2E_DIR/icegresd-lease-a.pid")"
 rm -f "$E2E_DIR/icegresd-lease-a.pid"
 lsb_leader=0
@@ -3971,7 +3978,7 @@ for _ in $(seq 1 200); do
   if [[ "$(jq -r .leader "$LSB_STATUS" 2>/dev/null)" == "true" ]]; then lsb_leader=1; break; fi
   sleep 0.1
 done
-takeover_ms=$(( $(date +%s%N) / 1000000 - lsa_kill_ms ))
+takeover_ms=$(( $("$DATE_BIN" +%s%N) / 1000000 - lsa_kill_ms ))
 [[ "$lsb_leader" == 1 ]] || { tail -n 20 "$LSB_LOG" >&2; fail "standby B never took the lease over"; }
 (( takeover_ms < 3 * LEASE_TTL_MS )) \
   || fail "lease takeover took ${takeover_ms}ms (> 3x TTL ${LEASE_TTL_MS}ms)"
