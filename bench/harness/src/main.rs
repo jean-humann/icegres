@@ -13,7 +13,7 @@
 //! Method: every latency metric discards 3 warmup iterations and reports
 //! p50/p95 over >= 20 measured iterations. qps_8conn is the MEDIAN of 3
 //! consecutive 10 s windows after a warmup window (single-window qps showed
-//! up to +/-34% run-to-run noise). cold_start_ms is >= 5 spawn->ready runs of
+//! up to +/-34% run-to-run noise). cold_start_ms is >= 20 spawn->ready runs of
 //! the release binary.
 //!
 //! Resource metrics (first-class, gated — see bench/gate.sh):
@@ -33,7 +33,7 @@ use tokio_postgres::{Client, NoTls};
 
 const WARMUP: usize = 3;
 const ITERS: usize = 20;
-const COLD_RUNS: usize = 5;
+const COLD_RUNS: usize = 20;
 const QPS_CONNS: usize = 8;
 const QPS_WINDOW_S: u64 = 10;
 const QPS_WINDOWS: usize = 3;
