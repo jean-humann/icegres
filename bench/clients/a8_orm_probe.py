@@ -50,7 +50,17 @@ def record(status, name, detail=""):
     RESULTS.append((status, name, detail))
 
 
-def step(name, fn, xfail=None, skip=None):
+def postgres_error_matches(error, sqlstate, message):
+    """Match the server's documented failure, not any driver exception."""
+    code = getattr(error, "pgcode", None)
+    detail = getattr(getattr(error, "diag", None), "message_primary", "")
+    if error.args and isinstance(error.args[0], dict):
+        code = error.args[0].get("C")
+        detail = error.args[0].get("M", "")
+    return code == sqlstate and message in (detail or "")
+
+
+def step(name, fn, xfail=None, xfail_when=None, skip=None):
     if skip:
         record("SKIP", name, skip)
         return None
@@ -60,7 +70,7 @@ def step(name, fn, xfail=None, skip=None):
         return detail
     except Exception as ex:  # noqa: BLE001 - a probe must report, not crash
         msg = f"{type(ex).__name__}: {str(ex)[:260]}"
-        if xfail:
+        if xfail and xfail_when is not None and xfail_when(ex):
             record("XFAIL", name, f"{xfail} [{msg}]")
         else:
             record("FAIL", name, msg)
@@ -90,9 +100,15 @@ def main():
         conn = pg8000.native.Connection(
             "postgres", host=HOST, port=PORT, database="icegres", password="ignored"
         )
-        n = conn.run("select count(*) from demo.cities")[0][0]
-        conn.close()
-        return f"count={n}"
+        try:
+            # pg8000.native.run uses the simple protocol without parameters.
+            n = conn.run(
+                "select count(*) from demo.cities where city <> :excluded_city",
+                excluded_city="__icegres_probe_no_such_city__",
+            )[0][0]
+            return f"bound-parameter count={n}"
+        finally:
+            conn.close()
 
     step("pg8000 connect+query (extended protocol)", pg8000_connect)
 
@@ -131,6 +147,11 @@ def main():
                 connect_timeout=5,
             )
         except psycopg2.OperationalError as ex:
+            # Startup errors may omit pgcode; still require the server's
+            # authentication rejection instead of accepting TLS/network errors.
+            if (ex.pgcode not in (None, "28P01") or
+                    "password authentication failed" not in str(ex).lower()):
+                raise
             return f"rejected as expected: {str(ex).strip()[:120]}"
         raise AssertionError("wrong password was ACCEPTED")
 
@@ -214,6 +235,10 @@ def main():
         server_side_cursor,
         xfail="DECLARE CURSOR/FETCH not implemented by the DataFusion pgwire "
         "front-end (architecturally out of scope; use client-side cursors)",
+        xfail_when=lambda error: postgres_error_matches(
+            error, "0A000",
+            "statement is not supported inside a transaction block: this statement type",
+        ),
     )
 
     # -- 11: prepared-statement reuse ---------------------------------------
@@ -309,18 +334,25 @@ def main():
         )
         try:
             conn.run("BEGIN")
-            rows = conn.run("select count(*) from demo.trips")
+            rows = conn.run(
+                "select count(*) from demo.trips where city <> :excluded_city",
+                excluded_city="__icegres_probe_no_such_city__",
+            )
             conn.run("COMMIT")
             return f"count={rows[0][0]}"
         finally:
             conn.close()
 
     step(
-        "pg8000 SELECT inside explicit transaction",
+        "pg8000 bound SELECT inside explicit transaction (extended protocol)",
         pg8000_select_in_explicit_txn,
         xfail="documented limit: extended-protocol SELECT inside an explicit "
         "transaction is rejected with 0A000 (transactional SELECT is simple-"
-        "protocol only; failing query: BEGIN; select count(*) from demo.trips)",
+        "protocol only; failing query: BEGIN; parameterized SELECT from demo.trips)",
+        xfail_when=lambda error: postgres_error_matches(
+            error, "0A000",
+            "SELECT inside an explicit transaction is supported on the simple query protocol only",
+        ),
     )
 
     engine.dispose()
