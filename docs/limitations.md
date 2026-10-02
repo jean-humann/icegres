@@ -817,14 +817,12 @@ Known-and-accepted sharp edges, queued rather than closed — none is a
 correctness hole under the documented deployment posture, each would harden
 an operational edge:
 
-- **Acceptor idle/read timeout + greeting-stage length cap** (`icekeeperd`):
-  a connected-but-silent client holds its connection task forever, and the
-  pre-greeting frame length is bounded only by the generic message cap —
-  acceptable under the trusted-network posture above, worth tightening.
 - **Acceptor transport is bounded, but disk work remains serial.** Each acceptor
   processes one state-machine operation on a blocking worker. This preserves
   persist-before-ack ordering and keeps fsync off the async runtime. A canceled
-  waiter cannot cancel an operation already started. Connection, request-count,
+  waiter cannot cancel an operation already started. Frame reads and response
+  writes have finite network deadlines, including idle connections waiting for
+  their next message; JSON headers are capped at 64 KiB. Connection, request-count,
   request-byte, response-byte and recovery-range limits reject excess load before
   allocation or disk mutation. They do not bound total process RSS, WAL disk usage,
   boot scanning, or the proposer's accumulated recovery data. A hung filesystem
