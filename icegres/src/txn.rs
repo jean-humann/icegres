@@ -551,12 +551,15 @@ impl SchemaProvider for TxnSchemaProvider {
         if name.contains('$') || name.contains('@') {
             return self.inner.table(name).await;
         }
-        if !self.inner.table_exist(name) {
-            return Ok(None);
-        }
         let ident = TableIdent::new(self.namespace.clone(), name.to_string());
         let mut sess = self.sess.lock().await;
         if !sess.tables.contains_key(&ident) {
+            // A confirmed external DROP removes shared registration, but an
+            // existing transaction still owns its first-touch snapshot. Only
+            // new pins depend on the currently registered table names.
+            if !self.inner.table_exist(name) {
+                return Ok(None);
+            }
             let pinned = TxnTable::pin(&self.catalog, &ident, &self.branch)
                 .await
                 .map_err(|e| DataFusionError::External(e.into()))?;
@@ -1545,6 +1548,185 @@ mod tests {
         Parser::parse_sql(&PostgreSqlDialect {}, sql)
             .unwrap()
             .remove(0)
+    }
+
+    #[tokio::test]
+    async fn pinned_parquet_read_survives_external_drop_and_registration_eviction() {
+        use arrow::array::Int64Array;
+        use datafusion::catalog::MemorySchemaProvider;
+        use datafusion::parquet::arrow::ArrowWriter;
+        use iceberg::memory::MemoryCatalogBuilder;
+        use iceberg::spec::{
+            DataContentType, DataFileBuilder, DataFileFormat, NestedField, PrimitiveType, Schema,
+            Struct, Type,
+        };
+        use iceberg::transaction::{ApplyTransactionAction, Transaction};
+        use iceberg::{CatalogBuilder, TableCreation};
+
+        struct TestDir(std::path::PathBuf);
+        impl Drop for TestDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = TestDir(
+            std::env::temp_dir().join(format!("icegres-transaction-pin-{}", uuid::Uuid::new_v4())),
+        );
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            MemoryCatalogBuilder::default()
+                .with_storage_factory(Arc::new(iceberg::io::LocalFsStorageFactory))
+                .load(
+                    "pin-drop",
+                    HashMap::from([(
+                        "warehouse".to_string(),
+                        dir.0.to_string_lossy().into_owned(),
+                    )]),
+                )
+                .await
+                .unwrap(),
+        );
+        let namespace = NamespaceIdent::new("demo".to_string());
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .unwrap();
+        let schema = Schema::builder()
+            .with_fields([Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .unwrap();
+        let creation = || {
+            TableCreation::builder()
+                .name("items".to_string())
+                .schema(schema.clone())
+                .build()
+        };
+        let table = catalog.create_table(&namespace, creation()).await.unwrap();
+        let arrow_schema = Arc::new(schema_to_arrow_schema(&schema).unwrap());
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![42]))],
+        )
+        .unwrap();
+        let path = dir.0.join("original.parquet");
+        let mut writer =
+            ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), arrow_schema, None)
+                .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let data_file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(path.to_string_lossy().into_owned())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(std::fs::metadata(&path).unwrap().len())
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::empty())
+            .build()
+            .unwrap();
+        let tx = Transaction::new(&table);
+        let table = tx
+            .fast_append()
+            .add_data_files([data_file])
+            .apply(tx)
+            .unwrap()
+            .commit(catalog.as_ref())
+            .await
+            .unwrap();
+        let ident = table.identifier().clone();
+        let original_uuid = table.metadata().uuid();
+        let inner = Arc::new(MemorySchemaProvider::new());
+        inner
+            .register_table(
+                "items".to_string(),
+                Arc::new(
+                    IcebergStaticTableProvider::try_new_from_table(table)
+                        .await
+                        .unwrap(),
+                ),
+            )
+            .unwrap();
+        let session = Arc::new(tokio::sync::Mutex::new(TxnSession::new()));
+        let provider = Arc::new(TxnSchemaProvider {
+            inner: inner.clone(),
+            namespace: namespace.clone(),
+            catalog: catalog.clone(),
+            branch: MAIN_BRANCH.to_string(),
+            sess: session.clone(),
+        });
+        let ctx = SessionContext::new();
+        ctx.catalog("datafusion")
+            .unwrap()
+            .register_schema("demo", provider)
+            .unwrap();
+        let before = ctx
+            .sql("SELECT id FROM demo.items")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(before.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        assert_eq!(
+            before[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            42
+        );
+
+        catalog.drop_table(&ident).await.unwrap();
+        inner.deregister_table("items").unwrap();
+        assert!(!inner.table_exist("items"));
+        let after = ctx
+            .sql("SELECT id FROM demo.items")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(after, before);
+        let fresh = TxnSchemaProvider {
+            inner: inner.clone(),
+            namespace: namespace.clone(),
+            catalog: catalog.clone(),
+            branch: MAIN_BRANCH.to_string(),
+            sess: Arc::new(tokio::sync::Mutex::new(TxnSession::new())),
+        };
+        assert!(fresh.table("items").await.unwrap().is_none());
+
+        // A replacement registration must not replace the retained pin.
+        let replacement = catalog.create_table(&namespace, creation()).await.unwrap();
+        assert_ne!(replacement.metadata().uuid(), original_uuid);
+        inner
+            .register_table(
+                "items".to_string(),
+                Arc::new(
+                    IcebergStaticTableProvider::try_new_from_table(replacement)
+                        .await
+                        .unwrap(),
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            ctx.sql("SELECT id FROM demo.items")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            session.lock().await.tables[&ident].pinned.metadata().uuid(),
+            original_uuid
+        );
     }
 
     #[tokio::test]
