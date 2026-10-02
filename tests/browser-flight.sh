@@ -7,11 +7,11 @@
 # the right rows (bench/clients/js/bench/smoke.mjs). This is the CI guard the
 # docs/frontend-dashboards.md numbers and the client package depend on.
 #
-# Like tests/helm.sh, it SKIPs loudly (exit 0) when its prerequisites are
-# absent so it never blocks a machine that cannot run it — CI runs it where
-# node, Chromium, and the lakehouse stack are all present.
+# Missing prerequisites are an explicit optional SKIP unless
+# ICEGRES_REQUIRE_LIVE_TESTS=1, which makes them fail. Build failures always
+# fail once prerequisites are present.
 #
-# Prereqs, each a loud SKIP if missing:
+# Prerequisites:
 #   - node on PATH
 #   - a Chromium at CHROMIUM_PATH (default /opt/pw-browsers/chromium)
 #   - the base lakehouse stack reachable (ICEGRES_CATALOG_URI, default the

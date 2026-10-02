@@ -1447,14 +1447,34 @@ pass "verify --tail-quorum: durability/exactly-once/fencing/freshness/failover a
 for n in 1 2 3; do stop_keeper_at "$E2E_DIR/vk-$n.pid"; done
 rm -rf "$E2E_DIR"/vk-*
 
-# p7-4: the negative proof — verify must CATCH a lying tail. A wiper loop
-# deletes the scratch tail's segment directories out from under the run;
-# the durability re-proof cannot hold and the run must exit NONZERO with
-# the durability suite marked FAIL (never a silent pass).
+# p7-4: verify must report an unusable scratch tail as a failed suite.
+# Preserve the intercepted directory as evidence and replace its original
+# path with a file. Unlike repeatedly deleting directories, this fault cannot
+# heal when the server recreates its WAL path between watcher polls.
 VF_SAB="$E2E_DIR/verify-sabotage"
 rm -rf "$VF_SAB"; mkdir -p "$VF_SAB"
-( while :; do rm -rf "$VF_SAB"/icegres_verify_*/ 2>/dev/null; sleep 0.05; done ) &
+python3 - "$VF_SAB" <<'PYFAULT' &
+import pathlib, sys, time
+root = pathlib.Path(sys.argv[1]).resolve()
+assert root.name == "verify-sabotage"
+(root / "watcher.ready").touch()
+deadline = time.monotonic() + 30
+while time.monotonic() < deadline:
+    for candidate in root.glob("icegres_verify_*"):
+        if candidate.is_dir() and not candidate.is_symlink():
+            candidate.rename(root / "withheld-wal")
+            candidate.write_text("deliberately unusable verification tail\n")
+            (root / "fault.applied").touch()
+            sys.exit(0)
+    time.sleep(.001)
+sys.exit("verification never created its scratch tail")
+PYFAULT
 VF_WIPER=$!
+for _ in $(seq 1 100); do
+  [[ -f "$VF_SAB/watcher.ready" ]] && break
+  sleep 0.01
+done
+[[ -f "$VF_SAB/watcher.ready" ]] || fail "tail fault watcher did not start"
 set +e
 "$BIN" verify --suite durability --tail-dir "$VF_SAB" --json \
   >"$E2E_DIR/p7-sabotage.json" 2>"$E2E_DIR/p7-sabotage.err"
@@ -1462,7 +1482,8 @@ p7_rc=$?
 set -e
 kill "$VF_WIPER" 2>/dev/null || true
 wait "$VF_WIPER" 2>/dev/null || true
-[[ $p7_rc -ne 0 ]] || fail "verify PASSED against a sabotaged tail (the report told a lie)"
+[[ -f "$VF_SAB/fault.applied" ]] || fail "tail fault was not applied"
+[[ $p7_rc -ne 0 ]] || fail "verify accepted an unusable scratch tail"
 assert_eq "sabotaged tail: the durability suite is marked FAIL in the report" "FAIL" \
   "$(jq -r '[.checks[] | select(.suite=="durability") | .status] | unique | join("|")' "$E2E_DIR/p7-sabotage.json")"
 pass "verify FAILS against a sabotaged tail (exit $p7_rc — the lie is caught, not reported green)"
