@@ -87,9 +87,10 @@
 //!
 //! * Format v2, unpartitioned tables, Parquet data files, no delete
 //!   manifests — anything else is rejected before any write.
-//! * DML/PK validation reads every live file. Replacement output can remain
-//!   resident for a manifest, alongside transaction rows and the final key
-//!   set. The query memory pool does not account for all of these buffers.
+//! * Deterministic row-local DML streams decoded batches from ranged Parquet
+//!   reads. Unsupported expression forms fall back to one decoded file.
+//!   Up to two compressed row groups during prefix replay, writer buffers,
+//!   transaction rows and the final PK set remain outside the query memory pool.
 //! * Predicates/assignment values must be self-contained row expressions:
 //!   subqueries are rejected (they would otherwise be evaluated per-file
 //!   and yield wrong answers).
@@ -130,6 +131,8 @@ use uuid::Uuid;
 
 use crate::context::CATALOG_NAME;
 use crate::CatalogOpts;
+
+mod streaming;
 
 /// Upper bound on optimistic-concurrency attempts (initial try + retries
 /// after 409 conflicts) for AUTOCOMMIT statements. Each retry recomputes
@@ -2132,6 +2135,23 @@ pub async fn prepare_commit(
     branch: &str,
     extra_properties: Option<&HashMap<String, String>>,
 ) -> Result<Option<PreparedCommit>> {
+    let stats = Arc::new(streaming::ScanStats::default());
+    let result =
+        prepare_commit_with_stats(table, ops, pk, branch, extra_properties, stats.clone()).await;
+    tracing::debug!(table = %table.identifier(), counters = ?stats, "DML preparation storage and batch counters");
+    result
+}
+
+async fn prepare_commit_with_stats(
+    table: &Table,
+    ops: &[TableOp],
+    pk: Option<&[String]>,
+    branch: &str,
+    extra_properties: Option<&HashMap<String, String>>,
+    stats: Arc<streaming::ScanStats>,
+) -> Result<Option<PreparedCommit>> {
+    use futures::TryStreamExt;
+    use std::sync::atomic::Ordering;
     let metadata = table.metadata();
 
     // ICEGRES_QUERY_TIMING write budget (timing.rs module docs): per-stage
@@ -2194,6 +2214,9 @@ pub async fn prepare_commit(
     // Existing files must be scanned when DML can touch them, or when the
     // final key set must be assembled for PK enforcement.
     let need_file_scan = has_dml || pk.is_some();
+    let programs = streaming::compile_ops(ops, &arrow_target);
+    let candidates =
+        streaming::candidate_files(table, head_id, ops, programs.as_deref(), &arrow_target).await?;
 
     let mut rows_by_op = vec![0u64; ops.len()];
     let commit_uuid = Uuid::new_v4();
@@ -2245,122 +2268,141 @@ pub async fn prepare_commit(
             let (entries, _meta) = manifest.into_parts();
 
             let mut rewrite_manifest = false;
-            // (entry index, fate) for live entries of this manifest.
-            let mut fates: Vec<(usize, FileFate)> = Vec::new();
+            // Only metadata survives each file. Replacement batches are staged
+            // immediately, never retained until the manifest is classified.
+            let mut fates: Vec<(usize, bool)> = Vec::new();
             for (idx, entry) in entries.iter().enumerate() {
                 if !entry.is_alive() {
-                    // Entry already deleted by an earlier snapshot: drop it
-                    // from the new manifest (spec: DELETED entries live only
-                    // in the snapshot that deleted them).
                     rewrite_manifest = true;
                     continue;
                 }
+                stats.files.fetch_add(1, Ordering::Relaxed);
                 let t = timing.then(Instant::now);
-                let file_schema =
-                    read_parquet_arrow_schema(file_io, entry.data_file().file_path()).await?;
-                ensure_write_schema(&file_schema, &arrow_target).with_context(|| {
+                let source =
+                    streaming::ParquetSource::open(file_io, entry.data_file(), stats.clone())
+                        .await?;
+                ensure_write_schema(source.schema(), &arrow_target).with_context(|| {
                     format!(
                         "refusing unsafe rewrite or key validation of {} in {}",
                         entry.data_file().file_path(),
                         table.identifier()
                     )
                 })?;
-                let batches = read_parquet_file(file_io, entry.data_file()).await?;
                 stage(&mut t_file_scan, t);
-                let rows_in: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
-                let fate = if has_dml {
-                    // RecordBatch clones share Arc'd buffers — cheap; the
-                    // original stays available for PK collection on Keep.
+                let candidate = candidates
+                    .as_ref()
+                    .is_none_or(|paths| paths.contains(entry.data_file().file_path()));
+                let changed = if !has_dml || !candidate {
+                    if !candidate {
+                        stats.pruned_files.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if let Some(keys) = pk {
+                        stats.pk_only_files.fetch_add(1, Ordering::Relaxed);
+                        let t = timing.then(Instant::now);
+                        streaming::read_keys(&source, keys, &arrow_target, &mut pk_rows, &stats)
+                            .await?;
+                        stage(&mut t_file_scan, t);
+                    }
+                    false
+                } else if let Some(programs) = &programs {
+                    stats.streamed_files.fetch_add(1, Ordering::Relaxed);
+                    if data_writer.is_none() {
+                        data_writer = Some(new_data_writer(table, &commit_uuid).await?);
+                    }
+                    // Streaming interleaves reading, evaluation and writing.
+                    // Record it as one stage rather than misleading split timings.
+                    let started = timing.then(Instant::now);
+                    let changed = streaming::rewrite_file(
+                        &source,
+                        programs,
+                        &arrow_target,
+                        data_writer.as_mut().expect("created"),
+                        pk,
+                        &mut pk_rows,
+                        &mut rows_by_op,
+                        &stats,
+                    )
+                    .await?;
+                    if let Some(started) = started {
+                        crate::timing::record("streamed_file_rewrite", started.elapsed());
+                    }
+                    changed
+                } else {
+                    stats.fallback_files.fetch_add(1, Ordering::Relaxed);
+                    let t = timing.then(Instant::now);
+                    let batches: Vec<RecordBatch> =
+                        source.stream(None, None, false)?.try_collect().await?;
+                    stage(&mut t_file_scan, t);
+                    let input_bytes: usize =
+                        batches.iter().map(RecordBatch::get_array_memory_size).sum();
                     let t = timing.then(Instant::now);
                     let (changed, out) =
-                        fold_dml_ops(ops, 0, &columns, batches.clone(), &mut rows_by_op).await?;
+                        fold_dml_ops(ops, 0, &columns, batches, &mut rows_by_op).await?;
                     stage(&mut t_dml_apply, t);
-                    let rows_out: u64 = out.iter().map(|b| b.num_rows() as u64).sum();
-                    if !changed {
-                        FileFate::Keep
-                    } else if rows_out == 0 {
-                        FileFate::Remove {
-                            matched: rows_in, // informational only
-                        }
-                    } else {
-                        FileFate::Rewrite {
-                            matched: rows_in.saturating_sub(rows_out),
-                            batches: out,
+                    let output_bytes: usize =
+                        out.iter().map(RecordBatch::get_array_memory_size).sum();
+                    stats
+                        .peak_batch_bytes
+                        .fetch_max((input_bytes + output_bytes) as u64, Ordering::Relaxed);
+                    if let Some(keys) = pk {
+                        if !out.is_empty() {
+                            pk_rows.push(project_columns(&out, keys)?);
                         }
                     }
-                } else {
-                    FileFate::Keep
+                    if changed {
+                        if data_writer.is_none() {
+                            data_writer = Some(new_data_writer(table, &commit_uuid).await?);
+                        }
+                        let t = timing.then(Instant::now);
+                        for batch in out {
+                            stats
+                                .output_rows
+                                .fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
+                            data_writer
+                                .as_mut()
+                                .expect("created")
+                                .write(align_batch(&batch, &arrow_target)?)
+                                .await?;
+                        }
+                        stage(&mut t_parquet_encode, t);
+                    }
+                    changed
                 };
-                if let Some(pk_cols) = pk {
-                    // Final rows of this file feed the PK check.
-                    match &fate {
-                        FileFate::Keep if !batches.is_empty() => {
-                            pk_rows.push(project_columns(&batches, pk_cols)?);
-                        }
-                        FileFate::Rewrite { batches, .. } if !batches.is_empty() => {
-                            pk_rows.push(project_columns(batches, pk_cols)?);
-                        }
-                        _ => {}
-                    }
+                if changed {
+                    any_file_changed = true;
+                    rewrite_manifest = true;
+                } else {
+                    kept_files += 1;
+                    kept_records += entry.data_file().record_count();
+                    kept_bytes += entry.data_file().file_size_in_bytes();
                 }
-                match &fate {
-                    FileFate::Keep => {
-                        kept_files += 1;
-                        kept_records += entry.data_file().record_count();
-                        kept_bytes += entry.data_file().file_size_in_bytes();
-                    }
-                    FileFate::Remove { .. } | FileFate::Rewrite { .. } => {
-                        any_file_changed = true;
-                        rewrite_manifest = true;
-                    }
-                }
-                fates.push((idx, fate));
+                fates.push((idx, changed));
             }
 
             if !rewrite_manifest {
                 carried.push(manifest_file.clone());
                 continue;
             }
-            for (idx, fate) in fates {
+            for (idx, changed) in fates {
                 let entry = &entries[idx];
                 let data_seq = entry
                     .sequence_number()
                     .unwrap_or(manifest_file.sequence_number);
                 let file_seq = entry.file_sequence_number;
-                match fate {
-                    FileFate::Keep => {
-                        existing.push((
-                            entry.data_file().clone(),
-                            entry
-                                .snapshot_id()
-                                .unwrap_or(manifest_file.added_snapshot_id),
-                            data_seq,
-                            file_seq,
-                        ));
-                    }
-                    FileFate::Remove { .. } | FileFate::Rewrite { .. } => {
-                        removed_files += 1;
-                        removed_records += entry.data_file().record_count();
-                        removed_bytes += entry.data_file().file_size_in_bytes();
-                        deleted.push((entry.data_file().clone(), data_seq, file_seq));
-                        if let FileFate::Rewrite { batches, .. } = fate {
-                            let writer = match data_writer.as_mut() {
-                                Some(w) => w,
-                                None => {
-                                    data_writer = Some(new_data_writer(table, &commit_uuid).await?);
-                                    data_writer.as_mut().expect("just set")
-                                }
-                            };
-                            let t = timing.then(Instant::now);
-                            for batch in batches {
-                                let aligned = align_batch(&batch, &arrow_target)?;
-                                writer.write(aligned).await.map_err(|e| {
-                                    anyhow!("failed to write replacement rows: {e}")
-                                })?;
-                            }
-                            stage(&mut t_parquet_encode, t);
-                        }
-                    }
+                if changed {
+                    removed_files += 1;
+                    removed_records += entry.data_file().record_count();
+                    removed_bytes += entry.data_file().file_size_in_bytes();
+                    deleted.push((entry.data_file().clone(), data_seq, file_seq));
+                } else {
+                    existing.push((
+                        entry.data_file().clone(),
+                        entry
+                            .snapshot_id()
+                            .unwrap_or(manifest_file.added_snapshot_id),
+                        data_seq,
+                        file_seq,
+                    ));
                 }
             }
         }
@@ -3526,6 +3568,550 @@ mod tests {
         assert!(schema_guard.check(Some(table.metadata())).is_ok());
         assert!(schema_guard.check(Some(evolved.metadata())).is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    struct StreamingFixture {
+        table: Table,
+        files: Vec<DataFile>,
+        directory: std::path::PathBuf,
+    }
+
+    impl Drop for StreamingFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    async fn streaming_fixture(file_count: usize, rows_per_file: usize) -> StreamingFixture {
+        use arrow::array::StringArray;
+        use datafusion::parquet::file::properties::WriterProperties;
+        use iceberg::spec::{SortOrder, TableMetadataBuilder, UnboundPartitionSpec};
+        let directory = std::env::temp_dir().join(format!("icegres-streaming-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let metadata = TableMetadataBuilder::new(
+            regression_schema(0, 2),
+            UnboundPartitionSpec::default(),
+            SortOrder::unsorted_order(),
+            directory.to_string_lossy().into_owned(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let table = Table::builder()
+            .identifier(TableIdent::from_strs(["demo", "t"]).unwrap())
+            .file_io(iceberg::io::FileIO::new_with_fs())
+            .metadata(metadata)
+            .build()
+            .unwrap();
+        let schema = Arc::new(schema_to_arrow_schema(table.metadata().current_schema()).unwrap());
+        let mut files = Vec::new();
+        for file_index in 0..file_count {
+            let parquet = ParquetWriterBuilder::new_with_match_mode(
+                WriterProperties::builder()
+                    .set_max_row_group_size(4096)
+                    .build(),
+                table.metadata().current_schema().clone(),
+                FieldMatchMode::Name,
+            );
+            let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+                parquet,
+                table.file_io().clone(),
+                DefaultLocationGenerator::new(table.metadata().clone()).unwrap(),
+                DefaultFileNameGenerator::new(
+                    format!("fixture-{file_index}"),
+                    None,
+                    DataFileFormat::Parquet,
+                ),
+            );
+            let mut writer = DataFileWriterBuilder::new(rolling)
+                .build(None)
+                .await
+                .unwrap();
+            let start = file_index * rows_per_file;
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(
+                        (start..start + rows_per_file).map(|id| id as i64),
+                    )),
+                    Arc::new(StringArray::from_iter_values(
+                        (start..start + rows_per_file)
+                            .map(|id| format!("original-{id:08}-payload")),
+                    )),
+                ],
+            )
+            .unwrap();
+            writer.write(batch).await.unwrap();
+            files.extend(writer.close().await.unwrap());
+        }
+        assert_eq!(files.len(), file_count);
+        let commit = prepare_commit(
+            &table,
+            &[TableOp::AppendFiles(files.clone())],
+            None,
+            "main",
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let table = regression_apply(&table, &commit.request.updates);
+        StreamingFixture {
+            table,
+            files,
+            directory,
+        }
+    }
+
+    async fn streaming_read(table: &Table) -> Vec<(i64, String)> {
+        use arrow::array::StringArray;
+        use futures::TryStreamExt;
+        let batches: Vec<RecordBatch> = table
+            .scan()
+            .build()
+            .unwrap()
+            .to_arrow()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut rows = Vec::new();
+        for batch in batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let values = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            rows.extend((0..batch.num_rows()).map(|i| (ids.value(i), values.value(i).to_string())));
+        }
+        rows.sort();
+        rows
+    }
+
+    fn streaming_op(sql: &str) -> TableOp {
+        TableOp::Dml(crate::dml::parse_single_dml(sql).unwrap().unwrap().0)
+    }
+
+    async fn streaming_prepare(
+        table: &Table,
+        ops: &[TableOp],
+        pk: Option<&[String]>,
+    ) -> (Option<PreparedCommit>, Arc<streaming::ScanStats>) {
+        let stats = Arc::new(streaming::ScanStats::default());
+        let prepared = prepare_commit_with_stats(table, ops, pk, "main", None, stats.clone())
+            .await
+            .unwrap();
+        (prepared, stats)
+    }
+
+    #[tokio::test]
+    async fn streaming_rewrites_many_files_without_manifest_batch_retention() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let fixture = streaming_fixture(5, streaming::BATCH_ROWS * 3).await;
+        let ops = [streaming_op(
+            "UPDATE demo.t SET id=id+1000000, v=concat(v, '-updated')",
+        )];
+        let (prepared, stats) = streaming_prepare(&fixture.table, &ops, None).await;
+        let prepared = prepared.unwrap();
+        assert_eq!(
+            prepared.rows_by_op,
+            vec![(5 * streaming::BATCH_ROWS * 3) as u64]
+        );
+        assert_eq!(stats.streamed_files.load(Relaxed), 5);
+        assert_eq!(stats.fallback_files.load(Relaxed), 0);
+        assert_eq!(stats.prefix_read_bytes.load(Relaxed), 0);
+        // This limit covers several simultaneous batches but is independent of
+        // the five-file manifest's 120k replacement rows.
+        assert!(
+            stats.peak_batch_bytes.load(Relaxed) < 2_000_000,
+            "{stats:?}"
+        );
+        let updated = regression_apply(&fixture.table, &prepared.request.updates);
+        let rows = streaming_read(&updated).await;
+        assert_eq!(rows.len(), 5 * streaming::BATCH_ROWS * 3);
+        for (offset, (id, value)) in rows.iter().enumerate() {
+            assert_eq!(*id, 1_000_000 + offset as i64);
+            assert_eq!(value, &format!("original-{offset:08}-payload-updated"));
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_late_match_copies_prefix_once_and_no_match_writes_nothing() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let count = streaming::BATCH_ROWS * 4;
+        let fixture = streaming_fixture(1, count).await;
+        let (prepared, stats) = streaming_prepare(
+            &fixture.table,
+            &[streaming_op(&format!(
+                "UPDATE demo.t SET v='changed' WHERE id={}",
+                count - 1
+            ))],
+            None,
+        )
+        .await;
+        let prepared = prepared.unwrap();
+        assert_eq!(prepared.rows_by_op, vec![1]);
+        assert!(stats.prefix_read_bytes.load(Relaxed) > 0);
+        assert!(stats.read_bytes.load(Relaxed) <= 2 * fixture.files[0].file_size_in_bytes());
+        assert_eq!(stats.output_rows.load(Relaxed), count as u64);
+        let updated = regression_apply(&fixture.table, &prepared.request.updates);
+        let rows = streaming_read(&updated).await;
+        assert_eq!(rows.len(), count);
+        assert_eq!(rows[count - 1], ((count - 1) as i64, "changed".into()));
+        for (offset, (id, value)) in rows[..count - 1].iter().enumerate() {
+            assert_eq!(*id, offset as i64);
+            assert_eq!(value, &format!("original-{offset:08}-payload"));
+        }
+        // Arithmetic makes pruning unsupported: this is a real decoded no-op.
+        let (none, stats) = streaming_prepare(
+            &fixture.table,
+            &[streaming_op(
+                "UPDATE demo.t SET v='forbidden' WHERE id+1=-1",
+            )],
+            None,
+        )
+        .await;
+        assert!(none.is_none());
+        assert_eq!(stats.streamed_files.load(Relaxed), 1);
+        assert_eq!(stats.output_rows.load(Relaxed), 0);
+        assert_eq!(stats.prefix_read_bytes.load(Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn streaming_prunes_only_proven_nonmatching_files_and_keeps_pk_checks() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let fixture = streaming_fixture(4, 1000).await;
+        let (prepared, stats) = streaming_prepare(
+            &fixture.table,
+            &[streaming_op(
+                "UPDATE demo.t SET v='matched' WHERE 1000 <= id AND id < 2000",
+            )],
+            None,
+        )
+        .await;
+        assert_eq!(stats.pruned_files.load(Relaxed), 3);
+        assert_eq!(stats.streamed_files.load(Relaxed), 1);
+        assert!(
+            stats.read_bytes.load(Relaxed)
+                < fixture
+                    .files
+                    .iter()
+                    .map(|f| f.file_size_in_bytes())
+                    .sum::<u64>()
+                    / 2
+        );
+        let prepared = prepared.unwrap();
+        assert_eq!(prepared.rows_by_op, vec![1000]);
+        let rows =
+            streaming_read(&regression_apply(&fixture.table, &prepared.request.updates)).await;
+        assert_eq!(
+            rows.iter().filter(|(_, value)| value == "matched").count(),
+            1000
+        );
+        let keys = ["id".to_string()];
+        let stats = Arc::new(streaming::ScanStats::default());
+        let error = prepare_commit_with_stats(
+            &fixture.table,
+            &[streaming_op("UPDATE demo.t SET id=2001 WHERE id=1")],
+            Some(&keys),
+            "main",
+            None,
+            stats.clone(),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(
+            error
+                .downcast_ref::<ConstraintViolation>()
+                .unwrap()
+                .sqlstate,
+            "23505"
+        );
+        assert_eq!(stats.pk_only_files.load(Relaxed), 3);
+        // Unsupported OR branch must keep every file eligible.
+        let (prepared, stats) = streaming_prepare(
+            &fixture.table,
+            &[streaming_op("DELETE FROM demo.t WHERE id=1 OR id+1=3001")],
+            None,
+        )
+        .await;
+        assert_eq!(stats.pruned_files.load(Relaxed), 0);
+        assert_eq!(prepared.unwrap().rows_by_op, vec![2]);
+    }
+
+    #[tokio::test]
+    async fn streaming_composed_predicates_use_updated_rows_and_fallback_is_explicit() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let fixture = streaming_fixture(2, 100).await;
+        let (prepared, stats) = streaming_prepare(
+            &fixture.table,
+            &[
+                streaming_op("UPDATE demo.t SET id=id+1000 WHERE id < 100"),
+                streaming_op("DELETE FROM demo.t WHERE id >= 1000"),
+            ],
+            None,
+        )
+        .await;
+        let prepared = prepared.unwrap();
+        assert_eq!(prepared.rows_by_op, vec![100, 100]);
+        assert_eq!(stats.pruned_files.load(Relaxed), 0);
+        let rows =
+            streaming_read(&regression_apply(&fixture.table, &prepared.request.updates)).await;
+        assert_eq!(rows.len(), 100);
+        assert!(rows.iter().all(|(id, _)| (100..200).contains(id)));
+        let (prepared, stats) = streaming_prepare(
+            &fixture.table,
+            &[streaming_op(
+                "UPDATE demo.t SET v=CAST(random() AS VARCHAR) WHERE id=0",
+            )],
+            None,
+        )
+        .await;
+        assert_eq!(stats.streamed_files.load(Relaxed), 0);
+        assert_eq!(stats.fallback_files.load(Relaxed), 2);
+        assert_eq!(prepared.unwrap().rows_by_op, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn streaming_preserves_simultaneous_assignments_nulls_and_full_delete_counts() {
+        use arrow::array::StringArray;
+        use futures::TryStreamExt;
+        use std::sync::atomic::Ordering::Relaxed;
+        let fixture = streaming_fixture(2, 4).await;
+        let schema =
+            Arc::new(schema_to_arrow_schema(fixture.table.metadata().current_schema()).unwrap());
+        let null_row = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![None])),
+                Arc::new(StringArray::from(vec![Some("null-key")])),
+            ],
+        )
+        .unwrap();
+        let appended = prepare_commit(
+            &fixture.table,
+            &[TableOp::Append(vec![null_row])],
+            None,
+            "main",
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let table = regression_apply(&fixture.table, &appended.request.updates);
+        let (prepared, _) = streaming_prepare(
+            &table,
+            &[streaming_op(
+                "UPDATE demo.t SET id=id+10, v=CAST(id AS VARCHAR) WHERE id >= 0",
+            )],
+            None,
+        )
+        .await;
+        let prepared = prepared.unwrap();
+        assert_eq!(prepared.rows_by_op, vec![8]);
+        let updated = regression_apply(&table, &prepared.request.updates);
+        let batches: Vec<RecordBatch> = updated
+            .scan()
+            .build()
+            .unwrap()
+            .to_arrow()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut saw_null = false;
+        let mut values = Vec::new();
+        for batch in batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let strings = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                if ids.is_null(row) {
+                    saw_null = true;
+                    assert_eq!(strings.value(row), "null-key");
+                } else {
+                    values.push(ids.value(row));
+                    assert_eq!(strings.value(row), (ids.value(row) - 10).to_string());
+                }
+            }
+        }
+        assert!(saw_null);
+        values.sort();
+        assert_eq!(values, (10..18).collect::<Vec<i64>>());
+        let (prepared, stats) =
+            streaming_prepare(&updated, &[streaming_op("DELETE FROM demo.t")], None).await;
+        let prepared = prepared.unwrap();
+        assert_eq!(prepared.rows_by_op, vec![9]);
+        assert_eq!(stats.output_rows.load(Relaxed), 0);
+        let deleted = regression_apply(&updated, &prepared.request.updates);
+        let batches: Vec<RecordBatch> = deleted
+            .scan()
+            .build()
+            .unwrap()
+            .to_arrow()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+    }
+
+    #[tokio::test]
+    async fn streaming_composite_pk_keeps_declared_column_order() {
+        let fixture = streaming_fixture(2, 4).await;
+        let keys = ["v".to_string(), "id".to_string()];
+        let error = prepare_commit(
+            &fixture.table,
+            &[streaming_op(
+                "UPDATE demo.t SET id=5, v='original-00000005-payload' WHERE id=1",
+            )],
+            Some(&keys),
+            "main",
+            None,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(
+            error
+                .downcast_ref::<ConstraintViolation>()
+                .unwrap()
+                .sqlstate,
+            "23505"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_missing_file_metrics_keep_all_candidates() {
+        use iceberg::spec::{
+            DataContentType, DataFileBuilder, SortOrder, TableMetadataBuilder, UnboundPartitionSpec,
+        };
+        use std::sync::atomic::Ordering::Relaxed;
+        let fixture = streaming_fixture(2, 1000).await;
+        let metadata = TableMetadataBuilder::new(
+            regression_schema(0, 2),
+            UnboundPartitionSpec::default(),
+            SortOrder::unsorted_order(),
+            fixture
+                .directory
+                .join("without-metrics")
+                .to_string_lossy()
+                .into_owned(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let table = Table::builder()
+            .identifier(fixture.table.identifier().clone())
+            .file_io(fixture.table.file_io().clone())
+            .metadata(metadata)
+            .build()
+            .unwrap();
+        let files = fixture
+            .files
+            .iter()
+            .map(|file| {
+                DataFileBuilder::default()
+                    .content(DataContentType::Data)
+                    .file_path(file.file_path().to_string())
+                    .file_format(DataFileFormat::Parquet)
+                    .record_count(file.record_count())
+                    .file_size_in_bytes(file.file_size_in_bytes())
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        let prepared = prepare_commit(&table, &[TableOp::AppendFiles(files)], None, "main", None)
+            .await
+            .unwrap()
+            .unwrap();
+        let table = regression_apply(&table, &prepared.request.updates);
+        let (prepared, stats) = streaming_prepare(
+            &table,
+            &[streaming_op("DELETE FROM demo.t WHERE id=1")],
+            None,
+        )
+        .await;
+        assert_eq!(stats.pruned_files.load(Relaxed), 0);
+        assert_eq!(stats.streamed_files.load(Relaxed), 2);
+        assert_eq!(prepared.unwrap().rows_by_op, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn streaming_nested_field_identity_is_checked_from_real_parquet_footer() {
+        use arrow::array::StructArray;
+        use datafusion::parquet::arrow::ArrowWriter;
+        use iceberg::spec::{DataContentType, DataFileBuilder};
+        use std::sync::atomic::Ordering::Relaxed;
+        let fixture = streaming_fixture(1, 1).await;
+        let field = |name: &str, id: i32, dtype| {
+            Field::new(name, dtype, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                id.to_string(),
+            )]))
+        };
+        let children = arrow::datatypes::Fields::from(vec![field("child", 2, DataType::Int64)]);
+        let schema = Arc::new(Schema::new(vec![field(
+            "nested",
+            1,
+            DataType::Struct(children.clone()),
+        )]));
+        let nested = StructArray::new(
+            children,
+            vec![Arc::new(Int64Array::from_iter_values(0..50000))],
+            None,
+        );
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(nested)]).unwrap();
+        let path = fixture.directory.join("nested.parquet");
+        let mut writer =
+            ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
+        let file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(path.to_string_lossy().into_owned())
+            .file_format(DataFileFormat::Parquet)
+            .record_count(50000)
+            .file_size_in_bytes(size)
+            .build()
+            .unwrap();
+        let stats = Arc::new(streaming::ScanStats::default());
+        let source = streaming::ParquetSource::open(fixture.table.file_io(), &file, stats.clone())
+            .await
+            .unwrap();
+        let current = Schema::new(vec![field(
+            "nested",
+            1,
+            DataType::Struct(vec![field("child", 3, DataType::Int64)].into()),
+        )]);
+        let error = ensure_write_schema(source.schema(), &current).unwrap_err();
+        assert!(error.to_string().contains("row.nested.child"));
+        assert_eq!(stats.read_requests.load(Relaxed), 2);
+        assert!(stats.read_bytes.load(Relaxed) < size / 10);
+        assert_eq!(stats.output_rows.load(Relaxed), 0);
     }
 
     #[test]
