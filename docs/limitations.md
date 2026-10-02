@@ -211,25 +211,34 @@ caveats:
   on the OS/TCP timeouts. Closing this needs a custom OpenDAL storage factory
   wrapping timeout+retry layers — its own hardening round. The *catalog* path
   IS bounded (`ICEGRES_CATALOG_TIMEOUT_MS`/`_RETRIES`).
-- **No per-statement (query) timeout yet.** A pathological query is bounded by
-  the memory pool (it spills, then errors with `ResourcesExhausted`) but not by
-  wall-clock. Statement-timeout integration at the execution layer is a
-  follow-up.
+- **Pgwire does not yet have a complete statement deadline.** The pinned
+  handler's timeout excludes custom hooks and portions of execution/streaming.
+  Flight read-only SQL and metadata now use one deadline from handler entry
+  through planning and streaming, with bounded admission when configured.
+  Flight writes have admission limits but no new execution timer. Client
+  cancellation can still leave a remote commit outcome unknown; it does not
+  prove rollback. See [configuration](configuration.md).
 
 ## Memory under load (per-operation bounds)
 
-Measured with `bench/mem.sh` (server peak RSS, `VmHWM`, one operation per fresh
-server, at 100k–4M rows). Reads and bulk ingest are bounded and do not scale
-with data volume; the remaining growth points are per-operation and listed with
-their hard limits.
+Prior `bench/mem.sh` artifacts measure individual workloads. Current limits
+cover specific owners and do not establish a hard process RSS ceiling.
 
-- **Reads stream — bounded.** Both `SELECT` over pgwire and Flight `DoGet`
-  execute the plan as a lazy `SendableRecordBatchStream` and encode
-  batch-by-batch with socket / HTTP-2 backpressure; a full result set is never
-  materialized. Peak RSS is bounded by one in-flight record batch per scan
-  partition (≈ scan parallelism × row-group size), not by result-set size — a
-  50M-row `SELECT` streams. The only full-materialization read path is gated
-  behind the diagnostic `ICEGRES_QUERY_TIMING=1` (off in production).
+- **Autocommit reads stream.** Normal pgwire SELECT and Flight DoGet encode
+  results batch by batch. Operator state, scan concurrency, row groups, and
+  decoding still consume memory. Flight's one-item producer channel bounds its
+  queued encoded output and a configured absolute deadline also stops an idle
+  producer. Pgwire diagnostic timing still collects complete results; Flight
+  timing uses the streaming path.
+- **Explicit transactions have retained Arrow limits.** INSERT inputs, eager
+  SELECT results, the first DML table materialization, and rewritten output are
+  collected incrementally. Defaults are 256 MiB per transaction and 1 GiB shared,
+  set by `ICEGRES_TXN_MAX_BYTES` and `ICEGRES_TXN_TOTAL_MAX_BYTES`. Reservations
+  survive with result streams until they drop, and old/new state both count
+  during a rewrite. Exceeding a retained limit raises `53200` and aborts the
+  transaction. Decoder temporaries, COMMIT-time assembly, metadata, and other
+  non-participating allocations remain outside these counters. Runtime memory
+  pools cover participating operators separately.
 - **Bulk ingest streams — bounded.** Flight `CommandStatementIngest` (ADBC
   `adbc_ingest`) writes the upload straight to Parquet through a rolling writer
   as batches arrive and commits one fast-append; peak RSS is bounded by the
