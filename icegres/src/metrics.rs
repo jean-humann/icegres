@@ -86,22 +86,18 @@ pub struct Metrics {
     pub peer_tail_ages_ms: Mutex<HashMap<String, u64>>,
 
     // --- Arrow Flight SQL listener (flight.rs) -----------------------------
-    /// Data-producing Flight RPCs handled (DoGet query streams; metadata
-    /// RPCs are not counted). Counter.
+    /// Admitted Flight SQL, metadata, and tail operations. Counter.
     pub flight_rpcs_total: AtomicU64,
-    /// Flight query streams currently in flight (gauge): rises with load and
-    /// is bounded by `--flight-max-concurrent-rpcs` when set.
+    /// Active admitted Flight operations. Subscriptions have their own cap.
     pub flight_rpcs_in_flight: AtomicU64,
-    /// Summed wall-clock of completed Flight query streams (ms). Divide by
+    /// Summed wall-clock of completed admitted Flight operations (ms). Divide by
     /// `flight_rpcs_total` for a rolling average.
     pub flight_rpc_duration_ms_total: AtomicU64,
-    /// Result bytes streamed to Flight clients (Arrow IPC body bytes, i.e.
-    /// post-compression on the wire). Counter.
+    /// Encoded FlightData bytes queued for transport, including message
+    /// headers and application metadata. Counter.
     pub flight_bytes_out_total: AtomicU64,
-    /// Flight query streams aborted by a resource guard — statement timeout
-    /// (`--flight-statement-timeout-ms`) or result cap
-    /// (`--flight-max-result-bytes`). Counter; a spike means dashboards are
-    /// issuing queries the limits are built to stop.
+    /// Stream producers stopped by deadline, result cap, or execution error.
+    /// Does not count queue/handler errors before a stream is constructed.
     pub flight_rpcs_aborted_total: AtomicU64,
     /// Failed Flight authentications (handshake + per-RPC Basic; bad
     /// credentials only, not missing-header). Counter.
@@ -219,19 +215,19 @@ impl Metrics {
              mirrors fall back to commit cadence).\n\
              # TYPE icegres_peer_tail_age_max_ms gauge\n\
              icegres_peer_tail_age_max_ms {pta}\n\
-             # HELP icegres_flight_rpcs_total Data-producing Flight query streams handled.\n\
+             # HELP icegres_flight_rpcs_total Admitted Flight SQL, metadata, and tail operations.\n\
              # TYPE icegres_flight_rpcs_total counter\n\
              icegres_flight_rpcs_total {frt}\n\
-             # HELP icegres_flight_rpcs_in_flight Flight query streams currently executing.\n\
+             # HELP icegres_flight_rpcs_in_flight Admitted Flight operations currently active.\n\
              # TYPE icegres_flight_rpcs_in_flight gauge\n\
              icegres_flight_rpcs_in_flight {frif}\n\
              # HELP icegres_flight_rpc_duration_ms_total Summed Flight query stream wall-clock (ms).\n\
              # TYPE icegres_flight_rpc_duration_ms_total counter\n\
              icegres_flight_rpc_duration_ms_total {frd}\n\
-             # HELP icegres_flight_bytes_out_total Arrow IPC result body bytes streamed to Flight clients.\n\
+             # HELP icegres_flight_bytes_out_total Encoded FlightData bytes queued for Flight clients.\n\
              # TYPE icegres_flight_bytes_out_total counter\n\
              icegres_flight_bytes_out_total {fbo}\n\
-             # HELP icegres_flight_rpcs_aborted_total Flight query streams stopped by the statement timeout or result cap.\n\
+             # HELP icegres_flight_rpcs_aborted_total Flight stream producers stopped by deadline, result cap, or execution error.\n\
              # TYPE icegres_flight_rpcs_aborted_total counter\n\
              icegres_flight_rpcs_aborted_total {fra}\n\
              # HELP icegres_flight_auth_failures_total Failed Flight authentications (bad credentials).\n\

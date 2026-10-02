@@ -498,26 +498,25 @@ enum Command {
               default_value_t = ResultCompression::Zstd)]
         result_compression: ResultCompression,
 
-        /// Wall-clock ceiling per DoGet query stream, in milliseconds
-        /// (0 = unbounded). A query running past it is aborted with
-        /// DEADLINE_EXCEEDED instead of holding an executor thread — the
-        /// guard against a runaway dashboard `SELECT`. Applies to the Flight
-        /// data path only (metadata RPCs are exempt).
+        /// Read-only SQL and metadata deadline from handler entry through
+        /// admission, planning, and response streaming. 0 is unbounded.
+        /// Writes use this timeout only while waiting for admission.
         #[arg(long, env = "ICEGRES_FLIGHT_STATEMENT_TIMEOUT_MS", default_value_t = 0)]
         flight_statement_timeout_ms: u64,
 
-        /// Byte ceiling per DoGet result (0 = unbounded), counted over the
-        /// Arrow IPC body streamed. A result past it is cut with
-        /// RESOURCE_EXHAUSTED — stops a `SELECT *` on a huge table from
-        /// streaming gigabytes into a browser tab.
+        /// Complete encoded FlightData byte ceiling per finite DoGet result.
+        /// 0 is unbounded; exceeded limits return RESOURCE_EXHAUSTED.
         #[arg(long, env = "ICEGRES_FLIGHT_MAX_RESULT_BYTES", default_value_t = 0)]
         flight_max_result_bytes: u64,
 
-        /// Cap on concurrent in-flight DoGet query streams (0 = uncapped) —
-        /// the Flight analogue of pgwire `--max-connections`. Excess RPCs
-        /// wait at the choke point rather than spawning unbounded scans.
+        /// Active SQL/metadata RPC cap, including planning and writes.
+        /// 0 is uncapped. Excess requests use the bounded admission queue.
         #[arg(long, env = "ICEGRES_FLIGHT_MAX_CONCURRENT_RPCS", default_value_t = 0)]
         flight_max_concurrent_rpcs: usize,
+
+        /// Maximum RPCs waiting for Flight admission; 0 rejects overload immediately.
+        #[arg(long, env = "ICEGRES_FLIGHT_MAX_QUEUED_RPCS", default_value_t = 64)]
+        flight_max_queued_rpcs: usize,
 
         /// Serve the HTTP liveness/metrics endpoint (`/health`, `/ready`,
         /// `/metrics`) on this port, as `icegres serve --health-port` does —
@@ -955,6 +954,7 @@ async fn main() -> Result<()> {
             flight_statement_timeout_ms,
             flight_max_result_bytes,
             flight_max_concurrent_rpcs,
+            flight_max_queued_rpcs,
             flight_health_port,
             read_only,
         } => {
@@ -990,6 +990,7 @@ async fn main() -> Result<()> {
                         .then_some(flight_max_result_bytes),
                     max_concurrent_rpcs: (flight_max_concurrent_rpcs > 0)
                         .then_some(flight_max_concurrent_rpcs),
+                    max_queued_rpcs: flight_max_queued_rpcs,
                     health_port: flight_health_port,
                     read_only,
                 },
