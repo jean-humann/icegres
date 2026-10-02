@@ -79,6 +79,18 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
 Full account: [`docs/catalog-support.md`](catalog-support.md). Summary of the
 caveats:
 
+- A confirmed external table or namespace deletion removes the missing table
+  and its metadata references from the running compute's cached inventory.
+  Catalog introspection for unrelated tables can continue. Metadata loading
+  still reports authentication failures, timeouts and other catalog errors.
+  Transactions that already pinned the table retain their read view while the
+  referenced data files remain available; writes still validate the table
+  UUID, schema and snapshot before committing.
+- External creation of tables and namespaces does not refresh that inventory.
+  After a deletion has been observed, recreating the same table name also
+  requires a compute restart to construct a new catalog context. Reconnecting
+  to the same process does not rebuild it. This discovery limitation is
+  separate from refreshing snapshots of tables the compute already knows.
 - **Serve any Iceberg REST catalog, with two auth flows.** icegres uses only
   REST-spec-standard endpoints (no Lakekeeper-proprietary calls). Auth is now
   configurable: `--catalog-token` (pre-minted bearer), `--catalog-credential`
