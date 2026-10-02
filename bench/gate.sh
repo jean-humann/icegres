@@ -5,7 +5,7 @@
 #        [<baseline-parity.json> <candidate-parity.json>] [--skip-e2e]
 #
 # FAILS if:
-#   - any latency metric p50 worsens by more than 20% vs baseline;
+#   - any latency metric p50 or p95 worsens by more than 20% vs baseline;
 #   - qps_8conn drops by more than 10%;
 #   - resource footprint regresses: rss_peak_mb or rss_idle_mb worsens by
 #     more than 25%, or binary_size_mb by more than 10% (performance must be
@@ -42,6 +42,12 @@ done
 
 FAILURES=0
 note_fail() { FAILURES=$((FAILURES + 1)); }
+
+# Validate all numeric fields and sample counts before jq comparisons. This
+# also gates p95, so a faster median cannot conceal a tail-latency regression.
+if ! python3 "$SCRIPT_DIR/check_metrics.py" "$BASE" "$CAND"; then
+  note_fail
+fi
 
 LATENCY_METRICS=(connect_ms point_lookup_ms filtered_scan_ms aggregate_ms join_ms
                  insert_single_ms insert_batch100_ms freshness_ms cold_start_ms)
@@ -108,12 +114,14 @@ done
 if [[ -n "$PBASE" ]]; then
   echo
   echo "=== parity gate: $(basename "$PBASE") -> $(basename "$PCAND") ==="
-  downgrades=$(jq -n --slurpfile b "$PBASE" --slurpfile c "$PCAND" '
+  if ! downgrades=$(jq -n --slurpfile b "$PBASE" --slurpfile c "$PCAND" '
     ($b[0].probes | map({key:.id, value:.verdict}) | from_entries) as $bv |
     ($c[0].probes | map({key:.id, value:.verdict}) | from_entries) as $cv |
     [ $bv | to_entries[] | select(.value == "PASS" and ($cv[.key] // "MISSING") != "PASS")
-      | "\(.key): PASS -> \($cv[.key] // "MISSING")" ] | .[]' -r)
-  if [[ -n "$downgrades" ]]; then
+      | "\(.key): PASS -> \($cv[.key] // "MISSING")" ] | .[]' -r); then
+    echo "parity result is invalid"
+    note_fail
+  elif [[ -n "$downgrades" ]]; then
     echo "$downgrades" | sed 's/^/DOWNGRADE /'
     while IFS= read -r _; do note_fail; done <<<"$downgrades"
   else
@@ -139,13 +147,13 @@ fi
 echo
 
 # --- browser-direct Flight gate ----------------------------------------------
-# The frontend data path in a real browser (SKIPs itself when node/Chromium/
-# the stack are absent, exit 0). Gated with e2e since it needs the live stack.
+# The frontend data path in a real browser. Required prerequisites fail this
+# release gate. It runs with e2e because it needs the live stack.
 if [[ "$SKIP_E2E" == 1 ]]; then
   echo "=== browser-flight: SKIPPED (--skip-e2e) ==="
 else
   echo "=== browser-flight: running tests/browser-flight.sh ==="
-  if bash "$REPO_DIR/tests/browser-flight.sh" >"$SCRIPT_DIR/.run/gate-browser.log" 2>&1; then
+  if ICEGRES_REQUIRE_LIVE_TESTS=1 bash "$REPO_DIR/tests/browser-flight.sh" >"$SCRIPT_DIR/.run/gate-browser.log" 2>&1; then
     tail -n 1 "$SCRIPT_DIR/.run/gate-browser.log"
   else
     echo "browser-flight FAILED — tail of bench/.run/gate-browser.log:"
