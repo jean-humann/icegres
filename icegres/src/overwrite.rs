@@ -87,9 +87,10 @@
 //!
 //! * Format v2, unpartitioned tables, Parquet data files, no delete
 //!   manifests — anything else is rejected before any write.
-//! * DML/PK validation reads every live file. Replacement output can remain
-//!   resident for a manifest, alongside transaction rows and the final key
-//!   set. The query memory pool does not account for all of these buffers.
+//! * Deterministic row-local DML streams decoded batches from ranged Parquet
+//!   reads. Unsupported expression forms fall back to one decoded file.
+//!   Up to two compressed row groups during prefix replay, writer buffers,
+//!   transaction rows and the final PK set remain outside the query memory pool.
 //! * Predicates/assignment values must be self-contained row expressions:
 //!   subqueries are rejected (they would otherwise be evaluated per-file
 //!   and yield wrong answers).
@@ -130,6 +131,8 @@ use uuid::Uuid;
 
 use crate::context::CATALOG_NAME;
 use crate::CatalogOpts;
+
+mod streaming;
 
 /// Upper bound on optimistic-concurrency attempts (initial try + retries
 /// after 409 conflicts) for AUTOCOMMIT statements. Each retry recomputes
@@ -2132,6 +2135,23 @@ pub async fn prepare_commit(
     branch: &str,
     extra_properties: Option<&HashMap<String, String>>,
 ) -> Result<Option<PreparedCommit>> {
+    let stats = Arc::new(streaming::ScanStats::default());
+    let result =
+        prepare_commit_with_stats(table, ops, pk, branch, extra_properties, stats.clone()).await;
+    tracing::debug!(table = %table.identifier(), counters = ?stats, "DML preparation storage and batch counters");
+    result
+}
+
+async fn prepare_commit_with_stats(
+    table: &Table,
+    ops: &[TableOp],
+    pk: Option<&[String]>,
+    branch: &str,
+    extra_properties: Option<&HashMap<String, String>>,
+    stats: Arc<streaming::ScanStats>,
+) -> Result<Option<PreparedCommit>> {
+    use futures::TryStreamExt;
+    use std::sync::atomic::Ordering;
     let metadata = table.metadata();
 
     // ICEGRES_QUERY_TIMING write budget (timing.rs module docs): per-stage
@@ -2194,6 +2214,9 @@ pub async fn prepare_commit(
     // Existing files must be scanned when DML can touch them, or when the
     // final key set must be assembled for PK enforcement.
     let need_file_scan = has_dml || pk.is_some();
+    let programs = streaming::compile_ops(ops, &arrow_target);
+    let candidates =
+        streaming::candidate_files(table, head_id, ops, programs.as_deref(), &arrow_target).await?;
 
     let mut rows_by_op = vec![0u64; ops.len()];
     let commit_uuid = Uuid::new_v4();
@@ -2245,122 +2268,141 @@ pub async fn prepare_commit(
             let (entries, _meta) = manifest.into_parts();
 
             let mut rewrite_manifest = false;
-            // (entry index, fate) for live entries of this manifest.
-            let mut fates: Vec<(usize, FileFate)> = Vec::new();
+            // Only metadata survives each file. Replacement batches are staged
+            // immediately, never retained until the manifest is classified.
+            let mut fates: Vec<(usize, bool)> = Vec::new();
             for (idx, entry) in entries.iter().enumerate() {
                 if !entry.is_alive() {
-                    // Entry already deleted by an earlier snapshot: drop it
-                    // from the new manifest (spec: DELETED entries live only
-                    // in the snapshot that deleted them).
                     rewrite_manifest = true;
                     continue;
                 }
+                stats.files.fetch_add(1, Ordering::Relaxed);
                 let t = timing.then(Instant::now);
-                let file_schema =
-                    read_parquet_arrow_schema(file_io, entry.data_file().file_path()).await?;
-                ensure_write_schema(&file_schema, &arrow_target).with_context(|| {
+                let source =
+                    streaming::ParquetSource::open(file_io, entry.data_file(), stats.clone())
+                        .await?;
+                ensure_write_schema(source.schema(), &arrow_target).with_context(|| {
                     format!(
                         "refusing unsafe rewrite or key validation of {} in {}",
                         entry.data_file().file_path(),
                         table.identifier()
                     )
                 })?;
-                let batches = read_parquet_file(file_io, entry.data_file()).await?;
                 stage(&mut t_file_scan, t);
-                let rows_in: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
-                let fate = if has_dml {
-                    // RecordBatch clones share Arc'd buffers — cheap; the
-                    // original stays available for PK collection on Keep.
+                let candidate = candidates
+                    .as_ref()
+                    .is_none_or(|paths| paths.contains(entry.data_file().file_path()));
+                let changed = if !has_dml || !candidate {
+                    if !candidate {
+                        stats.pruned_files.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if let Some(keys) = pk {
+                        stats.pk_only_files.fetch_add(1, Ordering::Relaxed);
+                        let t = timing.then(Instant::now);
+                        streaming::read_keys(&source, keys, &arrow_target, &mut pk_rows, &stats)
+                            .await?;
+                        stage(&mut t_file_scan, t);
+                    }
+                    false
+                } else if let Some(programs) = &programs {
+                    stats.streamed_files.fetch_add(1, Ordering::Relaxed);
+                    if data_writer.is_none() {
+                        data_writer = Some(new_data_writer(table, &commit_uuid).await?);
+                    }
+                    // Streaming interleaves reading, evaluation and writing.
+                    // Record it as one stage rather than misleading split timings.
+                    let started = timing.then(Instant::now);
+                    let changed = streaming::rewrite_file(
+                        &source,
+                        programs,
+                        &arrow_target,
+                        data_writer.as_mut().expect("created"),
+                        pk,
+                        &mut pk_rows,
+                        &mut rows_by_op,
+                        &stats,
+                    )
+                    .await?;
+                    if let Some(started) = started {
+                        crate::timing::record("streamed_file_rewrite", started.elapsed());
+                    }
+                    changed
+                } else {
+                    stats.fallback_files.fetch_add(1, Ordering::Relaxed);
+                    let t = timing.then(Instant::now);
+                    let batches: Vec<RecordBatch> =
+                        source.stream(None, None, false)?.try_collect().await?;
+                    stage(&mut t_file_scan, t);
+                    let input_bytes: usize =
+                        batches.iter().map(RecordBatch::get_array_memory_size).sum();
                     let t = timing.then(Instant::now);
                     let (changed, out) =
-                        fold_dml_ops(ops, 0, &columns, batches.clone(), &mut rows_by_op).await?;
+                        fold_dml_ops(ops, 0, &columns, batches, &mut rows_by_op).await?;
                     stage(&mut t_dml_apply, t);
-                    let rows_out: u64 = out.iter().map(|b| b.num_rows() as u64).sum();
-                    if !changed {
-                        FileFate::Keep
-                    } else if rows_out == 0 {
-                        FileFate::Remove {
-                            matched: rows_in, // informational only
-                        }
-                    } else {
-                        FileFate::Rewrite {
-                            matched: rows_in.saturating_sub(rows_out),
-                            batches: out,
+                    let output_bytes: usize =
+                        out.iter().map(RecordBatch::get_array_memory_size).sum();
+                    stats
+                        .peak_batch_bytes
+                        .fetch_max((input_bytes + output_bytes) as u64, Ordering::Relaxed);
+                    if let Some(keys) = pk {
+                        if !out.is_empty() {
+                            pk_rows.push(project_columns(&out, keys)?);
                         }
                     }
-                } else {
-                    FileFate::Keep
+                    if changed {
+                        if data_writer.is_none() {
+                            data_writer = Some(new_data_writer(table, &commit_uuid).await?);
+                        }
+                        let t = timing.then(Instant::now);
+                        for batch in out {
+                            stats
+                                .output_rows
+                                .fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
+                            data_writer
+                                .as_mut()
+                                .expect("created")
+                                .write(align_batch(&batch, &arrow_target)?)
+                                .await?;
+                        }
+                        stage(&mut t_parquet_encode, t);
+                    }
+                    changed
                 };
-                if let Some(pk_cols) = pk {
-                    // Final rows of this file feed the PK check.
-                    match &fate {
-                        FileFate::Keep if !batches.is_empty() => {
-                            pk_rows.push(project_columns(&batches, pk_cols)?);
-                        }
-                        FileFate::Rewrite { batches, .. } if !batches.is_empty() => {
-                            pk_rows.push(project_columns(batches, pk_cols)?);
-                        }
-                        _ => {}
-                    }
+                if changed {
+                    any_file_changed = true;
+                    rewrite_manifest = true;
+                } else {
+                    kept_files += 1;
+                    kept_records += entry.data_file().record_count();
+                    kept_bytes += entry.data_file().file_size_in_bytes();
                 }
-                match &fate {
-                    FileFate::Keep => {
-                        kept_files += 1;
-                        kept_records += entry.data_file().record_count();
-                        kept_bytes += entry.data_file().file_size_in_bytes();
-                    }
-                    FileFate::Remove { .. } | FileFate::Rewrite { .. } => {
-                        any_file_changed = true;
-                        rewrite_manifest = true;
-                    }
-                }
-                fates.push((idx, fate));
+                fates.push((idx, changed));
             }
 
             if !rewrite_manifest {
                 carried.push(manifest_file.clone());
                 continue;
             }
-            for (idx, fate) in fates {
+            for (idx, changed) in fates {
                 let entry = &entries[idx];
                 let data_seq = entry
                     .sequence_number()
                     .unwrap_or(manifest_file.sequence_number);
                 let file_seq = entry.file_sequence_number;
-                match fate {
-                    FileFate::Keep => {
-                        existing.push((
-                            entry.data_file().clone(),
-                            entry
-                                .snapshot_id()
-                                .unwrap_or(manifest_file.added_snapshot_id),
-                            data_seq,
-                            file_seq,
-                        ));
-                    }
-                    FileFate::Remove { .. } | FileFate::Rewrite { .. } => {
-                        removed_files += 1;
-                        removed_records += entry.data_file().record_count();
-                        removed_bytes += entry.data_file().file_size_in_bytes();
-                        deleted.push((entry.data_file().clone(), data_seq, file_seq));
-                        if let FileFate::Rewrite { batches, .. } = fate {
-                            let writer = match data_writer.as_mut() {
-                                Some(w) => w,
-                                None => {
-                                    data_writer = Some(new_data_writer(table, &commit_uuid).await?);
-                                    data_writer.as_mut().expect("just set")
-                                }
-                            };
-                            let t = timing.then(Instant::now);
-                            for batch in batches {
-                                let aligned = align_batch(&batch, &arrow_target)?;
-                                writer.write(aligned).await.map_err(|e| {
-                                    anyhow!("failed to write replacement rows: {e}")
-                                })?;
-                            }
-                            stage(&mut t_parquet_encode, t);
-                        }
-                    }
+                if changed {
+                    removed_files += 1;
+                    removed_records += entry.data_file().record_count();
+                    removed_bytes += entry.data_file().file_size_in_bytes();
+                    deleted.push((entry.data_file().clone(), data_seq, file_seq));
+                } else {
+                    existing.push((
+                        entry.data_file().clone(),
+                        entry
+                            .snapshot_id()
+                            .unwrap_or(manifest_file.added_snapshot_id),
+                        data_seq,
+                        file_seq,
+                    ));
                 }
             }
         }
