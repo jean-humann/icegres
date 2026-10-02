@@ -106,8 +106,7 @@ async fn external_drop_does_not_poison_unrelated_catalog_queries() {
     let error = context
         .sql("SELECT * FROM drop_regression.removed")
         .await
-        .err()
-        .expect("the dropped table must not resolve");
+        .expect_err("the dropped table must not resolve");
     assert!(error.to_string().contains("not found"), "{error}");
     assert!(schema.table("removed$snapshots").await.unwrap().is_none());
     assert!(schema.table("removed@123").await.unwrap().is_none());
@@ -186,8 +185,7 @@ async fn catalog_errors_do_not_remove_registered_tables() {
         let error = schema
             .table("removed$snapshots")
             .await
-            .err()
-            .expect("catalog failures must remain visible");
+            .expect_err("catalog failures must remain visible");
         assert!(error.to_string().contains(message));
         assert!(schema.table_exist("removed"));
         assert_eq!(schema.table_names(), before);
@@ -255,8 +253,7 @@ async fn confirmed_drop_cannot_fall_back_to_a_cached_snapshot() {
     let error = provider
         .current_provider()
         .await
-        .err()
-        .expect("known deletion must never serve the retained snapshot");
+        .expect_err("known deletion must never serve the retained snapshot");
     assert!(table_is_missing(&error), "{error}");
 }
 
@@ -291,7 +288,7 @@ async fn drop_filter_preserves_literal_dollar_and_at_names() {
         .as_any()
         .downcast_ref::<CachingSchemaProvider>()
         .unwrap();
-    caching.forget_dropped_table("removed");
+    caching.forget_dropped_table("removed", caching.registration_generation("removed"));
     for name in [
         "removed$other",
         "removed$snapshots",
@@ -327,7 +324,7 @@ async fn successful_explicit_registration_clears_drop_tombstone() {
         CachingSchemaProvider::try_new(inner.clone(), catalog, namespace, None, None, false, None)
             .await
             .unwrap();
-    caching.forget_dropped_table("removed");
+    caching.forget_dropped_table("removed", caching.registration_generation("removed"));
     assert!(caching.was_dropped("removed"));
     // Failed registration must not resurrect a tombstoned entry.
     assert!(caching

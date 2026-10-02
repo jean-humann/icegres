@@ -689,6 +689,7 @@ impl TableProvider for CachingTableProvider {
         input: Arc<dyn ExecutionPlan>,
         insert_op: InsertOp,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.ensure_present().map_err(to_datafusion_error)?;
         // Branch mode routes every INSERT through the overwrite engine (the
         // TxnHook intercepts them before planning reaches this provider);
         // the upstream delegate would fast_append to MAIN, silently leaking
@@ -704,6 +705,7 @@ impl TableProvider for CachingTableProvider {
             .write_delegate
             .insert_into(state, input, insert_op)
             .await?;
+        self.ensure_present().map_err(to_datafusion_error)?;
         // Freshness mode: the upstream provider commits when this plan is
         // EXECUTED, so wrap it to invalidate the cached snapshot as its
         // stream completes — a plan-time invalidation could be cleared by a
@@ -1019,6 +1021,10 @@ pub struct CachingSchemaProvider {
     /// Authoritative physical spellings distinguish literal $/@ names from
     /// synthetic metadata and time-travel references when filtering drops.
     physical_names: RwLock<HashSet<String>>,
+    /// Local DDL generations fence delayed catalog results for older names.
+    /// Hold a read guard through cache publication/forget, and a write guard
+    /// through registration changes and their cache cleanup.
+    registration_generations: RwLock<HashMap<String, u64>>,
     /// Snapshot-pinned time-travel providers (bounded LRU; snapshots are
     /// immutable, so entries never need invalidation — only eviction).
     pinned: PinnedCache,
@@ -1104,6 +1110,7 @@ impl CachingSchemaProvider {
             cached: RwLock::new(map),
             dropped: RwLock::new(HashSet::new()),
             physical_names: RwLock::new(physical_names),
+            registration_generations: RwLock::new(HashMap::new()),
             pinned: PinnedCache::new(),
             write_buffer,
             branch,
@@ -1173,11 +1180,32 @@ impl CachingSchemaProvider {
             .contains(base)
     }
 
-    fn forget_dropped_table(&self, base: &str) {
+    fn registration_generation(&self, base: &str) -> u64 {
+        *self
+            .registration_generations
+            .read()
+            .expect("registration lock poisoned")
+            .get(base)
+            .unwrap_or(&0)
+    }
+
+    fn forget_dropped_table(&self, base: &str, generation: u64) {
+        let registrations = self
+            .registration_generations
+            .read()
+            .expect("registration lock poisoned");
+        if registrations.get(base).copied().unwrap_or(0) != generation {
+            return;
+        }
         self.dropped
             .write()
             .expect("dropped table lock poisoned")
             .insert(base.to_string());
+        self.clear_table_caches(base);
+    }
+
+    /// Caller holds the registration lock through this cleanup.
+    fn clear_table_caches(&self, base: &str) {
         if let Some(provider) = self
             .cached
             .write()
@@ -1190,7 +1218,7 @@ impl CachingSchemaProvider {
             .map
             .write()
             .expect("pinned lock poisoned")
-            .retain(|name, _| !parse_time_travel(name).is_some_and(|(table, _)| table == base));
+            .retain(|name, _| parse_time_travel(name).is_none_or(|(table, _)| table != base));
         if self.freshness_enabled {
             let ident = TableIdent::new(self.namespace.clone(), base.to_string());
             crate::freshness::deregister(&crate::freshness::table_key(&ident));
@@ -1207,6 +1235,7 @@ impl CachingSchemaProvider {
         base: &str,
         snapshot_id: i64,
     ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        let generation = self.registration_generation(base);
         if let Some(provider) = self.pinned.get(name) {
             return Ok(Some(provider as Arc<dyn TableProvider>));
         }
@@ -1217,7 +1246,7 @@ impl CachingSchemaProvider {
         let table = match self.catalog.load_table(&ident).await {
             Ok(table) => table,
             Err(error) if table_is_missing(&error) => {
-                self.forget_dropped_table(base);
+                self.forget_dropped_table(base, generation);
                 return Ok(None);
             }
             Err(error) => return Err(to_datafusion_error(error)),
@@ -1227,7 +1256,13 @@ impl CachingSchemaProvider {
                 .await
                 .map_err(to_datafusion_error)?,
         );
-        self.pinned.insert(name, base, provider.clone());
+        let registrations = self
+            .registration_generations
+            .read()
+            .expect("registration lock poisoned");
+        if registrations.get(base).copied().unwrap_or(0) == generation {
+            self.pinned.insert(name, base, provider.clone());
+        }
         Ok(Some(provider as Arc<dyn TableProvider>))
     }
 }
@@ -1265,9 +1300,10 @@ impl SchemaProvider for CachingSchemaProvider {
         // Metadata tables ($snapshots, $manifests, ...) always come from the
         // inner provider — they are point-in-time views by construction.
         if let Some((base, _)) = name.split_once('$') {
+            let generation = self.registration_generation(base);
             return match self.inner.table(name).await {
                 Err(error) if missing_table_provider_error(&error) => {
-                    self.forget_dropped_table(base);
+                    self.forget_dropped_table(base, generation);
                     Ok(None)
                 }
                 result => result,
@@ -1287,9 +1323,19 @@ impl SchemaProvider for CachingSchemaProvider {
             return Ok(Some(provider));
         }
         // Table created after startup: wrap it lazily so it gets the same
-        // caching treatment.
+        // caching treatment. Local DDL may replace it while lookup is pending.
+        let generation = self.registration_generation(name);
         match self.inner.table(name).await? {
             Some(write_delegate) => {
+                let registrations = self
+                    .registration_generations
+                    .read()
+                    .expect("registration lock poisoned");
+                if registrations.get(name).copied().unwrap_or(0) != generation {
+                    return Err(DataFusionError::Plan(format!(
+                        "table {name:?} registration changed during lookup; retry the statement"
+                    )));
+                }
                 let ident = TableIdent::new(self.namespace.clone(), name.to_string());
                 let provider = Self::build_provider(
                     self.catalog.clone(),
@@ -1316,6 +1362,15 @@ impl SchemaProvider for CachingSchemaProvider {
         table: Arc<dyn TableProvider>,
     ) -> DFResult<Option<Arc<dyn TableProvider>>> {
         let result = self.inner.register_table(name.clone(), table)?;
+        let mut registrations = self
+            .registration_generations
+            .write()
+            .expect("registration lock poisoned");
+        let generation = registrations.entry(name.clone()).or_default();
+        *generation = generation
+            .checked_add(1)
+            .expect("registration generation exhausted");
+        self.clear_table_caches(&name);
         self.physical_names
             .write()
             .expect("physical name lock poisoned")
@@ -1328,16 +1383,18 @@ impl SchemaProvider for CachingSchemaProvider {
     }
 
     fn deregister_table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        self.cached
-            .write()
-            .expect("cache lock poisoned")
-            .remove(name);
-        // DDL fence (freshness mode): a dropped table's provider leaves the
-        // refresher registry invalidated, so neither the freshness fast
-        // path nor a cached plan can ever serve it again.
-        if self.freshness_enabled {
-            let ident = TableIdent::new(self.namespace.clone(), name.to_string());
-            crate::freshness::deregister(&crate::freshness::table_key(&ident));
+        // Invalidate before catalog I/O even if DROP has an uncertain outcome.
+        // Release the lock before the upstream synchronous catalog operation.
+        {
+            let mut registrations = self
+                .registration_generations
+                .write()
+                .expect("registration lock poisoned");
+            let generation = registrations.entry(name.to_string()).or_default();
+            *generation = generation
+                .checked_add(1)
+                .expect("registration generation exhausted");
+            self.clear_table_caches(name);
         }
         self.inner.deregister_table(name)
     }
