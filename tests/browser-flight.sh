@@ -22,7 +22,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 JS_DIR="$ROOT/bench/clients/js"
 PKG_DIR="$ROOT/clients/flight-web"
-BIN="$ROOT/icegres/target/release/icegres"
+BIN="${ICEGRES_BIN:-$ROOT/icegres/target/release/icegres}"
 CATALOG_URI="${ICEGRES_CATALOG_URI:-http://127.0.0.1:8181/catalog}"
 CHROMIUM="${CHROMIUM_PATH:-/opt/pw-browsers/chromium}"
 FLIGHT_PORT="${BROWSER_FLIGHT_PORT:-50060}"
