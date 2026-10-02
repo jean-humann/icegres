@@ -12,7 +12,7 @@ or equivalence to Lakebase.
 
 | PR | Result | Boundary that remains |
 | --- | --- | --- |
-| [22: write and authorization safety](https://github.com/jean-humann/icegres/pull/22) | Authorize SQL wrappers and resolved object identities; enforce read-only replicas and opt-in primary keys across SQL listeners; reject unsafe recursive field-ID/schema changes; retain table identity and schema requirements; report uncertain publication as `40003`; quarantine uncertain buffered commits; reserve buffer bytes before durable staging; make required integration prerequisites fail. | Schema evolution is safely rejected where projection is unsupported. Foreign writers do not inherit Icegres constraints. A timeout does not prove rollback. |
+| [22: write and authorization safety](https://github.com/jean-humann/icegres/pull/22) | Authorize SQL wrappers and resolved object identities; enforce read-only replicas and opt-in primary keys across SQL listeners; reject unsafe recursive field-ID/schema changes; retain table identity and schema requirements; report uncertain publication as `40003`; quarantine uncertain buffered commits; reserve buffer bytes before durable staging; contain confirmed external table drops; make required integration prerequisites fail. | Schema evolution is safely rejected where projection is unsupported. Foreign writers do not inherit Icegres constraints. A timeout does not prove rollback. Foreign table discovery and recreation still require compute restart. |
 | [23: request and transaction budgets](https://github.com/jean-humann/icegres/pull/23) | Bound Flight handler admission, read deadlines and encoded results; limit retained transaction batches with ownership-based reservations, including casts and replacement state. | External client cancellation can interrupt mutation handlers. Decoder temporaries, commit assembly and all process RSS are not fully budgeted. Shared session-setting isolation remains work. |
 | [24: streaming rewrites](https://github.com/jean-humann/icegres/pull/24) | Use ranged Parquet reads and deterministic batch evaluation; stage changed files without retaining a manifest's replacement rows; prune supported single-operation candidates; preserve schema guards and all-file PK checks; expose read-byte and batch counters. | Still copy-on-write. Unsupported expressions use a per-file fallback. Prefix rereads, compressed row groups, writer buffers and retained keys have separate costs. No persistent general-purpose index was added. |
 | [25: quorum resource and placement controls](https://github.com/jean-humann/icegres/pull/25) | Bound acceptor connections, requests and bytes; read bounded WAL ranges; move serialized durable disk work to blocking workers whose ownership survives caller cancellation; add strict three-zone placement for data and lease trios. | Quorum transport remains plaintext on a trusted network. A placement profile and local fault tests do not prove availability across real zones. Automated idle parking remains disabled in the strict profile. |
@@ -24,6 +24,24 @@ schema/table identity across retries, checking keys in pruned files, and
 retaining reservations through asynchronous work. This was substantive source
 review, supplemented by the regression suites below, rather than a substitute
 for execution.
+
+Confirmed external drops now stop poisoning unrelated catalog reflection.
+Missing-table handling clears stale providers and fences delayed responses
+against local registration changes. Authorization, timeout and availability
+errors remain errors rather than evidence of deletion. Existing explicit
+transactions retain their first-touch snapshot while its data files remain
+available; writes retain the commit UUID and schema checks. This does not add a
+database-wide snapshot. A new foreign table or namespace, or foreign recreation
+of an observed-dropped name, still needs a compute restart. Reconnecting alone
+does not rebuild the catalog inventory.
+
+The first PR also repairs captured SQLAlchemy 2.1 reflection queries and three
+notification races in the pinned Iceberg reader. The Iceberg version stays
+unchanged. Deterministic notification tests establish the race correction;
+they do not establish the cause of every observed query stall. Extended-protocol
+SELECT inside an explicit transaction and server-side cursors remain documented
+unsupported cases. The client gate recognizes only their specific server errors
+as expected failures.
 
 ## Disposition of the original findings
 
@@ -37,11 +55,11 @@ still apply.
 | 2. Stale physical field identity | Fixed by recursive validation and commit requirements; general evolved-schema writes remain unsupported. |
 | 3. False rollback after response loss | Fixed in custom commit paths with typed uncertainty and positive reconciliation; client-independent completion remains deferred. |
 | 4. Unbounded allocations | Partial: buffer, retained transaction and handler budgets added; total RSS, decode and full PK-set bounds remain open. |
-| 5. Per-table first-touch isolation | Deferred: no database-wide read snapshot added. Atomic multi-table publication does not close this gap. |
+| 5. Per-table first-touch isolation | Deferred: no database-wide read snapshot added. Existing pins now survive shared metadata eviction. Atomic multi-table publication does not close the isolation gap. |
 | 6. Inconsistent constraint paths | Fixed for opt-in SQL listener policy; constrained bulk ingestion rejects unsupported writes. Foreign-writer uniqueness remains a coordination problem. |
 | 7. Incomplete deadlines/admission | Partial: Flight reads and custom catalog requests bounded; supervised mutation completion and remaining pgwire hook coverage remain open. |
 | 8. DML scan/rewrite amplification | Partial: ranged streaming and conservative pruning added; indexed writes and lower-amplification updates remain open. |
-| 9. Catalog polling/discovery scale | Deferred: no event-driven invalidation, lazy foreign-table discovery or maximum stale-age contract added. |
+| 9. Catalog polling/discovery scale | Partial: confirmed external drops no longer poison unrelated metadata queries. Event-driven invalidation, foreign discovery/recreation without restart and a maximum stale-age contract remain deferred. |
 | 10. Median-only benchmark gate | Fixed for the specified metrics and artifact validation; production capacity and competitor measurements remain outstanding. |
 | 11. Writable read replicas | Fixed by server-side read-only policy on reviewed pgwire paths. |
 | 12. HA/security deployment gaps | Partial: bounded acceptor work and strict zone placement added; peer TLS, actual multi-zone chaos and safe idle parking remain open. |
@@ -128,9 +146,11 @@ reviewable contract and its acceptance evidence before being called complete.
    age budgets before testing. Apply bounded admission through prolonged catalog
    outages and slow consumers; demonstrate explicit overload errors without
    OOM, preserved acknowledged WAL, and recovery without sustained backlog.
-   Exercise large catalogs and foreign table creation; polling intervals are
-   targets, not maximum stale-age guarantees. Use these signals before adding
-   load-based autoscaling or a remote byte-range cache.
+   Exercise large catalogs, foreign namespace/table creation, deletion and
+   same-name recreation with new UUIDs. Require discovery without a compute
+   restart while retaining existing transaction pins and refusing stale writes.
+   Polling intervals are targets, not maximum stale-age guarantees. Use these
+   signals before adding load-based autoscaling or a remote byte-range cache.
 
 7. **Broader Iceberg writes and recovery.** Replace conservative schema refusal
    with recursive field-ID projection where semantics are known; add partition
@@ -160,14 +180,17 @@ reviewable contract and its acceptance evidence before being called complete.
 
 ## Verification and performance claims
 
-The combined stack completed 502 release Rust test invocations with live
+Earlier stack revisions completed 502 release Rust test invocations with live
 prerequisites required and no ignored tests; release clippy passed. The initial
 safety set also passed nine live safety regressions, 71 tail-durability
 assertions and four real-browser lanes. The mixed runner completed a
 100-transaction live fixture with exact final-state verification and no errors;
 a forced whole-run timeout produced a failing artifact. Broad ecosystem testing
-found a SQLAlchemy 2 reflection failure that is under repair. Those repairs and
-subsequent rebases need validation against their resulting heads.
+found SQLAlchemy 2.1 reflection failures and external-drop metadata poisoning.
+Their source fixes and focused regressions are now in the stack. Final broad
+client, safety and performance results for the rebased heads are pending. The
+294-assertion diagnostic client run excluded SQLAlchemy A8 and is not a full
+ecosystem gate pass.
 
 These are test results, not a capacity or comparative performance claim. PR
 descriptions track integration results and revisions tested; all five PRs are
