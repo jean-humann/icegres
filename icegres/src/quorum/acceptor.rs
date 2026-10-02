@@ -37,16 +37,19 @@
 //! single-process.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::Write as _;
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use serde_json::Value;
 
 use super::proto::{
-    decode_records, find_highest_common_point, read_message, write_message, Message, TermHistory,
-    WRONG_CLUSTER_MARK,
+    decode_records, find_highest_common_point, read_message_admitted, write_message, Message,
+    TermHistory, MAX_HEADER_BYTES, MAX_MESSAGE_BYTES, WRONG_CLUSTER_MARK,
 };
 use crate::segment::{lock_dir_exclusive, scan_frame_bytes, sync_dir, write_atomic, LOG_KIND_LOG};
 
@@ -251,6 +254,9 @@ impl<C: ControlStore, W: WalStore> Acceptor<C, W> {
     }
 
     fn handle_greeting(&mut self, tail_id: Option<String>) -> Result<Message> {
+        // A permanent identity must remain encodable as terms/LSNs grow. Check
+        // borrowed data before persistence or cloning a legacy retained ID.
+        ensure_greeting_response_fits(self.state.tail_id.as_deref().or(tail_id.as_deref()))?;
         if let Some(id) = tail_id {
             match &self.state.tail_id {
                 None => {
@@ -456,6 +462,9 @@ impl<C: ControlStore, W: WalStore> Acceptor<C, W> {
 
     fn handle_read(&mut self, from_lsn: u64, to_lsn: u64) -> Result<Message> {
         let to = to_lsn.min(self.wal.flush_lsn());
+        if to.saturating_sub(from_lsn) > (MAX_MESSAGE_BYTES - MAX_HEADER_BYTES - 4) as u64 {
+            bail!("requested WAL range exceeds the quorum response limit");
+        }
         let records = if from_lsn >= to {
             Vec::new()
         } else {
@@ -857,7 +866,9 @@ impl WalStore for SegmentWal {
     }
 
     fn read(&self, from: u64, to: u64) -> Result<Vec<u8>> {
-        let mut out: Vec<u8> = Vec::with_capacity((to.saturating_sub(from)) as usize);
+        let range = usize::try_from(to.checked_sub(from).context("reversed WAL range")?)
+            .context("WAL range exceeds address space")?;
+        let mut out: Vec<u8> = Vec::with_capacity(range);
         let mut segs: Vec<&Seg> = self.sealed.iter().collect();
         if let Some(active) = &self.active {
             segs.push(&active.seg);
@@ -867,18 +878,25 @@ impl WalStore for SegmentWal {
             if seg.end <= from || seg.start >= to {
                 continue;
             }
-            let data = fs::read(&seg.path)
+            let lo = from.max(seg.start) - seg.start;
+            let count = usize::try_from(to.min(seg.end) - from.max(seg.start))
+                .context("WAL slice exceeds address space")?;
+            let mut file = File::open(&seg.path)
                 .with_context(|| format!("cannot read segment {}", seg.path.display()))?;
-            let lo = (from.max(seg.start) - seg.start) as usize;
-            let hi = (to.min(seg.end) - seg.start) as usize;
-            if hi > data.len() {
-                bail!(
-                    "segment {} is shorter on disk than its bookkeeping ({} < {hi})",
-                    seg.path.display(),
-                    data.len()
-                );
-            }
-            out.extend_from_slice(&data[lo..hi]);
+            file.seek(SeekFrom::Start(lo))?;
+            let begin = out.len();
+            let end = begin.checked_add(count).context("WAL read size overflow")?;
+            anyhow::ensure!(
+                end <= range,
+                "overlapping WAL segments exceed requested range"
+            );
+            out.resize(end, 0);
+            file.read_exact(&mut out[begin..]).with_context(|| {
+                format!(
+                    "segment {} is shorter than its bookkeeping",
+                    seg.path.display()
+                )
+            })?;
         }
         if out.len() as u64 != to - from {
             bail!(
@@ -930,38 +948,304 @@ pub(crate) fn open_dir(dir: &Path, node_id: u64) -> Result<FileAcceptor> {
     Ok(acceptor)
 }
 
-/// Shared handle the serve loop mutates (one state machine, many
-/// connections; handlers run under the lock — an fsync briefly parks the
-/// other connections, exactly the contention profile of the local tail's
-/// buffer-lock fsync).
+/// One serialized state machine; its synchronous work runs on a blocking worker.
 pub(crate) type SharedAcceptor = Arc<tokio::sync::Mutex<FileAcceptor>>;
 
-/// Accept-and-serve loop over an already-bound listener (used by
-/// `icekeeperd` and by the in-process integration tests).
+/// Transport allocation budgets, separate from WAL and process RSS. JSON
+/// scratch receives conservative headroom and also has a hard header limit.
+const HEADER_WORKSPACE_FACTOR: usize = 32;
+const RESPONSE_WORKSPACE: usize = HEADER_WORKSPACE_FACTOR * MAX_HEADER_BYTES;
+
+#[derive(Clone, Debug)]
+pub(crate) struct ServeConfig {
+    pub max_connections: usize,
+    pub max_requests: usize,
+    pub request_bytes: usize,
+    pub response_bytes: usize,
+    pub max_read_bytes: usize,
+    pub io_timeout: Duration,
+}
+
+impl Default for ServeConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: 64,
+            max_requests: 16,
+            request_bytes: 64 << 20,
+            response_bytes: 64 << 20,
+            max_read_bytes: 8 << 20,
+            io_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+impl ServeConfig {
+    // Only the daemon loads environment settings; shared in-process tests use
+    // explicit defaults so parallel tests never mutate the process environment.
+    #[cfg_attr(test, allow(dead_code))]
+    pub fn from_env() -> Result<Self> {
+        fn setting(name: &str, default: usize) -> Result<usize> {
+            match std::env::var(name) {
+                Ok(value) => value
+                    .parse()
+                    .with_context(|| format!("{name} must be a positive integer")),
+                Err(std::env::VarError::NotPresent) => Ok(default),
+                Err(e) => Err(e).with_context(|| format!("cannot read {name}")),
+            }
+        }
+        let defaults = Self::default();
+        let cfg = Self {
+            max_connections: setting("ICEKEEPER_MAX_CONNECTIONS", defaults.max_connections)?,
+            max_requests: setting("ICEKEEPER_MAX_REQUESTS", defaults.max_requests)?,
+            request_bytes: setting("ICEKEEPER_REQUEST_BYTES", defaults.request_bytes)?,
+            response_bytes: setting("ICEKEEPER_RESPONSE_BYTES", defaults.response_bytes)?,
+            max_read_bytes: setting("ICEKEEPER_MAX_READ_BYTES", defaults.max_read_bytes)?,
+            io_timeout: Duration::from_millis(u64::try_from(setting(
+                "ICEKEEPER_IO_TIMEOUT_MS",
+                30_000,
+            )?)?),
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    fn validate(&self) -> Result<()> {
+        for (name, n) in [
+            ("max_connections", self.max_connections),
+            ("max_requests", self.max_requests),
+            ("request_bytes", self.request_bytes),
+            ("response_bytes", self.response_bytes),
+        ] {
+            anyhow::ensure!(
+                n > 0 && n <= Semaphore::MAX_PERMITS && u32::try_from(n).is_ok(),
+                "{name} must be positive and fit the admission counter"
+            );
+        }
+        anyhow::ensure!(!self.io_timeout.is_zero(), "io_timeout must be positive");
+        anyhow::ensure!(
+            self.max_read_bytes > 0
+                && self.max_read_bytes <= MAX_MESSAGE_BYTES - MAX_HEADER_BYTES - 4,
+            "max_read_bytes must fit a quorum response"
+        );
+        anyhow::ensure!(
+            self.response_bytes >= response_charge(self.max_read_bytes)?,
+            "response_bytes must hold a maximum read plus encoding/header workspace"
+        );
+        anyhow::ensure!(
+            self.request_bytes >= 1024,
+            "request_bytes must be at least 1024"
+        );
+        Ok(())
+    }
+}
+
+fn ensure_greeting_response_fits(tail_id: Option<&str>) -> Result<()> {
+    struct BoundedCounter(usize);
+    impl std::io::Write for BoundedCounter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.checked_sub(bytes.len()).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "header limit exceeded")
+            })?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    // Match GreetingResp's fixed keys with maximum-width numeric values;
+    // serializing just the borrowed ID accounts for JSON escaping without
+    // allocating a Value/String copy, even for a large legacy identity.
+    const FIXED_BYTES: usize = br#"{"type":"greeting_resp","tail_id":"#.len()
+        + br#","term":18446744073709551615,"flush_lsn":18446744073709551615}"#.len();
+    serde_json::to_writer(BoundedCounter(MAX_HEADER_BYTES - FIXED_BYTES), &tail_id)
+        .context("tail identity exceeds the bounded greeting response header")
+}
+
+fn request_charge(len: usize, header_len: usize) -> Result<usize> {
+    // Record validation also retains decoded records and frame-range metadata.
+    len.checked_mul(8)
+        .and_then(|n| {
+            header_len
+                .checked_mul(HEADER_WORKSPACE_FACTOR)
+                .and_then(|h| n.checked_add(h))
+        })
+        .context("quorum request admission size overflow")
+}
+
+fn response_charge(payload: usize) -> Result<usize> {
+    payload
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(RESPONSE_WORKSPACE))
+        .context("quorum response admission size overflow")
+}
+
+fn reserve(pool: &Arc<Semaphore>, bytes: usize, name: &str) -> Result<OwnedSemaphorePermit> {
+    let bytes = u32::try_from(bytes)
+        .with_context(|| format!("{name} request exceeds admission counter"))?;
+    pool.clone().try_acquire_many_owned(bytes).with_context(|| {
+        format!("acceptor {name} capacity exhausted; retry after current requests finish")
+    })
+}
+
+struct Admission {
+    config: ServeConfig,
+    requests: Arc<Semaphore>,
+    input: Arc<Semaphore>,
+    output: Arc<Semaphore>,
+}
+
+impl Admission {
+    fn new(config: ServeConfig) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            requests: Arc::new(Semaphore::new(config.max_requests)),
+            input: Arc::new(Semaphore::new(config.request_bytes)),
+            output: Arc::new(Semaphore::new(config.response_bytes)),
+            config,
+        })
+    }
+}
+
+/// Compatibility wrapper for in-process consensus tests, with finite defaults.
+#[cfg(test)]
 pub(crate) async fn serve(
     listener: tokio::net::TcpListener,
     acceptor: SharedAcceptor,
 ) -> Result<()> {
+    serve_with_config(listener, acceptor, ServeConfig::default()).await
+}
+
+pub(crate) async fn serve_with_config(
+    listener: tokio::net::TcpListener,
+    acceptor: SharedAcceptor,
+    config: ServeConfig,
+) -> Result<()> {
+    config.validate()?;
+    let connections = Arc::new(Semaphore::new(config.max_connections));
+    let admission = Arc::new(Admission::new(config)?);
+    let mut tasks = tokio::task::JoinSet::new();
     loop {
+        // Never accumulate a handler or accepted socket beyond this cap.
+        let permit = connections.clone().acquire_owned().await?;
         let (stream, peer) = listener.accept().await.context("icekeeper accept failed")?;
         let _ = stream.set_nodelay(true);
         let acceptor = acceptor.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_conn(stream, acceptor).await {
+        let admission = admission.clone();
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(async move {
+            let _connection = permit;
+            if let Err(e) = handle_conn(stream, acceptor, admission).await {
                 tracing::debug!(%peer, "icekeeper connection ended: {e:#}");
             }
         });
     }
 }
 
-async fn handle_conn(mut stream: tokio::net::TcpStream, acceptor: SharedAcceptor) -> Result<()> {
+/// Once started, processing survives cancellation of the network task. The
+/// owned state guard and permits remain in the blocking closure until fsync
+/// finishes. Lock BEFORE spawning, so only one blocking job per acceptor can
+/// run or wait in Tokio's blocking queue. An uncertain disk result is never
+/// undone merely because its response recipient disappeared.
+async fn process_blocking<C: ControlStore + 'static, W: WalStore + 'static>(
+    acceptor: Arc<tokio::sync::Mutex<Acceptor<C, W>>>,
+    msg: Message,
+    input: OwnedSemaphorePermit,
+    request: OwnedSemaphorePermit,
+    admission: Arc<Admission>,
+) -> Result<(Message, OwnedSemaphorePermit)> {
+    let mut state = tokio::time::timeout(admission.config.io_timeout, acceptor.lock_owned())
+        .await
+        .context("acceptor processing queue timed out")?;
+    let payload = if let Message::Read { from_lsn, to_lsn } = &msg {
+        let span = to_lsn
+            .checked_sub(*from_lsn)
+            .context("reversed WAL range")?;
+        anyhow::ensure!(
+            span <= admission.config.max_read_bytes as u64,
+            "requested WAL range exceeds ICEKEEPER_MAX_READ_BYTES"
+        );
+        usize::try_from(span)?
+    } else {
+        0
+    };
+    // A decoded legacy control history must also fit the bounded response
+    // header. Check before process() clones it into a vote response.
+    let history = match &msg {
+        Message::VoteRequest { .. } => Some(&state.state.term_history),
+        Message::Elected { term_history, .. } => Some(term_history),
+        _ => None,
+    };
+    if let Some(history) = history {
+        let header_size = history.0.iter().try_fold(512usize, |n, entry| {
+            n.checked_add(4 + entry.term.to_string().len() + entry.lsn.to_string().len())
+                .context("term history header overflow")
+        })?;
+        anyhow::ensure!(
+            header_size <= MAX_HEADER_BYTES,
+            "term history exceeds the bounded response header"
+        );
+    }
+    let output = reserve(
+        &admission.output,
+        response_charge(payload)?,
+        "response bytes",
+    )?;
+    tokio::task::spawn_blocking(move || {
+        let _input = input;
+        let _request = request;
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.process(msg))) {
+            Ok(response) => Ok((response, output)),
+            Err(_) => {
+                state.wedged = Some("state-machine worker panicked".to_string());
+                Err(anyhow!(
+                    "acceptor state-machine worker panicked; restart required"
+                ))
+            }
+        }
+    })
+    .await
+    .context("acceptor blocking worker failed")?
+}
+
+async fn handle_conn(
+    mut stream: tokio::net::TcpStream,
+    acceptor: SharedAcceptor,
+    admission: Arc<Admission>,
+) -> Result<()> {
     loop {
-        let msg = read_message(&mut stream).await?;
-        let resp = {
-            let mut a = acceptor.lock().await;
-            a.process(msg)
-        };
-        write_message(&mut stream, &resp).await?;
+        let (msg, (request, input)) = tokio::time::timeout(
+            admission.config.io_timeout,
+            read_message_admitted(&mut stream, |len, header| {
+                let request = reserve(&admission.requests, 1, "request count")?;
+                let input = reserve(
+                    &admission.input,
+                    request_charge(len, header)?,
+                    "request bytes",
+                )?;
+                Ok((request, input))
+            }),
+        )
+        .await
+        .context("acceptor message read timed out")??;
+        anyhow::ensure!(
+            matches!(
+                msg,
+                Message::Greeting { .. }
+                    | Message::VoteRequest { .. }
+                    | Message::Elected { .. }
+                    | Message::Append { .. }
+                    | Message::Read { .. }
+            ),
+            "unexpected response message sent to acceptor"
+        );
+        let (response, _output) =
+            process_blocking(acceptor.clone(), msg, input, request, admission.clone()).await?;
+        tokio::time::timeout(
+            admission.config.io_timeout,
+            write_message(&mut stream, &response),
+        )
+        .await
+        .context("acceptor response write timed out")??;
     }
 }
 
