@@ -1935,9 +1935,9 @@ log "(q) JDBC client probe (bench/clients/a9_jdbc_probe.sh)"
 if ! command -v java >/dev/null 2>&1 || ! command -v javac >/dev/null 2>&1; then
   log "    SKIPPED: java/javac not available (apt install openjdk-21-jdk-headless)"
 else
+  A9_RC=0
   A9_OUT=$(env ICEGRES_PROBE_HOST="$PG_HOST" ICEGRES_PROBE_PORT="$PG_PORT" \
-      bash "$REPO_DIR/bench/clients/a9_jdbc_probe.sh" 2>&1)
-  A9_RC=$?
+      bash "$REPO_DIR/bench/clients/a9_jdbc_probe.sh" 2>&1) || A9_RC=$?
   if [[ $A9_RC -eq 3 ]]; then
     log "    SKIPPED: $(echo "$A9_OUT" | tail -n 1)"
   else
@@ -1963,9 +1963,9 @@ log "(r) ODBC client probe (bench/clients/a10_odbc_probe.sh)"
 if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import pyodbc' 2>/dev/null; then
   log "    SKIPPED: pyodbc not available (apt install unixodbc odbc-postgresql; pip install pyodbc)"
 else
+  A10_RC=0
   A10_OUT=$(env ICEGRES_PROBE_HOST="$PG_HOST" ICEGRES_PROBE_PORT="$PG_PORT" \
-      bash "$REPO_DIR/bench/clients/a10_odbc_probe.sh" 2>&1)
-  A10_RC=$?
+      bash "$REPO_DIR/bench/clients/a10_odbc_probe.sh" 2>&1) || A10_RC=$?
   if [[ $A10_RC -eq 3 ]]; then
     log "    SKIPPED: $(echo "$A10_OUT" | tail -n 1)"
   else
