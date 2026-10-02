@@ -252,14 +252,24 @@ cover specific owners and do not establish a hard process RSS ceiling.
   primary-key-column bytes of the table within available RAM for PK-enforced
   writes; without a PK, writes stream. With enforcement enabled, constrained Flight bulk ingestion is rejected;
   ordinary SQL writes use the checked path.
-- **Copy-on-write DML retains decoded replacement rows.** UPDATE/DELETE
-  eagerly reads each Parquet file and retains changed output until its manifest
-  is processed. Peak memory can exceed one decoded file when a manifest covers
-  multiple changed files. Compaction also eagerly reads one input file at a
-  time. DataFusion's query pool does not account for all of these allocations.
-  Keep data files and rewrite batches within available memory. Ranged Parquet
-  reads are available in the pinned dependencies; streaming this path remains
-  implementation work.
+- **Copy-on-write DML streams deterministic row expressions.** UPDATE/DELETE
+  reads Parquet ranges and evaluates batches of up to 8,192 rows. It stages each
+  changed file before advancing through its manifest. An unchanged prefix may
+  be read a second time after the first matching batch; no-match files produce
+  no replacement data. Window/aggregate expressions and stable or volatile
+  functions keep the existing per-file evaluation path. That fallback retains
+  one decoded file, rather than all changed files in a manifest. Prefix replay
+  can retain two compressed Parquet row groups. These buffers, the rolling
+  writer's buffers, retained PK columns, and transaction rows remain outside
+  this batch bound. Compaction
+  still reads one whole input file at a time.
+- **DML file pruning is conservative.** A single deterministic DML operation
+  can use Iceberg metrics for simple integer/date/boolean comparisons and null
+  tests. Unsupported predicates and missing metrics retain candidate files.
+  Composed operations are not pruned from their original predicates because
+  earlier updates can change later matches. PK validation reads keys from
+  every live file, including files excluded from DML evaluation. Recursive
+  physical schema guards still run before reading rows.
 - **Buffered writes have a byte admission limit.**
   `ICEGRES_WRITE_BUFFER_MAX_BYTES` defaults to 256 MiB and rejects new writes
   before durable staging when pending, in-flight, and retained generations fill
