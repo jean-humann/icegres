@@ -28,7 +28,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CHART="$ROOT/deploy/helm/icegres"
 VALUES_DIR="$ROOT/deploy/helm/tests/values"
 GOLDEN_DIR="$ROOT/deploy/helm/tests/golden"
-PROFILES=(defaults ha tail-dir tail-quorum readreplicas-tls-auth flight-grpcweb)
+PROFILES=(defaults ha tail-dir tail-quorum readreplicas-tls-auth flight-grpcweb production-three-zone)
 RELEASE=icegres
 NAMESPACE=icegres-system
 KUBE_VERSIONS=(1.31.0 1.34.0)
@@ -174,7 +174,7 @@ echo "       schemas=$SCHEMAS"
 render() { # $1 profile -> file path on stdout
     local out="$TMP/render-$1.yaml"
     "$HELM" template "$RELEASE" "$CHART" --namespace "$NAMESPACE" \
-        -f "$VALUES_DIR/$1.yaml" > "$out" 2> "$TMP/render-$1.err" \
+        --kube-version "${KUBE_VERSIONS[0]}" -f "$VALUES_DIR/$1.yaml" > "$out" 2> "$TMP/render-$1.err" \
         || { bad "helm template $1: $(head -2 "$TMP/render-$1.err" | tr '\n' ' ')"; return 1; }
     echo "$out"
 }
@@ -467,6 +467,36 @@ echo "$ing" | grep -q 'host: "dash.example"' \
 grep -q "^# Source: icegres/templates/flight-deployment.yaml" "$TMP/render-defaults.yaml" \
     && bad "defaults leaked the flight Deployment" \
     || ok "defaults render no flight objects"
+
+# Strict zone placement must remain complete on both independent trios.
+r="$TMP/render-production-three-zone.yaml"
+for component in keeper lease; do
+    trio="$(doc "$r" StatefulSet "$RELEASE-$component")"
+    for expected in 'minDomains: 3' 'maxSkew: 1' 'whenUnsatisfiable: DoNotSchedule' 'topologyKey: "topology.kubernetes.io/zone"' 'operator: Exists' 'ICEKEEPER_REQUEST_BYTES' 'ICEKEEPER_RESPONSE_BYTES'; do
+        echo "$trio" | grep -qF "$expected" \
+            && ok "$component strict profile has $expected" \
+            || bad "$component strict profile missing $expected"
+    done
+    [ "$(echo "$trio" | grep -c 'kubernetes.io/hostname')" = 1 ] \
+        && ok "$component retains hostname anti-affinity" \
+        || bad "$component hostname separation lost"
+done
+
+# Every weakening of the profile must fail at render time.
+for override in 'keeper.zones.topologyKey=kubernetes.io/hostname' 'keeper.admission.maxRequests=1.5' 'keeper.resources.limits.memory=0' 'keeper.resources.limits.memory=-1Gi' 'keeper.resources.limits.memory=0Mi' 'keeper.resources.limits.memory=0.0Gi' 'keeper.resources.limits.memory=0e3' 'keeper.zones.enabled=false' 'lease.zones.enabled=false' 'keeper.antiAffinity=soft' 'lease.zones.topologyKey=' 'tail.mode=dir' 'ha.enabled=false' 'auth.enabled=false' 'tls.enabled=false' 'networkPolicy.enabled=false' 'trustedQuorumNetwork=false' 'k8sScaling.enabled=true' 'keeper.admission.maxConnections=0' 'lease.admission.requestBytes=0' 'keeper.admission.responseBytes=1024' 'lease.admission.maxReadBytes=268435456'; do
+    if "$HELM" template "$RELEASE" "$CHART" --namespace "$NAMESPACE" --kube-version 1.31.0 \
+        -f "$VALUES_DIR/production-three-zone.yaml" --set "$override" > /dev/null 2> "$TMP/invalid-profile.log"; then
+        bad "production profile accepted $override"
+    else
+        ok "production profile rejects $override"
+    fi
+done
+if "$HELM" template "$RELEASE" "$CHART" --kube-version 1.29.0 \
+    -f "$VALUES_DIR/production-three-zone.yaml" > /dev/null 2> "$TMP/old-kube.log"; then
+    bad "strict zones accepted Kubernetes before minDomains stability"
+else
+    ok "strict zones reject Kubernetes <1.30"
+fi
 
 echo "---- tests/helm.sh: $PASS passed, $FAIL failed"
 exit $((FAIL > 0))
