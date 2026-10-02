@@ -159,6 +159,41 @@ pub fn register_compat_udfs(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::new_from_impl(CatalogJsonObject {
         signature: datafusion::logical_expr::Signature::variadic_any(Volatility::Immutable),
     }));
+    // SQLAlchemy 2.1 asks for the default PostgreSQL access method while
+    // reflecting table options. This is an emulation constant; session
+    // settings such as search_path must never be answered from shared state.
+    ctx.register_udf(create_udf(
+        "icegres_catalog_setting",
+        vec![DataType::Utf8],
+        DataType::Utf8,
+        Volatility::Immutable,
+        Arc::new(|args| {
+            let arrays = ColumnarValue::values_to_arrays(args)?;
+            let names = arrays[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution("catalog setting name must be text".into())
+                })?;
+            let values = names
+                .iter()
+                .map(|name| match name {
+                    Some("default_table_access_method") => Ok(Some("heap".to_owned())),
+                    None => Ok(None),
+                    Some(name) => Err(DataFusionError::Execution(format!(
+                        "current_setting({name:?}) is not supported by catalog compatibility"
+                    ))),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if matches!(args[0], ColumnarValue::Scalar(_)) {
+                Ok(ColumnarValue::Scalar(ScalarValue::Utf8(
+                    values.into_iter().next().flatten(),
+                )))
+            } else {
+                Ok(ColumnarValue::Array(Arc::new(StringArray::from(values))))
+            }
+        }),
+    ));
 }
 
 /// Convert PostgreSQL LIKE escaping to Arrow's backslash escaping. A quoted
@@ -905,7 +940,7 @@ impl VisitorMut for CompatRewriter {
                         if let Some(normalized) = parse_expr_snippet(&format!(
                             "icegres_catalog_like_pattern(({pattern}), {escape})"
                         )) {
-                        **pattern = normalized;
+                            **pattern = normalized;
                             *escape_char = Some(Value::SingleQuotedString("\\".into()));
                             self.changed = true;
                         }
@@ -913,12 +948,17 @@ impl VisitorMut for CompatRewriter {
                 }
             }
             Expr::Function(f) => {
-                if func_is(&f.name, "json_build_object") {
+                let internal_name = if func_is(&f.name, "json_build_object") {
+                    Some("icegres_catalog_json_object")
+                } else if func_is(&f.name, "current_setting") {
+                    Some("icegres_catalog_setting")
+                } else {
+                    None
+                };
+                if let Some(internal_name) = internal_name {
                     f.name = ObjectName(vec![
                         datafusion::sql::sqlparser::ast::ObjectNamePart::Identifier(
-                            datafusion::sql::sqlparser::ast::Ident::new(
-                                "icegres_catalog_json_object",
-                            ),
+                            datafusion::sql::sqlparser::ast::Ident::new(internal_name),
                         ),
                     ]);
                     self.changed = true;
@@ -1944,6 +1984,93 @@ mod tests {
                 serde_json::json!({"number": 2, "null": null})
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn sqlalchemy_table_options_reflection_executes_simple_and_bound_queries() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/sqlalchemy2_table_options.json"
+        ))
+        .unwrap();
+        let ctx = catalog_test_context().await;
+        let params = fixture["params"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| ScalarValue::Utf8(Some(v.as_str().unwrap().to_owned())).into())
+            .collect::<Vec<_>>();
+        for (sql, params) in [
+            (fixture["literal_sql"].as_str().unwrap(), None),
+            (
+                fixture["sql"].as_str().unwrap(),
+                Some(ParamValues::List(params)),
+            ),
+        ] {
+            let batches = run_catalog_query(&ctx, sql, params).await;
+            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+            let batch = &batches[0];
+            assert_eq!(
+                batch
+                    .column_by_name("relname")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0),
+                "trips"
+            );
+            for column in [
+                "reloptions",
+                "relhasoids",
+                "access_method_name",
+                "tablespace_name",
+                "parent_table_names",
+            ] {
+                assert!(
+                    ScalarValue::try_from_array(batch.column_by_name(column).unwrap(), 0)
+                        .unwrap()
+                        .is_null(),
+                    "{column}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_setting_keeps_session_settings_out_of_shared_emulation() {
+        let ctx = catalog_test_context().await;
+        let batches = run_catalog_query(
+            &ctx,
+            "SELECT current_setting($1)",
+            Some(ParamValues::List(vec![ScalarValue::Utf8(Some(
+                "default_table_access_method".into(),
+            ))
+            .into()])),
+        )
+        .await;
+        assert_eq!(
+            batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "heap"
+        );
+        let null = run_catalog_query(&ctx, "SELECT current_setting(NULL)", None).await;
+        assert!(null[0].column(0).is_null(0));
+        let unknown = ctx
+            .sql("SELECT icegres_catalog_setting('search_path')")
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(unknown.is_err());
+        assert!(rewrite(&parse(
+            "SELECT current_setting('default_table_access_method') FROM demo.trips"
+        ))
+        .is_none());
+        assert!(rewrite(&parse("SELECT 'current_setting(''search_path'')'")).is_none());
     }
 
     // -- pg_type oid patch helpers ------------------------------------------
