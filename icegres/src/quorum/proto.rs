@@ -719,6 +719,54 @@ impl Conn {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn framing_admission_rejects_before_reading_body_and_releases_on_crc_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        struct Guard(Arc<AtomicUsize>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let wire = Message::Greeting {
+            tail_id: Some("test".into()),
+        }
+        .encode()
+        .unwrap();
+        // Only fixed framing exists: rejection must not try to read its body.
+        let mut truncated = &wire[..12];
+        let error =
+            read_message_admitted(&mut truncated, |_, _| Err::<(), _>(anyhow!("full budget")))
+                .await
+                .unwrap_err();
+        assert_eq!(error.to_string(), "full budget");
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut corrupt = wire;
+        *corrupt.last_mut().unwrap() ^= 1;
+        let result = read_message_admitted(&mut corrupt.as_slice(), |_, _| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(Guard(count.clone()))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn framing_rejects_oversized_json_header_before_admission() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&((MAX_HEADER_BYTES + 8) as u32).to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&((MAX_HEADER_BYTES + 1) as u32).to_le_bytes());
+        let error = read_message_admitted(&mut bytes.as_slice(), |_, _| -> Result<()> {
+            panic!("oversized header reached admission")
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("header length"));
+    }
+
     fn th(entries: &[(u64, u64)]) -> TermHistory {
         TermHistory(
             entries
