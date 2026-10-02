@@ -3851,8 +3851,8 @@ grep -q "exited UNCLEANLY" "$HA_LOG" || fail "the writer kill was not logged as 
 # replacement (whose election replayed the killed writer's un-flushed
 # window; nothing was committed — the 10-min cadence never fired).
 ha_acked_ids=$(awk '{print $1}' "$HA_ACKED" | sort -n | uniq)
-ha_acked_n=$(wc -l <<<"$ha_acked_ids")
-ha_in_list=$(paste -sd, <<<"$ha_acked_ids")
+ha_acked_n=$(awk 'END { print NR }' <<<"$ha_acked_ids")
+ha_in_list=$(paste -s -d, - <<<"$ha_acked_ids")
 ha_present=$("${HAQ[@]}" -c "select count(distinct id) from demo.e2e_ha where id in ($ha_in_list)")
 assert_eq "ZERO acked-row loss through the failover ($ha_acked_n acked inserts, incl. pre-kill window)" \
   "$ha_acked_n" "$ha_present"
