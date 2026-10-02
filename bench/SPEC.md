@@ -138,3 +138,11 @@ Every improvement lands only through this gate.
 Published reference numbers (context only; hardware differs, not a gate): Neon
 cold start ~500 ms–2 s; Moonlink freshness sub-second; Lakebase CDC apply
 ~150 rows/s/CU vs bulk 2k rows/s/CU.
+
+## Mixed workload and tail latency gates
+
+See [MIXED.md](MIXED.md) for the concurrent transaction/analytics runner. Its
+results require correct final data and no operation errors before performance
+is compared. Median, p95 and p99 are separate checks. The legacy gate now
+validates numeric input and p95 as well as p50, with at least 20 observations
+per latency metric. Five-run cold-start artifacts must be regenerated.
