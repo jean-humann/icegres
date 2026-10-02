@@ -185,10 +185,14 @@ are validated (NULL → `23502`, duplicate → `23505`) against the very snapsho
 the commit anchors to, and a 409 retry re-validates against fresh metadata —
 racing INSERTs of the same key cannot both land.
 
-**Transactions** (`txn.rs`): BEGIN pins each table's snapshot at first touch
-(REPEATABLE READ analogue); writes buffer in the session; COMMIT produces one
-snapshot per table anchored at the pin with **no retry** — a moved head is a
-clean `40001`. Multi-table COMMITs are atomic via the REST transactions
+**Transactions** (`txn.rs`): the first access pins each table independently.
+Reads of that table repeat, but different tables can be pinned at different
+times. This does not provide PostgreSQL REPEATABLE READ's transaction-wide
+snapshot. Writes buffer in the session; COMMIT validates both the pinned
+snapshot and schema. A moved head or schema returns `40001`. A lost response
+can leave the outcome unknown. The engine reports `40003` unless retained
+snapshot metadata proves that the prepared write committed. A client must
+reconcile an unknown outcome before retrying. Multi-table COMMITs are atomic via the REST transactions
 endpoint where the catalog supports it (Lakekeeper does); otherwise ordered
 per-table commits, with `ICEGRES_TXN_STRICT` available to refuse the
 non-atomic fallback up front.

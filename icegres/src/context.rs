@@ -1,6 +1,7 @@
 //! Catalog connection and DataFusion session wiring.
 
 use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
@@ -167,41 +168,168 @@ pub async fn build_session_context_with_peers(
     .await
 }
 
-/// Total system memory in bytes from `/proc/meminfo`, if readable.
-fn system_memory_bytes() -> Option<usize> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+const MIB: usize = 1024 * 1024;
+
+fn parse_system_memory(meminfo: &str) -> Option<usize> {
     for line in meminfo.lines() {
         if let Some(rest) = line.strip_prefix("MemTotal:") {
             let kb: usize = rest.split_whitespace().next()?.parse().ok()?;
-            return Some(kb * 1024);
+            return kb.checked_mul(1024).filter(|n| *n > 0);
         }
     }
     None
 }
 
-/// Build the DataFusion runtime with a BOUNDED memory pool + disk spill so a
-/// heavy sort/join/aggregate degrades to `ResourcesExhausted` (and spills to
-/// disk) instead of OOM-killing the whole process (production-readiness audit
-/// #3). Limit precedence: `ICEGRES_MEMORY_LIMIT_MB` env, else 70% of total
-/// system RAM, else a 1 GiB floor if `/proc/meminfo` is unreadable. Set the
-/// env to `0` to opt back into the historical unbounded pool.
-fn build_runtime_env() -> Result<Arc<RuntimeEnv>> {
-    let limit_bytes: Option<usize> = match std::env::var("ICEGRES_MEMORY_LIMIT_MB") {
-        Ok(raw) => match raw.trim().parse::<usize>() {
-            Ok(0) => None, // explicit opt-out: unbounded pool
-            Ok(mb) => Some(mb * 1024 * 1024),
-            Err(_) => {
-                warn!(value = %raw, "invalid ICEGRES_MEMORY_LIMIT_MB; using the default (70% of RAM)");
-                None // fall through to default below
+/// Decode the escapes used for mountinfo paths without treating arbitrary
+/// backslashes as filesystem traversal. Paths must remain absolute and clean.
+fn mount_path(raw: &str) -> Option<PathBuf> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut bytes = raw.as_bytes().iter().copied();
+    while let Some(byte) = bytes.next() {
+        if byte == b'\\' {
+            let escaped = [bytes.next()?, bytes.next()?, bytes.next()?];
+            out.push(match &escaped {
+                b"040" => b' ',
+                b"011" => b'\t',
+                b"012" => b'\n',
+                b"134" => b'\\',
+                _ => return None,
+            });
+        } else {
+            out.push(byte);
+        }
+    }
+    let path = PathBuf::from(String::from_utf8(out).ok()?);
+    (path.is_absolute() && !path.components().any(|c| matches!(c, Component::ParentDir)))
+        .then_some(path)
+}
+
+/// Resolve this process's memory cgroup through its mount, including delegated
+/// roots and cgroup namespaces. Read every visible ancestor: a parent's hard
+/// limit still constrains a child whose own limit is `max`.
+fn cgroup_memory_limit(
+    membership: &str,
+    mountinfo: &str,
+    read: impl Fn(&Path) -> Option<String>,
+) -> Option<usize> {
+    let groups: Vec<(&str, &str)> = membership
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, ':');
+            parts.next()?;
+            Some((parts.next()?, parts.next()?))
+        })
+        .collect();
+    let mut limit: Option<usize> = None;
+    for line in mountinfo.lines() {
+        let Some((before, after)) = line.split_once(" - ") else {
+            continue;
+        };
+        let fields: Vec<&str> = before.split_whitespace().collect();
+        let fs: Vec<&str> = after.split_whitespace().collect();
+        if fields.len() < 6 || fs.len() < 3 {
+            continue;
+        }
+        let (controller, filename) = match fs[0] {
+            "cgroup2" => ("", "memory.max"),
+            "cgroup" if fs[2].split(',').any(|c| c == "memory") => {
+                ("memory", "memory.limit_in_bytes")
             }
-        },
-        Err(_) => None,
+            _ => continue,
+        };
+        let Some((_, raw_group)) = groups.iter().find(|(controllers, _)| {
+            if controller.is_empty() {
+                controllers.is_empty()
+            } else {
+                controllers.split(',').any(|c| c == controller)
+            }
+        }) else {
+            continue;
+        };
+        let (Some(root), Some(mount), Some(group)) = (
+            mount_path(fields[3]),
+            mount_path(fields[4]),
+            mount_path(raw_group),
+        ) else {
+            continue;
+        };
+        let relative = group
+            .strip_prefix(&root)
+            // A cgroup namespace reports membership relative to its root,
+            // while an inherited mount may still name the host-side root.
+            .or_else(|_| group.strip_prefix("/"))
+            .ok()?;
+        let leaf = mount.join(relative);
+        for dir in leaf.ancestors().take_while(|p| p.starts_with(&mount)) {
+            let Some(raw) = read(&dir.join(filename)) else {
+                continue;
+            };
+            let Ok(bytes) = raw.trim().parse::<usize>() else {
+                continue; // v2 `max`, malformed values or integer overflow
+            };
+            // v1 represents no limit by a page-aligned LONG_MAX. Ignore
+            // that sentinel even when host RAM cannot be determined.
+            if controller == "memory" && bytes as u128 >= (1u128 << 60) {
+                continue;
+            }
+            limit = Some(limit.map_or(bytes, |previous| previous.min(bytes)));
+        }
+    }
+    limit
+}
+
+fn effective_memory_bytes() -> Option<usize> {
+    let host = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| parse_system_memory(&s));
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .zip(std::fs::read_to_string("/proc/self/mountinfo").ok())
+        .and_then(|(membership, mounts)| {
+            cgroup_memory_limit(&membership, &mounts, |path| {
+                std::fs::read_to_string(path).ok()
+            })
+        });
+    match (host, cgroup) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+fn memory_pool_limit(raw: Option<&str>, available: Option<usize>) -> Result<Option<usize>> {
+    if let Some(raw) = raw {
+        let mb = raw
+            .trim()
+            .parse::<usize>()
+            .context("ICEGRES_MEMORY_LIMIT_MB must be a nonnegative integer")?;
+        return if mb == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(
+                mb.checked_mul(MIB)
+                    .context("ICEGRES_MEMORY_LIMIT_MB is too large")?,
+            ))
+        };
+    }
+    // Compute 70% without floating-point rounding or multiplication overflow.
+    Ok(Some(match available {
+        Some(bytes) => (bytes / 10) * 7 + (bytes % 10) * 7 / 10,
+        None => 1024 * MIB,
+    }))
+}
+
+/// Configure the DataFusion operator pool, not a process RSS limit. The
+/// default is 70% of host RAM or a smaller visible cgroup hard limit, with
+/// a 1 GiB fallback if neither can be read. An explicit zero opts out;
+/// invalid/overflowing settings fail startup. Arrow batches, buffered writes,
+/// peer mirrors and other allocations require their own budgets.
+pub(crate) fn build_runtime_env() -> Result<Arc<RuntimeEnv>> {
+    let raw = match std::env::var("ICEGRES_MEMORY_LIMIT_MB") {
+        Ok(raw) => Some(raw),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(e) => return Err(e).context("ICEGRES_MEMORY_LIMIT_MB is not valid Unicode"),
     };
-    // If env was unset/invalid, default to 70% of system RAM (1 GiB floor).
-    let limit_bytes = limit_bytes.or_else(|| {
-        let sys = system_memory_bytes().unwrap_or(1024 * 1024 * 1024);
-        Some((sys as f64 * 0.70) as usize)
-    });
+    let limit_bytes = memory_pool_limit(raw.as_deref(), effective_memory_bytes())?;
 
     let mut builder =
         RuntimeEnvBuilder::new().with_disk_manager_builder(DiskManagerBuilder::default());
@@ -211,6 +339,8 @@ fn build_runtime_env() -> Result<Arc<RuntimeEnv>> {
             "bounded DataFusion memory pool (FairSpillPool) with disk spill enabled"
         );
         builder = builder.with_memory_pool(Arc::new(FairSpillPool::new(bytes)));
+    } else {
+        warn!("ICEGRES_MEMORY_LIMIT_MB=0 disables the DataFusion operator memory limit");
     }
     Ok(Arc::new(builder.build()?))
 }
@@ -265,6 +395,10 @@ async fn build_session_context_inner(
 
     let mem = MemoryCatalogProvider::new();
     for schema_name in iceberg_provider.schema_names() {
+        anyhow::ensure!(
+            !matches!(schema_name.to_ascii_lowercase().as_str(), "pg_catalog" | "information_schema"),
+            "Iceberg namespace {schema_name:?} uses a reserved system schema name; refusing to expose physical tables through the metadata authorization exemption"
+        );
         if let Some(schema) = iceberg_provider.schema(&schema_name) {
             let tables = schema.table_names();
             info!(
@@ -296,6 +430,168 @@ async fn build_session_context_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn physical_catalog_cannot_register_reserved_system_schemas() {
+        use iceberg::memory::MemoryCatalogBuilder;
+        use iceberg::CatalogBuilder;
+
+        for name in ["pg_catalog", "information_schema", "PG_CATALOG"] {
+            let catalog = MemoryCatalogBuilder::default()
+                .load(
+                    "test",
+                    HashMap::from([("warehouse".to_string(), "memory://warehouse".to_string())]),
+                )
+                .await
+                .unwrap();
+            catalog
+                .create_namespace(&NamespaceIdent::new(name.to_string()), HashMap::new())
+                .await
+                .unwrap();
+            let error = build_session_context(Arc::new(catalog))
+                .await
+                .err()
+                .expect("physical system schema must be rejected");
+            assert!(
+                error.to_string().contains("reserved system schema"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_pool_zero_is_an_explicit_opt_out_and_invalid_values_fail() {
+        assert_eq!(
+            memory_pool_limit(Some("0"), Some(4096 * MIB)).unwrap(),
+            None
+        );
+        assert_eq!(
+            memory_pool_limit(Some(" 32 "), None).unwrap(),
+            Some(32 * MIB)
+        );
+        for invalid in ["", "-1", "1.5", "unbounded"] {
+            assert!(memory_pool_limit(Some(invalid), Some(4096 * MIB)).is_err());
+        }
+        let overflow = (usize::MAX / MIB + 1).to_string();
+        assert!(memory_pool_limit(Some(&overflow), None).is_err());
+        assert_eq!(memory_pool_limit(None, Some(1000)).unwrap(), Some(700));
+        assert_eq!(memory_pool_limit(None, None).unwrap(), Some(1024 * MIB));
+        assert_eq!(memory_pool_limit(None, Some(0)).unwrap(), Some(0));
+        assert_eq!(
+            memory_pool_limit(None, Some(usize::MAX)).unwrap(),
+            Some(((usize::MAX as u128) * 7 / 10) as usize)
+        );
+    }
+
+    #[test]
+    fn host_memory_parser_rejects_overflow() {
+        assert_eq!(parse_system_memory("MemTotal: 4096 kB\n"), Some(4 * MIB));
+        assert_eq!(parse_system_memory("MemTotal: 0 kB\n"), None);
+        assert_eq!(
+            parse_system_memory(&format!("MemTotal: {} kB\n", usize::MAX)),
+            None
+        );
+    }
+
+    fn limits_from_fixture(
+        membership: &str,
+        mounts: &str,
+        files: &[(&str, &str)],
+    ) -> Option<usize> {
+        cgroup_memory_limit(membership, mounts, |path| {
+            files
+                .iter()
+                .find(|(name, _)| Path::new(name) == path)
+                .map(|(_, value)| value.to_string())
+        })
+    }
+
+    #[test]
+    fn cgroup_v2_uses_nested_membership_and_lowest_ancestor_limit() {
+        let mounts = "31 20 0:30 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n";
+        assert_eq!(
+            limits_from_fixture(
+                "0::/workload/child\n",
+                mounts,
+                &[
+                    ("/sys/fs/cgroup/workload/child/memory.max", "max\n"),
+                    ("/sys/fs/cgroup/workload/memory.max", "4096\n"),
+                    ("/sys/fs/cgroup/memory.max", "8192\n"),
+                ],
+            ),
+            Some(4096)
+        );
+        assert_eq!(
+            limits_from_fixture(
+                "0::/workload/child\n",
+                mounts,
+                &[
+                    ("/sys/fs/cgroup/workload/child/memory.max", "2048"),
+                    ("/sys/fs/cgroup/workload/memory.max", "4096"),
+                ],
+            ),
+            Some(2048)
+        );
+    }
+
+    #[test]
+    fn cgroup_v1_matches_controller_and_delegated_mount_root() {
+        assert_eq!(
+            limits_from_fixture(
+                "2:cpu,cpuacct:/ignored\n7:memory:/docker/container/child\n",
+                "31 20 0:30 / /cpu rw - cgroup cgroup rw,cpu,cpuacct\n\
+                 32 20 0:31 /docker/container /memory rw - cgroup cgroup rw,memory\n",
+                &[
+                    ("/cpu/ignored/memory.limit_in_bytes", "1"),
+                    ("/memory/child/memory.limit_in_bytes", "9223372036854771712"),
+                    ("/memory/memory.limit_in_bytes", "8192"),
+                    ("/memory.limit_in_bytes", "1"),
+                ],
+            ),
+            Some(8192)
+        );
+    }
+
+    #[test]
+    fn cgroup_namespace_and_escaped_mounts_are_resolved() {
+        let mounts = "31 20 0:30 /docker/container /mounted\\040cgroup rw - cgroup2 cgroup rw\n";
+        assert_eq!(
+            limits_from_fixture(
+                "0::/child\n",
+                mounts,
+                &[("/mounted cgroup/child/memory.max", "1024")],
+            ),
+            Some(1024)
+        );
+        assert_eq!(
+            limits_from_fixture("0::/\n", mounts, &[("/mounted cgroup/memory.max", "2048")],),
+            Some(2048)
+        );
+    }
+
+    #[test]
+    fn cgroup_unlimited_malformed_and_parent_traversal_do_not_invent_limits() {
+        let mounts = "31 20 0:30 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n";
+        assert_eq!(
+            limits_from_fixture(
+                "0::/child\n",
+                mounts,
+                &[
+                    ("/sys/fs/cgroup/child/memory.max", "not-a-number"),
+                    ("/sys/fs/cgroup/memory.max", "max"),
+                ],
+            ),
+            None
+        );
+        assert_eq!(
+            cgroup_memory_limit("0::/../../other\n", mounts, |_| {
+                panic!("must not read a traversal path")
+            }),
+            None
+        );
+        assert!(mount_path("/bad\\000path").is_none());
+        assert!(mount_path("relative").is_none());
+    }
 
     /// A CatalogOpts with the historical (open-Lakekeeper) defaults and no
     /// auth flags set — the byte-identical default path.

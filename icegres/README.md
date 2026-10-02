@@ -46,7 +46,7 @@ compatibility, and scale-to-zero economics on lakehouse data — leave
 | Zero-copy branches | Neon-style branch-per-endpoint over Iceberg snapshot refs (`src/branch.rs`) | `icegres branch create/list/drop`, `serve --branch` |
 | Buffered writes (opt-in) | Moonlink-style group commit: ~1.5 ms INSERT ack, union reads, ≤N ms durability window, WARN on enable (`src/buffer.rs`) | `--write-buffer-ms N` (default 0 = synchronous) |
 | Keyed tail upserts (opt-in) | Hot-row `UPDATE`/`DELETE` by exact PK ack from the durable tail (~5.2 ms p50 with `--freshness-ms 25`, ~7.0 ms without, vs ~47.5 ms synchronous COW UPDATE), coalesced per key into ONE commit per flush window (`src/keyed.rs`, `src/buffer.rs`) | table properties `icegres.primary-key` + `icegres.tail-upsert=true`, with `--write-buffer-ms > 0` and a tail backend |
-| Bounded-staleness reads (opt-in) | Freshness refresher + plan cache: scans skip the per-scan catalog check (point lookup ~7.4 → ~4.4 ms p50, repeated statements ~3.6/~2.8 ms via the physical-plan cache); own writes stay read-your-own-writes exact, foreign commits visible within ~N ms + one refresh round trip — tables refresh concurrently, so a slow table delays only itself (per-table timeout min(4·N, 2 s)); WARN on enable, staleness gauge on `/metrics` (`src/freshness.rs`, `src/plancache.rs`) | `--freshness-ms N` (default 0 = exact freshness) |
+| Bounded-staleness reads (opt-in) | Freshness refresher + plan cache: scans skip the per-scan catalog check (point lookup ~7.4 → ~4.4 ms p50, repeated statements ~3.6/~2.8 ms via the physical-plan cache); own writes stay read-your-own-writes exact, foreign visibility depends on the whole refresh pass and catalog availability; N is a polling target, not a maximum stale age; WARN on enable, staleness gauge on `/metrics` (`src/freshness.rs`, `src/plancache.rs`) | `--freshness-ms N` (default 0 = exact freshness) |
 | Scale-to-zero | clean exit after N idle seconds; stateless compute | `--idle-shutdown-secs` |
 | Wake-on-connect control plane | `icegresd`: pgwire-aware proxy that spawns computes on connect, routes `icegres@<branch>` dbnames to per-branch computes, supervises crashes with capped backoff, keeps a warm session pool (`--pool-size`, sub-ms connects; session pooling only — no transaction pooling, no cross-client reuse) | `icegresd serve` / `icegresd status` |
 | Health endpoint | HTTP 200 liveness | `--health-port` |
@@ -146,9 +146,9 @@ scan, cache, and DataFusion tuning knobs), grouped with defaults and meanings.
 | `--tls-cert` (serve) | `ICEGRES_TLS_CERT` | off | PEM certificate (chain) enabling TLS on the pgwire listener (requires `--tls-key`) |
 | `--tls-key` (serve) | `ICEGRES_TLS_KEY` | off | PEM private key for `--tls-cert` (PKCS#8/RSA/SEC1) |
 | `--auth-file` (serve) | `ICEGRES_AUTH_FILE` | off | Require SCRAM-SHA-256 auth against a `user:password` credentials file |
-| `--enforce-pk` (serve, sql) | `ICEGRES_ENFORCE_PK` | off | Enforce `icegres.primary-key` table properties: NOT NULL (23502) + uniqueness (23505) checks on INSERT and PK-assigning UPDATE, anchored to the commit snapshot |
+| `--enforce-pk` (serve, sql, flight-serve) | `ICEGRES_ENFORCE_PK` | off | Enforce `icegres.primary-key` table properties: NOT NULL (23502) + uniqueness (23505) checks on INSERT and PK-assigning UPDATE, anchored to the commit snapshot |
 | `--branch` (serve) | `ICEGRES_BRANCH` | `main` | Serve a zero-copy branch: reads pin to the ref's head, all writes commit to the ref with `assert-ref-snapshot-id` (never touching other branches) |
-| `--freshness-ms` (serve) | `ICEGRES_FRESHNESS_MS` | `0` (exact) | Opt-in bounded-staleness reads: scans serve the cached snapshot with no per-scan catalog check; ONE background task polls the catalog every N ms (up to 8 tables refreshed concurrently) and swaps changed snapshots. Own writes stay read-your-own-writes exact (synchronous invalidation); foreign commits visible within ~N ms + one refresh round trip — a slow table delays only itself (retry-free per-table refresh timeout min(4·N, 2 s); the next pass retries), never other tables (WARN on enable). Also enables the physical-plan cache. During a catalog outage reads keep serving the last refreshed snapshot (`ICEGRES_STALE_READ_ON_CATALOG_ERROR=0` fails loudly instead); worst-case age = `icegres_freshness_age_ms` on `/metrics`, sampled at refresher pass start (healthy ≈ N) |
+| `--freshness-ms` (serve) | `ICEGRES_FRESHNESS_MS` | `0` (exact) | Opt-in bounded-staleness reads: scans serve the cached snapshot with no per-scan catalog check; ONE background task polls the catalog every N ms (up to 8 tables refreshed concurrently) and swaps changed snapshots. Own writes stay read-your-own-writes exact (synchronous invalidation); foreign visibility depends on the full pass, with eight loads in flight and a timeout per load. N is a polling target, not a maximum stale age. Also enables the physical-plan cache. During a catalog outage reads keep serving the last refreshed snapshot (`ICEGRES_STALE_READ_ON_CATALOG_ERROR=0` fails loudly instead); worst-case age = `icegres_freshness_age_ms` on `/metrics`, sampled at refresher pass start (healthy ≈ N) |
 |  | `ICEGRES_PLAN_CACHE_ENTRIES` | `256` | LRU capacity of the physical-plan cache (active only with `--freshness-ms > 0`; `0` disables it) |
 |  | `ICEGRES_RESULT_CACHE_BYTES` | `0` (off) | Byte budget for the opt-in result cache: repeated identical queries at an unchanged snapshot are served from cached result batches with no execution or IO (freshness mode only; same version invalidation as the plan cache) |
 | `--write-buffer-ms` (serve) | `ICEGRES_WRITE_BUFFER_MS` | `0` (sync) | Opt-in buffered writes: INSERTs ack from an in-memory buffer, group-committed every N ms; unclean kill loses ≤N ms of acked writes (WARN on enable) |
@@ -435,7 +435,7 @@ select count(*) from demo."trips@4436304835314641572";  -- e.g. the seed snapsho
 ### Transactions
 
 `BEGIN` / `COMMIT` / `ROLLBACK` are real (`src/txn.rs`): reads inside a
-transaction are snapshot-pinned per table (snapshot isolation), writes are
+transaction are snapshot-pinned independently per table (per-table repeatable reads), writes are
 buffered in the session with read-your-own-writes overlays, and `COMMIT`
 composes everything into **one** Iceberg snapshot per table anchored at the
 pinned snapshot. Concurrency is first-committer-wins: if another writer
@@ -485,7 +485,7 @@ bounded instead:
 - ONE background task per server polls the catalog for every mounted table
   each `N` ms — tables refresh concurrently (up to 8 in flight), each with a
   retry-free per-table timeout of min(4·`N`, 2 s) (the next pass is the
-  retry), so a slow or stalled table delays only itself — and swaps the
+  retry). A pass over many or slow tables can exceed N. It swaps the
   cached provider on metadata change; scans serve the cached snapshot with
   **no catalog round trip**. The refresher runs under a supervisor that
   respawns it (budgeted, loudly) if it ever dies.
@@ -496,11 +496,10 @@ bounded instead:
   a live unit test and e2e §(z)). Buffered/keyed rows are additionally
   readable pre-commit through the per-scan buffer overlay, unchanged.
 - **Foreign writers** (other servers, Spark, anything committing through
-  the catalog) become visible within ~`N` ms plus one refresh round trip —
-  bounded staleness, per table: a slow table delays only itself (up to its
-  per-table refresh timeout), never other tables' visibility. Time travel
-  and branch-pinned reads are unaffected (snapshot-addressed reads are
-  immutable). Enabling the mode logs a WARN stating this bound.
+  the catalog) become visible after their table is refreshed. The complete
+  pass and catalog availability determine the delay. N is a target interval,
+  not a maximum stale age. Time travel and branch-pinned reads retain their
+  snapshot semantics.
 - **Catalog outage honesty:** reads keep serving the last refreshed
   snapshot (set `ICEGRES_STALE_READ_ON_CATALOG_ERROR=0` to fail loudly
   instead); the refresher WARNs (rate-limited) and exports the worst-case

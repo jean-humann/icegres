@@ -143,11 +143,18 @@ create_scratch() {
 JSON
 }
 
+# Linux returns a basename; macOS returns the executable path.
+process_is() {
+  local command
+  command=$(ps -o comm= -p "$1" 2>/dev/null) || return 1
+  [[ "${command##*/}" == "$2" ]]
+}
+
 stop_server() { # identity-checked, like e2e.sh
   if [[ -f "$PID_FILE" ]]; then
     local pid; pid=$(cat "$PID_FILE")
     if kill -0 "$pid" 2>/dev/null \
-        && [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == icegres ]]; then
+        && process_is "$pid" icegres; then
       kill "$pid" 2>/dev/null || true
       for _ in $(seq 1 20); do
         kill -0 "$pid" 2>/dev/null || break
@@ -216,7 +223,7 @@ stop_keeper() { # graceful, identity-checked
   if [[ -f "$pidfile" ]]; then
     pid=$(cat "$pidfile")
     if kill -0 "$pid" 2>/dev/null \
-        && [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == icekeeperd ]]; then
+        && process_is "$pid" icekeeperd; then
       kill "$pid" 2>/dev/null || true
       for _ in $(seq 1 20); do
         kill -0 "$pid" 2>/dev/null || break
@@ -248,7 +255,7 @@ stop_server2() {
   if [[ -f "$PID_FILE2" ]]; then
     local pid; pid=$(cat "$PID_FILE2")
     if kill -0 "$pid" 2>/dev/null \
-        && [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == icegres ]]; then
+        && process_is "$pid" icegres; then
       kill "$pid" 2>/dev/null || true
       for _ in $(seq 1 20); do
         kill -0 "$pid" 2>/dev/null || break

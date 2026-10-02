@@ -11,6 +11,19 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
 
 ## Transactions
 
+- **Reads repeat per table, not from one database snapshot.** Each table is
+  pinned on first access. A transaction can therefore observe versions of
+  different tables that never existed together. Atomic write publication
+  does not change this read contract. Applications requiring a shared
+  multi-table snapshot need additional coordination. Snapshot isolation and
+  serializability are separate targets; repeatable reads alone do not prevent
+  write skew.
+- **Commit outcome can be unknown after a lost response.** The engine checks
+  retained metadata for the exact prepared snapshot. Positive evidence can
+  establish success; absence does not establish rollback. An unresolved
+  outcome returns `40003`, including for single-table or atomic multi-table
+  commits. Reconcile before retrying the transaction.
+
 - **Multi-table transactions are atomic only when the catalog implements the
   Iceberg REST multi-table transaction endpoint**
   (`POST /v1/{prefix}/transactions/commit`). When it does — **verified
@@ -23,8 +36,8 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
   endpoint, a transaction touching N tables falls back to N commits in
   deterministic (sorted) order after re-validating every pin; if commit *k*
   fails after *k−1* succeeded, the COMMIT returns SQLSTATE **`40003`
-  (statement_completion_unknown)** naming exactly which tables committed and
-  which did not — **do not blindly retry** (that would double-apply the
+  (statement_completion_unknown)** separating confirmed commits, an uncertain current
+  table, and unattempted tables — **do not blindly retry** (that would double-apply the
   committed tables). Single-table transactions are always fully atomic.
   `ICEGRES_TXN_STRICT=true` now only bites on catalogs without the endpoint:
   it refuses such multi-table COMMITs up front (`0A000`, nothing applied);
@@ -66,6 +79,18 @@ yet closed (usually a constraint of the pinned dependency matrix: iceberg-rust
 Full account: [`docs/catalog-support.md`](catalog-support.md). Summary of the
 caveats:
 
+- A confirmed external table or namespace deletion removes the missing table
+  and its metadata references from the running compute's cached inventory.
+  Catalog introspection for unrelated tables can continue. Metadata loading
+  still reports authentication failures, timeouts and other catalog errors.
+  Transactions that already pinned the table retain their read view while the
+  referenced data files remain available; writes still validate the table
+  UUID, schema and snapshot before committing.
+- External creation of tables and namespaces does not refresh that inventory.
+  After a deletion has been observed, recreating the same table name also
+  requires a compute restart to construct a new catalog context. Reconnecting
+  to the same process does not rebuild it. This discovery limitation is
+  separate from refreshing snapshots of tables the compute already knows.
 - **Serve any Iceberg REST catalog, with two auth flows.** icegres uses only
   REST-spec-standard endpoints (no Lakekeeper-proprietary calls). Auth is now
   configurable: `--catalog-token` (pre-minted bearer), `--catalog-credential`
@@ -216,20 +241,24 @@ their hard limits.
   buffers the PK columns of every final row in memory to run the uniqueness
   check (`overwrite.rs`, `pk_rows`/`check_pk`). **Hard limit:** keep the total
   primary-key-column bytes of the table within available RAM for PK-enforced
-  writes; without a PK, writes stream. (Plain bulk ingest does not enforce PK.)
-- **Copy-on-write DML / compaction read one data file at a time — bounded by
-  file size.** UPDATE/DELETE and `maintain compact` decode one existing data
-  file into memory at a time (`overwrite.rs::read_parquet_file`); the write-out
-  is streamed. **Hard limit:** peak ≈ the largest single data file's decoded
-  size — keep the target data-file size (and any pre-existing large files)
-  within RAM. Streaming this per-file read is upstream-gated by
-  `iceberg-rust` 0.9.1's eager whole-file reader.
-- **Buffered mode grows unbounded during a catalog outage — operational
-  limit.** See the write-buffer section below: in health the in-memory buffer
-  is capped at `ICEGRES_WRITE_BUFFER_MAX_ROWS` (default 50k), but while the
-  catalog is unreachable the flusher cannot drain and the buffer (and its tail
-  frames) grow for the duration of the outage. **Bound the outage window** (or
-  the sustained write rate under it) to keep this within RAM.
+  writes; without a PK, writes stream. With enforcement enabled, constrained Flight bulk ingestion is rejected;
+  ordinary SQL writes use the checked path.
+- **Copy-on-write DML retains decoded replacement rows.** UPDATE/DELETE
+  eagerly reads each Parquet file and retains changed output until its manifest
+  is processed. Peak memory can exceed one decoded file when a manifest covers
+  multiple changed files. Compaction also eagerly reads one input file at a
+  time. DataFusion's query pool does not account for all of these allocations.
+  Keep data files and rewrite batches within available memory. Ranged Parquet
+  reads are available in the pinned dependencies; streaming this path remains
+  implementation work.
+- **Buffered writes have a byte admission limit.**
+  `ICEGRES_WRITE_BUFFER_MAX_BYTES` defaults to 256 MiB and rejects new writes
+  before durable staging when pending, in-flight, and retained generations fill
+  it. The row threshold only triggers a flush. Committed generations remain
+  charged for at least 30 seconds, and a catalog outage can exhaust capacity.
+  Query temporaries, IPC decoding, peer mirrors, and durable-log disk growth
+  need separate limits. Recovery preserves acknowledged WAL and fails startup
+  if its retained backlog exceeds the configured byte budget.
 
 ## Write buffer (opt-in)
 
@@ -631,24 +660,16 @@ their hard limits.
 
 ## Bounded-staleness reads (opt-in, `--freshness-ms`)
 
-- **`--freshness-ms N` with `N > 0` trades exact freshness for read latency,
-  boundedly.** Default (`0`) keeps today's contract byte-identical: every
-  scan performs one catalog `load_table` (~2–3 ms locally) and observes the
-  catalog's current snapshot with no staleness window. With `N > 0`, scans
-  serve the cached snapshot with no catalog round trip and ONE background
-  task per server re-polls every mounted table each `N` ms, refreshing
-  tables concurrently (up to 8 in flight) with a retry-free per-table
-  timeout of min(4·`N`, 2 s) — the next pass is the retry — so a slow or
-  stalled table delays only its OWN visibility, never other tables'. What
-  stays EXACT: this server's own writes (every local commit path — sync
-  DML, PK-enforced INSERT, transaction COMMIT, buffer flush, plain INSERT —
-  synchronously invalidates the table, so the next local read loads fresh
-  metadata), time travel (`table@snapshot`), and branch-pinned reads
-  (snapshot-addressed, immutable). What becomes BOUNDED: commits by OTHER
-  writers (other icegres servers, Spark, any catalog committer) are visible
-  within ~`N` ms plus one refresh round trip (up to that table's refresh
-  timeout when the catalog is slow for it). Enabling the mode logs a WARN
-  stating the bound.
+- **`--freshness-ms N` is a polling target, not a maximum stale age.**
+  Default zero checks catalog metadata on each scan. With a positive value,
+  cached reads skip that check and a background task visits registered tables
+  with up to eight refreshes in flight. Each load has a timeout, but the next
+  pass waits for the entire current pass. Large catalogs or slow responses
+  can therefore push visibility beyond N. Outages can leave the last cached
+  snapshot in use indefinitely unless stale reads are disabled. Local writes
+  invalidate their table synchronously; time travel and pinned branch reads
+  retain their snapshot semantics. Use the observed freshness gauge and a
+  workload-specific policy rather than treating N as an SLO.
 - **Catalog outage under freshness mode serves stale by default, visibly —
   with an explicit fail-loud opt-out.** The refresher keeps serving the
   last refreshed snapshot (reads do not start failing), WARNs rate-limited,

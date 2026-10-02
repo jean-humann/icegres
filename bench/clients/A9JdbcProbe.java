@@ -135,10 +135,12 @@ public final class A9JdbcProbe {
         try (ResultSet rs = md.getTables(null, "demo", "%", new String[] {"TABLE"})) {
             while (rs.next()) tables.add(rs.getString("TABLE_NAME"));
         }
-        if (tables.contains("trips") && tables.contains("cities") && tables.contains("trips_big")) {
-            pass("getTables(schema=demo) lists trips, cities, trips_big (" + tables.size() + " tables)");
+        // The standard seed creates these two tables. trips_big belongs to
+        // the optional scale benchmark and is not an e2e prerequisite.
+        if (tables.contains("trips") && tables.contains("cities")) {
+            pass("getTables(schema=demo) lists trips and cities (" + tables.size() + " tables)");
         } else {
-            fail("getTables(schema=demo) returned " + tables + " (missing trips/cities/trips_big)", null);
+            fail("getTables(schema=demo) returned " + tables + " (missing trips/cities)", null);
         }
     }
 

@@ -634,6 +634,12 @@ pub async fn run(
             TableRequirement::UuidMatch {
                 uuid: metadata.uuid(),
             },
+            TableRequirement::CurrentSchemaIdMatch {
+                current_schema_id: metadata.current_schema_id(),
+            },
+            TableRequirement::DefaultSpecIdMatch {
+                default_spec_id: metadata.default_partition_spec_id(),
+            },
             // First-committer-wins: main must still point at the snapshot
             // the plan was computed against, or the catalog answers 409.
             TableRequirement::RefSnapshotIdMatch {
@@ -791,7 +797,8 @@ fn ensure_file_schema_current(
             Some(_) => {}
         }
     }
-    Ok(())
+    overwrite::ensure_write_schema(file_schema, target)
+        .map_err(|e| anyhow!("refusing to compact {table}: data file {file_path}: {e}"))
 }
 
 /// The `PARQUET:field_id` annotation of one Arrow field (None when the

@@ -41,7 +41,7 @@ use datafusion_postgres::QueryHook;
 
 use crate::context::{CATALOG_NAME, DEFAULT_SCHEMA};
 use crate::overwrite::{
-    CommitConflict, ConstraintViolation, DmlKind, DmlStatement, OverwriteEngine,
+    CommitConflict, CommitUnknown, ConstraintViolation, DmlKind, DmlStatement, OverwriteEngine,
 };
 
 /// Query hook translating UPDATE/DELETE into copy-on-write Iceberg commits.
@@ -162,11 +162,14 @@ fn reject(e: anyhow::Error) -> PgWireError {
 }
 
 /// Map an engine error to the wire: typed constraint violations
-/// (23502/23505) and serialization failures (40001) keep their Postgres
+/// (23502/23505), serialization failures (40001), and unknown commit outcomes
+/// (40003) keep their Postgres
 /// sqlstate; everything else is `internal_error` (XX000).
 pub(crate) fn engine_error(e: &anyhow::Error) -> PgWireError {
     let (code, msg) = if let Some(v) = e.downcast_ref::<ConstraintViolation>() {
         (v.sqlstate.to_string(), v.message.clone())
+    } else if let Some(unknown) = e.downcast_ref::<CommitUnknown>() {
+        ("40003".to_string(), unknown.message.clone())
     } else if let Some(c) = e.downcast_ref::<CommitConflict>() {
         crate::metrics::metrics()
             .commit_conflicts_total
@@ -358,6 +361,22 @@ mod tests {
         Parser::parse_sql(&PostgreSqlDialect {}, sql)
             .unwrap()
             .remove(0)
+    }
+
+    #[test]
+    fn unknown_commit_keeps_40003_through_context() {
+        let err = anyhow::anyhow!(crate::overwrite::CommitUnknown {
+            message: "commit outcome unknown; do not retry blindly".into(),
+        })
+        .context("transaction COMMIT");
+        match engine_error(&err) {
+            PgWireError::UserError(info) => {
+                assert_eq!(info.code, "40003");
+                assert!(info.message.contains("unknown"));
+                assert!(!info.message.contains("rolled back"));
+            }
+            other => panic!("expected UserError, got {other:?}"),
+        }
     }
 
     #[test]

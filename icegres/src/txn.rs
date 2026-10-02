@@ -551,12 +551,15 @@ impl SchemaProvider for TxnSchemaProvider {
         if name.contains('$') || name.contains('@') {
             return self.inner.table(name).await;
         }
-        if !self.inner.table_exist(name) {
-            return Ok(None);
-        }
         let ident = TableIdent::new(self.namespace.clone(), name.to_string());
         let mut sess = self.sess.lock().await;
         if !sess.tables.contains_key(&ident) {
+            // A confirmed external DROP removes shared registration, but an
+            // existing transaction still owns its first-touch snapshot. Only
+            // new pins depend on the currently registered table names.
+            if !self.inner.table_exist(name) {
+                return Ok(None);
+            }
             let pinned = TxnTable::pin(&self.catalog, &ident, &self.branch)
                 .await
                 .map_err(|e| DataFusionError::External(e.into()))?;
@@ -720,11 +723,21 @@ impl TxnHook {
         // 40003 partial-apply outcome below becomes unreachable. Single-
         // table transactions never take this path (byte-identical behavior).
         if idents.len() > 1 {
-            let batch: Vec<(&TableIdent, Option<i64>, &[TableOp])> = idents
+            let batch: Vec<(
+                &TableIdent,
+                Option<i64>,
+                crate::overwrite::WriteIdentity,
+                &[TableOp],
+            )> = idents
                 .iter()
                 .map(|ident| {
                     let t = &sess.tables[*ident];
-                    (*ident, t.pin_snapshot, t.ops.as_slice())
+                    (
+                        *ident,
+                        t.pin_snapshot,
+                        crate::overwrite::WriteIdentity::of(&t.pinned),
+                        t.ops.as_slice(),
+                    )
                 })
                 .collect();
             match self.engine.commit_pinned_multi(&batch).await {
@@ -741,10 +754,15 @@ impl TxnHook {
                     // exactly once (no double staging).
                 }
                 Err(e) => {
-                    // All-or-nothing: NOTHING was applied. Preserve the
-                    // underlying sqlstate (40001 serialization_failure for
-                    // conflicts) — retrying the whole transaction is safe.
+                    // A missing response cannot establish rollback. Preserve
+                    // 40003 for unknown outcomes; definite failures retain
+                    // their original SQLSTATE and rollback explanation.
                     let base = dml::engine_error(&e);
+                    if e.downcast_ref::<crate::overwrite::CommitUnknown>()
+                        .is_some()
+                    {
+                        return Err(base);
+                    }
                     let msg = format!(
                         "COMMIT failed, transaction rolled back (no changes were \
                          applied): {}",
@@ -786,7 +804,12 @@ impl TxnHook {
             let t = &sess.tables[*ident];
             match self
                 .engine
-                .commit_pinned(ident, t.pin_snapshot, &t.ops)
+                .commit_pinned(
+                    ident,
+                    t.pin_snapshot,
+                    crate::overwrite::WriteIdentity::of(&t.pinned),
+                    &t.ops,
+                )
                 .await
             {
                 Ok(_) => committed.push(ident.to_string()),
@@ -794,6 +817,19 @@ impl TxnHook {
                     let remaining: Vec<String> =
                         idents[k + 1..].iter().map(|i| i.to_string()).collect();
                     let base = dml::engine_error(&e);
+                    if e.downcast_ref::<crate::overwrite::CommitUnknown>()
+                        .is_some()
+                    {
+                        return Err(user_err(
+                            "40003",
+                            &format!(
+                                "COMMIT outcome unknown for table {ident}: {}; previously committed tables [{}]; tables not attempted [{}]. Do not retry the transaction blindly; reconcile its outcome.",
+                                err_message(&base),
+                                committed.join(", "),
+                                remaining.join(", ")
+                            ),
+                        ));
+                    }
                     if committed.is_empty() {
                         // Nothing applied yet: a true rollback. Preserve the
                         // underlying sqlstate (e.g. 40001 serialization_failure)
@@ -850,6 +886,10 @@ impl TxnHook {
             .tables
             .get_mut(&ident)
             .ok_or_else(|| anyhow!("INSERT target {ident} was not pinned during planning"))?;
+        for batch in &batches {
+            crate::overwrite::ensure_write_schema(&batch.schema(), &entry.schema)
+                .context("planned INSERT differs from its pinned table schema")?;
+        }
         let aligned: Vec<RecordBatch> = batches
             .iter()
             .map(|b| align_batch(b, &entry.schema))
@@ -1289,6 +1329,14 @@ pub(crate) async fn plan_insert_rows(
         .collect()
         .await
         .map_err(|e| anyhow!("failed to evaluate INSERT rows: {e}"))?;
+    // The INSERT input can inherit source-column metadata. Stamp the planned
+    // target identity only after DataFusion has applied INSERT column mapping,
+    // so buffered rows retain the schema they were actually planned against.
+    let target = dml_plan.target.schema();
+    let batches = batches
+        .iter()
+        .map(|batch| align_batch(batch, &target))
+        .collect::<Result<Vec<_>>>()?;
     Ok((ident, batches))
 }
 
@@ -1500,6 +1548,255 @@ mod tests {
         Parser::parse_sql(&PostgreSqlDialect {}, sql)
             .unwrap()
             .remove(0)
+    }
+
+    #[tokio::test]
+    async fn pinned_parquet_read_survives_external_drop_and_registration_eviction() {
+        use arrow::array::Int64Array;
+        use datafusion::catalog::MemorySchemaProvider;
+        use datafusion::parquet::arrow::ArrowWriter;
+        use iceberg::memory::MemoryCatalogBuilder;
+        use iceberg::spec::{
+            DataContentType, DataFileBuilder, DataFileFormat, NestedField, PrimitiveType, Schema,
+            Struct, Type,
+        };
+        use iceberg::transaction::{ApplyTransactionAction, Transaction};
+        use iceberg::{CatalogBuilder, TableCreation};
+
+        struct TestDir(std::path::PathBuf);
+        impl Drop for TestDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = TestDir(
+            std::env::temp_dir().join(format!("icegres-transaction-pin-{}", uuid::Uuid::new_v4())),
+        );
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            MemoryCatalogBuilder::default()
+                .with_storage_factory(Arc::new(iceberg::io::LocalFsStorageFactory))
+                .load(
+                    "pin-drop",
+                    HashMap::from([(
+                        "warehouse".to_string(),
+                        dir.0.to_string_lossy().into_owned(),
+                    )]),
+                )
+                .await
+                .unwrap(),
+        );
+        let namespace = NamespaceIdent::new("demo".to_string());
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .unwrap();
+        let schema = Schema::builder()
+            .with_fields([Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .unwrap();
+        let creation = || {
+            TableCreation::builder()
+                .name("items".to_string())
+                .schema(schema.clone())
+                .build()
+        };
+        let table = catalog.create_table(&namespace, creation()).await.unwrap();
+        let arrow_schema = Arc::new(schema_to_arrow_schema(&schema).unwrap());
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![42]))],
+        )
+        .unwrap();
+        let path = dir.0.join("original.parquet");
+        let mut writer =
+            ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), arrow_schema, None)
+                .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let data_file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(path.to_string_lossy().into_owned())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(std::fs::metadata(&path).unwrap().len())
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::empty())
+            .build()
+            .unwrap();
+        let tx = Transaction::new(&table);
+        let table = tx
+            .fast_append()
+            .add_data_files([data_file])
+            .apply(tx)
+            .unwrap()
+            .commit(catalog.as_ref())
+            .await
+            .unwrap();
+        let ident = table.identifier().clone();
+        let original_uuid = table.metadata().uuid();
+        let inner = Arc::new(MemorySchemaProvider::new());
+        inner
+            .register_table(
+                "items".to_string(),
+                Arc::new(
+                    IcebergStaticTableProvider::try_new_from_table(table)
+                        .await
+                        .unwrap(),
+                ),
+            )
+            .unwrap();
+        let session = Arc::new(tokio::sync::Mutex::new(TxnSession::new()));
+        let provider = Arc::new(TxnSchemaProvider {
+            inner: inner.clone(),
+            namespace: namespace.clone(),
+            catalog: catalog.clone(),
+            branch: MAIN_BRANCH.to_string(),
+            sess: session.clone(),
+        });
+        let ctx = SessionContext::new();
+        ctx.catalog("datafusion")
+            .unwrap()
+            .register_schema("demo", provider)
+            .unwrap();
+        let before = ctx
+            .sql("SELECT id FROM demo.items")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(before.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        assert_eq!(
+            before[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            42
+        );
+
+        catalog.drop_table(&ident).await.unwrap();
+        inner.deregister_table("items").unwrap();
+        assert!(!inner.table_exist("items"));
+        let after = ctx
+            .sql("SELECT id FROM demo.items")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(after, before);
+        let fresh = TxnSchemaProvider {
+            inner: inner.clone(),
+            namespace: namespace.clone(),
+            catalog: catalog.clone(),
+            branch: MAIN_BRANCH.to_string(),
+            sess: Arc::new(tokio::sync::Mutex::new(TxnSession::new())),
+        };
+        assert!(fresh.table("items").await.unwrap().is_none());
+
+        // A replacement registration must not replace the retained pin.
+        let replacement = catalog.create_table(&namespace, creation()).await.unwrap();
+        assert_ne!(replacement.metadata().uuid(), original_uuid);
+        inner
+            .register_table(
+                "items".to_string(),
+                Arc::new(
+                    IcebergStaticTableProvider::try_new_from_table(replacement)
+                        .await
+                        .unwrap(),
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            ctx.sql("SELECT id FROM demo.items")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            session.lock().await.tables[&ident].pinned.metadata().uuid(),
+            original_uuid
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_planning_retains_target_field_ids_after_column_mapping() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::execution::context::SessionConfig;
+        use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+        let field = |name: &str, dtype, id: i32| {
+            Field::new(name, dtype, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                id.to_string(),
+            )]))
+        };
+        let target = Arc::new(Schema::new(vec![
+            field("id", DataType::Int64, 1),
+            field("v", DataType::Utf8, 2),
+        ]));
+        let source = Arc::new(Schema::new(vec![
+            field("source_id", DataType::Int64, 101),
+            field("source_v", DataType::Utf8, 102),
+        ]));
+        let rows = RecordBatch::try_new(
+            source.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![42])),
+                Arc::new(StringArray::from(vec!["value"])),
+            ],
+        )
+        .unwrap();
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new().with_default_catalog_and_schema(CATALOG_NAME, DEFAULT_SCHEMA),
+        );
+        ctx.register_table(
+            "target",
+            Arc::new(MemTable::try_new(target.clone(), vec![vec![]]).unwrap()),
+        )
+        .unwrap();
+        ctx.register_table(
+            "source",
+            Arc::new(MemTable::try_new(source, vec![vec![rows]]).unwrap()),
+        )
+        .unwrap();
+        let (_, batches) = plan_insert_rows(
+            &ctx,
+            &parse("INSERT INTO target (v, id) SELECT source_v, source_id FROM source"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].schema(), target);
+        assert_eq!(
+            batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            42
+        );
+        assert_eq!(
+            batches[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "value"
+        );
     }
 
     #[test]

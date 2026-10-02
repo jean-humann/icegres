@@ -16,6 +16,13 @@
 
 set -euo pipefail
 
+# Nanosecond timing and UTC epoch conversion require GNU date on macOS.
+DATE_BIN=date
+if [[ "$(uname -s)" == Darwin ]]; then
+  DATE_BIN=gdate
+  command -v "$DATE_BIN" >/dev/null || { echo "install coreutils for gdate" >&2; exit 1; }
+fi
+
 # ---------------------------------------------------------------------------
 # Paths / config
 # ---------------------------------------------------------------------------
@@ -23,7 +30,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ICEGRES_DIR="$(dirname "$SCRIPT_DIR")"
 REPO_DIR="$(dirname "$ICEGRES_DIR")"
 E2E_DIR="$ICEGRES_DIR/.e2e"
-BIN="$ICEGRES_DIR/target/debug/icegres"
+BUILD_PROFILE="${ICEGRES_E2E_PROFILE:-debug}"
+case "$BUILD_PROFILE" in
+  debug|release) ;;
+  *) echo "ICEGRES_E2E_PROFILE must be debug or release" >&2; exit 1 ;;
+esac
+TARGET_DIR="${ICEGRES_E2E_BIN_DIR:-$ICEGRES_DIR/target/$BUILD_PROFILE}"
+FLIGHT_DBAPI_PYTHON="${ICEGRES_FLIGHT_DBAPI_PYTHON:-python3}"
+BIN="$TARGET_DIR/icegres"
 
 PG_HOST=127.0.0.1
 PG_PORT=5439
@@ -82,6 +96,13 @@ q() { "${PSQL[@]}" -tA -c "$1"; }
 # ---------------------------------------------------------------------------
 # Server lifecycle
 # ---------------------------------------------------------------------------
+# Linux returns a basename; macOS returns the executable path.
+process_is() {
+  local command
+  command=$(ps -o comm= -p "$1" 2>/dev/null) || return 1
+  [[ "${command##*/}" == "$2" ]]
+}
+
 stop_server() {
   if [[ -f "$SERVE_PID_FILE" ]]; then
     local pid
@@ -89,7 +110,7 @@ stop_server() {
     # Only signal the PID if it is actually an icegres process: a pidfile left
     # behind by a crashed run may name a PID recycled by an unrelated process.
     if kill -0 "$pid" 2>/dev/null \
-        && [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == icegres ]]; then
+        && process_is "$pid" icegres; then
       kill "$pid" 2>/dev/null || true
       for _ in $(seq 1 20); do
         kill -0 "$pid" 2>/dev/null || break
@@ -128,7 +149,7 @@ stop_secure_server() {
     local pid
     pid=$(cat "$SECURE_PID_FILE")
     if kill -0 "$pid" 2>/dev/null \
-        && [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == icegres ]]; then
+        && process_is "$pid" icegres; then
       kill "$pid" 2>/dev/null || true
       for _ in $(seq 1 20); do
         kill -0 "$pid" 2>/dev/null || break
@@ -145,7 +166,7 @@ stop_pidfile_generic() { # pidfile — identity-checked kill
   if [[ -f "$pidfile" ]]; then
     pid=$(cat "$pidfile")
     if kill -0 "$pid" 2>/dev/null \
-        && [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == icegres ]]; then
+        && process_is "$pid" icegres; then
       kill "$pid" 2>/dev/null || true
       for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.25; done
       kill -9 "$pid" 2>/dev/null || true
@@ -159,7 +180,7 @@ stop_icegresd_at() { # pidfile — identity-checked kill of a control plane (com
   if [[ -f "$pidfile" ]]; then
     pid=$(cat "$pidfile")
     if kill -0 "$pid" 2>/dev/null \
-        && [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == icegresd ]]; then
+        && process_is "$pid" icegresd; then
       kill "$pid" 2>/dev/null || true # SIGTERM: icegresd terminates its computes
       for _ in $(seq 1 40); do kill -0 "$pid" 2>/dev/null || break; sleep 0.25; done
       kill -9 "$pid" 2>/dev/null || true
@@ -175,7 +196,7 @@ stop_keeper_at() { # pidfile — identity-checked kill of an acceptor (comm=icek
   if [[ -f "$pidfile" ]]; then
     pid=$(cat "$pidfile")
     if kill -0 "$pid" 2>/dev/null \
-        && [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == icekeeperd ]]; then
+        && process_is "$pid" icekeeperd; then
       kill "$pid" 2>/dev/null || true
       for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.25; done
       kill -9 "$pid" 2>/dev/null || true
@@ -229,19 +250,38 @@ trap cleanup EXIT
 # ---------------------------------------------------------------------------
 # 0. Stack up
 # ---------------------------------------------------------------------------
-log "starting lakehouse stack (infra/scripts/up.sh)"
-bash "$REPO_DIR/infra/scripts/up.sh" >"$E2E_DIR/up.log" 2>&1 \
-  || { tail -n 30 "$E2E_DIR/up.log" >&2; fail "infra/scripts/up.sh failed (log: $E2E_DIR/up.log)"; }
+if [[ "${ICEGRES_E2E_EXTERNAL_STACK:-0}" == "1" ]]; then
+  log "checking the externally provisioned test stack"
+  curl -fsS "$CATALOG_URI/v1/config?warehouse=$WAREHOUSE" >/dev/null \
+    || fail "external Iceberg catalog is not ready"
+  PGPASSWORD=lakekeeper psql -h 127.0.0.1 -p 5433 -U lakekeeper -d icegres_test \
+    -v ON_ERROR_STOP=1 -tAc 'SELECT 1' >/dev/null \
+    || fail "external tail database is not ready"
+else
+  log "starting lakehouse stack (infra/scripts/up.sh)"
+  bash "$REPO_DIR/infra/scripts/up.sh" >"$E2E_DIR/up.log" 2>&1 \
+    || { tail -n 30 "$E2E_DIR/up.log" >&2; fail "infra/scripts/up.sh failed (log: $E2E_DIR/up.log)"; }
+fi
 pass "lakehouse stack healthy"
 
 # ---------------------------------------------------------------------------
 # 1. Build (cargo skips work when the binary is fresh)
 # ---------------------------------------------------------------------------
-log "building icegres"
-(cd "$ICEGRES_DIR" && cargo build --quiet) \
-  || fail "cargo build failed"
-[[ -x "$BIN" ]] || fail "binary not found at $BIN"
-pass "cargo build"
+if [[ -n "${ICEGRES_E2E_BIN_DIR:-}" ]]; then
+  for executable in icegres icegresd icekeeperd; do
+    [[ -x "$TARGET_DIR/$executable" ]] || fail "prebuilt binary missing: $TARGET_DIR/$executable"
+  done
+  pass "using explicit prebuilt binaries in $TARGET_DIR"
+else
+  log "building icegres"
+  (cd "$ICEGRES_DIR" && if [[ "$BUILD_PROFILE" == release ]]; then
+    cargo build --release --locked --bins --quiet
+  else
+    cargo build --locked --bins --quiet
+  fi) || fail "cargo build failed"
+  [[ -x "$BIN" ]] || fail "binary not found at $BIN"
+  pass "cargo build"
+fi
 
 # ---------------------------------------------------------------------------
 # 2. Port must be ours to use
@@ -724,7 +764,7 @@ curl -sf -X POST "$(nested_table_url)" -H 'Content-Type: application/json' -d "{
     {\"action\":\"add-snapshot\",\"snapshot\":{
       \"snapshot-id\": $NESTED_SNAP,
       \"sequence-number\": 1,
-      \"timestamp-ms\": $(date +%s%3N),
+      \"timestamp-ms\": $("$DATE_BIN" +%s%3N),
       \"manifest-list\": \"$nested_loc/metadata/snap-$NESTED_SNAP-0-e2e-empty.avro\",
       \"summary\": {\"operation\":\"append\"},
       \"schema-id\": 0
@@ -1271,7 +1311,7 @@ p5_fork_ts=$(curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_p5_a" 
   | jq -r ".metadata.snapshots[] | select(.\"snapshot-id\" == $p5_fork_a) | .\"timestamp-ms\"")
 [[ -n "$p5_fork_ts" && "$p5_fork_ts" != null ]] || fail "could not read the fork snapshot's timestamp"
 p5_ms=$((p5_fork_ts + 1))
-p5_iso="$(date -u -d "@$((p5_ms / 1000))" +'%F %T').$(printf '%03d' $((p5_ms % 1000)))"
+p5_iso="$("$DATE_BIN" -u -d "@$((p5_ms / 1000))" +'%F %T').$(printf '%03d' $((p5_ms % 1000)))"
 assert_eq "AS OF TIMESTAMP (1 ms after the fork commit) resolves just-before" "1" \
   "$(q "select count(*) from demo.e2e_p5_a AS OF TIMESTAMP '$p5_iso'")"
 # Extended protocol (psql \bind): the AsOfParser path.
@@ -1387,7 +1427,7 @@ for kp in "${VF_KEEPER_PORTS[@]}"; do
     fail "something is already listening on :$kp — stop it first"
   fi
 done
-KBIN="$ICEGRES_DIR/target/debug/icekeeperd"
+KBIN="$TARGET_DIR/icekeeperd"
 [[ -x "$KBIN" ]] || fail "icekeeperd binary not found at $KBIN"
 for n in 1 2 3; do
   rm -rf "$E2E_DIR/vk-$n"
@@ -1414,14 +1454,34 @@ pass "verify --tail-quorum: durability/exactly-once/fencing/freshness/failover a
 for n in 1 2 3; do stop_keeper_at "$E2E_DIR/vk-$n.pid"; done
 rm -rf "$E2E_DIR"/vk-*
 
-# p7-4: the negative proof — verify must CATCH a lying tail. A wiper loop
-# deletes the scratch tail's segment directories out from under the run;
-# the durability re-proof cannot hold and the run must exit NONZERO with
-# the durability suite marked FAIL (never a silent pass).
+# p7-4: verify must report an unusable scratch tail as a failed suite.
+# Preserve the intercepted directory as evidence and replace its original
+# path with a file. Unlike repeatedly deleting directories, this fault cannot
+# heal when the server recreates its WAL path between watcher polls.
 VF_SAB="$E2E_DIR/verify-sabotage"
 rm -rf "$VF_SAB"; mkdir -p "$VF_SAB"
-( while :; do rm -rf "$VF_SAB"/icegres_verify_*/ 2>/dev/null; sleep 0.05; done ) &
+python3 - "$VF_SAB" <<'PYFAULT' &
+import pathlib, sys, time
+root = pathlib.Path(sys.argv[1]).resolve()
+assert root.name == "verify-sabotage"
+(root / "watcher.ready").touch()
+deadline = time.monotonic() + 30
+while time.monotonic() < deadline:
+    for candidate in root.glob("icegres_verify_*"):
+        if candidate.is_dir() and not candidate.is_symlink():
+            candidate.rename(root / "withheld-wal")
+            candidate.write_text("deliberately unusable verification tail\n")
+            (root / "fault.applied").touch()
+            sys.exit(0)
+    time.sleep(.001)
+sys.exit("verification never created its scratch tail")
+PYFAULT
 VF_WIPER=$!
+for _ in $(seq 1 100); do
+  [[ -f "$VF_SAB/watcher.ready" ]] && break
+  sleep 0.01
+done
+[[ -f "$VF_SAB/watcher.ready" ]] || fail "tail fault watcher did not start"
 set +e
 "$BIN" verify --suite durability --tail-dir "$VF_SAB" --json \
   >"$E2E_DIR/p7-sabotage.json" 2>"$E2E_DIR/p7-sabotage.err"
@@ -1429,7 +1489,8 @@ p7_rc=$?
 set -e
 kill "$VF_WIPER" 2>/dev/null || true
 wait "$VF_WIPER" 2>/dev/null || true
-[[ $p7_rc -ne 0 ]] || fail "verify PASSED against a sabotaged tail (the report told a lie)"
+[[ -f "$VF_SAB/fault.applied" ]] || fail "tail fault was not applied"
+[[ $p7_rc -ne 0 ]] || fail "verify accepted an unusable scratch tail"
 assert_eq "sabotaged tail: the durability suite is marked FAIL in the report" "FAIL" \
   "$(jq -r '[.checks[] | select(.suite=="durability") | .status] | unique | join("|")' "$E2E_DIR/p7-sabotage.json")"
 pass "verify FAILS against a sabotaged tail (exit $p7_rc — the lie is caught, not reported green)"
@@ -1444,7 +1505,7 @@ rm -rf "$VF_SAB" "$VF_TAIL"
 # ---------------------------------------------------------------------------
 PXY_PORT=5444
 PXY_MAIN=5445
-DBIN="$ICEGRES_DIR/target/debug/icegresd"
+DBIN="$TARGET_DIR/icegresd"
 PXY_LOG="$E2E_DIR/icegresd.log"
 PXY_STATUS="$E2E_DIR/icegresd-status.json"
 PXY_BRANCH=e2e_pxy
@@ -1487,7 +1548,7 @@ assert_eq "first connection through icegresd wakes the compute and answers" 20 \
   "$("${PXQ[@]}" -c 'select count(*) from demo.cities')"
 main_cpid=$(pxy_status main .pid)
 [[ "$main_cpid" =~ ^[0-9]+$ ]] || fail "status file has no main compute pid: $(cat "$PXY_STATUS" 2>/dev/null)"
-[[ "$(ps -o comm= -p "$main_cpid" 2>/dev/null)" == icegres ]] \
+process_is "$main_cpid" icegres \
   || fail "status pid $main_cpid is not a live icegres process"
 pass "status file reports the main compute (pid $main_cpid on :$(pxy_status main .port))"
 
@@ -1508,9 +1569,9 @@ pass "compute idle-exited (scale-to-zero): process gone, slot marked stopped"
 
 # n3: wake-after-idle — the next connection through icegresd re-spawns the
 #     compute transparently; measure the first-connection-after-idle latency.
-t0=$(($(date +%s%N) / 1000000))
+t0=$(($("$DATE_BIN" +%s%N) / 1000000))
 wake_out=$("${PXQ[@]}" -c 'select 1' 2>&1)
-wake_after_idle_ms=$(( $(date +%s%N) / 1000000 - t0 ))
+wake_after_idle_ms=$(( $("$DATE_BIN" +%s%N) / 1000000 - t0 ))
 assert_eq "reconnect after idle auto-wakes the compute" 1 "$wake_out"
 (( wake_after_idle_ms < 10000 )) || fail "wake-after-idle took ${wake_after_idle_ms}ms (>10s)"
 pass "wake-after-idle latency: ${wake_after_idle_ms}ms (cold start + splice setup, incl. psql overhead)"
@@ -1837,7 +1898,7 @@ PYEOF
   # pair — when the ADBC guard skips the whole section, A13 skips with it.
   # pandas rides the guard because flightsql-dbapi's cursor materializes
   # through it without declaring it (Superset ships pandas).
-  if ! python3 -c 'import flightsql, sqlalchemy, pandas' 2>/dev/null; then
+  if ! "$FLIGHT_DBAPI_PYTHON" -c 'import flightsql, sqlalchemy, pandas' 2>/dev/null; then
     log "    A13 SKIPPED: flightsql-dbapi stack not available (pip install flightsql-dbapi sqlalchemy pandas)"
   else
     A13_OUT=$(env ICEGRES_PROBE_FLIGHT_HOST=127.0.0.1 \
@@ -1845,7 +1906,7 @@ PYEOF
         ICEGRES_PROBE_FLIGHT_SECURE_PORT="$FLIGHT_SECURE_PORT" \
         ICEGRES_PROBE_FLIGHT_SECURE_USER=e2e_flight_user \
         ICEGRES_PROBE_FLIGHT_SECURE_PASSWORD=e2e-flight-pw \
-        python3 "$REPO_DIR/bench/clients/a13_flightsql_dbapi_probe.py" 2>&1) \
+        "$FLIGHT_DBAPI_PYTHON" "$REPO_DIR/bench/clients/a13_flightsql_dbapi_probe.py" 2>&1) \
       || { echo "$A13_OUT" | tail -n 15 >&2; fail "A13 flightsql-dbapi probe reported failures"; }
     echo "$A13_OUT" | sed 's/^/    /'
     echo "$A13_OUT" | grep -qE '^A13 RESULT: pass=[0-9]+ fail=0 ' \
@@ -1874,9 +1935,9 @@ log "(q) JDBC client probe (bench/clients/a9_jdbc_probe.sh)"
 if ! command -v java >/dev/null 2>&1 || ! command -v javac >/dev/null 2>&1; then
   log "    SKIPPED: java/javac not available (apt install openjdk-21-jdk-headless)"
 else
+  A9_RC=0
   A9_OUT=$(env ICEGRES_PROBE_HOST="$PG_HOST" ICEGRES_PROBE_PORT="$PG_PORT" \
-      bash "$REPO_DIR/bench/clients/a9_jdbc_probe.sh" 2>&1)
-  A9_RC=$?
+      bash "$REPO_DIR/bench/clients/a9_jdbc_probe.sh" 2>&1) || A9_RC=$?
   if [[ $A9_RC -eq 3 ]]; then
     log "    SKIPPED: $(echo "$A9_OUT" | tail -n 1)"
   else
@@ -1902,9 +1963,9 @@ log "(r) ODBC client probe (bench/clients/a10_odbc_probe.sh)"
 if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import pyodbc' 2>/dev/null; then
   log "    SKIPPED: pyodbc not available (apt install unixodbc odbc-postgresql; pip install pyodbc)"
 else
+  A10_RC=0
   A10_OUT=$(env ICEGRES_PROBE_HOST="$PG_HOST" ICEGRES_PROBE_PORT="$PG_PORT" \
-      bash "$REPO_DIR/bench/clients/a10_odbc_probe.sh" 2>&1)
-  A10_RC=$?
+      bash "$REPO_DIR/bench/clients/a10_odbc_probe.sh" 2>&1) || A10_RC=$?
   if [[ $A10_RC -eq 3 ]]; then
     log "    SKIPPED: $(echo "$A10_OUT" | tail -n 1)"
   else
@@ -2237,13 +2298,13 @@ done
 # First wrong attempt is ~baseline (no prior failures); after a couple more the
 # escalating backoff makes a later attempt visibly slower.
 # These are expected to FAIL (wrong password) — guard against `set -e`.
-t0=$(date +%s%N)
+t0=$("$DATE_BIN" +%s%N)
 PGPASSWORD=nope psql "host=$PG_HOST port=$THR_PORT user=thruser dbname=icegres connect_timeout=30" -tAc 'select 1' >/dev/null 2>&1 || true
-first_ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+first_ms=$(( ($("$DATE_BIN" +%s%N) - t0) / 1000000 ))
 for _ in 1 2; do PGPASSWORD=nope psql "host=$PG_HOST port=$THR_PORT user=thruser dbname=icegres connect_timeout=30" -tAc 'select 1' >/dev/null 2>&1 || true; done
-t0=$(date +%s%N)
+t0=$("$DATE_BIN" +%s%N)
 PGPASSWORD=nope psql "host=$PG_HOST port=$THR_PORT user=thruser dbname=icegres connect_timeout=30" -tAc 'select 1' >/dev/null 2>&1 || true
-later_ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+later_ms=$(( ($("$DATE_BIN" +%s%N) - t0) / 1000000 ))
 grep -q 'throttling this peer' "$THR_LOG" || fail "failed-auth throttle did not fire (log: $THR_LOG)"
 (( later_ms > first_ms + 100 )) || fail "no backoff escalation: first=${first_ms}ms later=${later_ms}ms"
 pass "per-peer failed-auth backoff escalates (first=${first_ms}ms -> later=${later_ms}ms)"
@@ -2358,13 +2419,13 @@ KY_SNAP1=$(curl -sf "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_keyed" \
   | jq -r '.metadata."current-snapshot-id"')
 
 # 20 sequential hot-row UPDATEs: each acks UPDATE 1 without a commit.
-ky_t0=$(date +%s%N)
+ky_t0=$("$DATE_BIN" +%s%N)
 for i in $(seq 1 20); do
   ky_tag=$(psql -h "$PG_HOST" -p "$KY_PORT" -U postgres -d icegres -c \
     "update demo.e2e_keyed set val = 'v$i' where id = 1" | tr -d '[:space:]')
   [[ "$ky_tag" == "UPDATE1" ]] || fail "keyed UPDATE $i answered [$ky_tag], expected UPDATE 1"
 done
-ky_ms=$(( ($(date +%s%N) - ky_t0) / 1000000 ))
+ky_ms=$(( ($("$DATE_BIN" +%s%N) - ky_t0) / 1000000 ))
 pass "20 sequential keyed UPDATEs acked (total ${ky_ms} ms ≈ $((ky_ms / 20)) ms/stmt incl. psql startup)"
 assert_eq "mid-window SELECT sees the NEWEST value (union read)" "v20" \
   "$("${KYQ[@]}" -c 'select val from demo.e2e_keyed where id = 1')"
@@ -2563,14 +2624,14 @@ assert_eq "freshness server serves the seeded rows" "280" \
 q "insert into demo.trips (trip_id, city, distance_km, fare, ts)
    values ($fr_base, 'Fresh City', 9.99, 19.99, TIMESTAMP '2026-07-10 00:00:00')" >/dev/null
 fr_seen=""
-fr_t0=$(date +%s%N)
+fr_t0=$("$DATE_BIN" +%s%N)
 for _ in $(seq 1 200); do
   if [[ "$("${FQ[@]}" -c "select count(*) from demo.trips where trip_id = $fr_base")" == "1" ]]; then
     fr_seen=1; break
   fi
   sleep 0.05
 done
-fr_ms=$(( ($(date +%s%N) - fr_t0) / 1000000 ))
+fr_ms=$(( ($("$DATE_BIN" +%s%N) - fr_t0) / 1000000 ))
 [[ "$fr_seen" == 1 ]] || fail "foreign commit not visible on the freshness server within 10 s (bound is ~${FR_MS} ms)"
 pass "foreign commit visible on the freshness server within ${fr_ms} ms (deadline 10000 ms >> ${FR_MS} ms bound)"
 
@@ -2708,7 +2769,7 @@ done
 # --- p3a: INSERT on A visible on B within the event bound (<< flush cadence)
 "${P1AQ[@]}" -c "insert into demo.e2e_p1 (trip_id, city, distance_km, fare, ts)
   values (980500, 'peer-a', 1.0, 2.0, TIMESTAMP '2026-07-11 00:00:00')" >/dev/null
-p1_t0=$(date +%s%N)
+p1_t0=$("$DATE_BIN" +%s%N)
 p1_seen=0
 for _ in $(seq 1 120); do
   if [[ "$("${P1BQ[@]}" -c 'select count(*) from demo.e2e_p1 where trip_id = 980500' 2>/dev/null)" == "1" ]]; then
@@ -2716,7 +2777,7 @@ for _ in $(seq 1 120); do
   fi
   sleep 0.05
 done
-p1_ms=$(( ($(date +%s%N) - p1_t0) / 1000000 ))
+p1_ms=$(( ($("$DATE_BIN" +%s%N) - p1_t0) / 1000000 ))
 [[ "$p1_seen" == 1 ]] || { tail -n 20 "$P1B_LOG" >&2; fail "A's buffered INSERT never became visible on B"; }
 (( p1_ms < P1A_MS )) || fail "peer visibility took ${p1_ms}ms — not faster than the ${P1A_MS}ms flush cadence"
 pass "peer overlay: A's buffered INSERT visible on B in ${p1_ms}ms (flush cadence ${P1A_MS}ms)"
@@ -2726,7 +2787,7 @@ pass "peer overlay: A's buffered INSERT visible on B in ${p1_ms}ms (flush cadenc
 #     flush cadence delivering the committed row while the poll is still
 #     running — hence the same elapsed-time bound p3a asserts.
 "${P1AQ[@]}" -c "update demo.e2e_p1 set city = 'peer-updated' where trip_id = 980500" >/dev/null
-p1_upd_t0=$(date +%s%N)
+p1_upd_t0=$("$DATE_BIN" +%s%N)
 p1_upd=0
 for _ in $(seq 1 120); do
   if [[ "$("${P1BQ[@]}" -c "select city from demo.e2e_p1 where trip_id = 980500" 2>/dev/null)" == "peer-updated" ]]; then
@@ -2734,7 +2795,7 @@ for _ in $(seq 1 120); do
   fi
   sleep 0.05
 done
-p1_upd_ms=$(( ($(date +%s%N) - p1_upd_t0) / 1000000 ))
+p1_upd_ms=$(( ($("$DATE_BIN" +%s%N) - p1_upd_t0) / 1000000 ))
 [[ "$p1_upd" == 1 ]] || fail "A's keyed UPDATE never replaced the row on B"
 (( p1_upd_ms < P1A_MS )) || fail "keyed-update peer visibility took ${p1_upd_ms}ms — not faster than the ${P1A_MS}ms flush cadence (the overlay, not the flush, must deliver it)"
 assert_eq "keyed UPDATE on A replaces (not duplicates) on B, in ${p1_upd_ms}ms" "1" \
@@ -2926,7 +2987,7 @@ done
 [[ "$p1g_ready" == 1 ]] || { tail -n 20 "$P1B2_LOG" "$P1B3_LOG" >&2; fail "P1 auth-leg readers not ready"; }
 "${P1A2Q[@]}" -c "insert into demo.e2e_p1 (trip_id, city, distance_km, fare, ts)
   values (980502, 'peer-authed', 1.0, 2.0, TIMESTAMP '2026-07-11 00:00:03')" >/dev/null
-p1g_t0=$(date +%s%N)
+p1g_t0=$("$DATE_BIN" +%s%N)
 p1g_seen=0
 for _ in $(seq 1 120); do
   if [[ "$("${P1B2Q[@]}" -c 'select count(*) from demo.e2e_p1 where trip_id = 980502' 2>/dev/null)" == "1" ]]; then
@@ -2934,7 +2995,7 @@ for _ in $(seq 1 120); do
   fi
   sleep 0.05
 done
-p1g_ms=$(( ($(date +%s%N) - p1g_t0) / 1000000 ))
+p1g_ms=$(( ($("$DATE_BIN" +%s%N) - p1g_t0) / 1000000 ))
 [[ "$p1g_seen" == 1 ]] || { tail -n 20 "$P1B2_LOG" >&2; fail "authed subscriber never mirrored the row from the authed tail API"; }
 (( p1g_ms < P1A_MS )) || fail "authed peer visibility took ${p1g_ms}ms — not faster than the ${P1A_MS}ms flush cadence"
 grep -q 'peer tail mirror installed' "$P1B2_LOG" \
@@ -3087,7 +3148,13 @@ cat = load_catalog("lakekeeper", **{
     "s3.secret-access-key": "$AWS_SECRET_ACCESS_KEY", "s3.region": "us-east-1",
     "s3.path-style-access": "true",
 })
-t = cat.load_table("demo.e2e_compact").scan().to_arrow()
+# This check uses the fixture's explicit S3 credentials. Credential vending
+# and remote signing are separate catalog-service tests.
+from pyiceberg.io.pyarrow import PyArrowFileIO
+table = cat.load_table("demo.e2e_compact")
+table.io = PyArrowFileIO({k: v for k, v in cat.properties.items()
+                         if k.startswith("s3.") and k != "s3.signer"})
+t = table.scan().to_arrow()
 print(f"{len(t)}|{pc.sum(t.column('id')).as_py() or 0}|{pc.sum(pc.utf8_length(t.column('v'))).as_py() or 0}")
 EOF
 )
@@ -3216,7 +3283,7 @@ curl -sf -X POST "$CATALOG_URI/v1/$prefix/namespaces/demo/tables/e2e_mor" \
     {\"action\":\"add-snapshot\",\"snapshot\":{
       \"snapshot-id\": $MOR_SNAP,
       \"sequence-number\": 1,
-      \"timestamp-ms\": $(date +%s%3N),
+      \"timestamp-ms\": $("$DATE_BIN" +%s%3N),
       \"manifest-list\": \"$mor_loc/metadata/snap-$MOR_SNAP-0-e2e-mor.avro\",
       \"summary\": {\"operation\":\"append\"},
       \"schema-id\": 0
@@ -3449,7 +3516,7 @@ CATGW_PORT=8182
 CATGW_TOK_PORT=5500
 CATGW_CRED_PORT=5501
 CATGW_NS=catgw
-CATGW_PREMINT="premint-bearer-$$-$(date +%s)"
+CATGW_PREMINT="premint-bearer-$$-$("$DATE_BIN" +%s)"
 CATGW_CLIENT="icegres:supersecret"
 CATGW_BIN="$E2E_DIR/catalog-gateway"
 CATGW_LOG="$E2E_DIR/catalog-gateway.log"
@@ -3647,7 +3714,7 @@ fi
 #        5487/5488 failover icegresd/main   5490-5493 lease icegresd A/B
 #        5494/5495 fence pair Z/W           5496-5498 autoscale/main/tail-api
 # ---------------------------------------------------------------------------
-HA_KBIN="$ICEGRES_DIR/target/debug/icekeeperd"
+HA_KBIN="$TARGET_DIR/icekeeperd"
 HA_QUORUM="127.0.0.1:5481,127.0.0.1:5482,127.0.0.1:5483"
 HA_LEASE_QUORUM="127.0.0.1:5484,127.0.0.1:5485,127.0.0.1:5486"
 HA_BUF_MS=600000 # 10 min: the flusher never auto-commits; replay is the only path
@@ -3740,7 +3807,7 @@ touch "$HA_ACKED"
     i=$((i + 1))
     if psql -h "$PG_HOST" -p "$HA_PORT" -U postgres -d icegres -tA \
          -c "insert into demo.e2e_ha (id, note) values ($i, 'ha-load')" >/dev/null 2>&1; then
-      echo "$i $(($(date +%s%N) / 1000000))" >>"$HA_ACKED"
+      echo "$i $(($("$DATE_BIN" +%s%N) / 1000000))" >>"$HA_ACKED"
     fi
     sleep 0.02
   done
@@ -3755,7 +3822,7 @@ done
 
 ha_cpid=$(ha_status main .pid)
 [[ "$ha_cpid" =~ ^[0-9]+$ ]] || { touch "$HA_STOP"; fail "no compute pid in $HA_STATUS"; }
-ha_kill_ms=$(($(date +%s%N) / 1000000))
+ha_kill_ms=$(($("$DATE_BIN" +%s%N) / 1000000))
 kill -9 "$ha_cpid" || { touch "$HA_STOP"; fail "could not SIGKILL compute $ha_cpid"; }
 # failover_ms = kill -> first ACKED insert on the replacement, as observed
 # by the CLIENT through the unchanged endpoint.
@@ -3784,8 +3851,8 @@ grep -q "exited UNCLEANLY" "$HA_LOG" || fail "the writer kill was not logged as 
 # replacement (whose election replayed the killed writer's un-flushed
 # window; nothing was committed — the 10-min cadence never fired).
 ha_acked_ids=$(awk '{print $1}' "$HA_ACKED" | sort -n | uniq)
-ha_acked_n=$(wc -l <<<"$ha_acked_ids")
-ha_in_list=$(paste -sd, <<<"$ha_acked_ids")
+ha_acked_n=$(awk 'END { print NR }' <<<"$ha_acked_ids")
+ha_in_list=$(paste -s -d, - <<<"$ha_acked_ids")
 ha_present=$("${HAQ[@]}" -c "select count(distinct id) from demo.e2e_ha where id in ($ha_in_list)")
 assert_eq "ZERO acked-row loss through the failover ($ha_acked_n acked inserts, incl. pre-kill window)" \
   "$ha_acked_n" "$ha_present"
@@ -3937,7 +4004,7 @@ assert_eq "standby B spawned NOTHING (no double-spawn)" "0" \
 pass "one leader serves; the standby refuses clients (57P03) and spawns no computes"
 
 lsa_cpid=$(jq -r '.computes[] | select(.key=="main") | .pid' "$LSA_STATUS")
-lsa_kill_ms=$(($(date +%s%N) / 1000000))
+lsa_kill_ms=$(($("$DATE_BIN" +%s%N) / 1000000))
 kill -9 "$(cat "$E2E_DIR/icegresd-lease-a.pid")"
 rm -f "$E2E_DIR/icegresd-lease-a.pid"
 lsb_leader=0
@@ -3945,7 +4012,7 @@ for _ in $(seq 1 200); do
   if [[ "$(jq -r .leader "$LSB_STATUS" 2>/dev/null)" == "true" ]]; then lsb_leader=1; break; fi
   sleep 0.1
 done
-takeover_ms=$(( $(date +%s%N) / 1000000 - lsa_kill_ms ))
+takeover_ms=$(( $("$DATE_BIN" +%s%N) / 1000000 - lsa_kill_ms ))
 [[ "$lsb_leader" == 1 ]] || { tail -n 20 "$LSB_LOG" >&2; fail "standby B never took the lease over"; }
 (( takeover_ms < 3 * LEASE_TTL_MS )) \
   || fail "lease takeover took ${takeover_ms}ms (> 3x TTL ${LEASE_TTL_MS}ms)"
@@ -3958,7 +4025,7 @@ grep -q "taking over the icegresd lease" "$LSB_LOG" \
 # design on the DATA tail in quorum deployments (proven in ha1z) — here it
 # is just reaped so the harness leaves nothing behind.
 if [[ "$lsa_cpid" =~ ^[0-9]+$ ]] && kill -0 "$lsa_cpid" 2>/dev/null \
-    && [[ "$(ps -o comm= -p "$lsa_cpid" 2>/dev/null)" == icegres ]]; then
+    && process_is "$lsa_cpid" icegres; then
   kill -9 "$lsa_cpid" 2>/dev/null || true
 fi
 stop_icegresd_at "$E2E_DIR/icegresd-lease-b.pid"

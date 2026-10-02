@@ -134,11 +134,12 @@
 //! (mirroring the durable tail's own documented outage growth).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context as _, Result};
-use arrow::array::{BooleanArray, RecordBatch};
+use arrow::array::{ArrayData, BooleanArray, RecordBatch};
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use async_trait::async_trait;
@@ -148,7 +149,7 @@ use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::Statement;
 use datafusion_postgres::pgwire::api::results::{Response, Tag};
 use datafusion_postgres::pgwire::api::ClientInfo;
-use datafusion_postgres::pgwire::error::PgWireResult;
+use datafusion_postgres::pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use datafusion_postgres::QueryHook;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::spec::TableMetadata;
@@ -158,18 +159,186 @@ use crate::dml;
 use crate::keyed;
 use crate::overwrite::{
     align_batch, apply_dml_to_batches, pk_columns_of, pk_columns_of_metadata, prepare_commit,
-    quote_ident, CommitOutcome, DmlKind, DmlStatement, OverwriteEngine, TableOp,
-    MAX_COMMIT_ATTEMPTS,
+    quote_ident, CommitOutcome, CommitUnknown, DmlKind, DmlStatement, OverwriteEngine,
+    PreparedCommit, TableOp, MAX_COMMIT_ATTEMPTS,
 };
 use crate::tail::{
     drop_stale_frames, effective_watermark, parse_watermark_property, TailOp, TailOpKind, TailStore,
 };
 use crate::txn::{insert_target, plan_insert_rows, TxnRegistry};
 
-/// Flush early once a table has this many pending buffered rows (bounds
-/// buffer memory under a hot writer regardless of the flush cadence).
+/// Flush early once a table has this many pending buffered rows. This is a
+/// scheduling threshold; the independent byte budget bounds admission.
 /// Overridable via `ICEGRES_WRITE_BUFFER_MAX_ROWS`.
 const DEFAULT_MAX_ROWS: usize = 50_000;
+
+/// Includes pending writes, in-flight flush snapshots, failed-write undo and
+/// retained committed generations. Query/IPC temporaries and the durable log
+/// need separate limits. Zero is deliberately not an unbounded opt-out.
+const DEFAULT_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+#[derive(Debug)]
+struct BufferCapacityError {
+    requested: usize,
+    used: usize,
+    limit: usize,
+}
+
+impl std::fmt::Display for BufferCapacityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "write buffer capacity exceeded: {} bytes requested, {} bytes retained, \
+             {} byte limit (ICEGRES_WRITE_BUFFER_MAX_BYTES); no tail append was made \
+             for this request; retry after buffered generations drain",
+            self.requested, self.used, self.limit
+        )
+    }
+}
+
+impl std::error::Error for BufferCapacityError {}
+
+#[derive(Debug)]
+struct WriteBudget {
+    limit: usize,
+    used: AtomicUsize,
+}
+
+impl Default for WriteBudget {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_BYTES)
+    }
+}
+
+impl WriteBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            used: AtomicUsize::new(0),
+        }
+    }
+
+    fn reserve(self: &Arc<Self>, bytes: usize) -> Result<Arc<WriteReservation>> {
+        self.used
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
+                used.checked_add(bytes).filter(|sum| *sum <= self.limit)
+            })
+            .map_err(|used| BufferCapacityError {
+                requested: bytes,
+                used,
+                limit: self.limit,
+            })?;
+        Ok(Arc::new(WriteReservation {
+            budget: self.clone(),
+            bytes,
+        }))
+    }
+}
+
+/// Shared by every buffer owner of one admitted statement. Moving data from
+/// pending into a flush or restoring a failed flush transfers this charge;
+/// cancellation/drop cannot release it while another owner still retains it.
+#[derive(Debug)]
+struct WriteReservation {
+    budget: Arc<WriteBudget>,
+    bytes: usize,
+}
+
+impl Drop for WriteReservation {
+    fn drop(&mut self) {
+        self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+fn buffer_limit(raw: Option<&str>) -> Result<usize> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_MAX_BYTES);
+    };
+    let limit = raw
+        .trim()
+        .parse::<usize>()
+        .context("ICEGRES_WRITE_BUFFER_MAX_BYTES must be a positive byte count")?;
+    anyhow::ensure!(limit > 0, "ICEGRES_WRITE_BUFFER_MAX_BYTES must be positive");
+    Ok(limit)
+}
+
+/// Charge retained backing allocations rather than logical row width: a
+/// one-row Arrow slice can retain a much larger input allocation. Deduplicate
+/// buffers within one statement, including routed row slices, but never
+/// assume sharing across independently admitted statements.
+#[derive(Default)]
+struct WriteFootprint {
+    allocations: HashMap<usize, usize>,
+    overhead: usize,
+}
+
+impl WriteFootprint {
+    fn add_bytes(&mut self, bytes: usize) -> Result<()> {
+        self.overhead = self
+            .overhead
+            .checked_add(bytes)
+            .context("write buffer byte accounting overflow")?;
+        Ok(())
+    }
+
+    fn buffer(&mut self, buffer: &arrow::buffer::Buffer) -> Result<()> {
+        let bytes = buffer.capacity().max(
+            buffer
+                .ptr_offset()
+                .checked_add(buffer.len())
+                .context("write buffer allocation size overflow")?,
+        );
+        self.allocations
+            .entry(buffer.data_ptr().as_ptr() as usize)
+            .and_modify(|previous| *previous = (*previous).max(bytes))
+            .or_insert(bytes);
+        Ok(())
+    }
+
+    fn array(&mut self, data: &ArrayData) -> Result<()> {
+        self.add_bytes(std::mem::size_of::<ArrayData>())?;
+        for buffer in data.buffers() {
+            self.add_bytes(std::mem::size_of::<arrow::buffer::Buffer>())?;
+            self.buffer(buffer)?;
+        }
+        if let Some(nulls) = data.nulls() {
+            self.buffer(nulls.buffer())?;
+        }
+        for child in data.child_data() {
+            self.array(child)?;
+        }
+        Ok(())
+    }
+
+    fn batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.add_bytes(std::mem::size_of::<RecordBatch>())?;
+        for column in batch.columns() {
+            self.array(&column.to_data())?;
+        }
+        Ok(())
+    }
+
+    fn total(self) -> Result<usize> {
+        self.allocations
+            .values()
+            .try_fold(self.overhead, |sum, bytes| {
+                sum.checked_add(*bytes)
+                    .context("write buffer byte accounting overflow")
+            })
+    }
+}
+
+fn buffer_error(error: &anyhow::Error) -> PgWireError {
+    if error.downcast_ref::<BufferCapacityError>().is_some() {
+        PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".to_string(),
+            "53200".to_string(),
+            format!("{error:#}"),
+        )))
+    } else {
+        dml::engine_error(error)
+    }
+}
 
 /// Retain committed `flushed(S)` generations at least this long before
 /// garbage collection. The age is the SECONDARY condition: a generation is
@@ -200,6 +369,7 @@ pub(crate) struct KeyedOp {
     /// serve the per-op seq the property-watermark exclusion rule needs;
     /// pure bookkeeping — no tail or flush semantics read it.
     seq: Option<u64>,
+    _reservation: Option<Arc<WriteReservation>>,
 }
 
 /// A keyed map entry: the op plus a per-table monotonic stamp. The stamp is
@@ -255,6 +425,7 @@ struct FlushedGen {
     /// (`None` without a tail) — seqs are retained purely for the open tail
     /// API (tailapi.rs) / peer-overlay exclusion rule.
     batches: Vec<(Option<u64>, RecordBatch)>,
+    append_reservations: Vec<Option<Arc<WriteReservation>>>,
     /// The keyed ops this generation committed (key, stamp, op) — scans
     /// whose metadata predates the commit still need their suppression and
     /// upsert rows; a conflicted post merges them back stamp-aware.
@@ -289,6 +460,7 @@ struct PendingBatch {
     /// bookkeeping for the open tail API only — see [`KeyedOp::seq`].
     seq: Option<u64>,
     batch: RecordBatch,
+    reservation: Option<Arc<WriteReservation>>,
 }
 
 /// Per-table buffer state.
@@ -364,6 +536,7 @@ pub struct TailItem {
     pub seq: u64,
     pub kind: TailEventKind,
     pub batch: RecordBatch,
+    _reservation: Option<Arc<WriteReservation>>,
 }
 
 /// A consistent view of one table's tail window (ONE lock acquisition):
@@ -398,6 +571,7 @@ pub struct TailEvent {
     pub seq: u64,
     pub kind: TailEventKind,
     pub batches: Vec<RecordBatch>,
+    _reservation: Option<Arc<WriteReservation>>,
 }
 
 /// A consistent snapshot of one table's pending work (append prefix +
@@ -408,6 +582,7 @@ struct PendingSnapshot {
     /// `(key, stamp, op)` sorted by stamp (arrival order).
     keyed: Vec<(Vec<u8>, u64, KeyedOp)>,
     tail_mark: Option<u64>,
+    append_reservations: Vec<Option<Arc<WriteReservation>>>,
 }
 
 impl PendingSnapshot {
@@ -424,6 +599,7 @@ impl PendingSnapshot {
 #[derive(Default)]
 struct BufferState {
     tables: StdMutex<HashMap<TableIdent, TableBuf>>,
+    budget: Arc<WriteBudget>,
     /// The DECLARED `icegres.primary-key` columns per table, recorded from
     /// every metadata load `note_activation` sees. The open tail API's
     /// wire header serves THIS declaration (F1) — never `entry.keyed`
@@ -435,6 +611,12 @@ struct BufferState {
 }
 
 impl BufferState {
+    fn with_limit(limit: usize) -> Self {
+        Self {
+            budget: Arc::new(WriteBudget::new(limit)),
+            ..Self::default()
+        }
+    }
     fn contains(&self, ident: &TableIdent) -> bool {
         self.tables
             .lock()
@@ -479,7 +661,11 @@ impl BufferState {
         batches: &[RecordBatch],
         tail: Option<&dyn TailStore>,
         replay_seq: Option<u64>,
-    ) -> Result<(usize, usize, Option<(u64, Vec<RecordBatch>)>)> {
+    ) -> Result<(
+        usize,
+        usize,
+        Option<(u64, Vec<RecordBatch>, Arc<WriteReservation>)>,
+    )> {
         let mut tables = self.tables.lock().expect("write-buffer lock poisoned");
         if !tables.contains_key(ident) {
             // Entries are never removed, so reaching here implies the caller
@@ -509,10 +695,19 @@ impl BufferState {
         // bookkeeping alone. One cached bool load when unset (timing.rs).
         let timing = crate::timing::enabled();
         let append_started = timing.then(std::time::Instant::now);
+        // Validate under the same lock as first-touch schema installation.
+        // Alignment must never relabel a stale field with a different ID.
+        for batch in batches {
+            crate::overwrite::ensure_write_schema(batch.schema().as_ref(), entry.schema.as_ref())?;
+        }
         let aligned: Vec<RecordBatch> = batches
             .iter()
             .map(|b| align_batch(b, &entry.schema))
             .collect::<Result<_>>()?;
+        let prepared = prepare_appends(entry, &aligned)?;
+        let reservation = self
+            .budget
+            .reserve(append_footprint(&aligned, &prepared)?)?;
         let staged = match tail {
             // ONE frame for the whole statement (all batches, one fsync,
             // one sequence): all-or-nothing by construction — a staging
@@ -535,9 +730,9 @@ impl BufferState {
         // The statement's tail sequence: staged live, or the replayed
         // frame's own (already-durable) sequence at boot.
         let stmt_seq = staged.as_ref().map(|s| s.seq()).or(replay_seq);
-        let published = stmt_seq.map(|seq| (seq, aligned.clone()));
+        let published = stmt_seq.map(|seq| (seq, aligned.clone(), reservation.clone()));
         let t = timing.then(std::time::Instant::now);
-        let routed = route_appends(entry, aligned, stmt_seq)?;
+        let routed = route_appends(entry, prepared, stmt_seq, &reservation);
         if let Some(t) = t {
             crate::timing::record("buffer_route", t.elapsed());
         }
@@ -676,8 +871,11 @@ impl BufferState {
         key: Vec<u8>,
         mut op: KeyedOp,
         tail: Option<&dyn TailStore>,
-    ) -> Result<(usize, usize, Option<u64>)> {
+    ) -> Result<(usize, usize, Option<u64>, Arc<WriteReservation>)> {
         let mut tables = self.tables.lock().expect("write-buffer lock poisoned");
+        if let (Some(incoming), Some(entry)) = (schema_if_first.as_ref(), tables.get(ident)) {
+            crate::overwrite::ensure_write_schema(incoming.as_ref(), entry.schema.as_ref())?;
+        }
         if !tables.contains_key(ident) {
             let schema = schema_if_first
                 .ok_or_else(|| anyhow!("write-buffer schema for {ident} disappeared"))?;
@@ -727,6 +925,15 @@ impl BufferState {
         // ICEGRES_QUERY_TIMING: the keyed ack's durable half — tail append
         // (backend logs its own encode/durability split) + map insert.
         let write_started = crate::timing::enabled().then(std::time::Instant::now);
+        let mut footprint = WriteFootprint::default();
+        footprint.add_bytes(std::mem::size_of::<KeyedEntry>())?;
+        footprint.add_bytes(key.capacity())?;
+        footprint.batch(&op.key_row)?;
+        if let KeyedKind::Upsert(row) = &op.kind {
+            footprint.batch(row)?;
+        }
+        let reservation = self.budget.reserve(footprint.total()?)?;
+        op._reservation = Some(reservation.clone());
         // Staged like BufferState::append: frame written + seq assigned +
         // map insert under THIS lock acquisition (keyed seq order == map
         // order — the watermark invariant), the durability wait after the
@@ -778,7 +985,7 @@ impl BufferState {
         if let Some(t) = write_started {
             crate::timing::record("keyed_write", t.elapsed());
         }
-        Ok((counts.0, counts.1, stmt_seq))
+        Ok((counts.0, counts.1, stmt_seq, reservation))
     }
 
     /// The wait-failure unroute: a statement whose tail durability wait
@@ -918,6 +1125,11 @@ impl BufferState {
                     n_batches: entry.pending.len(),
                     keyed,
                     tail_mark: entry.tail_high,
+                    append_reservations: entry
+                        .pending
+                        .iter()
+                        .map(|pb| pb.reservation.clone())
+                        .collect(),
                 }
             }
             None => PendingSnapshot {
@@ -925,6 +1137,7 @@ impl BufferState {
                 n_batches: 0,
                 keyed: Vec::new(),
                 tail_mark: None,
+                append_reservations: Vec::new(),
             },
         }
     }
@@ -1138,6 +1351,10 @@ impl BufferState {
     ) {
         let mut tables = self.tables.lock().expect("write-buffer lock poisoned");
         if let Some(entry) = tables.get_mut(ident) {
+            let append_reservations = entry.pending[..n_batches]
+                .iter()
+                .map(|pb| pb.reservation.clone())
+                .collect();
             let batches: Vec<(Option<u64>, RecordBatch)> = entry
                 .pending
                 .drain(..n_batches)
@@ -1148,6 +1365,7 @@ impl BufferState {
             entry.flushed.push(FlushedGen {
                 commit,
                 batches,
+                append_reservations,
                 keyed: keyed.to_vec(),
                 committed_at: Instant::now(),
                 observed: false,
@@ -1177,7 +1395,8 @@ impl BufferState {
             let mut restored: Vec<PendingBatch> = flushed_gen
                 .batches
                 .into_iter()
-                .map(|(seq, batch)| {
+                .zip(flushed_gen.append_reservations)
+                .map(|((seq, batch), reservation)| {
                     let id = entry.next_batch_id;
                     entry.next_batch_id += 1;
                     PendingBatch {
@@ -1185,6 +1404,7 @@ impl BufferState {
                         claimed: true,
                         seq,
                         batch,
+                        reservation,
                     }
                 })
                 .collect();
@@ -1214,6 +1434,23 @@ impl BufferState {
         }
     }
 
+    /// Idle write-only tables need a metadata observation too: otherwise the
+    /// final committed generation can retain its admission charge forever.
+    /// Bound each pass so maintenance cannot queue one request per table.
+    fn observation_candidates(&self) -> Vec<TableIdent> {
+        let tables = self.tables.lock().expect("write-buffer lock poisoned");
+        tables
+            .iter()
+            .filter(|(_, entry)| {
+                entry.flushed.iter().any(|generation| {
+                    !generation.observed && generation.committed_at.elapsed() >= FLUSHED_GC
+                })
+            })
+            .take(8)
+            .map(|(ident, _)| ident.clone())
+            .collect()
+    }
+
     /// The open tail API's TailSnapshot source (tailapi.rs): every un-GC'd
     /// DURABLE op of the table's window — pending appends, live keyed ops,
     /// AND retained flushed generations (their commits stamped a
@@ -1238,6 +1475,7 @@ impl BufferState {
             seq: Option<u64>,
             kind: TailEventKind,
             batch: &RecordBatch,
+            reservation: Option<Arc<WriteReservation>>,
         ) -> Result<()> {
             let seq = seq.ok_or_else(|| {
                 anyhow!(
@@ -1249,24 +1487,57 @@ impl BufferState {
                 seq,
                 kind,
                 batch: batch.clone(),
+                _reservation: reservation,
             });
             Ok(())
         }
         let mut items: Vec<TailItem> = Vec::new();
         let keyed_item = |items: &mut Vec<TailItem>, op: &KeyedOp| match &op.kind {
-            KeyedKind::Upsert(row) => push(items, ident, op.seq, TailEventKind::Upsert, row),
-            KeyedKind::Delete => push(items, ident, op.seq, TailEventKind::Delete, &op.key_row),
+            KeyedKind::Upsert(row) => push(
+                items,
+                ident,
+                op.seq,
+                TailEventKind::Upsert,
+                row,
+                op._reservation.clone(),
+            ),
+            KeyedKind::Delete => push(
+                items,
+                ident,
+                op.seq,
+                TailEventKind::Delete,
+                &op.key_row,
+                op._reservation.clone(),
+            ),
         };
         for flushed_gen in &entry.flushed {
-            for (seq, batch) in &flushed_gen.batches {
-                push(&mut items, ident, *seq, TailEventKind::Append, batch)?;
+            for ((seq, batch), reservation) in flushed_gen
+                .batches
+                .iter()
+                .zip(&flushed_gen.append_reservations)
+            {
+                push(
+                    &mut items,
+                    ident,
+                    *seq,
+                    TailEventKind::Append,
+                    batch,
+                    reservation.clone(),
+                )?;
             }
             for (_, _, op) in &flushed_gen.keyed {
                 keyed_item(&mut items, op)?;
             }
         }
         for pb in &entry.pending {
-            push(&mut items, ident, pb.seq, TailEventKind::Append, &pb.batch)?;
+            push(
+                &mut items,
+                ident,
+                pb.seq,
+                TailEventKind::Append,
+                &pb.batch,
+                pb.reservation.clone(),
+            )?;
         }
         if let Some(keyed) = &entry.keyed {
             for e in keyed.entries.values() {
@@ -1345,6 +1616,7 @@ fn push_pending(
     routed: &mut RoutedStmt,
     batch: RecordBatch,
     seq: Option<u64>,
+    reservation: Arc<WriteReservation>,
 ) {
     let id = entry.next_batch_id;
     entry.next_batch_id += 1;
@@ -1355,6 +1627,7 @@ fn push_pending(
         claimed: false,
         seq,
         batch,
+        reservation: Some(reservation),
     });
 }
 
@@ -1368,66 +1641,109 @@ fn push_pending(
 /// Live inserts and boot replay both land here (via
 /// [`BufferState::append`]), so replay rebuilds the identical routing by
 /// construction. Returns the statement's undo record ([`RoutedStmt`]).
+enum PreparedAppend {
+    Pending(RecordBatch),
+    Upsert {
+        key: Vec<u8>,
+        key_row: RecordBatch,
+        row: RecordBatch,
+    },
+}
+
+/// Finish fallible key decoding and batch filtering before staging any tail
+/// bytes or changing the visible buffer. Admission rejection leaves no partial
+/// prefix to flush or replay.
+fn prepare_appends(entry: &TableBuf, aligned: &[RecordBatch]) -> Result<Vec<PreparedAppend>> {
+    let mut prepared = Vec::new();
+    for batch in aligned.iter().filter(|batch| batch.num_rows() > 0) {
+        let Some(keyed) = entry.keyed.as_ref().filter(|k| !k.entries.is_empty()) else {
+            prepared.push(PreparedAppend::Pending(batch.clone()));
+            continue;
+        };
+        let keys = keyed::encode_batch_keys(batch, &keyed.pk_cols)?;
+        let hit: Vec<bool> = keys
+            .iter()
+            .map(|key| keyed.entries.contains_key(key))
+            .collect();
+        if hit.iter().all(|h| !h) {
+            prepared.push(PreparedAppend::Pending(batch.clone()));
+            continue;
+        }
+        let key_rows = keyed::project_key_rows(batch, &keyed.pk_cols)?;
+        for (index, key) in keys.into_iter().enumerate().filter(|(row, _)| hit[*row]) {
+            prepared.push(PreparedAppend::Upsert {
+                key,
+                key_row: key_rows.slice(index, 1),
+                row: batch.slice(index, 1),
+            });
+        }
+        if hit.iter().any(|h| !h) {
+            let mask = BooleanArray::from_iter(hit.iter().map(|h| Some(!h)));
+            let filtered = filter_record_batch(batch, &mask)
+                .map_err(|e| anyhow!("cannot split a routed insert batch: {e}"))?;
+            prepared.push(PreparedAppend::Pending(filtered));
+        }
+    }
+    Ok(prepared)
+}
+
+fn append_footprint(aligned: &[RecordBatch], prepared: &[PreparedAppend]) -> Result<usize> {
+    let mut footprint = WriteFootprint::default();
+    // Tail broadcasts can retain the original aligned batches, including the
+    // rows split into separate keyed entries below.
+    for batch in aligned {
+        footprint.batch(batch)?;
+    }
+    for route in prepared {
+        match route {
+            PreparedAppend::Pending(batch) => {
+                footprint.add_bytes(std::mem::size_of::<PendingBatch>())?;
+                footprint.batch(batch)?;
+            }
+            PreparedAppend::Upsert { key, key_row, row } => {
+                footprint.add_bytes(std::mem::size_of::<KeyedEntry>())?;
+                footprint.add_bytes(key.capacity())?;
+                footprint.batch(key_row)?;
+                footprint.batch(row)?;
+            }
+        }
+    }
+    footprint.total()
+}
+
 fn route_appends(
     entry: &mut TableBuf,
-    aligned: Vec<RecordBatch>,
+    prepared: Vec<PreparedAppend>,
     seq: Option<u64>,
-) -> Result<RoutedStmt> {
+    reservation: &Arc<WriteReservation>,
+) -> RoutedStmt {
     let mut routed = RoutedStmt::default();
-    if entry.keyed.as_ref().is_none_or(|k| k.entries.is_empty()) {
-        for batch in aligned {
-            push_pending(entry, &mut routed, batch, seq);
-        }
-        return Ok(routed);
-    }
-    for batch in aligned {
-        if batch.num_rows() == 0 {
-            continue;
-        }
-        let keyed = entry.keyed.as_mut().expect("checked above");
-        let keys = keyed::encode_batch_keys(&batch, &keyed.pk_cols)?;
-        let hit: Vec<bool> = keys.iter().map(|k| keyed.entries.contains_key(k)).collect();
-        if hit.iter().all(|h| !h) {
-            push_pending(entry, &mut routed, batch, seq);
-            continue;
-        }
-        let key_rows = keyed::project_key_rows(&batch, &keyed.pk_cols)?;
-        for (row, key) in keys.iter().enumerate().filter(|&(r, _)| hit[r]) {
-            let stamp = keyed.next_stamp;
-            keyed.next_stamp += 1;
-            let displaced = keyed.entries.insert(
-                key.clone(),
-                KeyedEntry {
-                    stamp,
-                    op: KeyedOp {
-                        key_row: key_rows.slice(row, 1),
-                        kind: KeyedKind::Upsert(batch.slice(row, 1)),
-                        seq,
+    for route in prepared {
+        match route {
+            PreparedAppend::Pending(batch) => {
+                push_pending(entry, &mut routed, batch, seq, reservation.clone());
+            }
+            PreparedAppend::Upsert { key, key_row, row } => {
+                let keyed = entry.keyed.as_mut().expect("prepared keyed route");
+                let stamp = keyed.next_stamp;
+                keyed.next_stamp += 1;
+                let displaced = keyed.entries.insert(
+                    key.clone(),
+                    KeyedEntry {
+                        stamp,
+                        op: KeyedOp {
+                            key_row,
+                            kind: KeyedKind::Upsert(row),
+                            seq,
+                            _reservation: Some(reservation.clone()),
+                        },
                     },
-                },
-            );
-            routed.keyed.push((key.clone(), stamp, displaced));
+                );
+                routed.keyed.push((key, stamp, displaced));
+            }
         }
-        if hit.iter().all(|h| *h) {
-            continue;
-        }
-        let mask = BooleanArray::from_iter(hit.iter().map(|h| Some(!h)));
-        let filtered = filter_record_batch(&batch, &mask)
-            .map_err(|e| anyhow!("cannot split a routed insert batch: {e}"))?;
-        // The invariant the overlay's own-keys-suppress-own-appends rule
-        // and the flush's fold-through-delete rely on: a row entering
-        // `pending` never carries a key with a CURRENT map entry — every
-        // keyed-map entry is therefore strictly NEWER than any pending
-        // append of its key.
-        debug_assert!(
-            keyed::encode_batch_keys(&filtered, &keyed.pk_cols)
-                .map(|ks| ks.iter().all(|k| !keyed.entries.contains_key(k)))
-                .unwrap_or(false),
-            "a pending append must never carry a keyed-map key"
-        );
-        push_pending(entry, &mut routed, filtered, seq);
     }
-    Ok(routed)
+    routed
 }
 
 /// Remove exactly the snapshotted keyed entries from the live map: an entry
@@ -1510,6 +1826,10 @@ pub struct WriteBuffer {
     tail: Option<Arc<dyn TailStore>>,
     /// Serializes flushes (background cadence vs. forced fences).
     flush_lock: tokio::sync::Mutex<()>,
+    /// Without a durable tail watermark, an uncertain POST must retain its
+    /// exact request and block fences until positive commit evidence appears.
+    /// Installed before POST so task cancellation follows the same rule.
+    uncertain: StdMutex<HashMap<TableIdent, Arc<PreparedCommit>>>,
     /// Per-table keyed serialization (L1; see [`KeyedSerial`]).
     keyed_serial: KeyedSerial,
     /// S5 — per-table keyed-activation cache, so the fallback path never
@@ -1579,26 +1899,34 @@ impl WriteBuffer {
         engine: Arc<OverwriteEngine>,
         interval_ms: u64,
         tail: Option<Arc<dyn TailStore>>,
-    ) -> Self {
+    ) -> Result<Self> {
         let max_rows = std::env::var("ICEGRES_WRITE_BUFFER_MAX_ROWS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|n| *n > 0)
             .unwrap_or(DEFAULT_MAX_ROWS);
-        Self {
+        let raw_bytes = match std::env::var("ICEGRES_WRITE_BUFFER_MAX_BYTES") {
+            Ok(raw) => Some(raw),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(e) => return Err(e).context("ICEGRES_WRITE_BUFFER_MAX_BYTES is not valid Unicode"),
+        };
+        let max_bytes = buffer_limit(raw_bytes.as_deref())?;
+        tracing::info!(max_bytes, "buffered write admission byte limit");
+        Ok(Self {
             catalog,
             engine,
             interval: Duration::from_millis(interval_ms),
             max_rows,
-            state: BufferState::default(),
+            state: BufferState::with_limit(max_bytes),
             tail,
             flush_lock: tokio::sync::Mutex::new(()),
+            uncertain: StdMutex::new(HashMap::new()),
             keyed_serial: KeyedSerial::default(),
             activation: StdMutex::new(HashMap::new()),
             kick: tokio::sync::Notify::new(),
             events: tokio::sync::broadcast::channel(TAIL_EVENT_CAPACITY).0,
             subscribers: TailSubscribers::default(),
-        }
+        })
     }
 
     /// One TailSubscribe stream slot (F15); `None` when
@@ -1662,6 +1990,7 @@ impl WriteBuffer {
                 seq: mark,
                 kind: TailEventKind::Watermark,
                 batches: Vec::new(),
+                _reservation: None,
             });
         }
     }
@@ -1874,7 +2203,7 @@ impl WriteBuffer {
                             .state
                             .append(&ident, Some(schema.clone()), &batches, None, Some(seq))
                             .with_context(|| {
-                                format!("tail replay: cannot re-buffer rows for {ident}")
+                                format!("tail replay: cannot re-buffer rows for {ident}; acknowledged WAL is retained; if the byte budget is too small, raise ICEGRES_WRITE_BUFFER_MAX_BYTES before restarting")
                             })?;
                         rows_here += rows;
                     }
@@ -1898,7 +2227,7 @@ impl WriteBuffer {
                         rows_here += self
                             .replay_keyed_frame(&ident, &schema, &pk, seq, op)
                             .with_context(|| {
-                                format!("tail replay: cannot re-buffer keyed op for {ident}")
+                                format!("tail replay: cannot re-buffer keyed op for {ident}; acknowledged WAL is retained; if the byte budget is too small, raise ICEGRES_WRITE_BUFFER_MAX_BYTES before restarting")
                             })?;
                     }
                 }
@@ -1939,6 +2268,7 @@ impl WriteBuffer {
                             key_row: key_rows.slice(row, 1),
                             kind: KeyedKind::Upsert(aligned.slice(row, 1)),
                             seq: Some(seq),
+                            _reservation: None,
                         };
                         self.state.keyed_write(
                             ident,
@@ -1963,6 +2293,7 @@ impl WriteBuffer {
                             key_row: key_batch.slice(row, 1),
                             kind: KeyedKind::Delete,
                             seq: Some(seq),
+                            _reservation: None,
                         };
                         self.state.keyed_write(
                             ident,
@@ -2027,17 +2358,25 @@ impl WriteBuffer {
         // With a tail: durable append FIRST, then pending, then the ack
         // (a tail error is this statement's error — never a silent
         // downgrade to non-durable buffering).
-        let (rows, pending_total, published) =
+        let result =
             self.state
-                .append(ident, schema_if_first, &batches, self.tail.as_deref(), None)?;
+                .append(ident, schema_if_first, &batches, self.tail.as_deref(), None);
+        if result
+            .as_ref()
+            .is_err_and(|e| e.downcast_ref::<BufferCapacityError>().is_some())
+        {
+            self.kick.notify_one();
+        }
+        let (rows, pending_total, published) = result?;
         // Open tail API: broadcast AFTER the durability wait succeeded —
         // never rows a failed statement unroutes.
-        if let Some((seq, batches)) = published {
+        if let Some((seq, batches, reservation)) = published {
             self.publish(TailEvent {
                 ident: ident.clone(),
                 seq,
                 kind: TailEventKind::Append,
                 batches,
+                _reservation: Some(reservation),
             });
         }
         if pending_total >= self.max_rows {
@@ -2282,7 +2621,7 @@ impl WriteBuffer {
             KeyedKind::Upsert(row) => (TailEventKind::Upsert, row.clone()),
             KeyedKind::Delete => (TailEventKind::Delete, key_batch.clone()),
         };
-        let (keyed_total, pending_rows, seq) = self.state.keyed_write(
+        let result = self.state.keyed_write(
             &cand.ident,
             Some(schema),
             &pk_cols,
@@ -2291,9 +2630,17 @@ impl WriteBuffer {
                 key_row: key_batch,
                 kind,
                 seq: None,
+                _reservation: None,
             },
             self.tail.as_deref(),
-        )?;
+        );
+        if result
+            .as_ref()
+            .is_err_and(|e| e.downcast_ref::<BufferCapacityError>().is_some())
+        {
+            self.kick.notify_one();
+        }
+        let (keyed_total, pending_rows, seq, reservation) = result?;
         // Open tail API: broadcast AFTER the durability wait succeeded.
         if let Some(seq) = seq {
             self.publish(TailEvent {
@@ -2301,6 +2648,7 @@ impl WriteBuffer {
                 seq,
                 kind: publish_kind,
                 batches: vec![publish_batch],
+                _reservation: Some(reservation),
             });
         }
         if keyed_total + pending_rows >= self.max_rows {
@@ -2356,7 +2704,7 @@ impl WriteBuffer {
         // — the documented lock order. Held across the synchronous commit.
         let serial = self.keyed_serial.lock_for(&ident);
         let _serial = serial.lock().await;
-        if self.state.has_pending() {
+        if self.has_pending() {
             self.flush_now()
                 .await
                 .context("write-buffer flush (required before this statement) failed")?;
@@ -2411,14 +2759,82 @@ impl WriteBuffer {
     pub async fn flush_now(&self) -> Result<()> {
         let _guard = self.flush_lock.lock().await;
         self.gc_flushed();
-        let idents = self.state.pending_idents();
+        let uncertain: Vec<_> = self
+            .uncertain
+            .lock()
+            .expect("uncertain commit lock poisoned")
+            .iter()
+            .map(|(ident, prepared)| (ident.clone(), prepared.clone()))
+            .collect();
         let mut first_err: Option<anyhow::Error> = None;
+        for (ident, prepared) in uncertain {
+            if self.engine.prepared_commit_visible(&ident, &prepared).await {
+                self.uncertain
+                    .lock()
+                    .expect("uncertain commit lock poisoned")
+                    .remove(&ident);
+            } else {
+                first_err.get_or_insert_with(|| anyhow!(CommitUnknown {
+                    message: format!("buffered commit for {ident} remains unknown; its generation is retained and will not be posted again"),
+                }));
+            }
+        }
+        let idents = self.state.pending_idents();
         for ident in idents {
+            if self
+                .uncertain
+                .lock()
+                .expect("uncertain commit lock poisoned")
+                .contains_key(&ident)
+            {
+                continue;
+            }
             if let Err(e) = self.flush_table(&ident).await {
                 tracing::error!(table = %ident, "write-buffer flush failed: {e:#}");
                 first_err.get_or_insert(e);
             }
         }
+        // No pending work is needed to release an old committed generation.
+        // Do this after flushes, concurrently and with a fixed deadline, so
+        // admission pressure cannot starve the writes that free capacity.
+        use futures::StreamExt as _;
+        let observations =
+            self.state
+                .observation_candidates()
+                .into_iter()
+                .map(|ident| async move {
+                    if let Some(provider) =
+                        crate::freshness::provider(&crate::freshness::table_key(&ident))
+                    {
+                        // Refresh the provider itself before releasing its overlay.
+                        // A bare catalog load could otherwise leave a precommit
+                        // snapshot available to the stale-read fallback.
+                        if matches!(
+                            tokio::time::timeout(Duration::from_secs(2), provider.refresh()).await,
+                            Ok(Ok(()))
+                        ) {
+                            if let Some((_, metadata)) = provider.fresh_metadata() {
+                                self.state
+                                    .note_observed(&ident, self.contained_in(&ident, &metadata));
+                            }
+                        }
+                    } else if !explicit_stale_reads() {
+                        if let Ok(Ok(table)) = tokio::time::timeout(
+                            Duration::from_secs(2),
+                            self.catalog.load_table(&ident),
+                        )
+                        .await
+                        {
+                            self.state
+                                .note_observed(&ident, self.contained_in(&ident, table.metadata()));
+                        }
+                    }
+                });
+        futures::stream::iter(observations)
+            .buffer_unordered(8)
+            .collect::<Vec<_>>()
+            .await;
+        self.gc_flushed();
         match first_err {
             None => Ok(()),
             Some(e) => Err(e),
@@ -2428,6 +2844,11 @@ impl WriteBuffer {
     /// Whether any pending rows exist (cheap check for the fence path).
     pub fn has_pending(&self) -> bool {
         self.state.has_pending()
+            || !self
+                .uncertain
+                .lock()
+                .expect("uncertain commit lock poisoned")
+                .is_empty()
     }
 
     /// Group-commit one table's pending rows AND coalesced keyed ops as ONE
@@ -2467,6 +2888,7 @@ impl WriteBuffer {
                 n_batches,
                 keyed: keyed_snapshot,
                 tail_mark,
+                append_reservations: _append_reservations,
             } = snap;
             // LOAD-BEARING: reload the table metadata on EVERY attempt. The
             // fresh properties feed the generation_already_committed guard
@@ -2484,8 +2906,12 @@ impl WriteBuffer {
             // I1: this fresh load is covering metadata for every EARLIER
             // generation it contains — record the observation so their GC
             // unblocks even on write-only tables no scan ever overlays.
-            self.state
-                .note_observed(ident, self.contained_in(ident, table.metadata()));
+            if crate::freshness::provider(&crate::freshness::table_key(ident)).is_none()
+                && !explicit_stale_reads()
+            {
+                self.state
+                    .note_observed(ident, self.contained_in(ident, table.metadata()));
+            }
             let pk = self.engine.pk_columns(&table)?;
             let rows: usize =
                 batches.iter().map(|b| b.num_rows()).sum::<usize>() + keyed_snapshot.len();
@@ -2602,8 +3028,19 @@ impl WriteBuffer {
             // docs for why this ordering makes the union race-free.
             self.state
                 .move_pending_to_flushed(ident, n_batches, &keyed_snapshot, snapshot_id);
+            let prepared = Arc::new(prepared);
+            if self.tail.is_none() {
+                self.uncertain
+                    .lock()
+                    .expect("uncertain commit lock poisoned")
+                    .insert(ident.clone(), prepared.clone());
+            }
             match self.engine.post_prepared(ident, &prepared).await {
                 Ok(CommitOutcome::Committed) => {
+                    self.uncertain
+                        .lock()
+                        .expect("uncertain commit lock poisoned")
+                        .remove(ident);
                     // The commit carries the watermark, so the covered tail
                     // segments are dead weight from here on.
                     tail_truncate_covered(self.tail.as_deref(), ident, tail_mark);
@@ -2618,6 +3055,10 @@ impl WriteBuffer {
                     return Ok(());
                 }
                 Ok(CommitOutcome::Conflict(msg)) => {
+                    self.uncertain
+                        .lock()
+                        .expect("uncertain commit lock poisoned")
+                        .remove(ident);
                     tracing::warn!(
                         table = %ident,
                         attempt,
@@ -2627,6 +3068,16 @@ impl WriteBuffer {
                     conflicts.push(msg);
                 }
                 Err(e) => {
+                    if self.tail.is_none() && e.downcast_ref::<CommitUnknown>().is_some() {
+                        // The generation remains flushed/charged and readable through
+                        // the overlay. A later fence only reconciles this request;
+                        // absence of evidence never authorizes a duplicate POST.
+                        return Err(e);
+                    }
+                    self.uncertain
+                        .lock()
+                        .expect("uncertain commit lock poisoned")
+                        .remove(ident);
                     // Ambiguous outcome: a transport error / 5xx can follow
                     // a commit the catalog actually APPLIED, and re-queueing
                     // then double-applies the generation on the next tick.
@@ -2641,8 +3092,13 @@ impl WriteBuffer {
                     // last stamped watermark, and flush_lock serializes any
                     // newer one.
                     if let (Some(tail), Some(mark)) = (&self.tail, tail_mark) {
-                        match self.catalog.load_table(ident).await {
-                            Ok(fresh) => {
+                        match tokio::time::timeout(
+                            Duration::from_secs(5),
+                            self.catalog.load_table(ident),
+                        )
+                        .await
+                        {
+                            Ok(Ok(fresh)) => {
                                 let seen = parse_watermark_property(
                                     ident,
                                     fresh
@@ -2667,13 +3123,15 @@ impl WriteBuffer {
                                     return Ok(());
                                 }
                             }
-                            Err(load_err) => tracing::warn!(
+                            Ok(Err(load_err)) => tracing::warn!(
                                 table = %ident,
                                 "cannot reload metadata to disambiguate a failed flush \
                                  POST; re-queueing the generation (the prepare-time \
                                  already-committed guard resolves it on the next \
                                  flush): {load_err}"
                             ),
+                            Err(_) => tracing::warn!(table = %ident,
+                                "timed out reconciling the tail watermark; retained frames guard the next flush"),
                         }
                     }
                     self.state.move_flushed_back_to_pending(ident, snapshot_id);
@@ -2700,6 +3158,14 @@ impl WriteBuffer {
         self.state
             .retain_flushed(|g| !flushed_gen_expired(g, FLUSHED_GC));
     }
+}
+
+/// Without a registered freshness provider we cannot advance an optional
+/// stale-read cache, so only a scan can safely observe its overlay for GC.
+fn explicit_stale_reads() -> bool {
+    std::env::var("ICEGRES_STALE_READ_ON_CATALOG_ERROR")
+        .ok()
+        .is_some_and(|raw| matches!(raw.trim(), "1" | "true" | "on" | "yes"))
 }
 
 /// The GC predicate for one flushed generation (I1): expired only once
@@ -2860,7 +3326,7 @@ impl BufferHook {
             Statement::Insert(_) if !self.enforce_pk => Some(
                 self.buffered_insert(stmt, shared, params)
                     .await
-                    .map_err(|e| dml::engine_error(&e)),
+                    .map_err(|e| buffer_error(&e)),
             ),
             // Pass-throughs that need no fence: reads see the buffer via
             // the union view; SET/SHOW are session-local; COMMIT/ROLLBACK
@@ -2890,12 +3356,12 @@ impl BufferHook {
                     match self.buffer.try_keyed_dml(stmt, shared).await {
                         Ok(Some(resp)) => return Some(Ok(resp)),
                         Ok(None) => {} // not keyed-shaped: sync path below
-                        Err(e) => return Some(Err(dml::engine_error(&e))),
+                        Err(e) => return Some(Err(buffer_error(&e))),
                     }
                     match self.buffer.try_serialized_sync_dml(stmt).await {
                         Ok(Some(resp)) => return Some(Ok(resp)),
                         Ok(None) => {} // not keyed-activated: plain fence
-                        Err(e) => return Some(Err(dml::engine_error(&e))),
+                        Err(e) => return Some(Err(buffer_error(&e))),
                     }
                 }
                 self.fence().await
@@ -2987,8 +3453,15 @@ mod tests {
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
 
+    fn field(name: &str, data_type: DataType, nullable: bool, id: i32) -> Field {
+        Field::new(name, data_type, nullable).with_metadata(HashMap::from([(
+            "PARQUET:field_id".to_string(),
+            id.to_string(),
+        )]))
+    }
+
     fn schema() -> ArrowSchemaRef {
-        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
+        Arc::new(Schema::new(vec![field("id", DataType::Int64, false, 1)]))
     }
 
     fn ident() -> TableIdent {
@@ -2997,6 +3470,295 @@ mod tests {
 
     fn batch(sch: &ArrowSchemaRef, vals: &[i64]) -> RecordBatch {
         RecordBatch::try_new(sch.clone(), vec![Arc::new(Int64Array::from(vals.to_vec()))]).unwrap()
+    }
+
+    #[test]
+    fn admission_rejects_changed_field_ids_before_tail_staging() {
+        let st = BufferState::default();
+        let tail = MockTail::default();
+        st.append(
+            &ident(),
+            Some(schema()),
+            &[batch(&schema(), &[1])],
+            None,
+            None,
+        )
+        .unwrap();
+        let evolved = Arc::new(Schema::new(vec![field("id", DataType::Int64, false, 2)]));
+        let before = st.budget.used.load(Ordering::Acquire);
+        let err = st
+            .append(
+                &ident(),
+                Some(evolved.clone()),
+                &[batch(&evolved, &[2])],
+                Some(&tail),
+                None,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("field id"));
+        assert!(tail.appends.lock().unwrap().is_empty());
+        assert_eq!(st.budget.used.load(Ordering::Acquire), before);
+        assert_eq!(
+            ids(&st.overlay_with(&ident(), |_| false).unwrap().unwrap()),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn admission_configuration_is_finite_and_rejects_invalid_values() {
+        assert_eq!(buffer_limit(None).unwrap(), DEFAULT_MAX_BYTES);
+        assert_eq!(buffer_limit(Some(" 4096 ")).unwrap(), 4096);
+        for value in ["0", "-1", "", "1.5", "18446744073709551616000"] {
+            assert!(buffer_limit(Some(value)).is_err(), "accepted {value:?}");
+        }
+    }
+
+    #[test]
+    fn admission_rejects_a_wide_row_before_tail_staging_or_replay_mutation() {
+        let st = BufferState::with_limit(4096);
+        let tail = MockTail::default();
+        let wide = krow(1, &"x".repeat(16 * 1024));
+        let error = st
+            .append(
+                &ident(),
+                Some(kschema()),
+                std::slice::from_ref(&wide),
+                Some(&tail),
+                None,
+            )
+            .unwrap_err();
+        assert!(error.downcast_ref::<BufferCapacityError>().is_some());
+        assert!(tail.appends.lock().unwrap().is_empty());
+        assert!(!st.has_pending());
+        assert_eq!(st.budget.used.load(Ordering::Relaxed), 0);
+        match buffer_error(&error.context("buffered INSERT")) {
+            PgWireError::UserError(info) => assert_eq!(info.code, "53200"),
+            other => panic!("expected resource error, got {other:?}"),
+        }
+
+        // An already acknowledged frame must remain available when recovery
+        // cannot fit it. Replay never rewrites or truncates that frame.
+        let seq = tail
+            .append(&ident(), TailOpKind::Append, std::slice::from_ref(&wide))
+            .unwrap();
+        assert!(st
+            .append(&ident(), Some(kschema()), &[wide], None, Some(seq))
+            .is_err());
+        assert_eq!(tail.appends.lock().unwrap().len(), 1);
+        assert!(tail.truncates.lock().unwrap().is_empty());
+        assert_eq!(st.budget.used.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn admission_accounts_for_arrow_backing_buffers_and_deduplicates_slices() {
+        let source = kbatch(&[(1, "x"), (2, &"y".repeat(16 * 1024))]);
+        let slice = source.slice(0, 1);
+        let mut footprint = WriteFootprint::default();
+        footprint.batch(&slice).unwrap();
+        let one = footprint.total().unwrap();
+        assert!(
+            one >= 16 * 1024,
+            "one-row slice retains the wide backing buffer"
+        );
+        let mut footprint = WriteFootprint::default();
+        footprint.batch(&slice).unwrap();
+        footprint.batch(&source.slice(1, 1)).unwrap();
+        let two = footprint.total().unwrap();
+        assert!(
+            two < 2 * one,
+            "shared allocation must not be charged per slice"
+        );
+    }
+
+    #[test]
+    fn admission_charge_survives_flush_conflict_retention_and_inflight_snapshot() {
+        let sch = schema();
+        let rows = batch(&sch, &[1, 2]);
+        let measure = BufferState::default();
+        measure
+            .append(
+                &ident(),
+                Some(sch.clone()),
+                std::slice::from_ref(&rows),
+                None,
+                None,
+            )
+            .unwrap();
+        let limit = measure.budget.used.load(Ordering::Relaxed);
+        let st = BufferState::with_limit(limit);
+        st.append(
+            &ident(),
+            Some(sch.clone()),
+            std::slice::from_ref(&rows),
+            None,
+            None,
+        )
+        .unwrap();
+        let other = TableIdent::from_strs(["demo", "another"]).unwrap();
+        assert!(st
+            .append(
+                &other,
+                Some(sch.clone()),
+                std::slice::from_ref(&rows),
+                None,
+                None
+            )
+            .is_err());
+        let snapshot = st.snapshot_pending(&ident());
+        st.move_pending_to_flushed(&ident(), snapshot.n_batches, &[], 7);
+        assert_eq!(st.budget.used.load(Ordering::Relaxed), limit);
+        st.move_flushed_back_to_pending(&ident(), 7);
+        assert_eq!(st.budget.used.load(Ordering::Relaxed), limit);
+        st.move_pending_to_flushed(&ident(), snapshot.n_batches, &[], 8);
+        st.retain_flushed(|g| !flushed_gen_expired(g, Duration::ZERO));
+        assert_eq!(
+            st.budget.used.load(Ordering::Relaxed),
+            limit,
+            "unobserved generation remains charged"
+        );
+        st.note_observed(&ident(), |_| true);
+        st.retain_flushed(|g| !flushed_gen_expired(g, Duration::ZERO));
+        assert_eq!(
+            st.budget.used.load(Ordering::Relaxed),
+            limit,
+            "in-flight snapshot still owns the allocation"
+        );
+        drop(snapshot);
+        assert_eq!(st.budget.used.load(Ordering::Relaxed), 0);
+        st.append(&other, Some(sch), &[rows], None, None).unwrap();
+    }
+
+    #[test]
+    fn admission_releases_failed_tail_writes_and_retains_displaced_keyed_data() {
+        let st = BufferState::default();
+        let sch = schema();
+        let tail = MockTail::default();
+        tail.fail_appends.store(true, Ordering::SeqCst);
+        assert!(st
+            .append(
+                &ident(),
+                Some(sch.clone()),
+                &[batch(&sch, &[1])],
+                Some(&tail),
+                None
+            )
+            .is_err());
+        assert_eq!(st.budget.used.load(Ordering::Relaxed), 0);
+        assert!(st
+            .append(
+                &ident(),
+                Some(sch.clone()),
+                &[batch(&sch, &[1])],
+                Some(&FailWaitTail::default()),
+                None
+            )
+            .is_err());
+        assert_eq!(st.budget.used.load(Ordering::Relaxed), 0);
+
+        let keyed = BufferState::default();
+        write_upsert(&keyed, 1, "old", None);
+        let before = keyed.budget.used.load(Ordering::Relaxed);
+        let error = keyed
+            .keyed_write(
+                &ident(),
+                Some(kschema()),
+                &pk(),
+                key_of(1),
+                KeyedOp {
+                    key_row: key_row(1),
+                    kind: KeyedKind::Upsert(krow(1, "replacement")),
+                    seq: None,
+                    _reservation: None,
+                },
+                Some(&FailWaitTail::default()),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("wait failed"));
+        assert_eq!(upserted_val(&keyed, 1), "old");
+        assert_eq!(keyed.budget.used.load(Ordering::Relaxed), before);
+        let snapshot = keyed.snapshot_pending(&ident());
+        write_upsert(&keyed, 1, "new", None);
+        assert!(
+            keyed.budget.used.load(Ordering::Relaxed) > before,
+            "replaced row remains owned by in-flight snapshot"
+        );
+        drop(snapshot);
+        assert_eq!(keyed.budget.used.load(Ordering::Relaxed), before);
+    }
+
+    #[test]
+    fn admission_reclaims_idle_committed_generations_only_after_observation() {
+        let st = BufferState::default();
+        let sch = schema();
+        st.append(
+            &ident(),
+            Some(sch.clone()),
+            &[batch(&sch, &[1])],
+            None,
+            None,
+        )
+        .unwrap();
+        st.move_pending_to_flushed(&ident(), 1, &[], 7);
+        assert!(st.observation_candidates().is_empty());
+        {
+            let mut tables = st.tables.lock().unwrap();
+            tables.get_mut(&ident()).unwrap().flushed[0].committed_at = Instant::now() - FLUSHED_GC;
+        }
+        assert_eq!(st.observation_candidates(), vec![ident()]);
+        st.retain_flushed(|g| !flushed_gen_expired(g, FLUSHED_GC));
+        assert!(st.budget.used.load(Ordering::Relaxed) > 0);
+        st.note_observed(&ident(), |_| true);
+        assert!(st.observation_candidates().is_empty());
+        st.retain_flushed(|g| !flushed_gen_expired(g, FLUSHED_GC));
+        assert_eq!(st.budget.used.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn admission_reservation_releases_on_task_cancellation() {
+        let budget = Arc::new(WriteBudget::new(64));
+        let (ready, wait) = tokio::sync::oneshot::channel();
+        let task_budget = budget.clone();
+        let task = tokio::spawn(async move {
+            let _reservation = task_budget.reserve(64).unwrap();
+            ready.send(()).unwrap();
+            futures::future::pending::<()>().await;
+        });
+        wait.await.unwrap();
+        assert!(budget.reserve(1).is_err());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(budget.used.load(Ordering::Relaxed), 0);
+        assert!(budget.reserve(usize::MAX).is_err());
+    }
+
+    #[test]
+    fn admission_concurrent_reservations_cannot_exceed_the_global_limit() {
+        let budget = Arc::new(WriteBudget::new(64));
+        let barrier = Arc::new(std::sync::Barrier::new(9));
+        let successful = Arc::new(AtomicUsize::new(0));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let (budget, barrier, successful) =
+                    (budget.clone(), barrier.clone(), successful.clone());
+                std::thread::spawn(move || {
+                    let reserved = budget.reserve(32);
+                    if reserved.is_ok() {
+                        successful.fetch_add(1, Ordering::Relaxed);
+                    }
+                    barrier.wait();
+                    barrier.wait();
+                    drop(reserved);
+                })
+            })
+            .collect();
+        barrier.wait();
+        assert_eq!(successful.load(Ordering::Relaxed), 2);
+        assert_eq!(budget.used.load(Ordering::Relaxed), 64);
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(budget.used.load(Ordering::Relaxed), 0);
     }
 
     /// The old 3-tuple view of a pending snapshot (most tests only need
@@ -3578,8 +4340,8 @@ mod tests {
     /// Two-column schema (id PK, val payload) for the keyed tests.
     fn kschema() -> ArrowSchemaRef {
         Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("val", DataType::Utf8, true),
+            field("id", DataType::Int64, false, 1),
+            field("val", DataType::Utf8, true, 2),
         ]))
     }
 
@@ -3633,6 +4395,7 @@ mod tests {
                 key_row: key_row(id),
                 kind: KeyedKind::Upsert(krow(id, val)),
                 seq: None,
+                _reservation: None,
             },
             tail,
         )
@@ -3649,6 +4412,7 @@ mod tests {
                 key_row: key_row(id),
                 kind: KeyedKind::Delete,
                 seq: None,
+                _reservation: None,
             },
             tail,
         )
@@ -3833,6 +4597,7 @@ mod tests {
                     key_row: key_row(9),
                     kind: KeyedKind::Delete,
                     seq: None,
+                    _reservation: None,
                 },
                 Some(&tail),
             )
@@ -3845,9 +4610,9 @@ mod tests {
     #[test]
     fn composite_keys_roundtrip_through_state() {
         let comp_schema: ArrowSchemaRef = Arc::new(Schema::new(vec![
-            Field::new("a", DataType::Int64, false),
-            Field::new("b", DataType::Utf8, false),
-            Field::new("val", DataType::Utf8, true),
+            field("a", DataType::Int64, false, 1),
+            field("b", DataType::Utf8, false, 2),
+            field("val", DataType::Utf8, true, 2),
         ]));
         let comp_pk = vec!["a".to_string(), "b".to_string()];
         let row = RecordBatch::try_new(
@@ -3873,6 +4638,7 @@ mod tests {
                 key_row,
                 kind: KeyedKind::Upsert(row),
                 seq: None,
+                _reservation: None,
             },
             None,
         )
@@ -3889,8 +4655,8 @@ mod tests {
         // A different composite value does not collide.
         let other = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
-                Field::new("a", DataType::Int64, false),
-                Field::new("b", DataType::Utf8, false),
+                field("a", DataType::Int64, false, 1),
+                field("b", DataType::Utf8, false, 2),
             ])),
             vec![
                 Arc::new(Int64Array::from(vec![1])),
@@ -4036,6 +4802,7 @@ mod tests {
                     key_row: key_row(9),
                     kind: KeyedKind::Delete,
                     seq: None,
+                    _reservation: None,
                 },
                 None,
             )
@@ -4055,6 +4822,7 @@ mod tests {
                     key_row: key_row(9),
                     kind: KeyedKind::Delete,
                     seq: None,
+                    _reservation: None,
                 },
                 None,
             )
@@ -4078,6 +4846,7 @@ mod tests {
                 key_row: key_row_new,
                 kind: KeyedKind::Upsert(row),
                 seq: None,
+                _reservation: None,
             },
             None,
         )
@@ -4512,6 +5281,7 @@ mod tests {
                     key_row: key_row(1),
                     kind: KeyedKind::Upsert(krow(1, "v20")),
                     seq: None,
+                    _reservation: None,
                 },
                 Some(&tail),
             )
@@ -4546,6 +5316,7 @@ mod tests {
                     key_row: key_row(2),
                     kind: KeyedKind::Delete,
                     seq: None,
+                    _reservation: None,
                 },
                 Some(&tail),
             )
@@ -4646,6 +5417,7 @@ mod tests {
                     key_row: key_row(1),
                     kind: KeyedKind::Upsert(krow(1, "v1")),
                     seq: None,
+                    _reservation: None,
                 },
                 Some(&tail),
             )
@@ -4890,6 +5662,7 @@ mod tests {
                 key_row: key_row(2),
                 kind: KeyedKind::Upsert(krow(2, "x")),
                 seq: None,
+                _reservation: None,
             },
             Some(&tail),
         )

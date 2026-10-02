@@ -31,6 +31,11 @@
 //!    connect-time type-loading query (Power BI / Excel). The coherent
 //!    snapshot re-materializes `pg_type` with `typnamespace` rewritten to
 //!    the snapshot's real `pg_catalog` namespace oid.
+//! 7. SQLAlchemy schema reflection uses a custom LIKE escape. The hook
+//!    translates only the pattern to Arrow's backslash convention, preserving
+//!    literal backslashes and prepared parameters. Its nested identity and
+//!    collation expressions also need post-order catalog cast normalization
+//!    and JSON construction for metadata values.
 //!
 //! The hook intercepts ONLY plain `SELECT` statements whose table references
 //! all live in `pg_catalog` AND that one of the rewrites actually changed —
@@ -107,6 +112,217 @@ pub fn register_compat_udfs(ctx: &SessionContext) {
         "pg_type_is_visible",
         ScalarValue::Boolean(Some(true)),
     )));
+    // Iceberg has no PostgreSQL serial/identity sequences, and the emulated
+    // collations belong to the visible pg_catalog namespace.
+    ctx.register_udf(ScalarUDF::new_from_impl(ConstStub::new(
+        "pg_get_serial_sequence",
+        ScalarValue::Utf8(None),
+    )));
+    ctx.register_udf(ScalarUDF::new_from_impl(ConstStub::new(
+        "pg_collation_is_visible",
+        ScalarValue::Boolean(Some(true)),
+    )));
+    ctx.register_udf(create_udf(
+        "icegres_catalog_like_pattern",
+        vec![DataType::Utf8, DataType::Utf8],
+        DataType::Utf8,
+        Volatility::Immutable,
+        Arc::new(|args| {
+            let arrays = ColumnarValue::values_to_arrays(args)?;
+            let patterns = arrays[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| DataFusionError::Execution("LIKE pattern must be text".into()))?;
+            let escapes = arrays[1]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| DataFusionError::Execution("LIKE escape must be text".into()))?;
+            let values = patterns
+                .iter()
+                .zip(escapes.iter())
+                .map(|(pattern, escape)| match (pattern, escape) {
+                    (Some(pattern), Some(escape)) => {
+                        normalize_like_pattern(pattern, escape).map(Some)
+                    }
+                    _ => Ok(None),
+                })
+                .collect::<Result<Vec<_>, DataFusionError>>()?;
+            if args.iter().all(|v| matches!(v, ColumnarValue::Scalar(_))) {
+                Ok(ColumnarValue::Scalar(ScalarValue::Utf8(
+                    values.into_iter().next().flatten(),
+                )))
+            } else {
+                Ok(ColumnarValue::Array(Arc::new(StringArray::from(values))))
+            }
+        }),
+    ));
+    ctx.register_udf(ScalarUDF::new_from_impl(CatalogJsonObject {
+        signature: datafusion::logical_expr::Signature::variadic_any(Volatility::Immutable),
+    }));
+    // SQLAlchemy 2.1 asks for the default PostgreSQL access method while
+    // reflecting table options. This is an emulation constant; session
+    // settings such as search_path must never be answered from shared state.
+    ctx.register_udf(create_udf(
+        "icegres_catalog_setting",
+        vec![DataType::Utf8],
+        DataType::Utf8,
+        Volatility::Immutable,
+        Arc::new(|args| {
+            let arrays = ColumnarValue::values_to_arrays(args)?;
+            let names = arrays[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution("catalog setting name must be text".into())
+                })?;
+            let values = names
+                .iter()
+                .map(|name| match name {
+                    Some("default_table_access_method") => Ok(Some("heap".to_owned())),
+                    None => Ok(None),
+                    Some(name) => Err(DataFusionError::Execution(format!(
+                        "current_setting({name:?}) is not supported by catalog compatibility"
+                    ))),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if matches!(args[0], ColumnarValue::Scalar(_)) {
+                Ok(ColumnarValue::Scalar(ScalarValue::Utf8(
+                    values.into_iter().next().flatten(),
+                )))
+            } else {
+                Ok(ColumnarValue::Array(Arc::new(StringArray::from(values))))
+            }
+        }),
+    ));
+}
+
+/// Convert PostgreSQL LIKE escaping to Arrow's backslash escaping. A quoted
+/// ordinary character loses its escape; literal backslashes remain literal.
+/// Empty ESCAPE disables escaping. Never change the value being matched.
+fn normalize_like_pattern(pattern: &str, escape: &str) -> Result<String, DataFusionError> {
+    let mut escape_chars = escape.chars();
+    let escape = escape_chars.next();
+    if escape_chars.next().is_some() {
+        return Err(DataFusionError::Execution(
+            "LIKE escape must be empty or one character".into(),
+        ));
+    }
+    let mut normalized = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars();
+    while let Some(ch) = chars.next() {
+        if Some(ch) == escape {
+            let quoted = chars.next().ok_or_else(|| {
+                DataFusionError::Execution("LIKE pattern must not end with escape character".into())
+            })?;
+            if matches!(quoted, '%' | '_' | '\\') {
+                normalized.push('\\');
+            }
+            normalized.push(quoted);
+        } else {
+            if ch == '\\' {
+                normalized.push('\\');
+            }
+            normalized.push(ch);
+        }
+    }
+    Ok(normalized)
+}
+
+/// JSON construction for catalog reflection. Keep every argument in the plan,
+/// including placeholders in unreachable identity/collation CASE branches.
+/// Arrow's JSON writer preserves numbers, booleans, strings and nulls instead
+/// of converting all values to strings.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct CatalogJsonObject {
+    signature: datafusion::logical_expr::Signature,
+}
+
+impl datafusion::logical_expr::ScalarUDFImpl for CatalogJsonObject {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "icegres_catalog_json_object"
+    }
+    fn signature(&self) -> &datafusion::logical_expr::Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType, DataFusionError> {
+        Ok(DataType::Utf8)
+    }
+    fn invoke_with_args(
+        &self,
+        args: datafusion::logical_expr::ScalarFunctionArgs,
+    ) -> Result<ColumnarValue, DataFusionError> {
+        use datafusion::arrow::datatypes::{Field, Schema};
+        use datafusion::arrow::json::writer::{JsonArray, WriterBuilder};
+
+        if !args.args.len().is_multiple_of(2) {
+            return Err(DataFusionError::Execution(
+                "json_build_object requires alternating keys and values".into(),
+            ));
+        }
+        if args.args.is_empty() {
+            return Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some("{}".into()))));
+        }
+        let arrays = ColumnarValue::values_to_arrays(&args.args)?;
+        let values = arrays
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .cloned()
+            .collect::<Vec<_>>();
+        let fields = values
+            .iter()
+            .enumerate()
+            .map(|(i, value)| Field::new(i.to_string(), value.data_type().clone(), true))
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), values)?;
+        let mut writer = WriterBuilder::new()
+            .with_explicit_nulls(true)
+            .build::<_, JsonArray>(Vec::new());
+        writer.write(&batch)?;
+        writer.finish()?;
+        let rows: Vec<serde_json::Map<String, serde_json::Value>> =
+            serde_json::from_slice(&writer.into_inner())
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+        let keys = arrays
+            .iter()
+            .step_by(2)
+            .map(|array| cast(array, &DataType::Utf8))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut results = Vec::with_capacity(rows.len());
+        for (row_index, mut row) in rows.into_iter().enumerate() {
+            let mut object = serde_json::Map::new();
+            for (key_index, keys) in keys.iter().enumerate() {
+                let keys = keys.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                    DataFusionError::Execution("json_build_object keys must be text".into())
+                })?;
+                if keys.is_null(row_index) {
+                    return Err(DataFusionError::Execution(
+                        "json_build_object keys must not be null".into(),
+                    ));
+                }
+                object.insert(
+                    keys.value(row_index).to_owned(),
+                    row.remove(&key_index.to_string())
+                        .unwrap_or(serde_json::Value::Null),
+                );
+            }
+            results.push(serde_json::Value::Object(object).to_string());
+        }
+        if args
+            .args
+            .iter()
+            .all(|v| matches!(v, ColumnarValue::Scalar(_)))
+        {
+            Ok(ColumnarValue::Scalar(ScalarValue::Utf8(
+                results.into_iter().next(),
+            )))
+        } else {
+            Ok(ColumnarValue::Array(Arc::new(StringArray::from(results))))
+        }
+    }
 }
 
 /// A pg_catalog function stub: accepts any arguments, always returns the
@@ -709,7 +925,44 @@ impl VisitorMut for CompatRewriter {
             }
         }
         match expr {
+            Expr::Like {
+                pattern,
+                escape_char,
+                ..
+            }
+            | Expr::ILike {
+                pattern,
+                escape_char,
+                ..
+            } => {
+                if let Some(escape) = escape_char.as_ref() {
+                    if !matches!(escape, Value::SingleQuotedString(s) if s == "\\") {
+                        if let Some(normalized) = parse_expr_snippet(&format!(
+                            "icegres_catalog_like_pattern(({pattern}), {escape})"
+                        )) {
+                            **pattern = normalized;
+                            *escape_char = Some(Value::SingleQuotedString("\\".into()));
+                            self.changed = true;
+                        }
+                    }
+                }
+            }
             Expr::Function(f) => {
+                let internal_name = if func_is(&f.name, "json_build_object") {
+                    Some("icegres_catalog_json_object")
+                } else if func_is(&f.name, "current_setting") {
+                    Some("icegres_catalog_setting")
+                } else {
+                    None
+                };
+                if let Some(internal_name) = internal_name {
+                    f.name = ObjectName(vec![
+                        datafusion::sql::sqlparser::ast::ObjectNamePart::Identifier(
+                            datafusion::sql::sqlparser::ast::Ident::new(internal_name),
+                        ),
+                    ]);
+                    self.changed = true;
+                }
                 // Rule 3a: unnest(<text vector col>).
                 if func_is(&f.name, "unnest") {
                     if let Some(arr) = first_arg(&f.args).and_then(vector_to_array_sql) {
@@ -742,6 +995,29 @@ impl VisitorMut for CompatRewriter {
             }
             Expr::Subquery(q) => self.wrap_scalar_subquery(q),
             _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+        // The upstream unsupported-type rule visits BEFORE children. Replacing
+        // an outer OID cast with its inner REGCLASS cast skips the new root,
+        // leaving nested SQLAlchemy identity expressions unplannable. Finish
+        // its existing catalog-only normalization in post-order; retain all
+        // operands and placeholders. User-table queries never enter this hook.
+        if let Expr::Cast {
+            expr: inner,
+            data_type,
+            ..
+        } = expr
+        {
+            if matches!(
+                data_type.to_string().to_ascii_lowercase().as_str(),
+                "regclass" | "pg_catalog.regclass" | "oid" | "pg_catalog.oid"
+            ) {
+                *expr = *inner.clone();
+                self.changed = true;
+            }
         }
         ControlFlow::Continue(())
     }
@@ -842,6 +1118,100 @@ fn strip_placeholder_types(plan: LogicalPlan) -> Result<LogicalPlan, DataFusionE
     .map(|t| t.data)
 }
 
+/// The pinned pg_attribute provider exposes no defaults, identity columns or
+/// nondefault collations (pg_attribute.rs:156-163). DataFusion cannot decorrelate
+/// scalar subqueries nested in SQLAlchemy's CASE projections. After binding,
+/// discard only branches whose exact, resolved catalog guard cannot be true.
+/// A NULL-extended outer-join row cannot make these guards true either. Keep
+/// placeholders through parsing/binding, and do not substitute catalog columns
+/// generally: that would change NULL semantics in outer joins.
+fn fold_catalog_metadata_cases(plan: LogicalPlan) -> Result<LogicalPlan, DataFusionError> {
+    use datafusion::common::tree_node::{Transformed, TreeNode};
+    use datafusion::logical_expr::expr_rewriter::NamePreserver;
+    use datafusion::logical_expr::{Expr as DfExpr, ExprSchemable, Operator};
+
+    fn attribute(expr: &DfExpr, name: &str) -> bool {
+        matches!(expr, DfExpr::Column(column) if column.name == name &&
+            column.relation.as_ref().is_some_and(|relation|
+                relation.schema() == Some("pg_catalog") && relation.table() == "pg_attribute"))
+    }
+    fn impossible(expr: &DfExpr) -> bool {
+        if attribute(expr, "atthasdef") {
+            return true;
+        }
+        let DfExpr::BinaryExpr(binary) = expr else {
+            return false;
+        };
+        if binary.op == Operator::And {
+            return impossible(&binary.left) || impossible(&binary.right);
+        }
+        if binary.op != Operator::NotEq {
+            return false;
+        }
+        fn literal(expr: &DfExpr) -> Option<ScalarValue> {
+            match expr {
+                DfExpr::Literal(value, _) => Some(value.clone()),
+                DfExpr::Cast(cast) => literal(&cast.expr)?.cast_to(&cast.data_type).ok(),
+                _ => None,
+            }
+        }
+        let comparison = |column: &DfExpr, value: &DfExpr| {
+            let Some(value) = literal(value) else {
+                return false;
+            };
+            if attribute(column, "attidentity") {
+                return matches!(&value, ScalarValue::Utf8(Some(v)) | ScalarValue::Utf8View(Some(v)) |
+                    ScalarValue::LargeUtf8(Some(v)) if v.is_empty());
+            }
+            if attribute(column, "attcollation") {
+                return matches!(
+                    value,
+                    ScalarValue::Int16(Some(0))
+                        | ScalarValue::Int32(Some(0))
+                        | ScalarValue::Int64(Some(0))
+                ) || matches!(&value, ScalarValue::Utf8(Some(v)) | ScalarValue::Utf8View(Some(v)) |
+                        ScalarValue::LargeUtf8(Some(v)) if v == "0");
+            }
+            false
+        };
+        comparison(&binary.left, &binary.right) || comparison(&binary.right, &binary.left)
+    }
+
+    plan.transform_up_with_subqueries(|node| {
+        let LogicalPlan::Projection(projection) = &node else {
+            return Ok(Transformed::no(node));
+        };
+        let schema = projection.input.schema().clone();
+        node.map_expressions(|expr| {
+            let saved_name = NamePreserver::new_for_projection().save(&expr);
+            let mut transformed = expr.transform_up(|expr| {
+                if let DfExpr::Case(case) = &expr {
+                    if case.expr.is_none()
+                        && case
+                            .when_then_expr
+                            .iter()
+                            .all(|(guard, _)| impossible(guard))
+                    {
+                        let data_type = expr.get_type(&schema)?;
+                        let replacement = match &case.else_expr {
+                            Some(otherwise) if !matches!(otherwise.as_ref(), DfExpr::Literal(value, _) if value.is_null()) => (*otherwise.clone()).cast_to(&data_type, &schema)?,
+                            Some(_) | None => DfExpr::Literal(
+                                ScalarValue::try_new_null(&data_type)?,
+                                None,
+                            ),
+                        };
+                        return Ok(Transformed::yes(replacement));
+                    }
+                }
+                Ok(Transformed::no(expr))
+            })?;
+            transformed.data = saved_name.restore(transformed.data);
+            Ok(transformed)
+        })
+    })
+    .map(|transformed| transformed.data)
+}
+
 /// Query hook applying the pg_catalog compatibility rewrites. Must run
 /// BEFORE [`crate::txn::TxnHook`]: ORMs reflect inside a driver-opened
 /// transaction, and TxnHook would otherwise route the un-rewritten SQL into
@@ -873,6 +1243,7 @@ impl CompatHook {
                 .and_then(|plan| plan.replace_params_with_values(p))
                 .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
         }
+        plan = fold_catalog_metadata_cases(plan).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
         let df = ctx
             .execute_logical_plan(plan)
             .await
@@ -1257,6 +1628,449 @@ mod tests {
     fn version_string_is_postgres_shaped() {
         let v = version_string();
         assert!(v.starts_with("PostgreSQL 16.6 "), "got: {v}");
+    }
+
+    #[test]
+    fn like_escape_translation_preserves_literals_and_rejects_invalid_patterns() {
+        for (pattern, escape, expected) in [
+            ("pg/_%", "/", "pg\\_%"),
+            ("a//b", "/", "a/b"),
+            ("/a", "/", "a"),
+            (r"a\b/%/_", "/", r"a\\b\%\_"),
+            (r"a\b_%", "", r"a\\b_%"),
+            ("a💠_b💠%", "💠", r"a\_b\%"),
+        ] {
+            assert_eq!(normalize_like_pattern(pattern, escape).unwrap(), expected);
+        }
+        assert!(normalize_like_pattern("ends/", "/").is_err());
+        assert!(normalize_like_pattern("a", "ab").is_err());
+        assert!(normalize_like_pattern("a", "💠x").is_err());
+        assert!(rewrite(&parse("SELECT city LIKE 'x/%' ESCAPE '/' FROM demo.trips")).is_none());
+        assert!(rewrite(&parse("SELECT 'CAST(x AS REGCLASS)' AS untouched")).is_none());
+        assert!(rewrite(&parse(
+            "SELECT json_build_object('k', city) FROM demo.trips"
+        ))
+        .is_none());
+    }
+
+    async fn catalog_test_context() -> SessionContext {
+        use datafusion::catalog::MemorySchemaProvider;
+        use datafusion_postgres::auth::AuthManager;
+        use datafusion_postgres::datafusion_pg_catalog::pg_catalog::setup_pg_catalog;
+
+        let ctx = SessionContext::new();
+        let demo = Arc::new(MemorySchemaProvider::new());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("trip_id", DataType::Int64, false),
+            Field::new("city", DataType::Utf8, true),
+        ]));
+        demo.register_table(
+            "trips".into(),
+            Arc::new(
+                MemTable::try_new(schema.clone(), vec![vec![RecordBatch::new_empty(schema)]])
+                    .unwrap(),
+            ),
+        )
+        .unwrap();
+        ctx.catalog("datafusion")
+            .unwrap()
+            .register_schema("demo", demo)
+            .unwrap();
+        setup_pg_catalog(&ctx, "datafusion", Arc::new(AuthManager::default())).unwrap();
+        register_compat_udfs(&ctx);
+        install_coherent_pg_catalog(&ctx, "datafusion")
+            .await
+            .unwrap();
+        ctx
+    }
+
+    async fn run_catalog_query(
+        ctx: &SessionContext,
+        sql: &str,
+        params: Option<ParamValues>,
+    ) -> Vec<RecordBatch> {
+        use datafusion_postgres::datafusion_pg_catalog::sql::PostgresCompatibilityParser;
+        // Use the same upstream parser/rewrite ordering as the wire server.
+        let statement = PostgresCompatibilityParser::new()
+            .parse(sql)
+            .unwrap()
+            .remove(0);
+        let rewritten = rewrite(&statement).expect("compatibility rewrite must intercept");
+        let mut plan = ctx
+            .state()
+            .statement_to_plan(datafusion::sql::parser::Statement::Statement(Box::new(
+                rewritten,
+            )))
+            .await
+            .unwrap();
+        if let Some(params) = params {
+            if let ParamValues::List(values) = &params {
+                assert_eq!(
+                    plan.get_parameter_types().unwrap().len(),
+                    values.len(),
+                    "every parameter must survive metadata rewriting"
+                );
+            }
+            plan = strip_placeholder_types(plan)
+                .unwrap()
+                .replace_params_with_values(&params)
+                .unwrap();
+        }
+        let plan = fold_catalog_metadata_cases(plan).unwrap();
+        let df = ctx.execute_logical_plan(plan).await.unwrap();
+        let optimized = df.clone().into_optimized_plan().unwrap();
+        df.collect()
+            .await
+            .unwrap_or_else(|error| panic!("{error}\n{}", optimized.display_indent()))
+    }
+
+    #[tokio::test]
+    async fn sqlalchemy_schema_escape_executes_with_bound_pattern() {
+        let ctx = catalog_test_context().await;
+        let batches = run_catalog_query(
+            &ctx,
+            "SELECT pg_catalog.pg_namespace.nspname FROM pg_catalog.pg_namespace \
+             WHERE pg_catalog.pg_namespace.nspname NOT LIKE $1 || '%' ESCAPE '/' \
+             ORDER BY pg_catalog.pg_namespace.nspname",
+            Some(ParamValues::List(vec![ScalarValue::Utf8(Some(
+                "pg/_".into(),
+            ))
+            .into()])),
+        )
+        .await;
+        let names = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .iter()
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"demo"));
+        assert!(!names.iter().any(|name| name.starts_with("pg_")));
+        let batches = run_catalog_query(
+            &ctx,
+            r"SELECT 'a\b_%' LIKE 'a\b/_/%' ESCAPE '/',
+                      'PG_Name' ILIKE 'pg/_%' ESCAPE '/',
+                      NULL LIKE 'pg/_%' ESCAPE '/',
+                      'a\b' LIKE 'a\b' ESCAPE ''",
+            None,
+        )
+        .await;
+        use datafusion::arrow::array::BooleanArray;
+        for index in [0, 1, 3] {
+            assert!(batches[0]
+                .column(index)
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap()
+                .value(0));
+        }
+        assert!(batches[0].column(2).is_null(0));
+    }
+
+    #[tokio::test]
+    async fn sqlalchemy_columns_reflection_executes_simple_and_bound_queries() {
+        // Captured from SQLAlchemy's PostgreSQL 16 reflection compiler, with
+        // nested identity/default/collation CASE expressions and 21 bindings.
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/sqlalchemy2_columns.json"))
+                .unwrap();
+        let ctx = catalog_test_context().await;
+        // Verify the provider invariant used by the post-bind CASE rewrite,
+        // rather than assuming similarly named columns are constant.
+        let metadata = ctx
+            .sql(
+                "SELECT atthasdef, attidentity, attcollation \
+            FROM pg_catalog.pg_attribute",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert!(metadata.iter().map(RecordBatch::num_rows).sum::<usize>() > 0);
+        for batch in metadata {
+            use datafusion::arrow::array::BooleanArray;
+            assert!(batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap()
+                .iter()
+                .all(|value| value == Some(false)));
+            assert!(batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .all(|value| value == Some("")));
+            assert!(batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .iter()
+                .all(|value| value == Some(0)));
+        }
+        let params = fixture["params"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| {
+                // pgwire's compat hook deliberately decodes all placeholders as
+                // text, preventing upstream's $10-before-$2 type ordering bug.
+                ScalarValue::Utf8(Some(
+                    v.as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| v.to_string()),
+                ))
+                .into()
+            })
+            .collect::<Vec<_>>();
+        for (sql, params) in [
+            (fixture["literal_sql"].as_str().unwrap(), None),
+            (
+                fixture["sql"].as_str().unwrap(),
+                Some(ParamValues::List(params)),
+            ),
+        ] {
+            let batches = run_catalog_query(&ctx, sql, params).await;
+            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+            let names = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap()
+                        .iter()
+                        .flatten()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(names, ["trip_id", "city"]);
+            for batch in batches {
+                for column in ["default", "identity_options", "collation"] {
+                    let col = batch.column_by_name(column).unwrap();
+                    assert_eq!(col.null_count(), batch.num_rows(), "{column}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_case_folding_uses_resolved_catalog_fields_and_preserves_nulls() {
+        let ctx = catalog_test_context().await;
+        for sql in [
+            "SELECT CASE WHEN a.atthasdef THEN 'yes' ELSE 'no' END FROM pg_catalog.pg_attribute AS a",
+            "SELECT CASE WHEN pg_attribute.atthasdef THEN 'yes' ELSE 'no' END \
+             FROM (SELECT true AS atthasdef) AS pg_attribute",
+            "SELECT CASE WHEN pg_catalog.pg_attribute.attidentity IS NULL THEN 'null' ELSE 'value' END \
+             FROM pg_catalog.pg_attribute",
+        ] {
+            let plan = ctx.sql(sql).await.unwrap().logical_plan().clone();
+            assert_eq!(fold_catalog_metadata_cases(plan.clone()).unwrap(), plan, "{sql}");
+        }
+        let plan = ctx
+            .sql(
+                "SELECT CASE WHEN pg_catalog.pg_attribute.atthasdef THEN 1 ELSE NULL END AS d \
+            FROM (VALUES (1)) AS seed(n) LEFT JOIN pg_catalog.pg_attribute ON false",
+            )
+            .await
+            .unwrap()
+            .logical_plan()
+            .clone();
+        let folded = fold_catalog_metadata_cases(plan.clone()).unwrap();
+        assert_eq!(folded.schema(), plan.schema());
+        let original = ctx
+            .execute_logical_plan(plan)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let rewritten = ctx
+            .execute_logical_plan(folded)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(original, rewritten);
+        assert_eq!(rewritten[0].column(0).null_count(), 1);
+        let plan = ctx
+            .sql(
+                "SELECT CASE WHEN pg_catalog.pg_attribute.atthasdef \
+            THEN CAST(1 AS BIGINT) ELSE CAST(2 AS SMALLINT) END AS typed \
+            FROM pg_catalog.pg_attribute",
+            )
+            .await
+            .unwrap()
+            .logical_plan()
+            .clone();
+        let folded = fold_catalog_metadata_cases(plan.clone()).unwrap();
+        assert_eq!(folded.schema(), plan.schema());
+        assert_eq!(
+            ctx.execute_logical_plan(plan)
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap(),
+            ctx.execute_logical_plan(folded)
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_json_preserves_value_types_and_bound_key_order() {
+        let ctx = catalog_test_context().await;
+        let batches = run_catalog_query(
+            &ctx,
+            "SELECT json_build_object($1, 7, $2, true, $3, NULL, $4, 'a\"b')",
+            Some(ParamValues::List(
+                ["number", "boolean", "null", "string"]
+                    .into_iter()
+                    .map(|s| ScalarValue::Utf8(Some(s.into())).into())
+                    .collect(),
+            )),
+        )
+        .await;
+        let value = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0);
+        let object: serde_json::Value = serde_json::from_str(value).unwrap();
+        assert_eq!(
+            object,
+            serde_json::json!({"number": 7, "boolean": true, "null": null, "string": "a\"b"})
+        );
+        let batches = run_catalog_query(
+            &ctx,
+            "SELECT json_build_object('number', n, 'null', NULL) \
+             FROM (VALUES (1), (2)) AS values_table(n)",
+            None,
+        )
+        .await;
+        let objects = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .iter()
+                    .flatten()
+            })
+            .map(|s| serde_json::from_str::<serde_json::Value>(s).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            objects,
+            vec![
+                serde_json::json!({"number": 1, "null": null}),
+                serde_json::json!({"number": 2, "null": null})
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlalchemy_table_options_reflection_executes_simple_and_bound_queries() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/sqlalchemy2_table_options.json"
+        ))
+        .unwrap();
+        let ctx = catalog_test_context().await;
+        let params = fixture["params"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| ScalarValue::Utf8(Some(v.as_str().unwrap().to_owned())).into())
+            .collect::<Vec<_>>();
+        for (sql, params) in [
+            (fixture["literal_sql"].as_str().unwrap(), None),
+            (
+                fixture["sql"].as_str().unwrap(),
+                Some(ParamValues::List(params)),
+            ),
+        ] {
+            let batches = run_catalog_query(&ctx, sql, params).await;
+            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+            let batch = &batches[0];
+            assert_eq!(
+                batch
+                    .column_by_name("relname")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0),
+                "trips"
+            );
+            for column in [
+                "reloptions",
+                "relhasoids",
+                "access_method_name",
+                "tablespace_name",
+                "parent_table_names",
+            ] {
+                assert!(
+                    ScalarValue::try_from_array(batch.column_by_name(column).unwrap(), 0)
+                        .unwrap()
+                        .is_null(),
+                    "{column}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_setting_keeps_session_settings_out_of_shared_emulation() {
+        let ctx = catalog_test_context().await;
+        let batches = run_catalog_query(
+            &ctx,
+            "SELECT current_setting($1)",
+            Some(ParamValues::List(vec![ScalarValue::Utf8(Some(
+                "default_table_access_method".into(),
+            ))
+            .into()])),
+        )
+        .await;
+        assert_eq!(
+            batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "heap"
+        );
+        let null = run_catalog_query(&ctx, "SELECT current_setting(NULL)", None).await;
+        assert!(null[0].column(0).is_null(0));
+        let unknown = ctx
+            .sql("SELECT icegres_catalog_setting('search_path')")
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(unknown.is_err());
+        assert!(rewrite(&parse(
+            "SELECT current_setting('default_table_access_method') FROM demo.trips"
+        ))
+        .is_none());
+        assert!(rewrite(&parse("SELECT 'current_setting(''search_path'')'")).is_none());
     }
 
     // -- pg_type oid patch helpers ------------------------------------------

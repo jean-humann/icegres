@@ -169,3 +169,8 @@ unsafe_code = "deny"
 
 [lints.clippy]
 unwrap_used = "deny"
+
+# Same-version correction for lost notification races in delete metadata loads.
+# Full upstream archive and exact patch provenance: vendor/README.md.
+[patch.crates-io]
+iceberg = { path = "vendor/iceberg-0.9.1" }

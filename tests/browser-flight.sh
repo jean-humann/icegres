@@ -7,11 +7,11 @@
 # the right rows (bench/clients/js/bench/smoke.mjs). This is the CI guard the
 # docs/frontend-dashboards.md numbers and the client package depend on.
 #
-# Like tests/helm.sh, it SKIPs loudly (exit 0) when its prerequisites are
-# absent so it never blocks a machine that cannot run it — CI runs it where
-# node, Chromium, and the lakehouse stack are all present.
+# Missing prerequisites are an explicit optional SKIP unless
+# ICEGRES_REQUIRE_LIVE_TESTS=1, which makes them fail. Build failures always
+# fail once prerequisites are present.
 #
-# Prereqs, each a loud SKIP if missing:
+# Prerequisites:
 #   - node on PATH
 #   - a Chromium at CHROMIUM_PATH (default /opt/pw-browsers/chromium)
 #   - the base lakehouse stack reachable (ICEGRES_CATALOG_URI, default the
@@ -22,7 +22,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 JS_DIR="$ROOT/bench/clients/js"
 PKG_DIR="$ROOT/clients/flight-web"
-BIN="$ROOT/icegres/target/release/icegres"
+BIN="${ICEGRES_BIN:-$ROOT/icegres/target/release/icegres}"
 CATALOG_URI="${ICEGRES_CATALOG_URI:-http://127.0.0.1:8181/catalog}"
 CHROMIUM="${CHROMIUM_PATH:-/opt/pw-browsers/chromium}"
 FLIGHT_PORT="${BROWSER_FLIGHT_PORT:-50060}"
@@ -31,10 +31,17 @@ export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-rustfsadmin}"
 export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-rustfssecret}"
 export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
 
-skip() { echo "SKIP tests/browser-flight.sh: $1 (runs where node + Chromium + the stack are present)"; exit 0; }
+skip() {
+  if [[ "${ICEGRES_REQUIRE_LIVE_TESTS:-0}" == "1" ]]; then
+    echo "FAIL tests/browser-flight.sh: required prerequisite missing: $1" >&2
+    exit 1
+  fi
+  echo "SKIP tests/browser-flight.sh: $1 (runs where node + Chromium + the stack are present)"
+  exit 0
+}
 # A hard failure (exit 1), distinct from a SKIP: used once the prerequisites
 # are all present, so a real regression cannot masquerade as a loud SKIP.
-die()  { echo "FAIL tests/browser-flight.sh: $1"; exit 1; }
+die()  { echo "FAIL tests/browser-flight.sh: $1" >&2; exit 1; }
 
 command -v node >/dev/null 2>&1 || skip "node not on PATH"
 [ -x "$CHROMIUM" ] || skip "no Chromium at $CHROMIUM (set CHROMIUM_PATH)"
@@ -43,7 +50,7 @@ curl -sf -o /dev/null "$CATALOG_URI/v1/config?warehouse=${ICEGRES_WAREHOUSE:-lak
 if [ ! -x "$BIN" ]; then
   command -v cargo >/dev/null 2>&1 || skip "icegres binary missing and no cargo to build it"
   echo "building icegres release binary ..."
-  (cd "$ROOT/icegres" && cargo build --release) || skip "icegres build failed"
+  (cd "$ROOT/icegres" && cargo build --release) || die "icegres build failed"
 fi
 
 PIDS=()

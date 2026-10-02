@@ -50,9 +50,12 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use datafusion::sql::sqlparser;
-use datafusion::sql::sqlparser::ast::{CopySource, Statement, TableObject};
+use datafusion::sql::sqlparser::ast::{
+    CopySource, ObjectName, ObjectNamePart, Statement, TableFactor, TableObject, Visit, Visitor,
+};
 use datafusion_postgres::pgwire::api::{ClientInfo, METADATA_USER};
 use datafusion_postgres::pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use std::ops::ControlFlow;
 
 /// A relation a principal can hold on an entity, strongest first. `implies`
 /// encodes Lakekeeper's relation strength ordering.
@@ -185,6 +188,8 @@ impl fmt::Display for TableRef {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     Allow,
+    /// The statement cannot be safely mapped to the served catalog.
+    Unsupported(String),
     /// Denied — carries the required action and target for the error message.
     Deny {
         action: Action,
@@ -206,7 +211,11 @@ pub trait Authorizer: Send + Sync {
         stmt: &Statement,
         default_namespace: &str,
     ) -> Decision {
-        for (action, target) in required_checks(stmt, default_namespace) {
+        let checks = match required_checks(stmt, default_namespace) {
+            Ok(checks) => checks,
+            Err(e) => return Decision::Unsupported(e.to_string()),
+        };
+        for (action, target) in checks {
             let d = self.check(principal, action, &target);
             if d != Decision::Allow {
                 return d;
@@ -347,96 +356,163 @@ fn flatten_memberships(
 /// True for schemas that carry catalog/session metadata rather than user data;
 /// reads against them are always allowed (Lakekeeper's metadata split).
 fn is_system_schema(ns: &str) -> bool {
-    matches!(
-        ns.to_ascii_lowercase().as_str(),
-        "pg_catalog" | "information_schema" | "pg_temp" | "pg_toast"
-    )
+    matches!(ns, "pg_catalog" | "information_schema")
 }
 
-/// Map a statement to the (action, table) checks it requires. Session and
-/// metadata statements (SET/SHOW/BEGIN/COMMIT, pg_catalog reads, …) yield no
-/// checks and are therefore allowed.
-pub fn required_checks(stmt: &Statement, default_ns: &str) -> Vec<(Action, TableRef)> {
+/// Enumerate every data access before any execution-capable planning call.
+/// Unknown statement and relation forms fail closed when grants are enabled.
+pub fn required_checks(stmt: &Statement, default_ns: &str) -> Result<Vec<(Action, TableRef)>> {
     let mut checks = Vec::new();
     match stmt {
-        Statement::Query(q) => {
-            collect_query_reads(q, default_ns, &mut checks);
+        Statement::Query(q) => collect_reads(q.as_ref(), default_ns, &mut checks)?,
+        Statement::Explain { statement, .. } => {
+            checks.extend(required_checks(statement, default_ns)?);
         }
         Statement::Insert(insert) => {
-            if let TableObject::TableName(name) = &insert.table {
-                if let Some(t) = object_name_to_ref(&name.to_string(), default_ns) {
-                    checks.push((Action::WriteData, t));
-                }
-            }
-            if let Some(src) = &insert.source {
-                collect_query_reads(src, default_ns, &mut checks);
-            }
+            let TableObject::TableName(name) = &insert.table else {
+                bail!("authorization does not support this INSERT target");
+            };
+            checks.push((
+                Action::WriteData,
+                object_name_to_ref(name, default_ns, Action::WriteData)?,
+            ));
+            collect_reads(stmt, default_ns, &mut checks)?;
         }
-        Statement::Update {
-            table, selection, ..
-        } => {
-            if let Some(t) = table_factor_to_ref(&table.relation, default_ns) {
-                checks.push((Action::WriteData, t));
-            }
-            let _ = selection; // subquery predicates: conservative, not read-gated
+        Statement::Update { table, .. } => {
+            let TableFactor::Table {
+                name, args: None, ..
+            } = &table.relation
+            else {
+                bail!("authorization requires a named UPDATE target");
+            };
+            checks.push((
+                Action::WriteData,
+                object_name_to_ref(name, default_ns, Action::WriteData)?,
+            ));
+            // Walk assignments, FROM, predicates and RETURNING as well as the target.
+            collect_reads(stmt, default_ns, &mut checks)?;
         }
         Statement::Delete(del) => {
-            for name in &del.tables {
-                if let Some(t) = object_name_to_ref(&name.to_string(), default_ns) {
-                    checks.push((Action::WriteData, t));
-                }
-            }
             let froms = match &del.from {
                 sqlparser::ast::FromTable::WithFromKeyword(f)
                 | sqlparser::ast::FromTable::WithoutKeyword(f) => f,
             };
-            for twj in froms {
-                if let Some(t) = table_factor_to_ref(&twj.relation, default_ns) {
-                    checks.push((Action::WriteData, t));
-                }
+            for table in froms {
+                let TableFactor::Table {
+                    name, args: None, ..
+                } = &table.relation
+                else {
+                    bail!("authorization requires a named DELETE target");
+                };
+                checks.push((
+                    Action::WriteData,
+                    object_name_to_ref(name, default_ns, Action::WriteData)?,
+                ));
             }
+            for name in &del.tables {
+                checks.push((
+                    Action::WriteData,
+                    object_name_to_ref(name, default_ns, Action::WriteData)?,
+                ));
+            }
+            collect_reads(stmt, default_ns, &mut checks)?;
         }
         Statement::Copy {
             source, to, target, ..
         } => {
-            let action = if *to {
-                Action::ReadData
-            } else {
-                Action::WriteData
-            };
+            use sqlparser::ast::CopyTarget;
+            anyhow::ensure!(
+                matches!(target, CopyTarget::Stdin | CopyTarget::Stdout),
+                "authorization permits COPY only through STDIN/STDOUT"
+            );
             match source {
-                CopySource::Table { table_name, .. } => {
-                    if let Some(t) = object_name_to_ref(&table_name.to_string(), default_ns) {
-                        checks.push((action, t));
-                    }
-                }
-                CopySource::Query(q) => collect_query_reads(q, default_ns, &mut checks),
+                CopySource::Table { table_name, .. } => checks.push((
+                    if *to {
+                        Action::ReadData
+                    } else {
+                        Action::WriteData
+                    },
+                    object_name_to_ref(
+                        table_name,
+                        default_ns,
+                        if *to {
+                            Action::ReadData
+                        } else {
+                            Action::WriteData
+                        },
+                    )?,
+                )),
+                CopySource::Query(q) => collect_reads(q.as_ref(), default_ns, &mut checks)?,
             }
-            let _ = target; // STDIN/STDOUT/file target does not add a table
         }
-        Statement::Drop { names, .. } => {
+        Statement::CreateTable(create) => {
+            anyhow::ensure!(
+                !create.external
+                    && create.location.is_none()
+                    && create.like.is_none()
+                    && create.clone.is_none()
+                    && create.inherits.is_none(),
+                "authorization does not support external or inherited CREATE TABLE"
+            );
+            anyhow::ensure!(
+                create.query.is_some(),
+                "authorization currently supports CREATE TABLE only with an explicit SELECT source"
+            );
+            checks.push((
+                Action::WriteData,
+                object_name_to_ref(&create.name, default_ns, Action::WriteData)?,
+            ));
+            collect_reads(stmt, default_ns, &mut checks)?;
+        }
+        Statement::Drop {
+            names,
+            object_type: sqlparser::ast::ObjectType::Table,
+            ..
+        } => {
             for name in names {
-                if let Some(t) = object_name_to_ref(&name.to_string(), default_ns) {
-                    checks.push((Action::DropTable, t));
-                }
+                checks.push((
+                    Action::DropTable,
+                    object_name_to_ref(name, default_ns, Action::DropTable)?,
+                ));
             }
         }
-        // SET / SHOW / BEGIN / COMMIT / ROLLBACK / CREATE / EXPLAIN / … are
-        // session or metadata operations: no data-plane check.
-        _ => {}
+        Statement::Set(set) => {
+            // Write hooks resolve bare names in the fixed served namespace.
+            // Until settings are session-isolated, deny changes that can make
+            // authorization and execution resolve the same SQL differently.
+            anyhow::ensure!(!changes_resolution(set),
+                "changing catalog/schema/parser resolution is not supported with table grants or constraints");
+            collect_reads(stmt, default_ns, &mut checks)?;
+        }
+        Statement::ShowVariable { .. }
+        | Statement::ShowVariables { .. }
+        | Statement::ShowStatus { .. }
+        | Statement::ShowTables { .. }
+        | Statement::ShowColumns { .. }
+        | Statement::ShowDatabases { .. }
+        | Statement::ShowSchemas { .. }
+        | Statement::ShowViews { .. }
+        | Statement::ShowFunctions { .. }
+        | Statement::ShowCreate { .. }
+        | Statement::ShowCollation { .. }
+        | Statement::ExplainTable { .. }
+        | Statement::StartTransaction { .. }
+        | Statement::Commit { .. }
+        | Statement::Rollback { .. } => collect_reads(stmt, default_ns, &mut checks)?,
+        _ => bail!("statement form is not supported with table grants"),
     }
-    // Drop metadata-schema reads (pg_catalog / information_schema).
-    checks.retain(|(_, t)| !is_system_schema(&t.namespace));
-    checks
+    // Only metadata READS are exempt. A write to a metadata-named schema
+    // must never bypass grants through this exception.
+    checks.retain(|(action, t)| *action != Action::ReadData || !is_system_schema(&t.namespace));
+    Ok(checks)
 }
 
 /// Whether `stmt` is side-effect-free and therefore admissible on a
-/// `--read-only` Flight listener.
+/// read-only pgwire or Flight listener.
 ///
 /// This is a distinct concern from [`required_checks`], which enumerates the
-/// ReBAC data-plane checks a statement needs: DDL such as `CREATE TABLE` or
-/// `ALTER` requires no table-grant check (and so yields none there), yet must
-/// still be refused on a read-only endpoint. This predicate is therefore
+/// ReBAC data-plane checks a statement needs. A permitted write must still
+/// be refused on a read-only endpoint. This predicate is therefore
 /// **fail-closed** — a statement form not positively known to be read-only
 /// (any DML or DDL: INSERT/UPDATE/DELETE/MERGE, CREATE/CTAS, ALTER, DROP,
 /// TRUNCATE, COPY … FROM, or a form added by a future parser) is treated as a
@@ -451,6 +527,15 @@ pub fn is_read_only(stmt: &Statement) -> bool {
         // the outer form, so the guard does not lean on the engine rejecting
         // these at planning.
         Statement::Query(q) => query_is_read_only(q),
+        Statement::Copy {
+            source,
+            to: true,
+            target: sqlparser::ast::CopyTarget::Stdout,
+            ..
+        } => match source {
+            CopySource::Table { .. } => true,
+            CopySource::Query(q) => query_is_read_only(q),
+        },
         // Read-only session and metadata forms.
         Statement::ShowVariable { .. }
         | Statement::ShowVariables { .. }
@@ -481,16 +566,20 @@ pub fn is_read_only(stmt: &Statement) -> bool {
 /// Whether a (possibly CTE-bearing) query only reads — no data-modifying CTE
 /// and no write in the body's set-expression tree.
 fn query_is_read_only(query: &sqlparser::ast::Query) -> bool {
-    if let Some(with) = &query.with {
-        if with
-            .cte_tables
-            .iter()
-            .any(|cte| !query_is_read_only(&cte.query))
-        {
-            return false;
+    struct ReadQueries;
+    impl Visitor for ReadQueries {
+        type Break = ();
+        fn pre_visit_query(&mut self, query: &sqlparser::ast::Query) -> ControlFlow<()> {
+            if !set_expr_is_read_only(&query.body)
+                || !query.pipe_operators.is_empty()
+                || !query.locks.is_empty()
+            {
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
         }
     }
-    set_expr_is_read_only(&query.body)
+    query.visit(&mut ReadQueries).is_continue()
 }
 
 /// Whether a query body's set-expression is a pure read. `Insert`/`Update`/
@@ -499,7 +588,8 @@ fn query_is_read_only(query: &sqlparser::ast::Query) -> bool {
 fn set_expr_is_read_only(body: &sqlparser::ast::SetExpr) -> bool {
     use sqlparser::ast::SetExpr;
     match body {
-        SetExpr::Select(_) | SetExpr::Values(_) | SetExpr::Table(_) => true,
+        SetExpr::Select(select) => select.into.is_none(),
+        SetExpr::Values(_) => true,
         SetExpr::Query(q) => query_is_read_only(q),
         SetExpr::SetOperation { left, right, .. } => {
             set_expr_is_read_only(left) && set_expr_is_read_only(right)
@@ -508,53 +598,211 @@ fn set_expr_is_read_only(body: &sqlparser::ast::SetExpr) -> bool {
     }
 }
 
-/// Recursively collect ReadData checks for every base table referenced by a
-/// query (FROM, JOINs, subqueries, CTEs, set operations).
-fn collect_query_reads(
-    query: &sqlparser::ast::Query,
+/// Walk all nested relations, including DML expression subqueries. Unknown
+/// table-producing forms are denied instead of silently skipping their input.
+fn collect_reads<T: Visit>(
+    node: &T,
     default_ns: &str,
     out: &mut Vec<(Action, TableRef)>,
-) {
-    use sqlparser::ast::visit_relations;
-    // visit_relations walks every ObjectName used as a table relation,
-    // including inside JOINs, subqueries, CTEs and set operations.
-    let _ = visit_relations(query, |name| {
-        if let Some(t) = object_name_to_ref(&name.to_string(), default_ns) {
-            out.push((Action::ReadData, t));
+) -> Result<()> {
+    struct Scope {
+        visible: HashSet<String>,
+        // A nonrecursive CTE becomes visible only after its definition.
+        // Otherwise WITH t AS (SELECT * FROM t) could hide a base-table read.
+        definitions: HashMap<usize, String>,
+    }
+    struct Reads<'a> {
+        default_ns: &'a str,
+        out: &'a mut Vec<(Action, TableRef)>,
+        scopes: Vec<Scope>,
+    }
+    impl Visitor for Reads<'_> {
+        type Break = anyhow::Error;
+        fn pre_visit_query(&mut self, query: &sqlparser::ast::Query) -> ControlFlow<Self::Break> {
+            if !query_is_read_only(query) || !query.pipe_operators.is_empty() {
+                return ControlFlow::Break(anyhow::anyhow!(
+                    "authorization does not support data-modifying query bodies"
+                ));
+            }
+            let mut scope = Scope {
+                visible: HashSet::new(),
+                definitions: HashMap::new(),
+            };
+            if let Some(with) = &query.with {
+                // DataFusion resolves a recursive CTE's seed before exposing
+                // its self-reference, and non-UNION bodies are nonrecursive.
+                // Until we model that exact scope, fail closed.
+                if with.recursive {
+                    return ControlFlow::Break(anyhow::anyhow!(
+                        "recursive CTEs are not supported with table grants"
+                    ));
+                }
+                for cte in &with.cte_tables {
+                    let name = normalized_ident(&cte.alias.name);
+                    scope
+                        .definitions
+                        .insert(cte.query.as_ref() as *const _ as usize, name);
+                }
+            }
+            self.scopes.push(scope);
+            ControlFlow::Continue(())
         }
-        std::ops::ControlFlow::<()>::Continue(())
-    });
+        fn post_visit_query(&mut self, query: &sqlparser::ast::Query) -> ControlFlow<Self::Break> {
+            self.scopes.pop();
+            if let Some(parent) = self.scopes.last_mut() {
+                if let Some(name) = parent.definitions.get(&(query as *const _ as usize)) {
+                    parent.visible.insert(name.clone());
+                }
+            }
+            ControlFlow::Continue(())
+        }
+        fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Self::Break> {
+            match factor {
+                TableFactor::Table { args: None, .. }
+                | TableFactor::Derived { .. }
+                | TableFactor::NestedJoin { .. }
+                | TableFactor::UNNEST { .. } => ControlFlow::Continue(()),
+                _ => ControlFlow::Break(anyhow::anyhow!(
+                    "table-producing function/form is not supported with table grants"
+                )),
+            }
+        }
+        fn pre_visit_relation(&mut self, name: &ObjectName) -> ControlFlow<Self::Break> {
+            if let [ObjectNamePart::Identifier(ident)] = name.0.as_slice() {
+                let normalized = normalized_ident(ident);
+                if self
+                    .scopes
+                    .iter()
+                    .rev()
+                    .any(|scope| scope.visible.contains(&normalized))
+                {
+                    return ControlFlow::Continue(());
+                }
+            }
+            match object_name_to_ref(name, self.default_ns, Action::ReadData) {
+                Ok(t) => {
+                    self.out.push((Action::ReadData, t));
+                    ControlFlow::Continue(())
+                }
+                Err(e) => ControlFlow::Break(e),
+            }
+        }
+    }
+    match node.visit(&mut Reads {
+        default_ns,
+        out,
+        scopes: Vec::new(),
+    }) {
+        ControlFlow::Continue(()) => Ok(()),
+        ControlFlow::Break(e) => Err(e),
+    }
 }
 
-fn table_factor_to_ref(factor: &sqlparser::ast::TableFactor, default_ns: &str) -> Option<TableRef> {
-    if let sqlparser::ast::TableFactor::Table { name, .. } = factor {
-        object_name_to_ref(&name.to_string(), default_ns)
+fn normalized_ident(ident: &sqlparser::ast::Ident) -> String {
+    if ident.quote_style.is_some() {
+        ident.value.clone()
     } else {
-        None
+        ident.value.to_lowercase()
     }
 }
 
-/// Resolve a possibly-qualified object name (`trips`, `demo.trips`,
-/// `icegres.demo.trips`) to a `namespace.table`, defaulting the namespace.
-/// Strips the leading catalog component and quotes; metadata-table suffixes
-/// like `trips$snapshots` keep the base table for the check.
-fn object_name_to_ref(name: &str, default_ns: &str) -> Option<TableRef> {
-    let clean = name.replace('"', "");
-    let parts: Vec<&str> = clean.split('.').collect();
-    let (ns, table) = match parts.as_slice() {
-        [t] => (default_ns.to_string(), (*t).to_string()),
-        [ns, t] => ((*ns).to_string(), (*t).to_string()),
-        // catalog.namespace.table — drop the catalog component.
-        [_cat, ns, t] => ((*ns).to_string(), (*t).to_string()),
-        _ => return None,
+fn object_name_to_ref(name: &ObjectName, default_ns: &str, action: Action) -> Result<TableRef> {
+    let parts: Vec<String> = name
+        .0
+        .iter()
+        .map(|part| match part {
+            ObjectNamePart::Identifier(ident) => Ok(normalized_ident(ident)),
+            _ => anyhow::bail!("unsupported table identifier"),
+        })
+        .collect::<Result<_>>()?;
+    let (namespace, table) = match parts.as_slice() {
+        [table] => (default_ns.to_string(), table.clone()),
+        [namespace, table] => (namespace.clone(), table.clone()),
+        [catalog, namespace, table] if catalog == crate::context::CATALOG_NAME => {
+            (namespace.clone(), table.clone())
+        }
+        _ => bail!("table identifier must resolve in the served Icegres catalog"),
     };
-    if table.is_empty() {
-        return None;
+    anyhow::ensure!(
+        !namespace.is_empty() && !table.is_empty(),
+        "empty table identifier"
+    );
+    if action != Action::ReadData {
+        // Write hooks resolve targets literally, while read providers interpret
+        // suffixes. Reject ambiguous write targets instead of granting a write
+        // on a different base table.
+        anyhow::ensure!(!table.contains('$') && !table.rsplit_once('@').is_some_and(|(base, suffix)|
+            !base.is_empty() && suffix.parse::<i64>().is_ok()),
+            "metadata/snapshot references cannot be write targets with table grants");
+        return Ok(TableRef { namespace, table });
     }
-    Some(TableRef {
-        namespace: ns,
-        table,
-    })
+    // Mirror CachingSchemaProvider and iceberg-datafusion exactly. A literal
+    // name such as "allowed@secret" is not a snapshot reference.
+    let table = if let Some((base, suffix)) = table.split_once('$') {
+        anyhow::ensure!(
+            !base.is_empty() && iceberg::inspect::MetadataTableType::try_from(suffix).is_ok(),
+            "unknown metadata-table suffix"
+        );
+        base.to_string()
+    } else if let Some((base, suffix)) = table.rsplit_once('@') {
+        if !base.is_empty() && suffix.parse::<i64>().is_ok() {
+            base.to_string()
+        } else {
+            table
+        }
+    } else {
+        table
+    };
+    Ok(TableRef { namespace, table })
+}
+
+fn changes_resolution(set: &sqlparser::ast::Set) -> bool {
+    fn key(name: &ObjectName) -> bool {
+        let parts: Option<Vec<_>> = name
+            .0
+            .iter()
+            .map(|part| match part {
+                ObjectNamePart::Identifier(ident) => Some(ident.value.to_ascii_lowercase()),
+                _ => None,
+            })
+            .collect();
+        let Some(parts) = parts else {
+            return true;
+        };
+        matches!(
+            parts.join(".").as_str(),
+            "search_path"
+                | "datafusion.catalog.default_schema"
+                | "datafusion.catalog.default_catalog"
+                | "datafusion.sql_parser.enable_ident_normalization"
+                | "datafusion.sql_parser.dialect"
+        )
+    }
+    use sqlparser::ast::Set;
+    match set {
+        Set::SingleAssignment { variable, .. } => key(variable),
+        Set::ParenthesizedAssignments { variables, .. } => variables.iter().any(key),
+        Set::MultipleAssignments { assignments } => assignments.iter().any(|a| key(&a.name)),
+        _ => false,
+    }
+}
+
+/// Refuse a changed default namespace because the write hooks currently use
+/// the served catalog/schema even when a DataFusion session setting changes.
+pub fn check_namespace(ctx: &SessionContext, default_ns: &str) -> Result<()> {
+    let state = ctx.state();
+    let catalog = &state.config_options().catalog;
+    let parser = &state.config_options().sql_parser;
+    anyhow::ensure!(parser.enable_ident_normalization
+        && matches!(parser.dialect, datafusion::common::config::Dialect::Generic
+            | datafusion::common::config::Dialect::PostgreSQL),
+        "changed SQL identifier normalization or dialect is not supported with table grants or constraints");
+    anyhow::ensure!(
+        catalog.default_catalog == crate::context::CATALOG_NAME
+            && catalog.default_schema == default_ns,
+        "changed catalog/schema resolution is not supported with table grants"
+    );
+    Ok(())
 }
 
 /// Shared authorizer handle used by the hook and the Flight SQL path.
@@ -604,7 +852,11 @@ impl AuthzHook {
         &self,
         stmt: &Statement,
         client: &(dyn ClientInfo + Send + Sync),
+        ctx: &SessionContext,
     ) -> Option<PgWireError> {
+        if let Err(e) = check_namespace(ctx, &self.default_namespace) {
+            return Some(policy_error("42501", &e.to_string()));
+        }
         let principal = client
             .metadata()
             .get(METADATA_USER)
@@ -615,6 +867,7 @@ impl AuthzHook {
             .authorize_sql(principal, stmt, &self.default_namespace)
         {
             Decision::Allow => None,
+            Decision::Unsupported(reason) => Some(policy_error("42501", &reason)),
             Decision::Deny { action, target } => Some(deny_error(principal, action, &target)),
         }
     }
@@ -632,19 +885,19 @@ impl QueryHook for AuthzHook {
     async fn handle_simple_query(
         &self,
         statement: &Statement,
-        _ctx: &SessionContext,
+        ctx: &SessionContext,
         client: &mut (dyn ClientInfo + Send + Sync),
     ) -> Option<PgWireResult<Response>> {
-        self.gate(statement, client).map(Err)
+        self.gate(statement, client, ctx).map(Err)
     }
 
     async fn handle_extended_parse_query(
         &self,
         sql: &Statement,
-        _ctx: &SessionContext,
+        ctx: &SessionContext,
         client: &(dyn ClientInfo + Send + Sync),
     ) -> Option<PgWireResult<LogicalPlan>> {
-        self.gate(sql, client).map(Err)
+        self.gate(sql, client, ctx).map(Err)
     }
 
     async fn handle_extended_query(
@@ -652,10 +905,141 @@ impl QueryHook for AuthzHook {
         statement: &Statement,
         _plan: &LogicalPlan,
         _params: &ParamValues,
-        _ctx: &SessionContext,
+        ctx: &SessionContext,
         client: &mut (dyn ClientInfo + Send + Sync),
     ) -> Option<PgWireResult<Response>> {
-        self.gate(statement, client).map(Err)
+        self.gate(statement, client, ctx).map(Err)
+    }
+}
+
+/// Constraint enforcement must intercept every statement that can write.
+/// Wrappers and alternative write forms cannot fall through to DataFusion's
+/// append path, which does not know the listener's constraint policy.
+pub fn check_constraint_statement(
+    stmt: &Statement,
+    ctx: &SessionContext,
+    default_ns: &str,
+) -> Result<()> {
+    check_namespace(ctx, default_ns)?;
+    if matches!(stmt, Statement::Set(_)) {
+        required_checks(stmt, default_ns)?;
+    }
+    anyhow::ensure!(
+        is_read_only(stmt)
+            || matches!(
+                stmt,
+                Statement::Insert(_) | Statement::Update { .. } | Statement::Delete(_)
+            ),
+        "--enforce-pk permits writes only as direct INSERT/UPDATE/DELETE statements"
+    );
+    struct QueryReads;
+    impl Visitor for QueryReads {
+        type Break = ();
+        fn pre_visit_query(&mut self, query: &sqlparser::ast::Query) -> ControlFlow<()> {
+            if query_is_read_only(query) {
+                ControlFlow::Continue(())
+            } else {
+                ControlFlow::Break(())
+            }
+        }
+    }
+    anyhow::ensure!(
+        stmt.visit(&mut QueryReads).is_continue(),
+        "data-modifying query bodies are not supported with --enforce-pk"
+    );
+    Ok(())
+}
+
+pub struct ConstraintHook;
+
+impl ConstraintHook {
+    fn gate(stmt: &Statement, ctx: &SessionContext) -> Option<PgWireError> {
+        check_constraint_statement(stmt, ctx, crate::context::DEFAULT_SCHEMA)
+            .err()
+            .map(|e| policy_error("0A000", &e.to_string()))
+    }
+}
+
+#[async_trait]
+impl QueryHook for ConstraintHook {
+    async fn handle_simple_query(
+        &self,
+        stmt: &Statement,
+        ctx: &SessionContext,
+        _client: &mut (dyn ClientInfo + Send + Sync),
+    ) -> Option<PgWireResult<Response>> {
+        Self::gate(stmt, ctx).map(Err)
+    }
+    async fn handle_extended_parse_query(
+        &self,
+        stmt: &Statement,
+        ctx: &SessionContext,
+        _client: &(dyn ClientInfo + Send + Sync),
+    ) -> Option<PgWireResult<LogicalPlan>> {
+        Self::gate(stmt, ctx).map(Err)
+    }
+    async fn handle_extended_query(
+        &self,
+        stmt: &Statement,
+        _plan: &LogicalPlan,
+        _params: &ParamValues,
+        ctx: &SessionContext,
+        _client: &mut (dyn ClientInfo + Send + Sync),
+    ) -> Option<PgWireResult<Response>> {
+        Self::gate(stmt, ctx).map(Err)
+    }
+}
+
+fn policy_error(code: &str, message: &str) -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".into(),
+        code.into(),
+        message.into(),
+    )))
+}
+
+/// Read-only enforcement is independent of optional table-grant policy and
+/// runs before any hook that can buffer, rewrite, or execute a statement.
+pub struct ReadOnlyHook;
+
+impl ReadOnlyHook {
+    fn gate(statement: &Statement) -> Option<PgWireError> {
+        (!is_read_only(statement)).then(|| {
+            policy_error(
+                "25006",
+                "cannot execute a write on a read-only Icegres server",
+            )
+        })
+    }
+}
+
+#[async_trait]
+impl QueryHook for ReadOnlyHook {
+    async fn handle_simple_query(
+        &self,
+        statement: &Statement,
+        _ctx: &SessionContext,
+        _client: &mut (dyn ClientInfo + Send + Sync),
+    ) -> Option<PgWireResult<Response>> {
+        Self::gate(statement).map(Err)
+    }
+    async fn handle_extended_parse_query(
+        &self,
+        statement: &Statement,
+        _ctx: &SessionContext,
+        _client: &(dyn ClientInfo + Send + Sync),
+    ) -> Option<PgWireResult<LogicalPlan>> {
+        Self::gate(statement).map(Err)
+    }
+    async fn handle_extended_query(
+        &self,
+        statement: &Statement,
+        _plan: &LogicalPlan,
+        _params: &ParamValues,
+        _ctx: &SessionContext,
+        _client: &mut (dyn ClientInfo + Send + Sync),
+    ) -> Option<PgWireResult<Response>> {
+        Self::gate(statement).map(Err)
     }
 }
 
@@ -668,7 +1052,7 @@ mod tests {
 
     fn parse1(sql: &str) -> Statement {
         Parser::parse_sql(&PostgreSqlDialect {}, sql)
-            .unwrap()
+            .unwrap_or_else(|error| panic!("failed to parse {sql:?}: {error}"))
             .pop()
             .unwrap()
     }
@@ -792,5 +1176,374 @@ mod tests {
         let a = authz("grant u read demo.trips\n");
         let stmt = parse1("select * from trips");
         assert_eq!(a.authorize_sql("u", &stmt, "demo"), Decision::Allow);
+    }
+    #[test]
+    fn nested_access_and_identifiers_are_checked() {
+        let a = authz("grant u write demo.allowed\ngrant u write demo.leak\n");
+        for sql in [
+            "EXPLAIN ANALYZE SELECT * FROM demo.secret",
+            "CREATE TABLE demo.leak AS SELECT * FROM demo.secret",
+            "SELECT * FROM demo.\"secret.with.dots\"",
+            "UPDATE demo.allowed SET id = (SELECT max(id) FROM demo.secret)",
+            "DELETE FROM demo.allowed WHERE id IN (SELECT id FROM demo.secret)",
+            "SELECT * FROM other.demo.allowed",
+            "SELECT * FROM \"PG_CATALOG\".secret",
+            "SELECT * FROM pg_temp.secret",
+            "CREATE VIEW demo.leak AS SELECT * FROM demo.secret",
+            "SELECT * FROM read_parquet('secret.parquet')",
+            "SET datafusion.catalog.default_schema = 'secret'",
+            "SET datafusion.sql_parser.enable_ident_normalization = false",
+            "SET \"datafusion\".\"sql_parser\".\"dialect\" = 'mysql'",
+            "WITH RECURSIVE secret AS (SELECT * FROM demo.secret) SELECT * FROM secret",
+        ] {
+            assert_ne!(
+                a.authorize_sql("u", &parse1(sql), "demo"),
+                Decision::Allow,
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            a.authorize_sql("u", &parse1("SELECT * FROM DEMO.ALLOWED"), "demo"),
+            Decision::Allow
+        );
+        assert_eq!(
+            a.authorize_sql("u", &parse1("SELECT * FROM icegres.demo.allowed"), "demo"),
+            Decision::Allow
+        );
+        assert_eq!(
+            a.authorize_sql(
+                "u",
+                &parse1("EXPLAIN ANALYZE SELECT * FROM demo.allowed"),
+                "demo"
+            ),
+            Decision::Allow
+        );
+        let dotted = authz("grant u read demo.secret.with.dots\n");
+        assert_eq!(
+            dotted.authorize_sql(
+                "u",
+                &parse1("SELECT * FROM demo.\"secret.with.dots\""),
+                "demo"
+            ),
+            Decision::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn wire_hooks_deny_before_datafusion_executes_wrappers() {
+        use arrow::array::{Int64Array, RecordBatch};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::catalog::MemTable;
+        use datafusion::common::TableReference;
+        use datafusion::execution::context::SessionConfig;
+        use datafusion_postgres::pgwire::api::DefaultClient;
+
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new().with_default_catalog_and_schema("icegres", "demo"),
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![42]))],
+        )
+        .unwrap();
+        for name in ["secret", "secret.with.dots", "allowed", "allowed@secret"] {
+            ctx.register_table(
+                TableReference::partial("demo", name),
+                Arc::new(MemTable::try_new(batch.schema(), vec![vec![batch.clone()]]).unwrap()),
+            )
+            .unwrap();
+        }
+        let hook = AuthzHook::new(
+            Arc::new(authz(
+                "grant u write demo.allowed\ngrant u write demo.leak\n",
+            )),
+            "demo".into(),
+        );
+        let mut client = DefaultClient::<()>::new("127.0.0.1:5432".parse().unwrap(), false);
+        client
+            .metadata_mut()
+            .insert(METADATA_USER.into(), "u".into());
+        let dummy = ctx.sql("SELECT 1").await.unwrap().logical_plan().clone();
+        for sql in [
+            "SELECT * FROM demo.secret",
+            "EXPLAIN ANALYZE SELECT * FROM demo.secret",
+            "CREATE TABLE demo.leak AS SELECT * FROM demo.secret",
+            "SELECT * FROM demo.\"secret.with.dots\"",
+            "SELECT * FROM demo.\"allowed@secret\"",
+            "WITH RECURSIVE secret AS (SELECT * FROM secret) SELECT * FROM secret",
+            "WITH RECURSIVE secret AS (SELECT * FROM demo.secret) SELECT * FROM secret",
+        ] {
+            let stmt = parse1(sql);
+            assert!(
+                matches!(
+                    hook.handle_simple_query(&stmt, &ctx, &mut client).await,
+                    Some(Err(_))
+                ),
+                "{sql}"
+            );
+            assert!(
+                matches!(
+                    hook.handle_extended_parse_query(&stmt, &ctx, &client).await,
+                    Some(Err(_))
+                ),
+                "{sql}"
+            );
+            assert!(
+                matches!(
+                    hook.handle_extended_query(
+                        &stmt,
+                        &dummy,
+                        &ParamValues::List(vec![]),
+                        &ctx,
+                        &mut client
+                    )
+                    .await,
+                    Some(Err(_))
+                ),
+                "{sql}"
+            );
+        }
+        assert!(ctx.table("demo.leak").await.is_err());
+        // The qualified source is an executable denied read. An unqualified
+        // self-reference instead fails during DataFusion's provider preload,
+        // so it does not establish an authorization bypass on its own.
+        let unguarded = ctx
+            .sql("WITH RECURSIVE secret AS (SELECT * FROM demo.secret) SELECT * FROM secret")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(unguarded.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+        let mut changed = SessionConfig::new().with_default_catalog_and_schema("icegres", "demo");
+        changed.options_mut().sql_parser.enable_ident_normalization = false;
+        assert!(check_namespace(&SessionContext::new_with_config(changed), "demo").is_err());
+        let allowed = parse1("EXPLAIN ANALYZE SELECT * FROM demo.allowed");
+        assert!(hook
+            .handle_simple_query(&allowed, &ctx, &mut client)
+            .await
+            .is_none());
+        ctx.sql(&allowed.to_string())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        // Fail closed if any other path changed the planner's namespace.
+        let other = SessionContext::new();
+        assert!(matches!(
+            hook.handle_simple_query(&allowed, &other, &mut client)
+                .await,
+            Some(Err(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_only_hook_covers_simple_parse_and_execute() {
+        use datafusion_postgres::pgwire::api::DefaultClient;
+        let ctx = SessionContext::new();
+        let mut client = DefaultClient::<()>::new("127.0.0.1:5432".parse().unwrap(), false);
+        let plan = ctx.sql("SELECT 1").await.unwrap().logical_plan().clone();
+        let hook = ReadOnlyHook;
+        assert!(is_read_only(&parse1("COPY demo.t TO STDOUT")));
+        assert!(is_read_only(&parse1(
+            "COPY (SELECT * FROM demo.t) TO STDOUT"
+        )));
+        assert!(!is_read_only(&parse1("COPY demo.t TO '/tmp/export'")));
+        for sql in [
+            "INSERT INTO demo.t VALUES (1)",
+            "UPDATE demo.t SET id=1",
+            "DELETE FROM demo.t",
+            "CREATE TABLE demo.leak AS SELECT 1",
+            "DROP TABLE demo.t",
+            "SELECT 1 INTO demo.leak",
+            "WITH x AS (SELECT 1) INSERT INTO demo.t SELECT * FROM x",
+            "EXPLAIN ANALYZE INSERT INTO demo.t VALUES (1)",
+        ] {
+            let stmt = parse1(sql);
+            assert!(
+                matches!(
+                    hook.handle_simple_query(&stmt, &ctx, &mut client).await,
+                    Some(Err(_))
+                ),
+                "{sql}"
+            );
+            assert!(
+                matches!(
+                    hook.handle_extended_parse_query(&stmt, &ctx, &client).await,
+                    Some(Err(_))
+                ),
+                "{sql}"
+            );
+            assert!(
+                matches!(
+                    hook.handle_extended_query(
+                        &stmt,
+                        &plan,
+                        &ParamValues::List(vec![]),
+                        &ctx,
+                        &mut client
+                    )
+                    .await,
+                    Some(Err(_))
+                ),
+                "{sql}"
+            );
+        }
+        assert!(hook
+            .handle_simple_query(&parse1("SELECT 1"), &ctx, &mut client)
+            .await
+            .is_none());
+    }
+    #[test]
+    fn cte_aliases_do_not_hide_denied_base_relations() {
+        let a = authz("grant u read demo.allowed\n");
+        for sql in [
+            "WITH x AS (SELECT * FROM demo.allowed) SELECT * FROM x",
+            "WITH x AS (SELECT * FROM demo.allowed), y AS (SELECT * FROM x) SELECT * FROM y",
+            "WITH x AS (SELECT * FROM demo.allowed) SELECT * FROM (WITH x AS (SELECT * FROM x) SELECT * FROM x) z",
+        ] {
+            assert_eq!(a.authorize_sql("u", &parse1(sql), "demo"), Decision::Allow, "{sql}");
+        }
+        for sql in [
+            "WITH secret AS (SELECT * FROM secret) SELECT * FROM secret",
+            "WITH allowed AS (SELECT * FROM demo.secret) SELECT * FROM allowed",
+            "WITH x AS (SELECT * FROM demo.allowed) SELECT * FROM (WITH x AS (SELECT * FROM demo.secret) SELECT * FROM x) z",
+        ] {
+            assert_ne!(a.authorize_sql("u", &parse1(sql), "demo"), Decision::Allow, "{sql}");
+        }
+    }
+    #[test]
+    fn quoted_and_unquoted_unicode_identifiers_follow_planner_normalization() {
+        let a = authz("grant u read demo.Å\n");
+        assert_eq!(
+            a.authorize_sql("u", &parse1("SELECT * FROM demo.\"Å\""), "demo"),
+            Decision::Allow
+        );
+        assert_ne!(
+            a.authorize_sql("u", &parse1("SELECT * FROM demo.Å"), "demo"),
+            Decision::Allow
+        );
+    }
+    #[test]
+    fn suffixes_match_provider_resolution() {
+        let a = authz("grant u read demo.allowed\n");
+        assert_ne!(
+            a.authorize_sql(
+                "u",
+                &parse1("SELECT * FROM demo.\"allowed@secret\""),
+                "demo"
+            ),
+            Decision::Allow
+        );
+        assert_ne!(
+            a.authorize_sql(
+                "u",
+                &parse1("SELECT * FROM demo.\"allowed@secret@123\""),
+                "demo"
+            ),
+            Decision::Allow
+        );
+        assert_eq!(
+            a.authorize_sql("u", &parse1("SELECT * FROM demo.\"allowed@123\""), "demo"),
+            Decision::Allow
+        );
+        assert_eq!(
+            a.authorize_sql(
+                "u",
+                &parse1("SELECT * FROM demo.\"allowed$snapshots\""),
+                "demo"
+            ),
+            Decision::Allow
+        );
+        assert_ne!(
+            a.authorize_sql(
+                "u",
+                &parse1("SELECT * FROM demo.\"allowed$unknown\""),
+                "demo"
+            ),
+            Decision::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn constrained_writes_cannot_escape_through_query_wrappers() {
+        use datafusion::execution::context::SessionConfig;
+        use datafusion_postgres::pgwire::api::DefaultClient;
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new().with_default_catalog_and_schema("icegres", "demo"),
+        );
+        let mut client = DefaultClient::<()>::new("127.0.0.1:5432".parse().unwrap(), false);
+        let plan = ctx.sql("SELECT 1").await.unwrap().logical_plan().clone();
+        let hook = ConstraintHook;
+        for sql in [
+            "EXPLAIN ANALYZE INSERT INTO demo.t VALUES (1)",
+            "WITH x AS (SELECT 1) INSERT INTO demo.t SELECT * FROM x",
+            "CREATE TABLE demo.leak AS SELECT 1",
+            "COPY demo.t FROM STDIN;\n\\.",
+            "SET datafusion.catalog.default_schema = 'other'",
+        ] {
+            let stmt = parse1(sql);
+            assert!(
+                matches!(
+                    hook.handle_simple_query(&stmt, &ctx, &mut client).await,
+                    Some(Err(_))
+                ),
+                "{sql}"
+            );
+            assert!(
+                matches!(
+                    hook.handle_extended_parse_query(&stmt, &ctx, &client).await,
+                    Some(Err(_))
+                ),
+                "{sql}"
+            );
+            assert!(
+                matches!(
+                    hook.handle_extended_query(
+                        &stmt,
+                        &plan,
+                        &ParamValues::List(vec![]),
+                        &ctx,
+                        &mut client
+                    )
+                    .await,
+                    Some(Err(_))
+                ),
+                "{sql}"
+            );
+        }
+        for sql in [
+            "SELECT 1",
+            "INSERT INTO demo.t VALUES (1)",
+            "UPDATE demo.t SET id=2",
+            "DELETE FROM demo.t",
+        ] {
+            assert!(
+                hook.handle_simple_query(&parse1(sql), &ctx, &mut client)
+                    .await
+                    .is_none(),
+                "{sql}"
+            );
+        }
+    }
+    #[test]
+    fn read_suffix_permissions_do_not_authorize_literal_write_targets() {
+        let a = authz("grant u write demo.allowed\ngrant u drop demo.allowed\n");
+        for sql in [
+            "UPDATE demo.\"allowed@123\" SET id=2",
+            "DELETE FROM demo.\"allowed@123\"",
+            "INSERT INTO demo.\"allowed@123\" VALUES (1)",
+            "DROP TABLE demo.\"allowed@123\"",
+            "CREATE TABLE demo.\"allowed@123\" AS SELECT 1",
+            "UPDATE demo.\"allowed$snapshots\" SET id=2",
+            "DELETE FROM demo.\"allowed@secret\"",
+        ] {
+            assert_ne!(
+                a.authorize_sql("u", &parse1(sql), "demo"),
+                Decision::Allow,
+                "{sql}"
+            );
+        }
     }
 }
