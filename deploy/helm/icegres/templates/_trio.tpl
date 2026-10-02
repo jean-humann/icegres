@@ -46,7 +46,25 @@ spec:
       automountServiceAccountToken: false
       securityContext:
         {{- toYaml $ctx.Values.podSecurityContext | nindent 8 }}
+      {{- if $cfg.zones.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          minDomains: 3
+          topologyKey: {{ $cfg.zones.topologyKey | quote }}
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              {{- include "icegres.selectorLabels" (dict "ctx" $ctx "component" $suffix) | nindent 14 }}
+      {{- end }}
       affinity:
+        {{- if $cfg.zones.enabled }}
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: {{ $cfg.zones.topologyKey | quote }}
+                    operator: Exists
+        {{- end }}
         podAntiAffinity:
           {{- if eq $cfg.antiAffinity "required" }}
           # Two acceptors on one node quietly reduce the 2-of-3 promise
@@ -86,6 +104,19 @@ spec:
               --port {{ int $cfg.port }}
               --data-dir /var/lib/icekeeper
               --node-id "${HOSTNAME##*-}"
+          env:
+            - name: ICEKEEPER_MAX_CONNECTIONS
+              value: {{ $cfg.admission.maxConnections | int64 | quote }}
+            - name: ICEKEEPER_MAX_REQUESTS
+              value: {{ $cfg.admission.maxRequests | int64 | quote }}
+            - name: ICEKEEPER_REQUEST_BYTES
+              value: {{ $cfg.admission.requestBytes | int64 | quote }}
+            - name: ICEKEEPER_RESPONSE_BYTES
+              value: {{ $cfg.admission.responseBytes | int64 | quote }}
+            - name: ICEKEEPER_MAX_READ_BYTES
+              value: {{ $cfg.admission.maxReadBytes | int64 | quote }}
+            - name: ICEKEEPER_IO_TIMEOUT_MS
+              value: {{ $cfg.admission.ioTimeoutMs | int64 | quote }}
           securityContext:
             {{- toYaml $ctx.Values.containerSecurityContext | nindent 12 }}
           ports:

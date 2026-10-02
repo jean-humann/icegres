@@ -271,6 +271,36 @@ TLS/auth — deploy on a trusted/loopback network. See
 | `ICEKEEPER_PORT` · `--port` | **required** | Bind port. |
 | `ICEKEEPER_DATA_DIR` · `--data-dir` | **required** | Data directory (control file + log segments), exclusively `flock`ed. |
 | `ICEKEEPER_NODE_ID` · `--node-id` | `0` | Diagnostic node id, pinned into the data dir on first start. |
+| `ICEKEEPER_MAX_CONNECTIONS` | `64` | Concurrent accepted sockets; excess connections wait in the OS backlog. |
+| `ICEKEEPER_MAX_REQUESTS` | `16` | Concurrent decoded/processing requests. |
+| `ICEKEEPER_REQUEST_BYTES` | `67108864` | Aggregate request allocation charge, reserved before body allocation. |
+| `ICEKEEPER_RESPONSE_BYTES` | `67108864` | Aggregate response allocation charge, reserved before WAL reads or state mutation. |
+| `ICEKEEPER_MAX_READ_BYTES` | `8388608` | Largest requested recovery range; larger ranges are rejected before reading WAL. |
+| `ICEKEEPER_IO_TIMEOUT_MS` | `30000` | Deadline for each message read, state-lock wait, and response write. Does not cancel a started fsync. |
+
+These limits are positive and finite; malformed/overflowing values fail startup.
+Request admission charges eight times the wire body plus 32 times the JSON header,
+covering retained/decoded copies and parser/record workspace conservatively. With
+the default 64 MiB request budget, one atomic append must be smaller than 8 MiB,
+and concurrent requests reduce that headroom. Raise the budget on every acceptor
+and size pod memory accordingly for larger statements. Admission failures close
+the connection before this request mutates the log; an earlier timed-out request
+can still have completed, so retain the normal unknown-outcome recovery rules.
+
+Responses reserve twice their read payload plus 2 MiB of header workspace. The
+response budget must hold at least one maximum read with that workspace. The
+wire-message ceiling remains 256 MiB, while JSON headers have a 64 KiB ceiling;
+exceptionally long term histories can therefore require operational intervention.
+These are transport allocation limits, not a total RSS, WAL-disk, or proposer
+recovery-memory budget. Helm's lease trio uses a 16 MiB request budget, an 8 MiB
+response budget and 1 MiB read ranges; the keeper uses the standalone defaults.
+
+One blocking worker at a time processes each acceptor's state. Votes and appends
+still become durable before their ACK. Disconnecting or canceling a response waiter
+does not cancel started disk work or release its admission charge prematurely. A
+stuck filesystem operation can still delay shutdown; the network timeout cannot
+interrupt an fsync safely.
+
 
 ---
 

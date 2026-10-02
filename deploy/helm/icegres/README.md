@@ -198,16 +198,55 @@ Tiny fsync-only processes; **must** land on different nodes.
 - **`helm upgrade` resets a parked writer to 1 replica**; the idle loop parks
   it again. Only traffic through icegresd holds the idle clock — TLS-direct
   clients don't.
-- **The `-read` Service is a convention, not enforcement** — a write sent
-  there executes. Replicas deliberately carry no tail/buffer env (a replica
-  opening the writer's tail would fence it).
+- The `-read` compute enforces `--read-only` before planning. Replicas also
+  carry no writer tail/buffer settings, which would otherwise fence the writer.
 - **Helm-time validation** (`icegres.validate`) rejects inconsistent values
   loudly: bad `tail.mode`, a tail without `writeBufferMs>0`, TLS without the
   Secret, auth without users, replicas+tail+auth without peer-tail creds.
 
+## Strict zone placement and acceptor limits
+
+Set `keeper.zones.enabled=true` and `lease.zones.enabled=true` to require three
+eligible failure domains for each independent trio. The chart keeps required
+hostname anti-affinity and adds zone spread with `maxSkew: 1`, `minDomains: 3`,
+`DoNotSchedule`, and a node-label requirement. Kubernetes must be at least 1.30.
+With fewer than three eligible zones, a third replica stays Pending. Placement
+uses each trio's own release/component selector. Outside the strict profile,
+`zones.topologyKey` can name another operator-managed failure-domain label.
+
+`availabilityProfile=production-three-zone` refuses weak or incomplete settings.
+It requires quorum tails, HA, strict standard zone placement for both trios,
+client authentication/TLS, NetworkPolicies, memory limits, and disabled Kubernetes
+idle scaling. The complete example is
+[`production-three-zone.yaml`](../tests/values/production-three-zone.yaml).
+
+The profile also requires `trustedQuorumNetwork=true`: quorum traffic still has
+**no TLS or peer authentication**. This is an explicit acknowledgment of the
+private-network trust boundary, not a substitute for mTLS. The CNI must enforce
+NetworkPolicies. The profile validates availability configuration; it does not
+certify a deployment's security or actual physical failure independence.
+
+Check node labels, selectors/tolerations and PVC topology before enabling strict
+placement. Use storage whose independent zone placement matches the intended
+failure model; delayed volume binding can help. Existing PVCs may prevent a pod
+moving zones. PDBs limit voluntary disruptions and do not prove AZ-loss tolerance.
+No region-failure guarantee is implied. Scheduling was validated by manifest
+rules; a real zone-failure exercise is still required for a production cluster.
+
+Both `keeper.admission` and `lease.admission` expose `maxConnections`,
+`maxRequests`, `requestBytes`, `responseBytes`, `maxReadBytes` and `ioTimeoutMs`.
+See [acceptor configuration](../../../docs/configuration.md#quorum-acceptor-daemon--icekeeperd-serve)
+for allocation charges, defaults and oversized-statement behavior. These budgets
+include request/response copies; they are not process RSS limits. Size memory
+limits above the budgets plus control state, runtime and filesystem overhead.
+
+TLS quorum transport and an authoritative compute activity/drain protocol remain
+separate work. Proxy-only idle counters cannot safely decide whether direct or
+old-proxy sessions are active, so this profile leaves idle parking disabled.
+
 ## Chart validation
 
-`tests/helm.sh` lints 5 values profiles, diffs `helm template` output against
+`tests/helm.sh` lints 7 values profiles, diffs `helm template` output against
 committed golden fixtures, runs strict `kubeconform` against two Kubernetes
 versions, and asserts the security/topology invariants (non-root, read-only
 rootfs, PDBs, RBAC scope, probe presence, …). Honest label: **it renders and

@@ -46,6 +46,8 @@ use crate::segment::{frame_bytes, scan_frame_bytes, FRAME_HEADER_BYTES, LOG_KIND
 /// records but never beyond this; a peer announcing a bigger message is
 /// treated as corrupt/foreign traffic.
 pub(crate) const MAX_MESSAGE_BYTES: usize = 256 << 20;
+/// Bound JSON parser scratch and term-history headers independently of payloads.
+pub(crate) const MAX_HEADER_BYTES: usize = 64 << 10;
 
 /// Marker the acceptor embeds in its wrong-tail-id greeting refusal and the
 /// proposer matches to classify the failure as PERMANENT for its run (FIX
@@ -464,21 +466,27 @@ impl Message {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let (header, payload) = self.header_and_payload();
         let header = serde_json::to_vec(&header).context("cannot encode message header")?;
-        let rest_len = 4 + header.len() + payload.len();
+        if header.len() > MAX_HEADER_BYTES {
+            bail!("quorum JSON header exceeds {MAX_HEADER_BYTES} bytes");
+        }
+        let rest_len = 4usize
+            .checked_add(header.len())
+            .and_then(|n| n.checked_add(payload.len()))
+            .context("quorum message size overflow")?;
         if rest_len > MAX_MESSAGE_BYTES {
             bail!(
                 "quorum message of {rest_len} bytes exceeds the {MAX_MESSAGE_BYTES}-byte cap; \
                  split the statement into smaller inserts"
             );
         }
-        let mut rest = Vec::with_capacity(rest_len);
-        rest.extend_from_slice(&(header.len() as u32).to_le_bytes());
-        rest.extend_from_slice(&header);
-        rest.extend_from_slice(payload);
-        let mut out = Vec::with_capacity(8 + rest.len());
-        out.extend_from_slice(&(rest.len() as u32).to_le_bytes());
-        out.extend_from_slice(&crc32fast::hash(&rest).to_le_bytes());
-        out.extend_from_slice(&rest);
+        let mut out = Vec::with_capacity(8 + rest_len);
+        out.extend_from_slice(&(rest_len as u32).to_le_bytes());
+        out.extend_from_slice(&[0; 4]);
+        out.extend_from_slice(&(header.len() as u32).to_le_bytes());
+        out.extend_from_slice(&header);
+        out.extend_from_slice(payload);
+        let crc = crc32fast::hash(&out[8..]);
+        out[4..8].copy_from_slice(&crc.to_le_bytes());
         Ok(out)
     }
 
@@ -488,6 +496,9 @@ impl Message {
             bail!("quorum message shorter than its header-length field");
         }
         let header_len = u32::from_le_bytes(rest[0..4].try_into().expect("4 bytes")) as usize;
+        if header_len > MAX_HEADER_BYTES {
+            bail!("quorum JSON header exceeds {MAX_HEADER_BYTES} bytes");
+        }
         if rest.len() - 4 < header_len {
             bail!("quorum message header length {header_len} overruns the message");
         }
@@ -602,21 +613,45 @@ pub(crate) async fn read_message<R>(r: &mut R) -> Result<Message>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let mut hdr = [0u8; 8];
-    r.read_exact(&mut hdr).await.context("quorum read failed")?;
+    Ok(read_message_admitted(r, |_, _| Ok(())).await?.0)
+}
+
+/// Read fixed framing first and obtain admission BEFORE allocating the body.
+/// The returned guard must follow the decoded message through processing.
+/// Cancellation/timeout requires closing the partially consumed stream.
+pub(crate) async fn read_message_admitted<R, G>(
+    r: &mut R,
+    admit: impl FnOnce(usize, usize) -> Result<G>,
+) -> Result<(Message, G)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut hdr = [0u8; 12];
+    r.read_exact(&mut hdr[..8])
+        .await
+        .context("quorum read failed")?;
     let len = u32::from_le_bytes(hdr[0..4].try_into().expect("4 bytes")) as usize;
     let crc = u32::from_le_bytes(hdr[4..8].try_into().expect("4 bytes"));
     if !(4..=MAX_MESSAGE_BYTES).contains(&len) {
         bail!("implausible quorum message length {len}");
     }
+    r.read_exact(&mut hdr[8..])
+        .await
+        .context("quorum header length read failed")?;
+    let header_len = u32::from_le_bytes(hdr[8..12].try_into().expect("4 bytes")) as usize;
+    if header_len > MAX_HEADER_BYTES || header_len > len - 4 {
+        bail!("invalid quorum JSON header length {header_len}");
+    }
+    let guard = admit(len, header_len)?;
     let mut rest = vec![0u8; len];
-    r.read_exact(&mut rest)
+    rest[..4].copy_from_slice(&hdr[8..]);
+    r.read_exact(&mut rest[4..])
         .await
         .context("quorum read failed mid-message")?;
     if crc32fast::hash(&rest) != crc {
         bail!("quorum message crc mismatch (torn or foreign traffic)");
     }
-    Message::decode_rest(&rest)
+    Ok((Message::decode_rest(&rest)?, guard))
 }
 
 /// Typed marker for a [`Conn::call_timeout`] expiry, so callers can tell a
@@ -683,6 +718,54 @@ impl Conn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn framing_admission_rejects_before_reading_body_and_releases_on_crc_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        struct Guard(Arc<AtomicUsize>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let wire = Message::Greeting {
+            tail_id: Some("test".into()),
+        }
+        .encode()
+        .unwrap();
+        // Only fixed framing exists: rejection must not try to read its body.
+        let mut truncated = &wire[..12];
+        let error =
+            read_message_admitted(&mut truncated, |_, _| Err::<(), _>(anyhow!("full budget")))
+                .await
+                .unwrap_err();
+        assert_eq!(error.to_string(), "full budget");
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut corrupt = wire;
+        *corrupt.last_mut().unwrap() ^= 1;
+        let result = read_message_admitted(&mut corrupt.as_slice(), |_, _| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(Guard(count.clone()))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn framing_rejects_oversized_json_header_before_admission() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&((MAX_HEADER_BYTES + 8) as u32).to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&((MAX_HEADER_BYTES + 1) as u32).to_le_bytes());
+        let error = read_message_admitted(&mut bytes.as_slice(), |_, _| -> Result<()> {
+            panic!("oversized header reached admission")
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("header length"));
+    }
 
     fn th(entries: &[(u64, u64)]) -> TermHistory {
         TermHistory(

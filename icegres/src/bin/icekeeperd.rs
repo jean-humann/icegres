@@ -91,6 +91,8 @@ async fn main() -> Result<()> {
         node_id,
     } = Cli::parse().command;
 
+    let limits = quorum::acceptor::ServeConfig::from_env()?;
+    info!(?limits, "acceptor resource admission limits");
     let acceptor = quorum::acceptor::open_dir(&data_dir, node_id)?;
     let flush = acceptor.wal.flush_lsn();
     let term = acceptor.state.term;
@@ -114,7 +116,7 @@ async fn main() -> Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("failed to install SIGTERM handler")?;
     tokio::select! {
-        res = quorum::acceptor::serve(listener, shared) => res,
+        res = quorum::acceptor::serve_with_config(listener, shared, limits) => res,
         _ = tokio::signal::ctrl_c() => {
             info!("icekeeperd shutting down (ctrl-c)");
             Ok(())

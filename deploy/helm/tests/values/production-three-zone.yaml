@@ -1,0 +1,22 @@
+availabilityProfile: production-three-zone
+trustedQuorumNetwork: true
+tail:
+  mode: quorum
+writer:
+  writeBufferMs: 100
+ha:
+  enabled: true
+keeper:
+  zones:
+    enabled: true
+lease:
+  zones:
+    enabled: true
+auth:
+  enabled: true
+  existingSecret: icegres-users
+tls:
+  enabled: true
+  existingSecret: icegres-tls
+networkPolicy:
+  enabled: true

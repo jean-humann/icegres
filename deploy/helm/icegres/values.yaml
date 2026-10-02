@@ -19,6 +19,12 @@
 #                             copy, peer-tailed to the writer's un-flushed
 #                             window; clients connect to the -read Service
 
+# production-three-zone validates availability and deployment safeguards.
+# It does not add quorum TLS: explicitly acknowledge its private-network trust
+# boundary after restricting acceptor access with an enforcing CNI.
+availabilityProfile: development
+trustedQuorumNetwork: false
+
 image:
   # The image built by the repository Dockerfile (ships icegres, icegresd,
   # icekeeperd). No public registry is published yet: build and push it to
@@ -267,6 +273,16 @@ keeper:
   # cluster are the honest signal); soft — prefer to spread (single-node
   # dev clusters, kind).
   antiAffinity: required
+  zones:
+    enabled: false
+    topologyKey: topology.kubernetes.io/zone
+  admission:
+    maxConnections: 64
+    maxRequests: 16
+    requestBytes: 67108864
+    responseBytes: 67108864
+    maxReadBytes: 8388608
+    ioTimeoutMs: 30000
   storage:
     size: 1Gi
     storageClass: ""
@@ -278,6 +294,16 @@ keeper:
 lease:
   port: 5471
   antiAffinity: required
+  zones:
+    enabled: false
+    topologyKey: topology.kubernetes.io/zone
+  admission:
+    maxConnections: 32
+    maxRequests: 8
+    requestBytes: 16777216
+    responseBytes: 8388608
+    maxReadBytes: 1048576
+    ioTimeoutMs: 30000
   storage:
     size: 256Mi
     storageClass: ""

@@ -448,6 +448,19 @@ spec:
               --port 5471
               --data-dir /var/lib/icekeeper
               --node-id "${HOSTNAME##*-}"
+          env:
+            - name: ICEKEEPER_MAX_CONNECTIONS
+              value: "32"
+            - name: ICEKEEPER_MAX_REQUESTS
+              value: "8"
+            - name: ICEKEEPER_REQUEST_BYTES
+              value: "16777216"
+            - name: ICEKEEPER_RESPONSE_BYTES
+              value: "8388608"
+            - name: ICEKEEPER_MAX_READ_BYTES
+              value: "1048576"
+            - name: ICEKEEPER_IO_TIMEOUT_MS
+              value: "30000"
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
