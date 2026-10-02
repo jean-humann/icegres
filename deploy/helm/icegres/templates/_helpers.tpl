@@ -93,6 +93,62 @@ combination fails `helm template`/`helm install` loudly no matter which
 subset of objects renders.
 */}}
 {{- define "icegres.validate" -}}
+{{- if not (has .Values.availabilityProfile (list "development" "production-three-zone")) -}}
+{{- fail "availabilityProfile must be development or production-three-zone" -}}
+{{- end -}}
+{{- range $name, $cfg := dict "keeper" .Values.keeper "lease" .Values.lease -}}
+{{- if $cfg.zones.enabled -}}
+{{- if not (semverCompare ">=1.30.0-0" $.Capabilities.KubeVersion.Version) -}}
+{{- fail "strict zone placement requires Kubernetes >=1.30 for stable minDomains support" -}}
+{{- end -}}
+{{- if not $cfg.zones.topologyKey -}}
+{{- fail (printf "%s.zones.topologyKey must be nonempty" $name) -}}
+{{- end -}}
+{{- if ne $cfg.antiAffinity "required" -}}
+{{- fail (printf "%s strict zones require hostname antiAffinity=required" $name) -}}
+{{- end -}}
+{{- end -}}
+{{- range $key, $value := $cfg.admission -}}
+{{- if or (le (int64 $value) 0) (gt (int64 $value) 4294967295) (ne (float64 $value) (float64 (int64 $value))) -}}
+{{- fail (printf "%s.admission.%s must be a positive integer <=4294967295" $name $key) -}}
+{{- end -}}
+{{- end -}}
+{{- if lt (int64 $cfg.admission.requestBytes) 1024 -}}
+{{- fail (printf "%s.admission.requestBytes must be >=1024" $name) -}}
+{{- end -}}
+{{- if gt (int64 $cfg.admission.maxReadBytes) 268369916 -}}
+{{- fail (printf "%s.admission.maxReadBytes exceeds the wire limit" $name) -}}
+{{- end -}}
+{{- if lt (int64 $cfg.admission.responseBytes) (add 2097152 (mul 2 (int64 $cfg.admission.maxReadBytes))) -}}
+{{- fail (printf "%s.admission.responseBytes must hold twice maxReadBytes plus 2097152 bytes of header workspace" $name) -}}
+{{- end -}}
+{{- end -}}
+{{- if eq .Values.availabilityProfile "production-three-zone" -}}
+{{- if or (ne .Values.tail.mode "quorum") (not .Values.ha.enabled) -}}
+{{- fail "production-three-zone requires tail.mode=quorum and ha.enabled=true" -}}
+{{- end -}}
+{{- if or (not .Values.keeper.zones.enabled) (not .Values.lease.zones.enabled) -}}
+{{- fail "production-three-zone requires strict zone placement for keeper and lease trios" -}}
+{{- end -}}
+{{- if or (ne .Values.keeper.zones.topologyKey "topology.kubernetes.io/zone") (ne .Values.lease.zones.topologyKey "topology.kubernetes.io/zone") -}}
+{{- fail "production-three-zone requires the standard topology.kubernetes.io/zone label" -}}
+{{- end -}}
+{{- range $name, $cfg := dict "keeper" .Values.keeper "lease" .Values.lease -}}
+{{- $memory := toString $cfg.resources.limits.memory -}}
+{{- if or (not $cfg.resources.limits.memory) (hasPrefix "-" $memory) (regexMatch "^[+-]?(0+(\\.0*)?|\\.0+)([eE][+-]?[0-9]+|[EPTGMK]i?|[numk])?$" $memory) -}}
+{{- fail (printf "production-three-zone requires a positive memory limit for %s" $name) -}}
+{{- end -}}
+{{- end -}}
+{{- if or (not .Values.auth.enabled) (not .Values.tls.enabled) (not .Values.networkPolicy.enabled) -}}
+{{- fail "production-three-zone requires auth.enabled, tls.enabled and networkPolicy.enabled" -}}
+{{- end -}}
+{{- if not .Values.trustedQuorumNetwork -}}
+{{- fail "quorum transport has no TLS/auth: production-three-zone requires explicit trustedQuorumNetwork=true acknowledgment and an enforcing private-network policy" -}}
+{{- end -}}
+{{- if .Values.k8sScaling.enabled -}}
+{{- fail "production-three-zone keeps k8sScaling disabled until compute activity and lifecycle fencing protect idle parking" -}}
+{{- end -}}
+{{- end -}}
 {{- if not (has .Values.tail.mode (list "none" "dir" "quorum")) -}}
 {{- fail (printf "tail.mode must be one of none|dir|quorum, got %q" .Values.tail.mode) -}}
 {{- end -}}
