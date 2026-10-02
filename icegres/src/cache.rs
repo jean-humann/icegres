@@ -53,8 +53,8 @@
 //! provider does not implement `insert_into`).
 
 use std::any::Any;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -143,6 +143,26 @@ fn stale_read_policy(override_: Option<bool>, freshness_enabled: bool) -> bool {
     override_.unwrap_or(freshness_enabled)
 }
 
+/// Missing table responses are terminal, unlike catalog outages. The pinned
+/// REST catalog maps GET 404 to this exact Unexpected error rather than
+/// TableNotFound. Do not classify arbitrary messages or HTTP failures as drops.
+fn table_is_missing(error: &iceberg::Error) -> bool {
+    matches!(
+        error.kind(),
+        iceberg::ErrorKind::TableNotFound | iceberg::ErrorKind::NamespaceNotFound
+    ) || (error.kind() == iceberg::ErrorKind::Unexpected
+        && error.message() == "Tried to load a table that does not exist")
+}
+
+fn missing_table_provider_error(error: &DataFusionError) -> bool {
+    match error {
+        DataFusionError::External(source) => source
+            .downcast_ref::<iceberg::Error>()
+            .is_some_and(table_is_missing),
+        _ => false,
+    }
+}
+
 /// `catalog.load_table` with a bounded per-attempt timeout and bounded
 /// retries, so a catalog blip surfaces as a bounded error (or a stale-cache
 /// fallback) instead of hanging every read indefinitely (production-readiness
@@ -168,6 +188,9 @@ async fn load_table_with_retry(
         match res {
             Ok(t) => return Ok(t),
             Err(e) => {
+                if table_is_missing(&e) {
+                    return Err(e);
+                }
                 if attempt < retries {
                     let backoff = Duration::from_millis(50u64 << attempt);
                     warn!(%ident, attempt, error = %e, "catalog load_table failed; retrying");
@@ -231,6 +254,9 @@ pub struct CachingTableProvider {
     write_delegate: Arc<dyn TableProvider>,
     schema: ArrowSchemaRef,
     cached: RwLock<Option<CachedSnapshot>>,
+    /// Once a catalog response proves deletion, this provider cannot revive.
+    /// A recreated name requires a new provider with its own table identity.
+    missing: AtomicBool,
     /// Buffered write mode (`--write-buffer-ms`, buffer.rs): scans union
     /// the committed snapshot with this buffer's overlay so acked-but-
     /// unflushed rows are readable on this server. `None` = default mode,
@@ -280,10 +306,30 @@ impl CachingTableProvider {
             write_delegate,
             schema,
             cached: RwLock::new(None),
+            missing: AtomicBool::new(false),
             write_buffer,
             branch,
             freshness,
             peer_mirrors,
+        }
+    }
+
+    fn ensure_present(&self) -> iceberg::Result<()> {
+        if self.missing.load(Ordering::Acquire) {
+            return Err(iceberg::Error::new(
+                iceberg::ErrorKind::TableNotFound,
+                format!("table {} was dropped", self.ident),
+            ));
+        }
+        Ok(())
+    }
+
+    fn mark_missing(&self) {
+        let mut cached = crate::freshness::recover("cache lock", self.cached.write());
+        self.missing.store(true, Ordering::Release);
+        *cached = None;
+        if let Some(freshness) = &self.freshness {
+            freshness.invalidate();
         }
     }
 
@@ -309,6 +355,7 @@ impl CachingTableProvider {
             return None;
         }
         let guard = crate::freshness::recover("cache lock", self.cached.read());
+        self.ensure_present().ok()?;
         let cached = guard.as_ref()?;
         Some((cached.version.0.clone(), cached.metadata.clone()))
     }
@@ -332,6 +379,7 @@ impl CachingTableProvider {
             return None;
         }
         let guard = crate::freshness::recover("cache lock", self.cached.read());
+        self.ensure_present().ok()?;
         guard.as_ref().map(|c| c.version.clone())
     }
 
@@ -341,8 +389,8 @@ impl CachingTableProvider {
     /// fresh — unless a local write invalidated it mid-load (generation
     /// guard). Unlike the scan path this neither retries (the refresher's
     /// next pass IS the retry) nor falls back to the cached snapshot on
-    /// error (the cache is simply left as-is and the error propagates so
-    /// the refresher can count and WARN about it); the refresher bounds the
+    /// error (outages retain the cache, while confirmed deletion clears and
+    /// fences it); the error propagates for failure accounting. The refresher bounds the
     /// call with its own short per-table timeout. Background loads are also
     /// excluded from the `ICEGRES_QUERY_TIMING` stage records: stage
     /// `freshness` means per-SCAN catalog work only.
@@ -363,9 +411,11 @@ impl CachingTableProvider {
         Arc<IcebergStaticTableProvider>,
         iceberg::spec::TableMetadataRef,
     )> {
+        self.ensure_present()?;
         if let Some(f) = &self.freshness {
             if f.is_fresh() {
                 let guard = crate::freshness::recover("cache lock", self.cached.read());
+                self.ensure_present()?;
                 if let Some(cached) = guard.as_ref() {
                     return Ok((cached.provider.clone(), cached.metadata.clone()));
                 }
@@ -387,6 +437,7 @@ impl CachingTableProvider {
         Arc<IcebergStaticTableProvider>,
         iceberg::spec::TableMetadataRef,
     )> {
+        self.ensure_present()?;
         // Freshness generation observed BEFORE the load: completing the
         // load only marks the cache fresh if no local write invalidated it
         // in between (freshness.rs module docs).
@@ -408,6 +459,10 @@ impl CachingTableProvider {
         let fresh = match loaded {
             Ok(t) => t,
             Err(e) => {
+                if table_is_missing(&e) {
+                    self.mark_missing();
+                    return Err(e);
+                }
                 // Scan path, catalog unreachable after timeout+retries:
                 // optionally fall back to the last cached snapshot
                 // (bounded-stale read) so reads stay available during a
@@ -422,6 +477,7 @@ impl CachingTableProvider {
                 // the failure and the cache is simply left as-is.
                 if path == LoadPath::Scan && stale_read_on_catalog_error(self.freshness.is_some()) {
                     let guard = crate::freshness::recover("cache lock", self.cached.read());
+                    self.ensure_present()?;
                     if let Some(cached) = guard.as_ref() {
                         warn!(
                             ident = %self.ident,
@@ -468,6 +524,7 @@ impl CachingTableProvider {
         };
         {
             let guard = crate::freshness::recover("cache lock", self.cached.read());
+            self.ensure_present()?;
             if let Some(cached) = guard.as_ref() {
                 if cached.version == version {
                     // The load proved the cached snapshot is still current.
@@ -488,6 +545,9 @@ impl CachingTableProvider {
         let loaded_gen = load_token.unwrap_or(0);
         {
             let mut guard = crate::freshness::recover("cache lock", self.cached.write());
+            // Deletion and install share this lock: a pre-DROP load cannot
+            // reinstall metadata after a newer missing-table response.
+            self.ensure_present()?;
             // Generation-guarded install (freshness mode): a slow load that
             // began before a local write's invalidation must not overwrite a
             // snapshot installed by a later (post-commit) load — otherwise a
@@ -509,6 +569,7 @@ impl CachingTableProvider {
         if let (Some(f), Some(token)) = (&self.freshness, load_token) {
             f.complete_load(token);
         }
+        self.ensure_present()?;
         Ok((provider, metadata))
     }
 }
@@ -950,6 +1011,14 @@ pub struct CachingSchemaProvider {
     catalog: Arc<dyn Catalog>,
     namespace: NamespaceIdent,
     cached: RwLock<HashMap<String, Arc<CachingTableProvider>>>,
+    /// Confirmed external drops must hide the stale upstream inventory without
+    /// calling its deregister_table, which would issue a second catalog DROP.
+    /// Foreign recreation of the same name requires a new schema provider:
+    /// the upstream inventory has no local-only eviction or rediscovery API.
+    dropped: RwLock<HashSet<String>>,
+    /// Authoritative physical spellings distinguish literal $/@ names from
+    /// synthetic metadata and time-travel references when filtering drops.
+    physical_names: RwLock<HashSet<String>>,
     /// Snapshot-pinned time-travel providers (bounded LRU; snapshots are
     /// immutable, so entries never need invalidation — only eviction).
     pinned: PinnedCache,
@@ -1002,6 +1071,13 @@ impl CachingSchemaProvider {
         freshness_enabled: bool,
         peer_mirrors: Option<Arc<PeerMirrors>>,
     ) -> DFResult<Self> {
+        let physical_names = catalog
+            .list_tables(&namespace)
+            .await
+            .map_err(to_datafusion_error)?
+            .into_iter()
+            .map(|ident| ident.name().to_string())
+            .collect();
         let mut map = HashMap::new();
         for name in inner.table_names() {
             if name.contains('$') {
@@ -1026,6 +1102,8 @@ impl CachingSchemaProvider {
             catalog,
             namespace,
             cached: RwLock::new(map),
+            dropped: RwLock::new(HashSet::new()),
+            physical_names: RwLock::new(physical_names),
             pinned: PinnedCache::new(),
             write_buffer,
             branch,
@@ -1065,6 +1143,60 @@ impl CachingSchemaProvider {
         provider
     }
 
+    fn was_dropped(&self, name: &str) -> bool {
+        let physical = self
+            .physical_names
+            .read()
+            .expect("physical name lock poisoned");
+        let base = if physical.contains(name) {
+            name
+        } else if let Some((base, kind)) = name.rsplit_once('$') {
+            if iceberg::inspect::MetadataTableType::try_from(kind).is_ok()
+                && physical.contains(base)
+            {
+                base
+            } else {
+                name
+            }
+        } else if let Some((base, _)) = parse_time_travel(name) {
+            if physical.contains(base) {
+                base
+            } else {
+                name
+            }
+        } else {
+            name
+        };
+        self.dropped
+            .read()
+            .expect("dropped table lock poisoned")
+            .contains(base)
+    }
+
+    fn forget_dropped_table(&self, base: &str) {
+        self.dropped
+            .write()
+            .expect("dropped table lock poisoned")
+            .insert(base.to_string());
+        if let Some(provider) = self
+            .cached
+            .write()
+            .expect("cache lock poisoned")
+            .remove(base)
+        {
+            provider.mark_missing();
+        }
+        self.pinned
+            .map
+            .write()
+            .expect("pinned lock poisoned")
+            .retain(|name, _| !parse_time_travel(name).is_some_and(|(table, _)| table == base));
+        if self.freshness_enabled {
+            let ident = TableIdent::new(self.namespace.clone(), base.to_string());
+            crate::freshness::deregister(&crate::freshness::table_key(&ident));
+        }
+    }
+
     /// Resolve a `table@snapshot_id` time-travel reference to a read-only
     /// provider pinned to that snapshot, building (and caching) it on first
     /// use. `Ok(None)` when the base table does not exist; an error when the
@@ -1082,11 +1214,14 @@ impl CachingSchemaProvider {
             return Ok(None);
         }
         let ident = TableIdent::new(self.namespace.clone(), base.to_string());
-        let table = self
-            .catalog
-            .load_table(&ident)
-            .await
-            .map_err(to_datafusion_error)?;
+        let table = match self.catalog.load_table(&ident).await {
+            Ok(table) => table,
+            Err(error) if table_is_missing(&error) => {
+                self.forget_dropped_table(base);
+                return Ok(None);
+            }
+            Err(error) => return Err(to_datafusion_error(error)),
+        };
         let provider = Arc::new(
             IcebergStaticTableProvider::try_new_from_table_snapshot(table, snapshot_id)
                 .await
@@ -1104,10 +1239,17 @@ impl SchemaProvider for CachingSchemaProvider {
     }
 
     fn table_names(&self) -> Vec<String> {
-        self.inner.table_names()
+        self.inner
+            .table_names()
+            .into_iter()
+            .filter(|name| !self.was_dropped(name))
+            .collect()
     }
 
     fn table_exist(&self, name: &str) -> bool {
+        if self.was_dropped(name) {
+            return false;
+        }
         if let Some((base, _)) = parse_time_travel(name) {
             // Snapshot existence needs IO; report the base table's existence
             // and let `table()` surface an unknown-snapshot error.
@@ -1117,10 +1259,19 @@ impl SchemaProvider for CachingSchemaProvider {
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        if self.was_dropped(name) {
+            return Ok(None);
+        }
         // Metadata tables ($snapshots, $manifests, ...) always come from the
         // inner provider — they are point-in-time views by construction.
-        if name.contains('$') {
-            return self.inner.table(name).await;
+        if let Some((base, _)) = name.split_once('$') {
+            return match self.inner.table(name).await {
+                Err(error) if missing_table_provider_error(&error) => {
+                    self.forget_dropped_table(base);
+                    Ok(None)
+                }
+                result => result,
+            };
         }
         // Time-travel reference: "<table>@<snapshot_id>" pins a snapshot.
         if let Some((base, snapshot_id)) = parse_time_travel(name) {
@@ -1164,7 +1315,16 @@ impl SchemaProvider for CachingSchemaProvider {
         name: String,
         table: Arc<dyn TableProvider>,
     ) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        self.inner.register_table(name, table)
+        let result = self.inner.register_table(name.clone(), table)?;
+        self.physical_names
+            .write()
+            .expect("physical name lock poisoned")
+            .insert(name.clone());
+        self.dropped
+            .write()
+            .expect("dropped table lock poisoned")
+            .remove(&name);
+        Ok(result)
     }
 
     fn deregister_table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
