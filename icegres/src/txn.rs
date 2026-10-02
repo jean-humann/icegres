@@ -1726,7 +1726,10 @@ mod tests {
                 ),
             )
             .unwrap();
-        let session = Arc::new(tokio::sync::Mutex::new(TxnSession::new()));
+        let retained = RetainedPool::new(1_000_000, "all transactions");
+        let session = Arc::new(tokio::sync::Mutex::new(TxnSession::new(
+            RetentionBudget::new(64_000, retained.clone()),
+        )));
         let provider = Arc::new(TxnSchemaProvider {
             inner: inner.clone(),
             namespace: namespace.clone(),
@@ -1773,7 +1776,9 @@ mod tests {
             namespace: namespace.clone(),
             catalog: catalog.clone(),
             branch: MAIN_BRANCH.to_string(),
-            sess: Arc::new(tokio::sync::Mutex::new(TxnSession::new())),
+            sess: Arc::new(tokio::sync::Mutex::new(TxnSession::new(
+                RetentionBudget::new(64_000, retained),
+            ))),
         };
         assert!(fresh.table("items").await.unwrap().is_none());
 
