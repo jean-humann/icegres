@@ -67,6 +67,8 @@ See [`catalog-support.md`](catalog-support.md) for the catalog compatibility mat
 | `ICEGRES_BRANCH` · `--branch` | `main` | Serve a zero-copy branch: reads pin to the branch head, writes commit to the branch ref with `assert-ref-snapshot-id`. |
 | `ICEGRES_ENFORCE_PK` · `--enforce-pk` | off | Enforce `icegres.primary-key` table properties: NOT NULL (23502) + uniqueness (23505) on INSERT and PK-assigning UPDATE, anchored to the commit snapshot. Also honored by `icegres sql` and `flight-serve`. |
 | `ICEGRES_TXN_STRICT` | off | Refuse a multi-table `COMMIT` up front with `0A000` when the catalog cannot apply it atomically (only bites on catalogs lacking the multi-table transactions endpoint; with it — e.g. Lakekeeper — COMMITs are always atomic and this never triggers). |
+| `ICEGRES_TXN_MAX_BYTES` | `268435456` (256 MiB) | Conservative retained Arrow limit per explicit transaction, including buffered INSERT rows, materialized DML state, and eager SELECT results. Positive byte count; exhaustion aborts the statement with `53200` and requires rollback. |
+| `ICEGRES_TXN_TOTAL_MAX_BYTES` | `1073741824` (1 GiB) | Shared retained Arrow limit across explicit transactions and their outstanding result streams. Reservations survive COMMIT/ROLLBACK until a result stream releases its data. Positive byte count; malformed or zero values fail startup. |
 
 ## Serving — Arrow Flight SQL (`icegres flight-serve`)
 
@@ -82,11 +84,47 @@ from pgwire (so both can run in one process), but shares auth/freshness.
 | `ICEGRES_GRPC_WEB` · `--grpc-web` | off | Also answer gRPC-web on the same port so browsers run Flight SQL directly (`@icegres/flight-web`, [frontend-dashboards.md](frontend-dashboards.md)); native gRPC clients are unaffected. Auth over gRPC-web is a per-RPC `authorization: Basic …` header verified against `--auth-file` (the Handshake RPC does not exist in that protocol; verified credentials are cached server-side so the SCRAM KDF is off the hot path, and failed attempts pay the same per-source-IP backoff as pgwire SASL). Startup WARNs if auth is on without TLS — the password would cross the wire per-RPC in cleartext. With TLS, the listener additionally advertises `http/1.1` ALPN. |
 | `ICEGRES_CORS_ORIGIN` · `--cors-origin` | `*` | Origin allowed on gRPC-web CORS preflights/responses. Pin to the dashboard origin whenever `--auth-file` is set. |
 | `ICEGRES_RESULT_COMPRESSION` · `--result-compression` | `zstd` | Flight result-batch compression at the Arrow IPC buffer level. `zstd` is the measured ~5× wire reduction; `none` serves uncompressed batches for clients whose arrow build lacks the zstd feature (e.g. `@lakehouse-rs/flight-sql-client` 0.0.10). |
-| `ICEGRES_FLIGHT_STATEMENT_TIMEOUT_MS` · `--flight-statement-timeout-ms` | `0` (unbounded) | Wall-clock ceiling per DoGet query stream; a query past it aborts with `DEADLINE_EXCEEDED` rather than holding an executor thread. Fires even mid-scan (live timer). Data path only — metadata RPCs are exempt. |
-| `ICEGRES_FLIGHT_MAX_RESULT_BYTES` · `--flight-max-result-bytes` | `0` (unbounded) | Byte ceiling per DoGet result over the Arrow IPC body streamed; a result past it is cut with `RESOURCE_EXHAUSTED`, so a `SELECT *` on a huge table cannot stream gigabytes into a browser tab. |
-| `ICEGRES_FLIGHT_MAX_CONCURRENT_RPCS` · `--flight-max-concurrent-rpcs` | `0` (uncapped) | Cap on concurrent in-flight DoGet query streams — the Flight analogue of pgwire `--max-connections`; excess RPCs wait at the choke point rather than spawning unbounded scans. |
+| `ICEGRES_FLIGHT_STATEMENT_TIMEOUT_MS` · `--flight-statement-timeout-ms` | `0` (unbounded) | Absolute deadline for read-only SQL, metadata, and safe parameter-binding RPCs, captured at SQL handler entry before admission. Includes queue wait, authentication, planning, execution, encoding, and result streaming. Writes use it only while waiting for admission; see cancellation scope below. |
+| `ICEGRES_FLIGHT_MAX_RESULT_BYTES` · `--flight-max-result-bytes` | `0` (unbounded) | Complete encoded `FlightData` byte limit for finite DoGet results, including metadata messages and schema headers. Exceeding it returns `RESOURCE_EXHAUSTED`. This is a response-volume limit, not an allocation limit. |
+| `ICEGRES_FLIGHT_MAX_CONCURRENT_RPCS` · `--flight-max-concurrent-rpcs` | `0` (uncapped) | Active SQL/metadata handler cap, including schema planning, prepared statements, UPDATE/DELETE, INSERT, and ingest. A stream keeps its permit through consumption or read deadline. External cancellation ends the handler permit; it does not prove remote writes stopped. |
+| `ICEGRES_FLIGHT_MAX_QUEUED_RPCS` · `--flight-max-queued-rpcs` | `64` | Maximum requests waiting for an active permit. A full queue rejects with `RESOURCE_EXHAUSTED`; zero rejects overload immediately. Ignored when active admission is uncapped. |
+| `ICEGRES_FLIGHT_MAX_SUBSCRIPTIONS` | `64` | Separate positive active limit for long-lived tail subscriptions. No waiting queue. Subscriptions have no server statement deadline or total result-byte cap; initial authentication and lookup have the request deadline. |
 | `ICEGRES_HEALTH_PORT` · `--health-port` (flight-serve) | off | Serve `/health`, `/ready`, and `/metrics` on this port for a **standalone** flight-serve (the Flight per-RPC metrics — `icegres_flight_*` — render here). Shared env var with `serve`; each process binds its own. |
 | `ICEGRES_FLIGHT_READ_ONLY` · `--read-only` (flight-serve) | off | Reject every write on the listener — INSERT/UPDATE/DELETE/DROP (query flow, prepared statements, and bulk ingest) return `PERMISSION_DENIED` before execution. Statement-form based (reuses the authz analyzer), independent of `--authz-file`. The posture for a browser SQL explorer. |
+
+The embedded tail listener reads the same Flight limit environment variables.
+Tail table discovery and snapshots use ordinary query limits; subscriptions use
+their separate cap. Authentication handshakes and prepared-statement close are
+control operations outside the SQL admission cap.
+
+Each GetFlightInfo/CreatePreparedStatement RPC and its later DoGet has its own
+budget. A prepared handle does not keep a permit between calls. The earlier of
+the server read deadline and a valid client `grpc-timeout` applies to reads.
+Streaming uses a one-item output channel; producer errors release execution and
+admission without waiting for a stalled consumer. Flight diagnostic timing no
+longer collects the full result first. Tokio deadlines cannot preempt a
+non-yielding CPU or blocking library call; a result that finishes after its
+deadline is rejected when control returns.
+
+Write execution deliberately has no new server statement timer. Dropping a
+publication future could discard the catalog's answer after it committed.
+Tonic still honors client deadlines and disconnects, which can cancel mutation
+handlers. A transport timeout or cancellation therefore means the write may
+have committed; it is not proof of rollback and must not trigger blind replay.
+This change does not supervise write completion after external cancellation.
+The existing engine's finite HTTP deadlines and exact-snapshot reconciliation
+remain separate from the read-query deadline.
+
+Transaction limits count retained Arrow allocations conservatively and may count
+shared buffers more than once. They cover explicit transaction INSERT inputs,
+SELECT results, and UPDATE/DELETE materialization and rewritten output. During a
+rewrite, old and new state both count until validation succeeds. Temporary batch
+allocation, all metadata, autocommit materialization, and COMMIT-time file/key
+assembly are not included in those counters. Participating transaction DML and
+PK operators share the listener's RuntimeEnv; configure its operator pool as
+well. These limits are not a total-process RSS ceiling. Pgwire custom-hook and
+stream deadline coverage remains separate work. Shared SessionContext setting
+isolation is also unchanged; request budgets do not establish PostgreSQL session parity.
 
 With `ICEGRES_ENFORCE_PK=1` or `--enforce-pk`, standalone Flight SQL checks
 ordinary INSERT and UPDATE/DELETE through the same write engine as pgwire.

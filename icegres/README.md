@@ -160,6 +160,8 @@ scan, cache, and DataFusion tuning knobs), grouped with defaults and meanings.
 | `--peer-tail` (serve) | `ICEGRES_PEER_TAILS` | off | Fleet overlays: comma-separated tail APIs of buffering peer computes to mirror; scans union each peer's un-flushed rows under the exactly-once watermark rule (best-effort — a dead/silent peer falls back to commit cadence with one WARN per outage) |
 |  | `ICEGRES_PEER_TAIL_USER` / `ICEGRES_PEER_TAIL_PASSWORD` | off | Credentials the `--peer-tail` subscriber presents to peers secured with `--auth-file` (one identity for every configured peer; standard Flight basic-auth handshake per connection). Without them, an authed peer rejects the subscriber (Unauthenticated; reads stay on commit cadence) |
 |  | `ICEGRES_TXN_STRICT` | off | Only relevant on catalogs WITHOUT the multi-table `transactions/commit` endpoint (with it — e.g. Lakekeeper — multi-table COMMITs are always atomic and strict mode never bites): refuse a multi-table `COMMIT` up front with `0A000` (nothing applied) instead of best-effort ordered per-table commits (where a partial apply reports `40003`, not the retryable `40001`). |
+|  | `ICEGRES_TXN_MAX_BYTES` | `268435456` | Retained Arrow byte cap per explicit transaction; limit failures return `53200` and require rollback. |
+|  | `ICEGRES_TXN_TOTAL_MAX_BYTES` | `1073741824` | Shared retained Arrow cap across transactions and outstanding result streams. These counters do not cover total RSS or COMMIT-time assembly; see [configuration](../docs/configuration.md). |
 
 Logging uses `tracing` with an env filter: `RUST_LOG=debug icegres serve`.
 Every connection runs inside a correlation span (`conn` id + peer) so

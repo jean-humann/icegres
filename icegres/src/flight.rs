@@ -125,55 +125,257 @@ const BASE64_ANY_PAD: GeneralPurpose = GeneralPurpose::new(
 type DoGetStream = Pin<Box<dyn Stream<Item = Result<arrow_flight::FlightData, Status>> + Send>>;
 type HandshakeStream = Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Status>> + Send>>;
 
-/// Resource guard wrapping a data DoGet stream: enforces the statement
-/// timeout and result-byte cap, holds the concurrency permit for the
-/// stream's lifetime, and accounts the per-RPC metrics on completion.
-///
-/// The deadline is checked against a live timer registered on every poll, so
-/// it fires even if the inner stream stalls mid-scan (not only between
-/// items) — a genuinely hung query still returns DEADLINE_EXCEEDED. Drop
-/// releases the permit, decrements the in-flight gauge, and records the
-/// stream's wall-clock, whether it ended cleanly, by error, or by client
-/// cancel (tonic drops the stream).
-struct GuardedStream {
-    inner: DoGetStream,
-    deadline: Option<Pin<Box<tokio::time::Sleep>>>,
-    byte_budget: Option<u64>,
-    bytes_seen: u64,
+/// One RPC deadline, captured before admission and never restarted by helpers.
+#[derive(Clone, Copy)]
+struct RequestBudget {
     started: Instant,
-    done: bool,
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl RequestBudget {
+    fn new<T>(request: &Request<T>, timeout: Option<Duration>) -> Result<Self, Status> {
+        let client = request
+            .metadata()
+            .get("grpc-timeout")
+            .map(|value| {
+                value
+                    .to_str()
+                    .map_err(|_| Status::invalid_argument("invalid grpc-timeout"))
+                    .and_then(parse_grpc_timeout)
+            })
+            .transpose()?;
+        let timeout = match (timeout, client) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let now = tokio::time::Instant::now();
+        let deadline = timeout
+            .map(|duration| {
+                now.checked_add(duration)
+                    .ok_or_else(|| Status::invalid_argument("request deadline overflows clock"))
+            })
+            .transpose()?;
+        Ok(Self {
+            started: Instant::now(),
+            deadline,
+        })
+    }
+
+    fn without_deadline(self) -> Self {
+        Self {
+            deadline: None,
+            ..self
+        }
+    }
+
+    async fn run<T>(&self, future: impl Future<Output = Result<T, Status>>) -> Result<T, Status> {
+        match self.deadline {
+            Some(deadline) if deadline <= tokio::time::Instant::now() => Err(
+                Status::deadline_exceeded("Flight request deadline exceeded"),
+            ),
+            Some(deadline) => {
+                let value = tokio::time::timeout_at(deadline, future)
+                    .await
+                    .map_err(|_| Status::deadline_exceeded("Flight request deadline exceeded"))??;
+                // A non-yielding poll can finish after the timer expired.
+                // Refuse a late success even though Tokio cannot preempt it.
+                if tokio::time::Instant::now() >= deadline {
+                    Err(Status::deadline_exceeded(
+                        "Flight request deadline exceeded",
+                    ))
+                } else {
+                    Ok(value)
+                }
+            }
+            None => future.await,
+        }
+    }
+}
+
+fn parse_grpc_timeout(value: &str) -> Result<Duration, Status> {
+    let invalid = || Status::invalid_argument("invalid grpc-timeout");
+    if !value.is_ascii() || !(2..=9).contains(&value.len()) {
+        return Err(invalid());
+    }
+    let (digits, unit) = value.split_at(value.len() - 1);
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    let amount = digits.parse::<u64>().map_err(|_| invalid())?;
+    Ok(match unit {
+        "H" => Duration::from_secs(amount * 3600),
+        "M" => Duration::from_secs(amount * 60),
+        "S" => Duration::from_secs(amount),
+        "m" => Duration::from_millis(amount),
+        "u" => Duration::from_micros(amount),
+        "n" => Duration::from_nanos(amount),
+        _ => return Err(invalid()),
+    })
+}
+
+/// One active operation. Unary calls drop this on return; streams transfer it
+/// to their bounded producer so even an unpolled client cannot retain a slot
+/// beyond a read deadline.
+#[derive(Debug)]
+struct RpcLease {
     _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    started: Instant,
+}
+
+impl RpcLease {
+    fn new(permit: Option<tokio::sync::OwnedSemaphorePermit>, started: Instant) -> Self {
+        let m = crate::metrics::metrics();
+        m.flight_rpcs_total.fetch_add(1, Ordering::Relaxed);
+        m.flight_rpcs_in_flight.fetch_add(1, Ordering::Relaxed);
+        Self {
+            _permit: permit,
+            started,
+        }
+    }
+}
+
+impl Drop for RpcLease {
+    fn drop(&mut self) {
+        let m = crate::metrics::metrics();
+        m.flight_rpcs_in_flight.fetch_sub(1, Ordering::Relaxed);
+        m.flight_rpc_duration_ms_total
+            .fetch_add(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+}
+
+/// Bounded waiting, separate from active admission. An RPC acquires once,
+/// before auth, planning, input decoding, or execution.
+struct Admission {
+    active: Arc<tokio::sync::Semaphore>,
+    queued: tokio::sync::Semaphore,
+}
+
+impl Admission {
+    fn new(active: usize, queued: usize) -> Result<Arc<Self>, Status> {
+        if active == 0
+            || active > tokio::sync::Semaphore::MAX_PERMITS
+            || queued > tokio::sync::Semaphore::MAX_PERMITS
+        {
+            return Err(Status::invalid_argument("invalid Flight admission limits"));
+        }
+        Ok(Arc::new(Self {
+            active: Arc::new(tokio::sync::Semaphore::new(active)),
+            queued: tokio::sync::Semaphore::new(queued),
+        }))
+    }
+
+    async fn acquire(self: &Arc<Self>, started: Instant) -> Result<RpcLease, Status> {
+        let permit = match self.active.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                return Err(Status::unavailable("Flight admission closed"))
+            }
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                let _queued = self
+                    .queued
+                    .try_acquire()
+                    .map_err(|_| Status::resource_exhausted("Flight request queue is full"))?;
+                self.active
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| Status::unavailable("Flight admission closed"))?
+            }
+        };
+        Ok(RpcLease::new(Some(permit), started))
+    }
+}
+
+/// The producer holds the execution stream and lease. Its deadline continues
+/// to run while the consumer is idle or transport flow control is blocked.
+struct GuardedStream {
+    receiver: tokio::sync::mpsc::Receiver<Result<arrow_flight::FlightData, Status>>,
+    deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+    task: tokio::task::JoinHandle<()>,
+    terminal: Arc<Mutex<Option<Status>>>,
+    finished: Option<tokio::sync::oneshot::Sender<()>>,
+    done: bool,
 }
 
 impl GuardedStream {
-    /// Construct a guarded stream and register it in the in-flight gauge. The
-    /// paired decrement lives in `Drop`, so every `GuardedStream` — including
-    /// those built directly in tests — balances the gauge regardless of how it
-    /// ends (clean, error, timeout, or client cancel).
     fn new(
-        inner: DoGetStream,
-        timeout: Option<Duration>,
+        mut inner: DoGetStream,
+        budget: RequestBudget,
         byte_budget: Option<u64>,
-        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        lease: RpcLease,
     ) -> Self {
-        crate::metrics::metrics()
-            .flight_rpcs_in_flight
-            .fetch_add(1, Ordering::Relaxed);
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let terminal = Arc::new(Mutex::new(None));
+        let producer_terminal = terminal.clone();
+        let (finished, finish_receiver) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _lease = lease;
+            let work = async {
+                let mut bytes = 0u64;
+                while let Some(item) = inner.next().await {
+                    let data = item?;
+                    let n = data.encoded_len() as u64;
+                    if byte_budget.is_some_and(|limit| bytes.saturating_add(n) > limit) {
+                        return Err(Status::resource_exhausted(
+                            "Flight encoded result byte limit exceeded",
+                        ));
+                    }
+                    bytes = bytes.saturating_add(n);
+                    if sender.send(Ok(data)).await.is_err() {
+                        return Ok(());
+                    }
+                    crate::metrics::metrics()
+                        .flight_bytes_out_total
+                        .fetch_add(n, Ordering::Relaxed);
+                }
+                Ok(())
+            };
+            let outcome = budget.run(work).await;
+            drop(inner);
+            if let Err(error) = outcome {
+                crate::metrics::metrics()
+                    .flight_rpcs_aborted_total
+                    .fetch_add(1, Ordering::Relaxed);
+                // Error reporting must never retain execution or admission
+                // behind a full output channel. The receiver drains any prior
+                // item, then reads this terminal status after channel closure.
+                *producer_terminal.lock().expect("terminal status lock") = Some(error);
+                return;
+            }
+            drop(sender);
+            // Successful completion retains its permit until the consumer
+            // observes end-of-stream. A deadline also bounds an idle consumer.
+            let _ = budget
+                .run(async {
+                    let _ = finish_receiver.await;
+                    Ok(())
+                })
+                .await;
+        });
         Self {
-            inner,
-            deadline: timeout.map(|d| Box::pin(tokio::time::sleep(d))),
-            byte_budget,
-            bytes_seen: 0,
-            started: Instant::now(),
+            receiver,
+            deadline: budget
+                .deadline
+                .map(|d| Box::pin(tokio::time::sleep_until(d))),
+            task,
+            terminal,
+            finished: Some(finished),
             done: false,
-            _permit: permit,
         }
+    }
+
+    fn finish(&mut self) {
+        self.done = true;
+        self.receiver.close();
+        if let Some(finished) = self.finished.take() {
+            let _ = finished.send(());
+        }
+        self.task.abort();
     }
 }
 
 impl Stream for GuardedStream {
     type Item = Result<arrow_flight::FlightData, Status>;
-
     fn poll_next(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -181,51 +383,22 @@ impl Stream for GuardedStream {
         if self.done {
             return Poll::Ready(None);
         }
-        // Deadline first: a hung inner poll must not outlive the budget.
-        if let Some(deadline) = self.deadline.as_mut() {
-            if deadline.as_mut().poll(cx).is_ready() {
-                self.done = true;
-                crate::metrics::metrics()
-                    .flight_rpcs_aborted_total
-                    .fetch_add(1, Ordering::Relaxed);
-                return Poll::Ready(Some(Err(Status::deadline_exceeded(
-                    "query exceeded the Flight statement timeout \
-                     (--flight-statement-timeout-ms)",
-                ))));
-            }
+        if self
+            .deadline
+            .as_mut()
+            .is_some_and(|d| d.as_mut().poll(cx).is_ready())
+        {
+            self.finish();
+            return Poll::Ready(Some(Err(Status::deadline_exceeded(
+                "Flight request deadline exceeded",
+            ))));
         }
-        match self.inner.as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok(fd))) => {
-                let n = fd.data_body.len() as u64;
-                // Enforce the cap BEFORE counting: a batch that pushes past the
-                // budget is dropped (replaced by RESOURCE_EXHAUSTED) and never
-                // reaches the client, so its bytes must not land in
-                // flight_bytes_out_total ("bytes streamed to clients").
-                if let Some(budget) = self.byte_budget {
-                    if self.bytes_seen.saturating_add(n) > budget {
-                        self.done = true;
-                        crate::metrics::metrics()
-                            .flight_rpcs_aborted_total
-                            .fetch_add(1, Ordering::Relaxed);
-                        return Poll::Ready(Some(Err(Status::resource_exhausted(format!(
-                            "query result exceeded the Flight result cap of {budget} bytes \
-                             (--flight-max-result-bytes); narrow the query or raise the limit"
-                        )))));
-                    }
-                }
-                self.bytes_seen += n;
-                crate::metrics::metrics()
-                    .flight_bytes_out_total
-                    .fetch_add(n, Ordering::Relaxed);
-                Poll::Ready(Some(Ok(fd)))
-            }
-            Poll::Ready(Some(Err(e))) => {
-                self.done = true;
-                Poll::Ready(Some(Err(e)))
-            }
+        match self.receiver.poll_recv(cx) {
+            Poll::Ready(Some(item)) => Poll::Ready(Some(item)),
             Poll::Ready(None) => {
-                self.done = true;
-                Poll::Ready(None)
+                let terminal = self.terminal.lock().expect("terminal status lock").take();
+                self.finish();
+                Poll::Ready(terminal.map(Err))
             }
             Poll::Pending => Poll::Pending,
         }
@@ -234,11 +407,14 @@ impl Stream for GuardedStream {
 
 impl Drop for GuardedStream {
     fn drop(&mut self) {
-        let m = crate::metrics::metrics();
-        m.flight_rpcs_in_flight.fetch_sub(1, Ordering::Relaxed);
-        m.flight_rpc_duration_ms_total
-            .fetch_add(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        self.task.abort();
     }
+}
+
+fn sql_is_read_only(sql: &str) -> bool {
+    Parser::parse_sql(&PostgreSqlDialect {}, sql).is_ok_and(|statements| {
+        !statements.is_empty() && statements.iter().all(authz::is_read_only)
+    })
 }
 
 /// A prepared statement: the SQL text plus the last bound parameter rows
@@ -410,21 +586,14 @@ struct FlightSqlServiceImpl {
     /// before handshake and per-RPC `Basic` verification so all three
     /// credential-guessing surfaces slow a brute-forcer identically.
     throttle: Arc<crate::ops::AuthThrottle>,
-    /// Wall-clock ceiling on a single DoGet query stream
-    /// (`--flight-statement-timeout-ms`; `None` = unbounded). A dashboard
-    /// query that runs past it is aborted with DEADLINE_EXCEEDED rather than
-    /// tying up an executor thread indefinitely.
+    /// Absolute deadline for read-only SQL, metadata, and safe binding RPCs.
+    /// Writes use the deadline only while waiting for admission.
     statement_timeout: Option<Duration>,
-    /// Byte ceiling on a single DoGet result (`--flight-max-result-bytes`;
-    /// `None` = unbounded), counted over the Arrow IPC body bytes actually
-    /// streamed. A `SELECT *` on a huge table is cut with RESOURCE_EXHAUSTED
-    /// instead of streaming gigabytes into a browser tab.
+    /// Complete encoded FlightData byte ceiling for finite DoGet results.
     max_result_bytes: Option<u64>,
-    /// Concurrency cap on in-flight DoGet query streams
-    /// (`--flight-max-concurrent-rpcs`; `None` = uncapped) — the Flight
-    /// analogue of the pgwire `--max-connections` accept-loop limit, so a
-    /// dashboard fleet cannot open unbounded parallel scans.
-    rpc_limiter: Option<Arc<tokio::sync::Semaphore>>,
+    /// One permit per SQL/metadata operation, including writes and planning.
+    rpc_limiter: Option<Arc<Admission>>,
+    subscription_limiter: Arc<tokio::sync::Semaphore>,
     prepared: Mutex<HashMap<String, Prepared>>,
     sql_info: SqlInfoData,
     /// Buffered-write overlay source. `Some` only on the tail-api listener
@@ -753,12 +922,7 @@ impl FlightSqlServiceImpl {
             };
             return Ok((schema, Some(pinned)));
         }
-        // Bound the expensive planning work under the same concurrency cap as
-        // DoGet streaming: create_logical_plan/create_physical_plan read
-        // Iceberg manifests, so an unbounded fleet of GetFlightInfo /
-        // CreatePreparedStatement calls could exhaust catalog IO while never
-        // touching the cap. Cache hits above return before this and never wait.
-        let _permit = self.acquire_permit().await;
+        // The outer RPC already owns admission, including cache hits.
         let logical = state
             .create_logical_plan(sql)
             .await
@@ -826,32 +990,11 @@ impl FlightSqlServiceImpl {
         entry.take_if_valid()
     }
 
-    /// Execute a physical plan into a DoGet Arrow stream. Streaming in
-    /// normal operation; with `ICEGRES_QUERY_TIMING=1`, collect-then-encode
-    /// so the `flight_execute` / `flight_encode` stages can be recorded
-    /// (the same disclosed buffered-not-streamed diagnostic divergence as
-    /// timing.rs and plancache.rs).
+    /// Execute without collecting the result, including diagnostic timing mode.
+    /// The outer RPC guard owns admission and the original deadline.
     async fn plan_to_stream(&self, plan: Arc<dyn ExecutionPlan>) -> Result<DoGetStream, Status> {
         let task_ctx = self.ctx.task_ctx();
         let schema = plan.schema();
-        if crate::timing::enabled() {
-            let t = Instant::now();
-            let batches = datafusion::physical_plan::collect(plan, task_ctx)
-                .await
-                .map_err(|e| Status::internal(format!("execution failed: {e}")))?;
-            crate::timing::record("flight_execute", t.elapsed());
-            let t = Instant::now();
-            let data: Vec<Result<arrow_flight::FlightData, Status>> =
-                FlightDataEncoderBuilder::new()
-                    .with_options(flight_ipc_options(self.ipc_compression))
-                    .with_schema(schema)
-                    .build(stream::iter(batches.into_iter().map(Ok)))
-                    .map_err(Status::from)
-                    .collect::<Vec<_>>()
-                    .await;
-            crate::timing::record("flight_encode", t.elapsed());
-            return Ok(self.guard(Box::pin(stream::iter(data))).await);
-        }
         let stream = datafusion::physical_plan::execute_stream(plan, task_ctx)
             .map_err(|e| Status::internal(format!("execution failed: {e}")))?;
         let flight = FlightDataEncoderBuilder::new()
@@ -859,7 +1002,7 @@ impl FlightSqlServiceImpl {
             .with_schema(schema)
             .build(stream.map_err(|e| FlightError::ExternalError(Box::new(e))))
             .map_err(Status::from);
-        Ok(self.guard(Box::pin(flight)).await)
+        Ok(Box::pin(flight))
     }
 
     /// Reject writes on a read-only listener. Two listeners set `read_only`:
@@ -914,42 +1057,45 @@ impl FlightSqlServiceImpl {
             .with_schema(schema)
             .build(stream.map_err(|e| FlightError::ExternalError(Box::new(e))))
             .map_err(Status::from);
-        Ok(self.guard(Box::pin(flight)).await)
+        Ok(Box::pin(flight))
     }
 
-    /// Acquire a concurrency permit when `--flight-max-concurrent-rpcs` is
-    /// set; `None` when uncapped. The permit is held for the lifetime of the
-    /// returned guard — a DoGet stream (via [`Self::guard`]) or a planning
-    /// region (via [`Self::plan_for_schema`]).
-    async fn acquire_permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    async fn admit(&self, started: Instant) -> Result<RpcLease, Status> {
         match &self.rpc_limiter {
-            Some(sem) => Some(
-                sem.clone()
-                    .acquire_owned()
-                    .await
-                    .expect("flight rpc semaphore closed"),
-            ),
-            None => None,
+            Some(admission) => admission.acquire(started).await,
+            None => Ok(RpcLease::new(None, started)),
         }
     }
 
-    /// Wrap a data DoGet stream with the resource guards (statement timeout,
-    /// result-byte cap, concurrency permit) and the per-RPC metrics. Applied
-    /// to every query stream (`plan_to_stream`/`df_to_stream`); metadata
-    /// streams are cheap and bypass it. Acquires the concurrency permit here
-    /// (await), so an over-cap fleet waits at the choke point rather than
-    /// spawning unbounded scans.
-    async fn guard(&self, inner: DoGetStream) -> DoGetStream {
-        let permit = self.acquire_permit().await;
-        crate::metrics::metrics()
-            .flight_rpcs_total
-            .fetch_add(1, Ordering::Relaxed);
-        Box::pin(GuardedStream::new(
-            inner,
-            self.statement_timeout,
-            self.max_result_bytes,
-            permit,
-        ))
+    fn prepared_is_read_only(&self, handle: &[u8]) -> bool {
+        std::str::from_utf8(handle)
+            .ok()
+            .and_then(|h| {
+                self.prepared
+                    .lock()
+                    .ok()
+                    .and_then(|entries| entries.get(h).map(|entry| sql_is_read_only(&entry.sql)))
+            })
+            .unwrap_or(false)
+    }
+
+    fn guard_response(
+        &self,
+        response: Response<DoGetStream>,
+        budget: RequestBudget,
+        lease: RpcLease,
+    ) -> Response<DoGetStream> {
+        let (metadata, inner, extensions) = response.into_parts();
+        Response::from_parts(
+            metadata,
+            Box::pin(GuardedStream::new(
+                inner,
+                budget,
+                self.max_result_bytes,
+                lease,
+            )),
+            extensions,
+        )
     }
 
     /// One-batch DoGet stream (metadata responses).
@@ -997,7 +1143,7 @@ impl FlightSqlServiceImpl {
             vec![Arc::new(UInt64Array::from(vec![rows as u64]))],
         )
         .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(self.guard(Self::batch_to_stream(batch)).await)
+        Ok(Self::batch_to_stream(batch))
     }
 
     /// Execute a non-query statement (INSERT / UPDATE / DELETE) and return
@@ -1292,48 +1438,61 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandStatementQuery,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        let principal = self.authorize(&request).await?;
-        let sql = query.query.clone();
-        self.check_sql(&principal, &sql)?;
-        debug!(%sql, "GetFlightInfo(CommandStatementQuery)");
-        // UPDATE/DELETE cannot physical-plan (append-only providers): keep
-        // the historical shape — logical plan for the schema, raw-SQL ticket,
-        // DoGet routes through the engine.
-        if dml::parse_single_dml(&sql)
-            .map_err(|e| Status::invalid_argument(format!("{e:#}")))?
-            .is_some()
-            || self.enforced_insert(&sql)?
-        {
-            let df = self.plan(&sql).await?;
-            let schema = df.schema().as_arrow().clone();
-            let ticket = TicketStatementQuery {
-                statement_handle: sql.into_bytes().into(),
-            };
-            return Ok(Response::new(Self::make_info(
-                &schema,
-                ticket,
-                request.into_inner(),
-            )?));
-        }
-        // Plan ONCE — to the physical plan when it is sound to pin
-        // (freshness-mode eligible; versions re-validated at DoGet) — and
-        // hand DoGet the stashed result through the ticket, killing the
-        // historical double planning (bench/COMPARISON.md caveat 4). The
-        // SQL rides in the ticket as the miss fallback (version mismatch/
-        // TTL/eviction/restart degrades to a re-plan); ineligible
-        // statements (default mode, overlays, volatile shapes) get a
-        // raw-SQL ticket so DoGet always re-plans them against fresh state.
-        let (schema, pinned) = self.plan_for_schema(&sql).await?;
-        let statement_handle = match pinned {
-            Some(entry) => encode_plan_ticket(&self.stash_plan(entry), &sql).into(),
-            None => sql.into_bytes().into(),
+        let arrival = RequestBudget::new(&request, self.statement_timeout)?;
+        let lease = arrival.run(self.admit(arrival.started)).await?;
+        // Publication is never cancelled by the read-query timer.
+        let budget = if sql_is_read_only(&query.query) {
+            arrival
+        } else {
+            arrival.without_deadline()
         };
-        let ticket = TicketStatementQuery { statement_handle };
-        Ok(Response::new(Self::make_info(
-            &schema,
-            ticket,
-            request.into_inner(),
-        )?))
+        let _lease = lease;
+        budget
+            .run(async {
+                let principal = self.authorize(&request).await?;
+                let sql = query.query.clone();
+                self.check_sql(&principal, &sql)?;
+                debug!(%sql, "GetFlightInfo(CommandStatementQuery)");
+                // UPDATE/DELETE cannot physical-plan (append-only providers): keep
+                // the historical shape — logical plan for the schema, raw-SQL ticket,
+                // DoGet routes through the engine.
+                if dml::parse_single_dml(&sql)
+                    .map_err(|e| Status::invalid_argument(format!("{e:#}")))?
+                    .is_some()
+                    || self.enforced_insert(&sql)?
+                {
+                    let df = self.plan(&sql).await?;
+                    let schema = df.schema().as_arrow().clone();
+                    let ticket = TicketStatementQuery {
+                        statement_handle: sql.into_bytes().into(),
+                    };
+                    return Ok(Response::new(Self::make_info(
+                        &schema,
+                        ticket,
+                        request.into_inner(),
+                    )?));
+                }
+                // Plan ONCE — to the physical plan when it is sound to pin
+                // (freshness-mode eligible; versions re-validated at DoGet) — and
+                // hand DoGet the stashed result through the ticket, killing the
+                // historical double planning (bench/COMPARISON.md caveat 4). The
+                // SQL rides in the ticket as the miss fallback (version mismatch/
+                // TTL/eviction/restart degrades to a re-plan); ineligible
+                // statements (default mode, overlays, volatile shapes) get a
+                // raw-SQL ticket so DoGet always re-plans them against fresh state.
+                let (schema, pinned) = self.plan_for_schema(&sql).await?;
+                let statement_handle = match pinned {
+                    Some(entry) => encode_plan_ticket(&self.stash_plan(entry), &sql).into(),
+                    None => sql.into_bytes().into(),
+                };
+                let ticket = TicketStatementQuery { statement_handle };
+                Ok(Response::new(Self::make_info(
+                    &schema,
+                    ticket,
+                    request.into_inner(),
+                )?))
+            })
+            .await
     }
 
     async fn do_get_statement(
@@ -1341,33 +1500,48 @@ impl FlightSqlService for FlightSqlServiceImpl {
         ticket: TicketStatementQuery,
         request: Request<Ticket>,
     ) -> Result<Response<<Self::FlightService as FlightService>::DoGetStream>, Status> {
-        let principal = self.authorize(&request).await?;
-        let (handle, sql) = decode_plan_ticket(&ticket.statement_handle)?;
-        // Authorization stays per-RPC: the ticket's SQL is re-checked even
-        // when the plan itself comes from the stash.
-        self.check_sql(&principal, &sql)?;
-        debug!(%sql, "DoGet(TicketStatementQuery)");
-        if let Some(stream) = self.dml_via_doget(&sql).await? {
-            return Ok(Response::new(stream));
-        }
-        // One-shot stash hit: execute the plan GetFlightInfo already built —
-        // only after take_stashed re-validated every table's current
-        // version against the plan-time set.
-        if let Some(plan) = handle.as_deref().and_then(|h| self.take_stashed(h)) {
-            let timing = crate::timing::enabled();
-            let t = timing.then(Instant::now);
-            let plan = plancache::reset_plan(plan)
-                .map_err(|e| Status::internal(format!("plan reset failed: {e}")))?;
-            if let Some(t) = t {
-                crate::timing::record("flight_doget_stash_hit", t.elapsed());
-            }
-            return Ok(Response::new(self.plan_to_stream(plan).await?));
-        }
-        // Miss (version mismatch/expired/evicted/retried/foreign ticket):
-        // re-plan — via the reusable SQL-keyed cache in freshness mode,
-        // from scratch otherwise.
-        let plan = self.physical_plan(&sql, "flight_doget_plan").await?;
-        Ok(Response::new(self.plan_to_stream(plan).await?))
+        let arrival = RequestBudget::new(&request, self.statement_timeout)?;
+        let lease = arrival.run(self.admit(arrival.started)).await?;
+        // Publication is never cancelled by the read-query timer.
+        let budget = if decode_plan_ticket(&ticket.statement_handle)
+            .is_ok_and(|(_, sql)| sql_is_read_only(&sql))
+        {
+            arrival
+        } else {
+            arrival.without_deadline()
+        };
+        let response = budget
+            .run(async {
+                let principal = self.authorize(&request).await?;
+                let (handle, sql) = decode_plan_ticket(&ticket.statement_handle)?;
+                // Authorization stays per-RPC: the ticket's SQL is re-checked even
+                // when the plan itself comes from the stash.
+                self.check_sql(&principal, &sql)?;
+                debug!(%sql, "DoGet(TicketStatementQuery)");
+                if let Some(stream) = self.dml_via_doget(&sql).await? {
+                    return Ok(Response::new(stream));
+                }
+                // One-shot stash hit: execute the plan GetFlightInfo already built —
+                // only after take_stashed re-validated every table's current
+                // version against the plan-time set.
+                if let Some(plan) = handle.as_deref().and_then(|h| self.take_stashed(h)) {
+                    let timing = crate::timing::enabled();
+                    let t = timing.then(Instant::now);
+                    let plan = plancache::reset_plan(plan)
+                        .map_err(|e| Status::internal(format!("plan reset failed: {e}")))?;
+                    if let Some(t) = t {
+                        crate::timing::record("flight_doget_stash_hit", t.elapsed());
+                    }
+                    return Ok(Response::new(self.plan_to_stream(plan).await?));
+                }
+                // Miss (version mismatch/expired/evicted/retried/foreign ticket):
+                // re-plan — via the reusable SQL-keyed cache in freshness mode,
+                // from scratch otherwise.
+                let plan = self.physical_plan(&sql, "flight_doget_plan").await?;
+                Ok(Response::new(self.plan_to_stream(plan).await?))
+            })
+            .await?;
+        Ok(self.guard_response(response, budget, lease))
     }
 
     // ------------------------------------------------------------------
@@ -1379,56 +1553,69 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: ActionCreatePreparedStatementRequest,
         request: Request<Action>,
     ) -> Result<ActionCreatePreparedStatementResult, Status> {
-        let principal = self.authorize(&request).await?;
-        let sql = query.query.clone();
-        self.check_sql(&principal, &sql)?;
-        debug!(%sql, "CreatePreparedStatement");
-        // Plan for the dataset schema; a plan with untyped `$n` placeholders
-        // that DataFusion cannot infer still yields a schema for SELECTs.
-        // For plain (non-DML) statements, ALSO try to physical-plan now so
-        // the paired zero-params DoGet executes instead of re-planning
-        // (ADBC's dbapi prepares EVERY statement, so this is the hot path).
-        // DML and placeholder-bearing statements cannot physical-plan here;
-        // they keep the logical-only schema pass.
-        let is_dml = dml::parse_single_dml(&sql)
-            .map_err(|e| Status::invalid_argument(format!("{e:#}")))?
-            .is_some()
-            || self.enforced_insert(&sql)?;
-        let (schema_ref, plan): (SchemaRef, Option<StashedPlan>) = if is_dml {
-            let df = self.plan(&sql).await?;
-            (Arc::new(df.schema().as_arrow().clone()), None)
+        let arrival = RequestBudget::new(&request, self.statement_timeout)?;
+        let lease = arrival.run(self.admit(arrival.started)).await?;
+        // Publication is never cancelled by the read-query timer.
+        let budget = if sql_is_read_only(&query.query) {
+            arrival
         } else {
-            // Pins the create-time plan only when it is version-validatable
-            // (freshness-mode eligible); otherwise DoGet re-plans against
-            // fresh state. A statement plan_for_schema cannot plan at all
-            // falls back to the upstream logical pass for the schema.
-            match self.plan_for_schema(&sql).await {
-                Ok((schema, pinned)) => (schema, pinned),
-                Err(_) => {
+            arrival.without_deadline()
+        };
+        let _lease = lease;
+        budget
+            .run(async {
+                let principal = self.authorize(&request).await?;
+                let sql = query.query.clone();
+                self.check_sql(&principal, &sql)?;
+                debug!(%sql, "CreatePreparedStatement");
+                // Plan for the dataset schema; a plan with untyped `$n` placeholders
+                // that DataFusion cannot infer still yields a schema for SELECTs.
+                // For plain (non-DML) statements, ALSO try to physical-plan now so
+                // the paired zero-params DoGet executes instead of re-planning
+                // (ADBC's dbapi prepares EVERY statement, so this is the hot path).
+                // DML and placeholder-bearing statements cannot physical-plan here;
+                // they keep the logical-only schema pass.
+                let is_dml = dml::parse_single_dml(&sql)
+                    .map_err(|e| Status::invalid_argument(format!("{e:#}")))?
+                    .is_some()
+                    || self.enforced_insert(&sql)?;
+                let (schema_ref, plan): (SchemaRef, Option<StashedPlan>) = if is_dml {
                     let df = self.plan(&sql).await?;
                     (Arc::new(df.schema().as_arrow().clone()), None)
-                }
-            }
-        };
-        let dataset_schema = encode_schema(&schema_ref)?;
-        // Parameter types are not inferred (DataFusion resolves them at bind
-        // time); advertise an empty parameter schema.
-        let parameter_schema = encode_schema(&Schema::empty())?;
-        let handle = uuid::Uuid::new_v4().to_string();
-        self.prepared.lock().expect("prepared lock").insert(
-            handle.clone(),
-            Prepared {
-                sql,
-                params: Vec::new(),
-                schema: schema_ref,
-                plan,
-            },
-        );
-        Ok(ActionCreatePreparedStatementResult {
-            prepared_statement_handle: handle.into_bytes().into(),
-            dataset_schema,
-            parameter_schema,
-        })
+                } else {
+                    // Pins the create-time plan only when it is version-validatable
+                    // (freshness-mode eligible); otherwise DoGet re-plans against
+                    // fresh state. A statement plan_for_schema cannot plan at all
+                    // falls back to the upstream logical pass for the schema.
+                    match self.plan_for_schema(&sql).await {
+                        Ok((schema, pinned)) => (schema, pinned),
+                        Err(_) => {
+                            let df = self.plan(&sql).await?;
+                            (Arc::new(df.schema().as_arrow().clone()), None)
+                        }
+                    }
+                };
+                let dataset_schema = encode_schema(&schema_ref)?;
+                // Parameter types are not inferred (DataFusion resolves them at bind
+                // time); advertise an empty parameter schema.
+                let parameter_schema = encode_schema(&Schema::empty())?;
+                let handle = uuid::Uuid::new_v4().to_string();
+                self.prepared.lock().expect("prepared lock").insert(
+                    handle.clone(),
+                    Prepared {
+                        sql,
+                        params: Vec::new(),
+                        schema: schema_ref,
+                        plan,
+                    },
+                );
+                Ok(ActionCreatePreparedStatementResult {
+                    prepared_statement_handle: handle.into_bytes().into(),
+                    dataset_schema,
+                    parameter_schema,
+                })
+            })
+            .await
     }
 
     async fn do_action_close_prepared_statement(
@@ -1448,19 +1635,28 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandPreparedStatementQuery,
         request: Request<PeekableFlightDataStream>,
     ) -> Result<DoPutPreparedStatementResult, Status> {
-        self.authorize(&request).await?;
-        let handle = String::from_utf8(query.prepared_statement_handle.to_vec())
-            .map_err(|_| Status::invalid_argument("invalid prepared statement handle"))?;
-        let batches = decode_put_stream(request.into_inner()).await?;
-        let rows = batches_to_param_rows(&batches)?;
-        let mut prepared = self.prepared.lock().expect("prepared lock");
-        let entry = prepared
-            .get_mut(&handle)
-            .ok_or_else(|| Status::not_found(format!("unknown prepared statement {handle}")))?;
-        entry.params = rows;
-        Ok(DoPutPreparedStatementResult {
-            prepared_statement_handle: Some(query.prepared_statement_handle),
-        })
+        let arrival = RequestBudget::new(&request, self.statement_timeout)?;
+        let lease = arrival.run(self.admit(arrival.started)).await?;
+        // Publication is never cancelled by the read-query timer.
+        let budget = arrival;
+        let _lease = lease;
+        budget
+            .run(async {
+                self.authorize(&request).await?;
+                let handle = String::from_utf8(query.prepared_statement_handle.to_vec())
+                    .map_err(|_| Status::invalid_argument("invalid prepared statement handle"))?;
+                let batches = decode_put_stream(request.into_inner()).await?;
+                let rows = batches_to_param_rows(&batches)?;
+                let mut prepared = self.prepared.lock().expect("prepared lock");
+                let entry = prepared.get_mut(&handle).ok_or_else(|| {
+                    Status::not_found(format!("unknown prepared statement {handle}"))
+                })?;
+                entry.params = rows;
+                Ok(DoPutPreparedStatementResult {
+                    prepared_statement_handle: Some(query.prepared_statement_handle),
+                })
+            })
+            .await
     }
 
     async fn get_flight_info_prepared_statement(
@@ -1468,23 +1664,34 @@ impl FlightSqlService for FlightSqlServiceImpl {
         cmd: CommandPreparedStatementQuery,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        self.authorize(&request).await?;
-        let handle = String::from_utf8(cmd.prepared_statement_handle.to_vec())
-            .map_err(|_| Status::invalid_argument("invalid prepared statement handle"))?;
-        // Answer from the schema captured at create time — no second plan pass.
-        let schema = {
-            let prepared = self.prepared.lock().expect("prepared lock");
-            prepared
-                .get(&handle)
-                .ok_or_else(|| Status::not_found(format!("unknown prepared statement {handle}")))?
-                .schema
-                .clone()
-        };
-        Ok(Response::new(Self::make_info(
-            &schema,
-            cmd,
-            request.into_inner(),
-        )?))
+        let arrival = RequestBudget::new(&request, self.statement_timeout)?;
+        let lease = arrival.run(self.admit(arrival.started)).await?;
+        // Publication is never cancelled by the read-query timer.
+        let budget = arrival;
+        let _lease = lease;
+        budget
+            .run(async {
+                self.authorize(&request).await?;
+                let handle = String::from_utf8(cmd.prepared_statement_handle.to_vec())
+                    .map_err(|_| Status::invalid_argument("invalid prepared statement handle"))?;
+                // Answer from the schema captured at create time — no second plan pass.
+                let schema = {
+                    let prepared = self.prepared.lock().expect("prepared lock");
+                    prepared
+                        .get(&handle)
+                        .ok_or_else(|| {
+                            Status::not_found(format!("unknown prepared statement {handle}"))
+                        })?
+                        .schema
+                        .clone()
+                };
+                Ok(Response::new(Self::make_info(
+                    &schema,
+                    cmd,
+                    request.into_inner(),
+                )?))
+            })
+            .await
     }
 
     async fn do_get_prepared_statement(
@@ -1492,81 +1699,94 @@ impl FlightSqlService for FlightSqlServiceImpl {
         cmd: CommandPreparedStatementQuery,
         request: Request<Ticket>,
     ) -> Result<Response<<Self::FlightService as FlightService>::DoGetStream>, Status> {
-        let principal = self.authorize(&request).await?;
-        let handle = String::from_utf8(cmd.prepared_statement_handle.to_vec())
-            .map_err(|_| Status::invalid_argument("invalid prepared statement handle"))?;
-        let (sql, params, stashed) = {
-            let mut prepared = self.prepared.lock().expect("prepared lock");
-            let entry = prepared
-                .get_mut(&handle)
-                .ok_or_else(|| Status::not_found(format!("unknown prepared statement {handle}")))?;
-            // The create-time physical plan is consumed ONE-SHOT (a second
-            // execute of the same handle re-plans for a fresh snapshot).
-            (entry.sql.clone(), entry.params.clone(), entry.plan.take())
+        let arrival = RequestBudget::new(&request, self.statement_timeout)?;
+        let lease = arrival.run(self.admit(arrival.started)).await?;
+        // Publication is never cancelled by the read-query timer.
+        let budget = if self.prepared_is_read_only(&cmd.prepared_statement_handle) {
+            arrival
+        } else {
+            arrival.without_deadline()
         };
-        self.check_sql(&principal, &sql)?;
-        debug!(%sql, bound_rows = params.len(), "DoGet(CommandPreparedStatementQuery)");
-        if self.enforced_insert(&sql)? && !params.is_empty() {
-            if params.len() != 1 {
-                return Err(Status::unimplemented(
-                    "bind one parameter row to a query INSERT",
-                ));
-            }
-            let rows = self
-                .execute_update(
-                    &sql,
-                    Some(ParamValues::from(
-                        params.into_iter().next().expect("one row"),
-                    )),
-                )
-                .await?;
-            return Ok(Response::new(self.count_stream(rows).await?));
-        }
-        // ADBC's dbapi prepares EVERY statement, so UPDATE/DELETE arrive
-        // here too: same engine routing as the plain-statement flow.
-        if params.is_empty() {
-            if let Some(stream) = self.dml_via_doget(&sql).await? {
-                return Ok(Response::new(stream));
-            }
-            // Zero-params SELECT: execute the plan built at create time
-            // (the double-planning fix) — only if every planned table is
-            // still at its plan-time version; a mismatch or TTL expiry
-            // re-plans instead.
-            if let Some(plan) = stashed.and_then(StashedPlan::take_if_valid) {
-                let plan = plancache::reset_plan(plan)
-                    .map_err(|e| Status::internal(format!("plan reset failed: {e}")))?;
-                return Ok(Response::new(self.plan_to_stream(plan).await?));
-            }
-            let plan = self.physical_plan(&sql, "flight_doget_plan").await?;
-            return Ok(Response::new(self.plan_to_stream(plan).await?));
-        } else if dml::parse_single_dml(&sql)
-            .map_err(|e| Status::invalid_argument(format!("{e:#}")))?
-            .is_some()
-        {
-            return Err(Status::unimplemented(
-                "parameterized UPDATE/DELETE ($n bind values) is not supported; \
-                 inline the values",
-            ));
-        }
-        let mut df = self.plan(&sql).await?;
-        match params.len() {
-            0 => {}
-            1 => {
-                df = df
-                    .with_param_values(ParamValues::from(
-                        params.into_iter().next().expect("one row"),
-                    ))
-                    .map_err(|e| {
-                        Status::invalid_argument(format!("parameter binding failed: {e}"))
+        let response = budget
+            .run(async {
+                let principal = self.authorize(&request).await?;
+                let handle = String::from_utf8(cmd.prepared_statement_handle.to_vec())
+                    .map_err(|_| Status::invalid_argument("invalid prepared statement handle"))?;
+                let (sql, params, stashed) = {
+                    let mut prepared = self.prepared.lock().expect("prepared lock");
+                    let entry = prepared.get_mut(&handle).ok_or_else(|| {
+                        Status::not_found(format!("unknown prepared statement {handle}"))
                     })?;
-            }
-            n => {
-                return Err(Status::unimplemented(format!(
-                    "binding {n} parameter rows to a query is not supported (bind one row)"
-                )))
-            }
-        }
-        Ok(Response::new(self.df_to_stream(df).await?))
+                    // The create-time physical plan is consumed ONE-SHOT (a second
+                    // execute of the same handle re-plans for a fresh snapshot).
+                    (entry.sql.clone(), entry.params.clone(), entry.plan.take())
+                };
+                self.check_sql(&principal, &sql)?;
+                debug!(%sql, bound_rows = params.len(), "DoGet(CommandPreparedStatementQuery)");
+                if self.enforced_insert(&sql)? && !params.is_empty() {
+                    if params.len() != 1 {
+                        return Err(Status::unimplemented(
+                            "bind one parameter row to a query INSERT",
+                        ));
+                    }
+                    let rows = self
+                        .execute_update(
+                            &sql,
+                            Some(ParamValues::from(
+                                params.into_iter().next().expect("one row"),
+                            )),
+                        )
+                        .await?;
+                    return Ok(Response::new(self.count_stream(rows).await?));
+                }
+                // ADBC's dbapi prepares EVERY statement, so UPDATE/DELETE arrive
+                // here too: same engine routing as the plain-statement flow.
+                if params.is_empty() {
+                    if let Some(stream) = self.dml_via_doget(&sql).await? {
+                        return Ok(Response::new(stream));
+                    }
+                    // Zero-params SELECT: execute the plan built at create time
+                    // (the double-planning fix) — only if every planned table is
+                    // still at its plan-time version; a mismatch or TTL expiry
+                    // re-plans instead.
+                    if let Some(plan) = stashed.and_then(StashedPlan::take_if_valid) {
+                        let plan = plancache::reset_plan(plan)
+                            .map_err(|e| Status::internal(format!("plan reset failed: {e}")))?;
+                        return Ok(Response::new(self.plan_to_stream(plan).await?));
+                    }
+                    let plan = self.physical_plan(&sql, "flight_doget_plan").await?;
+                    return Ok(Response::new(self.plan_to_stream(plan).await?));
+                } else if dml::parse_single_dml(&sql)
+                    .map_err(|e| Status::invalid_argument(format!("{e:#}")))?
+                    .is_some()
+                {
+                    return Err(Status::unimplemented(
+                        "parameterized UPDATE/DELETE ($n bind values) is not supported; \
+                     inline the values",
+                    ));
+                }
+                let mut df = self.plan(&sql).await?;
+                match params.len() {
+                    0 => {}
+                    1 => {
+                        df = df
+                            .with_param_values(ParamValues::from(
+                                params.into_iter().next().expect("one row"),
+                            ))
+                            .map_err(|e| {
+                                Status::invalid_argument(format!("parameter binding failed: {e}"))
+                            })?;
+                    }
+                    n => {
+                        return Err(Status::unimplemented(format!(
+                            "binding {n} parameter rows to a query is not supported (bind one row)"
+                        )))
+                    }
+                }
+                Ok(Response::new(self.df_to_stream(df).await?))
+            })
+            .await?;
+        Ok(self.guard_response(response, budget, lease))
     }
 
     async fn do_put_prepared_statement_update(
@@ -1574,34 +1794,45 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandPreparedStatementUpdate,
         request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
-        let principal = self.authorize(&request).await?;
-        let handle = String::from_utf8(query.prepared_statement_handle.to_vec())
-            .map_err(|_| Status::invalid_argument("invalid prepared statement handle"))?;
-        let sql = {
-            let prepared = self.prepared.lock().expect("prepared lock");
-            prepared
-                .get(&handle)
-                .ok_or_else(|| Status::not_found(format!("unknown prepared statement {handle}")))?
-                .sql
-                .clone()
-        };
-        self.check_sql(&principal, &sql)?;
-        let batches = decode_put_stream(request.into_inner()).await?;
-        let rows = batches_to_param_rows(&batches)?;
-        debug!(%sql, bound_rows = rows.len(), "DoPut(CommandPreparedStatementUpdate)");
-        if rows.is_empty() {
-            return self.execute_update(&sql, None).await;
-        }
-        // One execution (= one Iceberg commit) per bound row: correct but
-        // slow for bulk data — that is exactly what CommandStatementIngest
-        // (adbc_ingest) exists for, and the docs/bench say so.
-        let mut affected = 0i64;
-        for row in rows {
-            affected += self
-                .execute_update(&sql, Some(ParamValues::from(row)))
-                .await?;
-        }
-        Ok(affected)
+        let arrival = RequestBudget::new(&request, self.statement_timeout)?;
+        let lease = arrival.run(self.admit(arrival.started)).await?;
+        // Publication is never cancelled by the read-query timer.
+        let budget = arrival.without_deadline();
+        let _lease = lease;
+        budget
+            .run(async {
+                let principal = self.authorize(&request).await?;
+                let handle = String::from_utf8(query.prepared_statement_handle.to_vec())
+                    .map_err(|_| Status::invalid_argument("invalid prepared statement handle"))?;
+                let sql = {
+                    let prepared = self.prepared.lock().expect("prepared lock");
+                    prepared
+                        .get(&handle)
+                        .ok_or_else(|| {
+                            Status::not_found(format!("unknown prepared statement {handle}"))
+                        })?
+                        .sql
+                        .clone()
+                };
+                self.check_sql(&principal, &sql)?;
+                let batches = decode_put_stream(request.into_inner()).await?;
+                let rows = batches_to_param_rows(&batches)?;
+                debug!(%sql, bound_rows = rows.len(), "DoPut(CommandPreparedStatementUpdate)");
+                if rows.is_empty() {
+                    return self.execute_update(&sql, None).await;
+                }
+                // One execution (= one Iceberg commit) per bound row: correct but
+                // slow for bulk data — that is exactly what CommandStatementIngest
+                // (adbc_ingest) exists for, and the docs/bench say so.
+                let mut affected = 0i64;
+                for row in rows {
+                    affected += self
+                        .execute_update(&sql, Some(ParamValues::from(row)))
+                        .await?;
+                }
+                Ok(affected)
+            })
+            .await
     }
 
     // ------------------------------------------------------------------
@@ -1613,15 +1844,24 @@ impl FlightSqlService for FlightSqlServiceImpl {
         ticket: CommandStatementUpdate,
         request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
-        let principal = self.authorize(&request).await?;
-        if ticket.transaction_id.is_some() {
-            return Err(Status::unimplemented(
-                "Flight SQL transactions are not supported",
-            ));
-        }
-        self.check_sql(&principal, &ticket.query)?;
-        debug!(sql = %ticket.query, "DoPut(CommandStatementUpdate)");
-        self.execute_update(&ticket.query, None).await
+        let arrival = RequestBudget::new(&request, self.statement_timeout)?;
+        let lease = arrival.run(self.admit(arrival.started)).await?;
+        // Publication is never cancelled by the read-query timer.
+        let budget = arrival.without_deadline();
+        let _lease = lease;
+        budget
+            .run(async {
+                let principal = self.authorize(&request).await?;
+                if ticket.transaction_id.is_some() {
+                    return Err(Status::unimplemented(
+                        "Flight SQL transactions are not supported",
+                    ));
+                }
+                self.check_sql(&principal, &ticket.query)?;
+                debug!(sql = %ticket.query, "DoPut(CommandStatementUpdate)");
+                self.execute_update(&ticket.query, None).await
+            })
+            .await
     }
 
     async fn do_put_statement_ingest(
@@ -1629,82 +1869,91 @@ impl FlightSqlService for FlightSqlServiceImpl {
         ticket: CommandStatementIngest,
         request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
-        let principal = self.authorize(&request).await?;
-        self.reject_if_read_only()?;
-        if ticket.transaction_id.is_some() {
-            return Err(Status::unimplemented(
-                "ingest transactions are not supported",
-            ));
-        }
-        if ticket.temporary {
-            return Err(Status::unimplemented(
-                "temporary-table ingest is not supported",
-            ));
-        }
-        if let Some(catalog) = &ticket.catalog {
-            if catalog != CATALOG_NAME {
-                return Err(Status::not_found(format!(
-                    "unknown catalog {catalog:?} (only {CATALOG_NAME:?} is served)"
-                )));
-            }
-        }
-        let namespace = ticket
-            .schema
-            .clone()
-            .unwrap_or_else(|| DEFAULT_SCHEMA.to_string());
-        let table = ticket.table.clone();
-        self.check_write(&principal, &namespace, &table)?;
+        let arrival = RequestBudget::new(&request, self.statement_timeout)?;
+        let lease = arrival.run(self.admit(arrival.started)).await?;
+        // Publication is never cancelled by the read-query timer.
+        let budget = arrival.without_deadline();
+        let _lease = lease;
+        budget
+            .run(async {
+                let principal = self.authorize(&request).await?;
+                self.reject_if_read_only()?;
+                if ticket.transaction_id.is_some() {
+                    return Err(Status::unimplemented(
+                        "ingest transactions are not supported",
+                    ));
+                }
+                if ticket.temporary {
+                    return Err(Status::unimplemented(
+                        "temporary-table ingest is not supported",
+                    ));
+                }
+                if let Some(catalog) = &ticket.catalog {
+                    if catalog != CATALOG_NAME {
+                        return Err(Status::not_found(format!(
+                            "unknown catalog {catalog:?} (only {CATALOG_NAME:?} is served)"
+                        )));
+                    }
+                }
+                let namespace = ticket
+                    .schema
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_SCHEMA.to_string());
+                let table = ticket.table.clone();
+                self.check_write(&principal, &namespace, &table)?;
 
-        // Scope: append into an EXISTING Iceberg table (ADBC mode="append").
-        // mode="create"/"replace" would need DDL through the REST catalog —
-        // rejected loudly rather than half-implemented.
-        let exists = self
-            .ctx
-            .catalog(CATALOG_NAME)
-            .and_then(|c| c.schema(&namespace))
-            .is_some_and(|s| s.table_exist(&table));
-        if !exists {
-            return Err(Status::not_found(format!(
-                "table {namespace}.{table} does not exist; icegres bulk ingest appends into \
-                 existing tables only (ADBC mode=\"append\"; create the table first)"
-            )));
-        }
-        if let Some(opts) = &ticket.table_definition_options {
-            if opts.if_exists() == TableExistsOption::Replace {
-                return Err(Status::unimplemented(
-                    "ingest mode \"replace\" is not supported (append only)",
-                ));
-            }
-            if opts.if_exists() == TableExistsOption::Fail
-                && opts.if_not_exist() == TableNotExistOption::Create
-            {
-                return Err(Status::already_exists(format!(
-                    "table {namespace}.{table} already exists (ADBC mode=\"create\"); \
-                     use mode=\"append\""
+                // Scope: append into an EXISTING Iceberg table (ADBC mode="append").
+                // mode="create"/"replace" would need DDL through the REST catalog —
+                // rejected loudly rather than half-implemented.
+                let exists = self
+                    .ctx
+                    .catalog(CATALOG_NAME)
+                    .and_then(|c| c.schema(&namespace))
+                    .is_some_and(|s| s.table_exist(&table));
+                if !exists {
+                    return Err(Status::not_found(format!(
+                    "table {namespace}.{table} does not exist; icegres bulk ingest appends into \
+                     existing tables only (ADBC mode=\"append\"; create the table first)"
                 )));
-            }
-        }
+                }
+                if let Some(opts) = &ticket.table_definition_options {
+                    if opts.if_exists() == TableExistsOption::Replace {
+                        return Err(Status::unimplemented(
+                            "ingest mode \"replace\" is not supported (append only)",
+                        ));
+                    }
+                    if opts.if_exists() == TableExistsOption::Fail
+                        && opts.if_not_exist() == TableNotExistOption::Create
+                    {
+                        return Err(Status::already_exists(format!(
+                            "table {namespace}.{table} already exists (ADBC mode=\"create\"); \
+                         use mode=\"append\""
+                        )));
+                    }
+                }
 
-        // Stream the upload straight into a rolling Parquet writer and commit
-        // it as ONE fast-append: peak memory is bounded by the writer's target
-        // file size, NOT the ingest volume. (The prior path collected every
-        // batch into a Vec and re-held it in a MemTable through the INSERT, so
-        // a large upload was resident in full.) Same one-commit atomicity.
-        let ident = iceberg::TableIdent::from_strs([namespace.as_str(), table.as_str()])
-            .map_err(|e| Status::invalid_argument(format!("bad table identifier: {e}")))?;
-        let batch_stream = decode_put_stream_lazy(request.into_inner());
-        let outcome = self
-            .engine
-            .append_stream(&ident, batch_stream)
+                // Stream the upload straight into a rolling Parquet writer and commit
+                // it as ONE fast-append: peak memory is bounded by the writer's target
+                // file size, NOT the ingest volume. (The prior path collected every
+                // batch into a Vec and re-held it in a MemTable through the INSERT, so
+                // a large upload was resident in full.) Same one-commit atomicity.
+                let ident = iceberg::TableIdent::from_strs([namespace.as_str(), table.as_str()])
+                    .map_err(|e| Status::invalid_argument(format!("bad table identifier: {e}")))?;
+                let batch_stream = decode_put_stream_lazy(request.into_inner());
+                let outcome = self
+                    .engine
+                    .append_stream(&ident, batch_stream)
+                    .await
+                    .map_err(engine_status)?;
+                info!(
+                    table = %format!("{namespace}.{table}"),
+                    rows = outcome.rows,
+                    snapshot_id = ?outcome.snapshot_id,
+                    "DoPut(CommandStatementIngest): streamed append committed as one Iceberg commit"
+                );
+                Ok(outcome.rows as i64)
+            })
             .await
-            .map_err(engine_status)?;
-        info!(
-            table = %format!("{namespace}.{table}"),
-            rows = outcome.rows,
-            snapshot_id = ?outcome.snapshot_id,
-            "DoPut(CommandStatementIngest): streamed append committed as one Iceberg commit"
-        );
-        Ok(outcome.rows as i64)
     }
 
     // ------------------------------------------------------------------
@@ -1716,13 +1965,22 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandGetCatalogs,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        self.authorize(&request).await?;
-        let schema = GetCatalogsBuilder::new().schema();
-        Ok(Response::new(Self::make_info(
-            &schema,
-            query,
-            request.into_inner(),
-        )?))
+        let arrival = RequestBudget::new(&request, self.statement_timeout)?;
+        let lease = arrival.run(self.admit(arrival.started)).await?;
+        // Publication is never cancelled by the read-query timer.
+        let budget = arrival;
+        let _lease = lease;
+        budget
+            .run(async {
+                self.authorize(&request).await?;
+                let schema = GetCatalogsBuilder::new().schema();
+                Ok(Response::new(Self::make_info(
+                    &schema,
+                    query,
+                    request.into_inner(),
+                )?))
+            })
+            .await
     }
 
     async fn do_get_catalogs(
@@ -1730,13 +1988,22 @@ impl FlightSqlService for FlightSqlServiceImpl {
         _query: CommandGetCatalogs,
         request: Request<Ticket>,
     ) -> Result<Response<<Self::FlightService as FlightService>::DoGetStream>, Status> {
-        self.authorize(&request).await?;
-        let mut builder = GetCatalogsBuilder::new();
-        builder.append(CATALOG_NAME);
-        let batch = builder
-            .build()
-            .map_err(|e| Status::internal(format!("catalogs batch failed: {e}")))?;
-        Ok(Response::new(Self::batch_to_stream(batch)))
+        let arrival = RequestBudget::new(&request, self.statement_timeout)?;
+        let lease = arrival.run(self.admit(arrival.started)).await?;
+        // Publication is never cancelled by the read-query timer.
+        let budget = arrival;
+        let response = budget
+            .run(async {
+                self.authorize(&request).await?;
+                let mut builder = GetCatalogsBuilder::new();
+                builder.append(CATALOG_NAME);
+                let batch = builder
+                    .build()
+                    .map_err(|e| Status::internal(format!("catalogs batch failed: {e}")))?;
+                Ok(Response::new(Self::batch_to_stream(batch)))
+            })
+            .await?;
+        Ok(self.guard_response(response, budget, lease))
     }
 
     async fn get_flight_info_schemas(
@@ -1744,13 +2011,22 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandGetDbSchemas,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        self.authorize(&request).await?;
-        let schema = GetDbSchemasBuilder::new(None::<String>, None::<String>).schema();
-        Ok(Response::new(Self::make_info(
-            &schema,
-            query,
-            request.into_inner(),
-        )?))
+        let arrival = RequestBudget::new(&request, self.statement_timeout)?;
+        let lease = arrival.run(self.admit(arrival.started)).await?;
+        // Publication is never cancelled by the read-query timer.
+        let budget = arrival;
+        let _lease = lease;
+        budget
+            .run(async {
+                self.authorize(&request).await?;
+                let schema = GetDbSchemasBuilder::new(None::<String>, None::<String>).schema();
+                Ok(Response::new(Self::make_info(
+                    &schema,
+                    query,
+                    request.into_inner(),
+                )?))
+            })
+            .await
     }
 
     async fn do_get_schemas(
@@ -1758,24 +2034,33 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandGetDbSchemas,
         request: Request<Ticket>,
     ) -> Result<Response<<Self::FlightService as FlightService>::DoGetStream>, Status> {
-        self.authorize(&request).await?;
-        let mut builder = GetDbSchemasBuilder::new(
-            query.catalog.clone(),
-            query.db_schema_filter_pattern.clone(),
-        );
-        if query.catalog.as_deref().is_none_or(|c| c == CATALOG_NAME) {
-            if let Some(catalog) = self.ctx.catalog(CATALOG_NAME) {
-                let mut names = catalog.schema_names();
-                names.sort();
-                for name in names {
-                    builder.append(CATALOG_NAME, name);
+        let arrival = RequestBudget::new(&request, self.statement_timeout)?;
+        let lease = arrival.run(self.admit(arrival.started)).await?;
+        // Publication is never cancelled by the read-query timer.
+        let budget = arrival;
+        let response = budget
+            .run(async {
+                self.authorize(&request).await?;
+                let mut builder = GetDbSchemasBuilder::new(
+                    query.catalog.clone(),
+                    query.db_schema_filter_pattern.clone(),
+                );
+                if query.catalog.as_deref().is_none_or(|c| c == CATALOG_NAME) {
+                    if let Some(catalog) = self.ctx.catalog(CATALOG_NAME) {
+                        let mut names = catalog.schema_names();
+                        names.sort();
+                        for name in names {
+                            builder.append(CATALOG_NAME, name);
+                        }
+                    }
                 }
-            }
-        }
-        let batch = builder
-            .build()
-            .map_err(|e| Status::internal(format!("schemas batch failed: {e}")))?;
-        Ok(Response::new(Self::batch_to_stream(batch)))
+                let batch = builder
+                    .build()
+                    .map_err(|e| Status::internal(format!("schemas batch failed: {e}")))?;
+                Ok(Response::new(Self::batch_to_stream(batch)))
+            })
+            .await?;
+        Ok(self.guard_response(response, budget, lease))
     }
 
     async fn get_flight_info_tables(
@@ -1783,20 +2068,29 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandGetTables,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        self.authorize(&request).await?;
-        let schema = GetTablesBuilder::new(
-            None::<String>,
-            None::<String>,
-            None::<String>,
-            Vec::<String>::new(),
-            query.include_schema,
-        )
-        .schema();
-        Ok(Response::new(Self::make_info(
-            &schema,
-            query,
-            request.into_inner(),
-        )?))
+        let arrival = RequestBudget::new(&request, self.statement_timeout)?;
+        let lease = arrival.run(self.admit(arrival.started)).await?;
+        // Publication is never cancelled by the read-query timer.
+        let budget = arrival;
+        let _lease = lease;
+        budget
+            .run(async {
+                self.authorize(&request).await?;
+                let schema = GetTablesBuilder::new(
+                    None::<String>,
+                    None::<String>,
+                    None::<String>,
+                    Vec::<String>::new(),
+                    query.include_schema,
+                )
+                .schema();
+                Ok(Response::new(Self::make_info(
+                    &schema,
+                    query,
+                    request.into_inner(),
+                )?))
+            })
+            .await
     }
 
     async fn do_get_tables(
@@ -1804,67 +2098,76 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandGetTables,
         request: Request<Ticket>,
     ) -> Result<Response<<Self::FlightService as FlightService>::DoGetStream>, Status> {
-        self.authorize(&request).await?;
-        // The builder applies catalog/table-type filters itself; the schema
-        // pattern is applied here (we enumerate schemas), the table pattern
-        // by the builder at build() time.
-        let mut builder = GetTablesBuilder::new(
-            query.catalog.clone(),
-            query.db_schema_filter_pattern.clone(),
-            query.table_name_filter_pattern.clone(),
-            query.table_types.clone(),
-            query.include_schema,
-        );
-        let type_ok =
-            query.table_types.is_empty() || query.table_types.iter().any(|t| t == TABLE_TYPE);
-        if type_ok && query.catalog.as_deref().is_none_or(|c| c == CATALOG_NAME) {
-            if let Some(catalog) = self.ctx.catalog(CATALOG_NAME) {
-                let mut schema_names = catalog.schema_names();
-                schema_names.sort();
-                for schema_name in schema_names {
-                    if let Some(pat) = &query.db_schema_filter_pattern {
-                        if !like_match(pat, &schema_name) {
-                            continue;
-                        }
-                    }
-                    let Some(schema) = catalog.schema(&schema_name) else {
-                        continue;
-                    };
-                    let mut table_names = schema.table_names();
-                    table_names.sort();
-                    for table_name in table_names {
-                        if let Some(pat) = &query.table_name_filter_pattern {
-                            if !like_match(pat, &table_name) {
+        let arrival = RequestBudget::new(&request, self.statement_timeout)?;
+        let lease = arrival.run(self.admit(arrival.started)).await?;
+        // Publication is never cancelled by the read-query timer.
+        let budget = arrival;
+        let response = budget
+            .run(async {
+                self.authorize(&request).await?;
+                // The builder applies catalog/table-type filters itself; the schema
+                // pattern is applied here (we enumerate schemas), the table pattern
+                // by the builder at build() time.
+                let mut builder = GetTablesBuilder::new(
+                    query.catalog.clone(),
+                    query.db_schema_filter_pattern.clone(),
+                    query.table_name_filter_pattern.clone(),
+                    query.table_types.clone(),
+                    query.include_schema,
+                );
+                let type_ok = query.table_types.is_empty()
+                    || query.table_types.iter().any(|t| t == TABLE_TYPE);
+                if type_ok && query.catalog.as_deref().is_none_or(|c| c == CATALOG_NAME) {
+                    if let Some(catalog) = self.ctx.catalog(CATALOG_NAME) {
+                        let mut schema_names = catalog.schema_names();
+                        schema_names.sort();
+                        for schema_name in schema_names {
+                            if let Some(pat) = &query.db_schema_filter_pattern {
+                                if !like_match(pat, &schema_name) {
+                                    continue;
+                                }
+                            }
+                            let Some(schema) = catalog.schema(&schema_name) else {
                                 continue;
+                            };
+                            let mut table_names = schema.table_names();
+                            table_names.sort();
+                            for table_name in table_names {
+                                if let Some(pat) = &query.table_name_filter_pattern {
+                                    if !like_match(pat, &table_name) {
+                                        continue;
+                                    }
+                                }
+                                let table_schema: Schema = if query.include_schema {
+                                    match schema.table(&table_name).await {
+                                        Ok(Some(provider)) => provider.schema().as_ref().clone(),
+                                        _ => Schema::empty(),
+                                    }
+                                } else {
+                                    Schema::empty()
+                                };
+                                builder
+                                    .append(
+                                        CATALOG_NAME,
+                                        &schema_name,
+                                        &table_name,
+                                        TABLE_TYPE,
+                                        &table_schema,
+                                    )
+                                    .map_err(|e| {
+                                        Status::internal(format!("tables batch append failed: {e}"))
+                                    })?;
                             }
                         }
-                        let table_schema: Schema = if query.include_schema {
-                            match schema.table(&table_name).await {
-                                Ok(Some(provider)) => provider.schema().as_ref().clone(),
-                                _ => Schema::empty(),
-                            }
-                        } else {
-                            Schema::empty()
-                        };
-                        builder
-                            .append(
-                                CATALOG_NAME,
-                                &schema_name,
-                                &table_name,
-                                TABLE_TYPE,
-                                &table_schema,
-                            )
-                            .map_err(|e| {
-                                Status::internal(format!("tables batch append failed: {e}"))
-                            })?;
                     }
                 }
-            }
-        }
-        let batch = builder
-            .build()
-            .map_err(|e| Status::internal(format!("tables batch failed: {e}")))?;
-        Ok(Response::new(Self::batch_to_stream(batch)))
+                let batch = builder
+                    .build()
+                    .map_err(|e| Status::internal(format!("tables batch failed: {e}")))?;
+                Ok(Response::new(Self::batch_to_stream(batch)))
+            })
+            .await?;
+        Ok(self.guard_response(response, budget, lease))
     }
 
     async fn get_flight_info_table_types(
@@ -1872,12 +2175,21 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandGetTableTypes,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        self.authorize(&request).await?;
-        Ok(Response::new(Self::make_info(
-            &table_types_schema(),
-            query,
-            request.into_inner(),
-        )?))
+        let arrival = RequestBudget::new(&request, self.statement_timeout)?;
+        let lease = arrival.run(self.admit(arrival.started)).await?;
+        // Publication is never cancelled by the read-query timer.
+        let budget = arrival;
+        let _lease = lease;
+        budget
+            .run(async {
+                self.authorize(&request).await?;
+                Ok(Response::new(Self::make_info(
+                    &table_types_schema(),
+                    query,
+                    request.into_inner(),
+                )?))
+            })
+            .await
     }
 
     async fn do_get_table_types(
@@ -1885,13 +2197,22 @@ impl FlightSqlService for FlightSqlServiceImpl {
         _query: CommandGetTableTypes,
         request: Request<Ticket>,
     ) -> Result<Response<<Self::FlightService as FlightService>::DoGetStream>, Status> {
-        self.authorize(&request).await?;
-        let batch = RecordBatch::try_new(
-            Arc::new(table_types_schema()),
-            vec![Arc::new(arrow::array::StringArray::from(vec![TABLE_TYPE]))],
-        )
-        .map_err(|e| Status::internal(format!("table-types batch failed: {e}")))?;
-        Ok(Response::new(Self::batch_to_stream(batch)))
+        let arrival = RequestBudget::new(&request, self.statement_timeout)?;
+        let lease = arrival.run(self.admit(arrival.started)).await?;
+        // Publication is never cancelled by the read-query timer.
+        let budget = arrival;
+        let response = budget
+            .run(async {
+                self.authorize(&request).await?;
+                let batch = RecordBatch::try_new(
+                    Arc::new(table_types_schema()),
+                    vec![Arc::new(arrow::array::StringArray::from(vec![TABLE_TYPE]))],
+                )
+                .map_err(|e| Status::internal(format!("table-types batch failed: {e}")))?;
+                Ok(Response::new(Self::batch_to_stream(batch)))
+            })
+            .await?;
+        Ok(self.guard_response(response, budget, lease))
     }
 
     async fn get_flight_info_sql_info(
@@ -1899,13 +2220,22 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandGetSqlInfo,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        self.authorize(&request).await?;
-        let schema = self.sql_info.schema();
-        Ok(Response::new(Self::make_info(
-            &schema,
-            query,
-            request.into_inner(),
-        )?))
+        let arrival = RequestBudget::new(&request, self.statement_timeout)?;
+        let lease = arrival.run(self.admit(arrival.started)).await?;
+        // Publication is never cancelled by the read-query timer.
+        let budget = arrival;
+        let _lease = lease;
+        budget
+            .run(async {
+                self.authorize(&request).await?;
+                let schema = self.sql_info.schema();
+                Ok(Response::new(Self::make_info(
+                    &schema,
+                    query,
+                    request.into_inner(),
+                )?))
+            })
+            .await
     }
 
     async fn do_get_sql_info(
@@ -1913,12 +2243,21 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandGetSqlInfo,
         request: Request<Ticket>,
     ) -> Result<Response<<Self::FlightService as FlightService>::DoGetStream>, Status> {
-        self.authorize(&request).await?;
-        let batch = self
-            .sql_info
-            .record_batch(query.info)
-            .map_err(|e| Status::internal(format!("sql-info batch failed: {e}")))?;
-        Ok(Response::new(Self::batch_to_stream(batch)))
+        let arrival = RequestBudget::new(&request, self.statement_timeout)?;
+        let lease = arrival.run(self.admit(arrival.started)).await?;
+        // Publication is never cancelled by the read-query timer.
+        let budget = arrival;
+        let response = budget
+            .run(async {
+                self.authorize(&request).await?;
+                let batch = self
+                    .sql_info
+                    .record_batch(query.info)
+                    .map_err(|e| Status::internal(format!("sql-info batch failed: {e}")))?;
+                Ok(Response::new(Self::batch_to_stream(batch)))
+            })
+            .await?;
+        Ok(self.guard_response(response, budget, lease))
     }
 
     /// The open tail read API (tailapi.rs, docs/open-tail-protocol.md):
@@ -1932,44 +2271,85 @@ impl FlightSqlService for FlightSqlServiceImpl {
         request: Request<Ticket>,
         message: arrow_flight::sql::Any,
     ) -> Result<Response<<Self::FlightService as FlightService>::DoGetStream>, Status> {
-        let principal = self.authorize(&request).await?;
-        let ticket = crate::tailapi::TailTicket::from_any(&message)
-            .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
-        let Some(ticket) = ticket else {
-            return Err(Status::unimplemented(format!(
-                "do_get: The defined request is invalid: {}",
-                message.type_url
-            )));
+        let arrival = RequestBudget::new(&request, self.statement_timeout)?;
+        let subscription = matches!(
+            crate::tailapi::TailTicket::from_any(&message),
+            Ok(Some(crate::tailapi::TailTicket::Subscribe { .. }))
+        );
+        let lease = if subscription {
+            RpcLease::new(
+                Some(
+                    self.subscription_limiter
+                        .clone()
+                        .try_acquire_owned()
+                        .map_err(|_| {
+                            Status::resource_exhausted("Flight tail subscription limit exceeded")
+                        })?,
+                ),
+                arrival.started,
+            )
+        } else {
+            arrival.run(self.admit(arrival.started)).await?
         };
-        let Some(buffer) = &self.write_buffer else {
-            return Err(Status::failed_precondition(
-                "this endpoint is not buffering: the open tail API is served by the \
-                 buffering `icegres serve` process (--write-buffer-ms + a durable tail \
-                 + --tail-api-port); reads here already see committed data exactly",
-            ));
-        };
-        match ticket {
-            crate::tailapi::TailTicket::Tables => {
-                // Discovery is filtered per table by the SAME ReadData check
-                // the Snapshot/Subscribe arms enforce, so a denied principal
-                // sees the table in neither discovery nor data.
-                Ok(Response::new(crate::tailapi::tables_stream(
-                    buffer,
-                    |ident| check_read_with(&self.authorizer, &principal, ident).is_ok(),
-                )?))
-            }
-            crate::tailapi::TailTicket::Snapshot { table } => {
-                self.check_read(&principal, &table)?;
-                Ok(Response::new(crate::tailapi::snapshot_stream(
-                    buffer, &table,
-                )?))
-            }
-            crate::tailapi::TailTicket::Subscribe { table, from_seq } => {
-                self.check_read(&principal, &table)?;
-                Ok(Response::new(crate::tailapi::subscribe_stream(
-                    buffer, &table, from_seq,
-                )?))
-            }
+        // Subscriptions are intentionally long-lived and have a separate cap.
+        // Initial authentication/lookup still uses the request deadline.
+        let response = arrival
+            .run(async {
+                let principal = self.authorize(&request).await?;
+                let ticket = crate::tailapi::TailTicket::from_any(&message)
+                    .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
+                let Some(ticket) = ticket else {
+                    return Err(Status::unimplemented(format!(
+                        "do_get: The defined request is invalid: {}",
+                        message.type_url
+                    )));
+                };
+                let Some(buffer) = &self.write_buffer else {
+                    return Err(Status::failed_precondition(
+                        "this endpoint is not buffering: the open tail API is served by the \
+                     buffering `icegres serve` process (--write-buffer-ms + a durable tail \
+                     + --tail-api-port); reads here already see committed data exactly",
+                    ));
+                };
+                match ticket {
+                    crate::tailapi::TailTicket::Tables => {
+                        // Discovery is filtered per table by the SAME ReadData check
+                        // the Snapshot/Subscribe arms enforce, so a denied principal
+                        // sees the table in neither discovery nor data.
+                        Ok(Response::new(crate::tailapi::tables_stream(
+                            buffer,
+                            |ident| check_read_with(&self.authorizer, &principal, ident).is_ok(),
+                        )?))
+                    }
+                    crate::tailapi::TailTicket::Snapshot { table } => {
+                        self.check_read(&principal, &table)?;
+                        Ok(Response::new(crate::tailapi::snapshot_stream(
+                            buffer, &table,
+                        )?))
+                    }
+                    crate::tailapi::TailTicket::Subscribe { table, from_seq } => {
+                        self.check_read(&principal, &table)?;
+                        Ok(Response::new(crate::tailapi::subscribe_stream(
+                            buffer, &table, from_seq,
+                        )?))
+                    }
+                }
+            })
+            .await?;
+        if subscription {
+            let (metadata, inner, extensions) = response.into_parts();
+            Ok(Response::from_parts(
+                metadata,
+                Box::pin(GuardedStream::new(
+                    inner,
+                    arrival.without_deadline(),
+                    None,
+                    lease,
+                )) as DoGetStream,
+                extensions,
+            ))
+        } else {
+            Ok(self.guard_response(response, arrival, lease))
         }
     }
 
@@ -2031,6 +2411,10 @@ pub async fn spawn_tail_api(
     auth_file: Option<PathBuf>,
     authorizer: Option<SharedAuthorizer>,
 ) -> Result<()> {
+    let timeout_ms = env_u64("ICEGRES_FLIGHT_STATEMENT_TIMEOUT_MS", 0)?;
+    let result_bytes = env_u64("ICEGRES_FLIGHT_MAX_RESULT_BYTES", 0)?;
+    let active = usize::try_from(env_u64("ICEGRES_FLIGHT_MAX_CONCURRENT_RPCS", 0)?)?;
+    let queued = usize::try_from(env_u64("ICEGRES_FLIGHT_MAX_QUEUED_RPCS", 64)?)?;
     let auth = load_basic_auth(&auth_file)?;
     let service = FlightSqlServiceImpl {
         ctx,
@@ -2051,11 +2435,12 @@ pub async fn spawn_tail_api(
         // enabled here (this listener serves no browsers).
         ipc_compression: Some(arrow::ipc::CompressionType::ZSTD),
         throttle: Arc::new(crate::ops::AuthThrottle::default()),
-        // The tail-api serves only icegres peers; the browser-oriented
-        // resource guards do not apply.
-        statement_timeout: None,
-        max_result_bytes: None,
-        rpc_limiter: None,
+        statement_timeout: (timeout_ms > 0).then(|| Duration::from_millis(timeout_ms)),
+        max_result_bytes: (result_bytes > 0).then_some(result_bytes),
+        rpc_limiter: (active > 0)
+            .then(|| Admission::new(active, queued))
+            .transpose()?,
+        subscription_limiter: subscription_limiter()?,
         plans: PlanCache::from_env(),
         stash: Mutex::new(HashMap::new()),
     };
@@ -2088,6 +2473,25 @@ pub async fn spawn_tail_api(
     Ok(())
 }
 
+fn env_u64(name: &str, default: u64) -> Result<u64> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse()
+            .with_context(|| format!("{name} must be a nonnegative integer")),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn subscription_limiter() -> Result<Arc<tokio::sync::Semaphore>> {
+    let limit = usize::try_from(env_u64("ICEGRES_FLIGHT_MAX_SUBSCRIPTIONS", 64)?)?;
+    anyhow::ensure!(
+        limit > 0 && limit <= tokio::sync::Semaphore::MAX_PERMITS,
+        "ICEGRES_FLIGHT_MAX_SUBSCRIPTIONS is out of range"
+    );
+    Ok(Arc::new(tokio::sync::Semaphore::new(limit)))
+}
+
 /// Listener configuration for [`run`] beyond the bind address (kept as a
 /// struct so the CLI surface can grow without another parameter each time).
 pub struct ListenerOpts {
@@ -2108,8 +2512,9 @@ pub struct ListenerOpts {
     pub statement_timeout: Option<Duration>,
     /// Per-result byte ceiling (`--flight-max-result-bytes`).
     pub max_result_bytes: Option<u64>,
-    /// In-flight DoGet concurrency cap (`--flight-max-concurrent-rpcs`).
+    /// Active SQL/metadata RPC cap, including planning and writes.
     pub max_concurrent_rpcs: Option<usize>,
+    pub max_queued_rpcs: usize,
     /// HTTP liveness/metrics port (`--health-port`); `None` = not served.
     pub health_port: Option<u16>,
     /// Reject every write on this listener (`--read-only`).
@@ -2135,6 +2540,7 @@ pub async fn run(
         statement_timeout,
         max_result_bytes,
         max_concurrent_rpcs,
+        max_queued_rpcs,
         health_port,
         read_only,
     } = listener_opts;
@@ -2235,7 +2641,10 @@ pub async fn run(
         throttle: Arc::new(crate::ops::AuthThrottle::default()),
         statement_timeout,
         max_result_bytes,
-        rpc_limiter: max_concurrent_rpcs.map(|n| Arc::new(tokio::sync::Semaphore::new(n))),
+        rpc_limiter: max_concurrent_rpcs
+            .map(|n| Admission::new(n, max_queued_rpcs))
+            .transpose()?,
+        subscription_limiter: subscription_limiter()?,
         plans: PlanCache::from_env(),
         stash: Mutex::new(HashMap::new()),
     };
@@ -2705,13 +3114,235 @@ mod tests {
         }
     }
 
+    #[test]
+    fn timeout_metadata_parser_is_total_and_checked() {
+        for invalid in ["", "1", "é", "1é", "123456789S", "-1S", "1x", " 1S"] {
+            assert!(parse_grpc_timeout(invalid).is_err(), "{invalid:?}");
+        }
+        assert_eq!(
+            parse_grpc_timeout("99999999H").unwrap(),
+            Duration::from_secs(99999999 * 3600)
+        );
+        assert_eq!(
+            parse_grpc_timeout("25m").unwrap(),
+            Duration::from_millis(25)
+        );
+        let mut request = Request::new(());
+        request.set_timeout(Duration::from_millis(10));
+        let budget = RequestBudget::new(&request, Some(Duration::from_secs(5))).unwrap();
+        assert!(
+            budget.deadline.unwrap() <= tokio::time::Instant::now() + Duration::from_millis(10)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn admission_bounds_queue_and_expires_without_starting_work() {
+        let admission = Admission::new(1, 1).unwrap();
+        let first = admission.acquire(Instant::now()).await.unwrap();
+        let waiting = admission.clone();
+        let queued = tokio::spawn(async move {
+            let budget =
+                RequestBudget::new(&Request::new(()), Some(Duration::from_millis(50))).unwrap();
+            budget.run(waiting.acquire(budget.started)).await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(admission.queued.available_permits(), 0);
+        assert_eq!(
+            admission.acquire(Instant::now()).await.unwrap_err().code(),
+            tonic::Code::ResourceExhausted
+        );
+        tokio::time::advance(Duration::from_millis(51)).await;
+        assert_eq!(
+            queued.await.unwrap().unwrap_err().code(),
+            tonic::Code::DeadlineExceeded
+        );
+        assert_eq!(admission.queued.available_permits(), 1);
+        assert_eq!(admission.active.available_permits(), 0);
+        drop(first);
+        assert_eq!(admission.active.available_permits(), 1);
+        let no_queue = Admission::new(1, 0).unwrap();
+        let _active = no_queue.acquire(Instant::now()).await.unwrap();
+        assert_eq!(
+            no_queue.acquire(Instant::now()).await.unwrap_err().code(),
+            tonic::Code::ResourceExhausted
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn planning_and_idle_stream_share_one_absolute_deadline() {
+        let admission = Admission::new(1, 1).unwrap();
+        let budget =
+            RequestBudget::new(&Request::new(()), Some(Duration::from_millis(50))).unwrap();
+        let lease = budget.run(admission.acquire(budget.started)).await.unwrap();
+        budget
+            .run(async {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let mut output = GuardedStream::new(
+            Box::pin(stream::repeat(Ok(fd(10)))) as DoGetStream,
+            budget,
+            None,
+            lease,
+        );
+        tokio::task::yield_now().await;
+        // Never poll the consumer before the original 50ms deadline. The
+        // producer blocks behind one queued item and must still release IO.
+        tokio::time::advance(Duration::from_millis(21)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(admission.active.available_permits(), 1);
+        assert_eq!(
+            output.next().await.unwrap().unwrap_err().code(),
+            tonic::Code::DeadlineExceeded
+        );
+        assert!(output.next().await.is_none());
+        assert_eq!(
+            budget.run(async { Ok(()) }).await.unwrap_err().code(),
+            tonic::Code::DeadlineExceeded
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_consumer_cannot_retain_execution_after_result_cap() {
+        let admission = Admission::new(1, 0).unwrap();
+        let lease = admission.acquire(Instant::now()).await.unwrap();
+        let budget = RequestBudget::new(&Request::new(()), None).unwrap();
+        let mut output = GuardedStream::new(
+            Box::pin(stream::iter([Ok(fd(60)), Ok(fd(60))])),
+            budget,
+            Some(100),
+            lease,
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(
+            admission.active.available_permits(),
+            1,
+            "cap failure releases admission without a consumer poll"
+        );
+        assert!(output.next().await.unwrap().is_ok());
+        assert_eq!(
+            output.next().await.unwrap().unwrap_err().code(),
+            tonic::Code::ResourceExhausted
+        );
+        assert!(output.next().await.is_none());
+        let mut data = fd(0);
+        data.app_metadata = vec![0; 200].into();
+        let mut output = guarded(vec![Ok(data)], None, Some(100));
+        assert_eq!(
+            output.next().await.unwrap().unwrap_err().code(),
+            tonic::Code::ResourceExhausted
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn write_execution_is_outside_server_read_timer() {
+        for sql in [
+            "INSERT INTO t VALUES (1)",
+            "EXPLAIN ANALYZE INSERT INTO t VALUES (1)",
+            "CREATE TABLE t AS SELECT 1",
+            "DELETE FROM t",
+        ] {
+            assert!(!sql_is_read_only(sql), "{sql}");
+        }
+        assert!(sql_is_read_only("SELECT 1"));
+        let budget = RequestBudget::new(&Request::new(()), Some(Duration::from_millis(5))).unwrap();
+        budget
+            .without_deadline()
+            .run(async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_transport_deadline_does_not_prove_write_rollback() {
+        // A synthetic remote publication survives cancellation of its RPC
+        // handler. This captures the transport limitation, not an engine
+        // reconciliation guarantee.
+        struct Probe {
+            applied: Arc<tokio::sync::Notify>,
+        }
+        #[tonic::async_trait]
+        impl FlightSqlService for Probe {
+            type FlightService = Self;
+            async fn get_flight_info_statement(
+                &self,
+                _: CommandStatementQuery,
+                request: Request<FlightDescriptor>,
+            ) -> Result<Response<FlightInfo>, Status> {
+                let budget = RequestBudget::new(&request, None)?.without_deadline();
+                let applied = self.applied.clone();
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    applied.notify_one();
+                    let _ = sender.send(());
+                });
+                budget
+                    .run(async {
+                        let _ = receiver.await;
+                        Ok(Response::new(FlightInfo::default()))
+                    })
+                    .await
+            }
+            async fn register_sql_info(&self, _: i32, _: &SqlInfo) {}
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let applied = Arc::new(tokio::sync::Notify::new());
+        let (stop, shutdown) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(
+            Server::builder()
+                .add_service(FlightServiceServer::new(Probe {
+                    applied: applied.clone(),
+                }))
+                .serve_with_incoming_shutdown(tcp_incoming(listener), async {
+                    let _ = shutdown.await;
+                }),
+        );
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = arrow_flight::flight_service_client::FlightServiceClient::new(channel);
+        let mut request = Request::new(FlightDescriptor::new_cmd(
+            CommandStatementQuery {
+                query: "INSERT INTO t VALUES (1)".into(),
+                transaction_id: None,
+            }
+            .as_any()
+            .encode_to_vec(),
+        ));
+        request.set_timeout(Duration::from_millis(30));
+        let error = client.get_flight_info(request).await.unwrap_err();
+        assert!(matches!(
+            error.code(),
+            tonic::Code::Cancelled | tonic::Code::DeadlineExceeded
+        ));
+        tokio::time::timeout(Duration::from_secs(2), applied.notified())
+            .await
+            .unwrap();
+        let _ = stop.send(());
+        server.await.unwrap().unwrap();
+    }
+
     /// Build a GuardedStream over `items` with the given guards (no permit).
     fn guarded(
         items: Vec<Result<arrow_flight::FlightData, Status>>,
         timeout: Option<Duration>,
         byte_budget: Option<u64>,
     ) -> GuardedStream {
-        GuardedStream::new(Box::pin(stream::iter(items)), timeout, byte_budget, None)
+        GuardedStream::new(
+            Box::pin(stream::iter(items)),
+            RequestBudget::new(&Request::new(()), timeout).unwrap(),
+            byte_budget,
+            RpcLease::new(None, Instant::now()),
+        )
     }
 
     fn fd(body_len: usize) -> arrow_flight::FlightData {
@@ -2739,7 +3370,12 @@ mod tests {
         // the paused clock past it makes poll_next return DEADLINE_EXCEEDED
         // even though the inner stream is still pending.
         let inner: DoGetStream = Box::pin(stream::pending());
-        let mut s = GuardedStream::new(inner, Some(Duration::from_millis(50)), None, None);
+        let mut s = GuardedStream::new(
+            inner,
+            RequestBudget::new(&Request::new(()), Some(Duration::from_millis(50))).unwrap(),
+            None,
+            RpcLease::new(None, Instant::now()),
+        );
         tokio::time::advance(Duration::from_millis(60)).await;
         let err = s.next().await.unwrap().unwrap_err();
         assert_eq!(err.code(), tonic::Code::DeadlineExceeded);
