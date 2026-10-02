@@ -35,7 +35,8 @@ case "$BUILD_PROFILE" in
   debug|release) ;;
   *) echo "ICEGRES_E2E_PROFILE must be debug or release" >&2; exit 1 ;;
 esac
-TARGET_DIR="$ICEGRES_DIR/target/$BUILD_PROFILE"
+TARGET_DIR="${ICEGRES_E2E_BIN_DIR:-$ICEGRES_DIR/target/$BUILD_PROFILE}"
+FLIGHT_DBAPI_PYTHON="${ICEGRES_FLIGHT_DBAPI_PYTHON:-python3}"
 BIN="$TARGET_DIR/icegres"
 
 PG_HOST=127.0.0.1
@@ -266,15 +267,21 @@ pass "lakehouse stack healthy"
 # ---------------------------------------------------------------------------
 # 1. Build (cargo skips work when the binary is fresh)
 # ---------------------------------------------------------------------------
-log "building icegres"
-(cd "$ICEGRES_DIR" && if [[ "$BUILD_PROFILE" == release ]]; then
-  cargo build --release --locked --bins --quiet
+if [[ -n "${ICEGRES_E2E_BIN_DIR:-}" ]]; then
+  for executable in icegres icegresd icekeeperd; do
+    [[ -x "$TARGET_DIR/$executable" ]] || fail "prebuilt binary missing: $TARGET_DIR/$executable"
+  done
+  pass "using explicit prebuilt binaries in $TARGET_DIR"
 else
-  cargo build --locked --bins --quiet
-fi) \
-  || fail "cargo build failed"
-[[ -x "$BIN" ]] || fail "binary not found at $BIN"
-pass "cargo build"
+  log "building icegres"
+  (cd "$ICEGRES_DIR" && if [[ "$BUILD_PROFILE" == release ]]; then
+    cargo build --release --locked --bins --quiet
+  else
+    cargo build --locked --bins --quiet
+  fi) || fail "cargo build failed"
+  [[ -x "$BIN" ]] || fail "binary not found at $BIN"
+  pass "cargo build"
+fi
 
 # ---------------------------------------------------------------------------
 # 2. Port must be ours to use
@@ -1891,7 +1898,7 @@ PYEOF
   # pair — when the ADBC guard skips the whole section, A13 skips with it.
   # pandas rides the guard because flightsql-dbapi's cursor materializes
   # through it without declaring it (Superset ships pandas).
-  if ! python3 -c 'import flightsql, sqlalchemy, pandas' 2>/dev/null; then
+  if ! "$FLIGHT_DBAPI_PYTHON" -c 'import flightsql, sqlalchemy, pandas' 2>/dev/null; then
     log "    A13 SKIPPED: flightsql-dbapi stack not available (pip install flightsql-dbapi sqlalchemy pandas)"
   else
     A13_OUT=$(env ICEGRES_PROBE_FLIGHT_HOST=127.0.0.1 \
@@ -1899,7 +1906,7 @@ PYEOF
         ICEGRES_PROBE_FLIGHT_SECURE_PORT="$FLIGHT_SECURE_PORT" \
         ICEGRES_PROBE_FLIGHT_SECURE_USER=e2e_flight_user \
         ICEGRES_PROBE_FLIGHT_SECURE_PASSWORD=e2e-flight-pw \
-        python3 "$REPO_DIR/bench/clients/a13_flightsql_dbapi_probe.py" 2>&1) \
+        "$FLIGHT_DBAPI_PYTHON" "$REPO_DIR/bench/clients/a13_flightsql_dbapi_probe.py" 2>&1) \
       || { echo "$A13_OUT" | tail -n 15 >&2; fail "A13 flightsql-dbapi probe reported failures"; }
     echo "$A13_OUT" | sed 's/^/    /'
     echo "$A13_OUT" | grep -qE '^A13 RESULT: pass=[0-9]+ fail=0 ' \

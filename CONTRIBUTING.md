@@ -41,6 +41,23 @@ See [`icegres/README.md`](icegres/README.md) for the full tour,
 [`docs/limitations.md`](docs/limitations.md) before filing behavior issues —
 many deliberate non-goals are documented there with their rationale.
 
+### Reusing a live test stack
+
+`ICEGRES_E2E_EXTERNAL_STACK=1 bash icegres/tests/e2e.sh` uses an already running
+local stack without starting or stopping its containers. Use an isolated test
+warehouse and database. The suite creates fixtures and exercises crashes.
+
+By default, the suite builds all three release binaries. To test a fixed build,
+set `ICEGRES_E2E_BIN_DIR` to a directory containing executable `icegres`,
+`icegresd` and `icekeeperd` binaries. The suite checks all three before running.
+
+The SQLAlchemy 2 ORM probe and the Flight SQL DB-API probe can require different
+Python dependencies. In particular, `flightsql-dbapi` can constrain SQLAlchemy
+to version 1.4. Keep the ORM probe's SQLAlchemy 2 and pandas environment on
+`PATH`, and set `ICEGRES_FLIGHT_DBAPI_PYTHON` to the Python executable in a
+separate environment containing `flightsql-dbapi`, its SQLAlchemy dependency
+and pandas. Both probes run when their dependencies are installed.
+
 ## Security issues
 
 Never report suspected vulnerabilities in public issues — see
