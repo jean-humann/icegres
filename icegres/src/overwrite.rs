@@ -87,10 +87,9 @@
 //!
 //! * Format v2, unpartitioned tables, Parquet data files, no delete
 //!   manifests — anything else is rejected before any write.
-//! * With DML ops (or PK enforcement) every live data file is read once per
-//!   commit, one file at a time, so peak memory is one data file's decoded
-//!   batches (plus the buffered transaction rows and, under enforcement,
-//!   the table's key columns).
+//! * DML/PK validation reads every live file. Replacement output can remain
+//!   resident for a manifest, alongside transaction rows and the final key
+//!   set. The query memory pool does not account for all of these buffers.
 //! * Predicates/assignment values must be self-contained row expressions:
 //!   subqueries are rejected (they would otherwise be evaluated per-file
 //!   and yield wrong answers).
@@ -102,10 +101,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context as _, Result};
 use arrow::array::{Array, AsArray, RecordBatch};
 use arrow::compute::{cast_with_options, CastOptions};
-use arrow::datatypes::{Int64Type, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
+use arrow::datatypes::{
+    DataType, Field, Int64Type, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
+};
 use datafusion::datasource::MemTable;
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use datafusion::parquet::arrow::parquet_to_arrow_schema;
+use datafusion::parquet::arrow::{parquet_to_arrow_schema, PARQUET_FIELD_ID_META_KEY};
 use datafusion::parquet::file::metadata::{FooterTail, ParquetMetaDataReader};
 use datafusion::parquet::file::FOOTER_SIZE;
 use datafusion::prelude::{SessionConfig, SessionContext};
@@ -213,6 +214,66 @@ impl std::fmt::Display for CommitConflict {
 }
 impl std::error::Error for CommitConflict {}
 
+/// The catalog may have committed, but neither the response nor retained
+/// metadata establishes the outcome. Callers must reconcile instead of retrying.
+#[derive(Debug)]
+pub struct CommitUnknown {
+    pub message: String,
+}
+
+impl std::fmt::Display for CommitUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for CommitUnknown {}
+
+/// Write requests include the response body in their deadline. Never retry an
+/// ambiguous POST automatically. Reconciliation has a separate, short budget.
+const DEFAULT_WRITE_TIMEOUT_MS: u64 = 10_000;
+const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 3_000;
+const RECONCILE_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn positive_timeout(name: &str, default_ms: u64) -> Result<Duration> {
+    let millis = match std::env::var(name) {
+        Ok(value) => value
+            .parse::<u64>()
+            .with_context(|| format!("{name} must be a positive integer"))?,
+        Err(std::env::VarError::NotPresent) => default_ms,
+        Err(e) => return Err(e.into()),
+    };
+    if millis == 0 {
+        bail!("{name} must be positive; catalog write deadlines cannot be disabled");
+    }
+    Ok(Duration::from_millis(millis))
+}
+
+fn commit_http_client(token: Option<&str>) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(positive_timeout(
+            "ICEGRES_CATALOG_CONNECT_TIMEOUT_MS",
+            DEFAULT_CONNECT_TIMEOUT_MS,
+        )?)
+        .timeout(positive_timeout(
+            "ICEGRES_CATALOG_WRITE_TIMEOUT_MS",
+            DEFAULT_WRITE_TIMEOUT_MS,
+        )?)
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never());
+    if let Some(token) = token {
+        use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+        let mut headers = HeaderMap::new();
+        let mut value = HeaderValue::from_str(&format!("Bearer {token}"))
+            .context("--catalog-token is not a valid HTTP header value")?;
+        value.set_sensitive(true);
+        headers.insert(AUTHORIZATION, value);
+        builder = builder.default_headers(headers);
+    }
+    builder
+        .build()
+        .context("failed to build the catalog commit HTTP client")
+}
+
 /// Result of a committed (or no-op) DML statement.
 #[derive(Debug)]
 pub struct DmlOutcome {
@@ -263,33 +324,9 @@ impl OverwriteEngine {
         enforce_pk: bool,
         branch: Option<String>,
     ) -> Result<Self> {
-        // The copy-on-write DML commit path issues its OWN REST calls (config
-        // discovery, per-table commit, transactions/commit) through this
-        // client, separately from the read catalog. When the operator supplies
-        // a pre-minted bearer (`--catalog-token`) it must authenticate here
-        // too, or every write would 401 against an auth-guarded catalog. A
-        // static bearer has the same non-refreshing semantics as the read
-        // client's `token` prop, so they stay consistent. The OAuth2
-        // client-credentials (`--catalog-credential`) grant is NOT duplicated
-        // here (house rule: no hand-rolled auth; iceberg-rust 0.9.1 does not
-        // expose its token provider) — see docs/catalog-support.md for the
-        // write-plane-under-pure-client-credentials note. Absent a token this
-        // is `reqwest::Client::new()` byte-for-byte (invariant I3).
-        let http = match &opts.catalog_token {
-            Some(token) => {
-                use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
-                let mut headers = HeaderMap::new();
-                let mut value = HeaderValue::from_str(&format!("Bearer {token}"))
-                    .context("--catalog-token is not a valid HTTP header value")?;
-                value.set_sensitive(true);
-                headers.insert(AUTHORIZATION, value);
-                reqwest::Client::builder()
-                    .default_headers(headers)
-                    .build()
-                    .context("failed to build the authenticated commit HTTP client")?
-            }
-            None => reqwest::Client::new(),
-        };
+        // Custom write requests share finite deadlines and the static bearer.
+        // OAuth client-credential refresh remains owned by the read catalog.
+        let http = commit_http_client(opts.catalog_token.as_deref())?;
         let config_url = format!(
             "{}/v1/config?warehouse={}",
             opts.catalog_uri.trim_end_matches('/'),
@@ -381,6 +418,7 @@ impl OverwriteEngine {
             .map_err(|e| anyhow!("bad table identifier: {e}"))?;
         let ops = [TableOp::Dml(stmt.clone())];
         let mut conflicts: Vec<String> = Vec::new();
+        let mut original_identity = None;
         for attempt in 1..=MAX_COMMIT_ATTEMPTS {
             // ICEGRES_QUERY_TIMING write budget: one line per attempt, so the
             // retry loop's cost is visible as extra `commit_attempt` records.
@@ -390,6 +428,10 @@ impl OverwriteEngine {
                 .load_table(&ident)
                 .await
                 .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?;
+            match original_identity {
+                Some(identity) => validate_write_identity(&table, identity)?,
+                None => original_identity = Some(WriteIdentity::of(&table)),
+            }
             let pk = self.pk_columns(&table)?;
             let prepared = prepare_commit(&table, &ops, pk.as_deref(), &self.branch, None)
                 .await
@@ -448,11 +490,13 @@ impl OverwriteEngine {
                 }
             }
         }
-        bail!(
-            "DML on {ident} lost the optimistic-concurrency race {MAX_COMMIT_ATTEMPTS} times; \
+        Err(anyhow!(CommitConflict {
+            message: format!(
+                "DML on {ident} lost the optimistic-concurrency race {MAX_COMMIT_ATTEMPTS} times; \
              giving up (no partial effects were committed). Conflicts: {}",
-            conflicts.join(" | ")
-        )
+                conflicts.join(" | ")
+            ),
+        }))
     }
 
     /// Commit one AUTOCOMMIT INSERT under PK enforcement. The uniqueness
@@ -477,6 +521,7 @@ impl OverwriteEngine {
         let ops = [TableOp::Append(batches)];
         let mut conflicts: Vec<String> = Vec::new();
         let mut preloaded = preloaded;
+        let mut original_identity = None;
         for attempt in 1..=MAX_COMMIT_ATTEMPTS {
             // Same per-attempt timing record as `execute` (write budget).
             let attempt_started = crate::timing::enabled().then(Instant::now);
@@ -488,6 +533,10 @@ impl OverwriteEngine {
                     .await
                     .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?,
             };
+            match original_identity {
+                Some(identity) => validate_write_identity(&table, identity)?,
+                None => original_identity = Some(WriteIdentity::of(&table)),
+            }
             let pk = self.pk_columns(&table)?;
             let prepared = prepare_commit(&table, &ops, pk.as_deref(), &self.branch, None)
                 .await
@@ -530,11 +579,13 @@ impl OverwriteEngine {
                 }
             }
         }
-        bail!(
-            "INSERT into {ident} lost the optimistic-concurrency race {MAX_COMMIT_ATTEMPTS} \
+        Err(anyhow!(CommitConflict {
+            message: format!(
+                "INSERT into {ident} lost the optimistic-concurrency race {MAX_COMMIT_ATTEMPTS} \
              times; giving up (no partial effects were committed). Conflicts: {}",
-            conflicts.join(" | ")
-        )
+                conflicts.join(" | ")
+            ),
+        }))
     }
 
     /// Stream-append a batch stream into an existing table as ONE fast-append
@@ -549,8 +600,8 @@ impl OverwriteEngine {
     /// commit against fresh table state — the already-durable data files are
     /// never re-encoded. Atomicity is preserved: either the single snapshot
     /// lands or nothing does (a lost race leaves the files as unreferenced
-    /// orphans that GC reclaims). No PK enforcement — matching the prior
-    /// bulk-append semantics.
+    /// orphans that GC reclaims). Constrained ingestion is refused before
+    /// consuming the stream because this path cannot validate uniqueness.
     pub async fn append_stream<S>(&self, ident: &TableIdent, stream: S) -> Result<DmlOutcome>
     where
         S: futures::Stream<Item = Result<RecordBatch>>,
@@ -564,6 +615,8 @@ impl OverwriteEngine {
             .load_table(ident)
             .await
             .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?;
+        self.reject_constrained_ingest(&table)?;
+        let original_identity = WriteIdentity::of(&table);
         let arrow_target: ArrowSchemaRef = Arc::new(
             schema_to_arrow_schema(table.metadata().current_schema())
                 .map_err(|e| anyhow!("schema conversion failed: {e}"))?,
@@ -608,6 +661,8 @@ impl OverwriteEngine {
                 .load_table(ident)
                 .await
                 .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?;
+            validate_write_identity(&table, original_identity)?;
+            self.reject_constrained_ingest(&table)?;
             let prepared = prepare_commit(&table, &ops, None, &self.branch, None)
                 .await
                 .with_context(|| format!("ingest into {ident} failed"))?;
@@ -643,12 +698,24 @@ impl OverwriteEngine {
                 }
             }
         }
-        bail!(
-            "ingest into {ident} lost the optimistic-concurrency race \
+        Err(anyhow!(CommitConflict {
+            message: format!(
+                "ingest into {ident} lost the optimistic-concurrency race \
              {MAX_COMMIT_ATTEMPTS} times; giving up (the written data files are \
              unreferenced orphans, reclaimed by GC). Conflicts: {}",
-            conflicts.join(" | ")
-        )
+                conflicts.join(" | ")
+            ),
+        }))
+    }
+
+    fn reject_constrained_ingest(&self, table: &Table) -> Result<()> {
+        if self.pk_columns(table)?.is_some() {
+            return Err(anyhow!(ConstraintViolation {
+                sqlstate: "0A000",
+                message: "bulk ingestion into a primary-key-enforced table is not supported; use INSERT so uniqueness is validated".into(),
+            }));
+        }
+        Ok(())
     }
 
     /// Commit a transaction's buffered op list for one table as ONE snapshot
@@ -664,10 +731,11 @@ impl OverwriteEngine {
         &self,
         ident: &TableIdent,
         expected_head: Option<i64>,
+        expected_identity: WriteIdentity,
         ops: &[TableOp],
     ) -> Result<Option<i64>> {
-        // Fresh metadata for correct sequence numbers / uuid; the pin only
-        // anchors the ref requirement. If the branch already moved, abort
+        // Fresh metadata supplies sequence numbers; retained identity and
+        // snapshot requirements protect the original transaction pin. If the branch already moved, abort
         // cheaply before doing any work (the POSTed requirement is the real
         // guard).
         let table = self
@@ -675,6 +743,7 @@ impl OverwriteEngine {
             .load_table(ident)
             .await
             .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?;
+        validate_write_identity(&table, expected_identity)?;
         let fresh_head = branch_head(table.metadata(), &self.branch)?.map(|s| s.snapshot_id());
         if fresh_head != expected_head {
             let show = |s: Option<i64>| {
@@ -750,7 +819,7 @@ impl OverwriteEngine {
     /// single data file having been written twice.
     pub async fn commit_pinned_multi(
         &self,
-        tables: &[(&TableIdent, Option<i64>, &[TableOp])],
+        tables: &[(&TableIdent, Option<i64>, WriteIdentity, &[TableOp])],
     ) -> Result<MultiTableCommit> {
         // Resolve the endpoint capability BEFORE staging (writing Parquet
         // for) any table: when unknown this costs one data-free probe, so an
@@ -763,12 +832,13 @@ impl OverwriteEngine {
         // any catalog mutation), with the same cheap pre-check as
         // commit_pinned so a stale pin aborts before staging N tables.
         let mut prepared_all: Vec<Option<PreparedCommit>> = Vec::with_capacity(tables.len());
-        for (ident, expected_head, ops) in tables {
+        for (ident, expected_head, expected_identity, ops) in tables {
             let table = self
                 .catalog
                 .load_table(ident)
                 .await
                 .map_err(|e| anyhow!("failed to load table {ident}: {e}"))?;
+            validate_write_identity(&table, *expected_identity)?;
             let fresh_head = branch_head(table.metadata(), &self.branch)?.map(|s| s.snapshot_id());
             if fresh_head != *expected_head {
                 let show = |s: Option<i64>| {
@@ -1354,22 +1424,97 @@ impl OverwriteEngine {
             urlencode(namespace),
             urlencode(table)
         );
-        let resp = self
-            .http
-            .post(&url)
-            .json(request)
-            .send()
+        self.send_commit(&url, serde_json::to_value(request)?, &[request])
             .await
-            .with_context(|| format!("commit POST to {url} failed"))?;
-        let status = resp.status();
-        if status.is_success() {
+    }
+
+    /// Positively reconcile a retained ambiguous buffered generation. A false
+    /// result means unresolved, never rejected, so callers must not replay it.
+    pub async fn prepared_commit_visible(
+        &self,
+        ident: &TableIdent,
+        prepared: &PreparedCommit,
+    ) -> bool {
+        if prepared.request.identifier.as_ref() != Some(ident) {
+            return false;
+        }
+        self.reconcile_commits(&[&prepared.request]).await
+    }
+
+    /// Only retained evidence of this exact AddSnapshot proves success. A
+    /// missing snapshot may have expired or been rolled back, so it never
+    /// proves rejection. Metadata-only requests remain unknown on response loss.
+    async fn reconcile_commits(&self, requests: &[&CommitTableRequest]) -> bool {
+        let reconciliation = async {
+            for request in requests {
+                let Some(ident) = &request.identifier else {
+                    return false;
+                };
+                let Ok(table) = self.catalog.load_table(ident).await else {
+                    return false;
+                };
+                if !request_snapshot_visible(request, &table) {
+                    return false;
+                }
+            }
+            !requests.is_empty()
+        };
+        tokio::time::timeout(RECONCILE_TIMEOUT, reconciliation)
+            .await
+            .unwrap_or(false)
+    }
+
+    async fn send_commit(
+        &self,
+        url: &str,
+        body: serde_json::Value,
+        requests: &[&CommitTableRequest],
+    ) -> Result<CommitOutcome> {
+        let response = self.http.post(url).json(&body).send().await;
+        let reason = match response {
+            Ok(response) => {
+                let status = response.status();
+                if status.is_success() {
+                    return Ok(CommitOutcome::Committed);
+                }
+                let body = response.text().await.unwrap_or_default();
+                if status == reqwest::StatusCode::CONFLICT {
+                    return Ok(CommitOutcome::Conflict(body));
+                }
+                // Definite request rejection. A timeout or server/proxy failure
+                // can follow successful publication and must remain ambiguous.
+                if status.is_client_error() && status != reqwest::StatusCode::REQUEST_TIMEOUT {
+                    bail!("catalog rejected commit ({status}) at {url}: {body}");
+                }
+                format!("catalog response {status} at {url}: {body}")
+            }
+            Err(error) if error.is_builder() || error.is_connect() => {
+                return Err(error).with_context(|| format!("commit request could not reach {url}"));
+            }
+            Err(error) => format!("commit response from {url} failed: {error}"),
+        };
+        if self.reconcile_commits(requests).await {
+            tracing::warn!(%url, "lost commit response reconciled through retained prepared snapshots");
             return Ok(CommitOutcome::Committed);
         }
-        let body = resp.text().await.unwrap_or_default();
-        if status == reqwest::StatusCode::CONFLICT {
-            return Ok(CommitOutcome::Conflict(body));
-        }
-        bail!("catalog rejected commit ({status}) at {url}: {body}")
+        let tables: Vec<String> = requests
+            .iter()
+            .filter_map(|r| r.identifier.as_ref())
+            .map(ToString::to_string)
+            .collect();
+        Err(anyhow!(CommitUnknown {
+            message: format!(
+                "commit outcome unknown for [{}]: {reason}; the catalog may have committed. Do not retry blindly; reconcile using the prepared snapshot IDs {:?}",
+                tables.join(", "),
+                requests
+                    .iter()
+                    .flat_map(|r| r.updates.iter().filter_map(|u| match u {
+                        TableUpdate::AddSnapshot { snapshot } => Some(snapshot.snapshot_id()),
+                        _ => None,
+                    }))
+                    .collect::<Vec<_>>()
+            ),
+        }))
     }
 
     /// The multi-table transaction endpoint URL for this catalog.
@@ -1480,27 +1625,79 @@ impl OverwriteEngine {
             return Ok(TxnCommitOutcome::Unsupported);
         }
         let url = self.transactions_commit_url();
-        let resp = self
-            .http
-            .post(&url)
-            .json(&transaction_request_body(requests))
-            .send()
-            .await
-            .with_context(|| format!("transaction commit POST to {url} failed"))?;
-        let status = resp.status();
-        if status.is_success() {
-            return Ok(TxnCommitOutcome::Committed);
+        match self
+            .send_commit(&url, transaction_request_body(requests), requests)
+            .await?
+        {
+            CommitOutcome::Committed => Ok(TxnCommitOutcome::Committed),
+            CommitOutcome::Conflict(message) => Ok(TxnCommitOutcome::Conflict(message)),
         }
-        let body = resp.text().await.unwrap_or_default();
-        if status == reqwest::StatusCode::CONFLICT {
-            return Ok(TxnCommitOutcome::Conflict(body));
-        }
-        // Endpoint support was established above, so ANY other status —
-        // including 404 (a table named in the transaction does not exist) —
-        // is a commit-level failure of THIS transaction (nothing applied),
-        // never a capability signal.
-        bail!("catalog rejected transaction commit ({status}) at {url}: {body}")
     }
+}
+
+fn request_snapshot_visible(request: &CommitTableRequest, table: &Table) -> bool {
+    if !request.requirements.iter().any(|requirement| {
+        matches!(requirement,
+        TableRequirement::UuidMatch { uuid } if *uuid == table.metadata().uuid())
+    }) {
+        return false;
+    }
+    let mut snapshots = request
+        .updates
+        .iter()
+        .filter_map(|update| match update {
+            TableUpdate::AddSnapshot { snapshot } => Some(snapshot),
+            _ => None,
+        })
+        .peekable();
+    if snapshots.peek().is_none() {
+        return false;
+    }
+    snapshots.all(|expected| {
+        table
+            .metadata()
+            .snapshot_by_id(expected.snapshot_id())
+            .is_some_and(|actual| actual.as_ref() == expected)
+    })
+}
+
+/// The table and schema identity retained with planned or buffered writes.
+/// Snapshot IDs alone cannot detect schema-only commits or table replacement.
+#[derive(Debug, Clone, Copy)]
+pub struct WriteIdentity {
+    uuid: Uuid,
+    schema_id: i32,
+}
+
+impl WriteIdentity {
+    pub fn of(table: &Table) -> Self {
+        Self {
+            uuid: table.metadata().uuid(),
+            schema_id: table.metadata().current_schema_id(),
+        }
+    }
+}
+
+fn validate_write_identity(table: &Table, expected: WriteIdentity) -> Result<()> {
+    if table.metadata().uuid() != expected.uuid {
+        return Err(anyhow!(CommitConflict {
+            message: format!(
+                "could not serialize access: table {} was replaced since this write was planned; retry the statement or transaction",
+                table.identifier()
+            ),
+        }));
+    }
+    if table.metadata().current_schema_id() != expected.schema_id {
+        return Err(anyhow!(CommitConflict {
+            message: format!(
+                "could not serialize access: schema of {} changed from pinned schema {} to {}; retry the statement or transaction",
+                table.identifier(),
+                expected.schema_id,
+                table.metadata().current_schema_id()
+            ),
+        }));
+    }
+    Ok(())
 }
 
 /// Interpret the status a DATA-FREE capability probe (one empty,
@@ -1937,6 +2134,16 @@ pub async fn prepare_commit(
         .iter()
         .map(|f| f.name.clone())
         .collect();
+    // Validate buffered row identities before DML or PK evaluation. A schema
+    // refresh must not silently relabel old rows with a replacement field ID.
+    for op in ops {
+        if let TableOp::Append(batches) = op {
+            for batch in batches {
+                ensure_write_schema(&batch.schema(), &arrow_target)
+                    .context("buffered INSERT schema differs from the current table schema")?;
+            }
+        }
+    }
     // Validate every DML op eagerly (unknown assignment columns etc.).
     for op in ops {
         if let TableOp::Dml(stmt) = op {
@@ -2009,6 +2216,15 @@ pub async fn prepare_commit(
                     continue;
                 }
                 let t = timing.then(Instant::now);
+                let file_schema =
+                    read_parquet_arrow_schema(file_io, entry.data_file().file_path()).await?;
+                ensure_write_schema(&file_schema, &arrow_target).with_context(|| {
+                    format!(
+                        "refusing unsafe rewrite or key validation of {} in {}",
+                        entry.data_file().file_path(),
+                        table.identifier()
+                    )
+                })?;
                 let batches = read_parquet_file(file_io, entry.data_file()).await?;
                 stage(&mut t_file_scan, t);
                 let rows_in: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
@@ -2155,6 +2371,18 @@ pub async fn prepare_commit(
     let mut prewritten: Vec<DataFile> = Vec::new();
     for (i, op) in ops.iter().enumerate() {
         if let TableOp::AppendFiles(files) = op {
+            if pk.is_some() || has_dml {
+                bail!("prewritten append files cannot bypass primary-key or DML validation");
+            }
+            for file in files {
+                let physical = read_parquet_arrow_schema(file_io, file.file_path()).await?;
+                ensure_write_schema(&physical, &arrow_target).with_context(|| {
+                    format!(
+                        "refusing an append file with a different schema: {}",
+                        file.file_path()
+                    )
+                })?;
+            }
             let r: u64 = files.iter().map(|f| f.record_count()).sum();
             rows_by_op[i] = r;
             appended_rows += r;
@@ -2403,6 +2631,12 @@ pub async fn prepare_commit(
             TableRequirement::UuidMatch {
                 uuid: metadata.uuid(),
             },
+            TableRequirement::CurrentSchemaIdMatch {
+                current_schema_id: metadata.current_schema_id(),
+            },
+            TableRequirement::DefaultSpecIdMatch {
+                default_spec_id: metadata.default_partition_spec_id(),
+            },
             // Optimistic concurrency: the target BRANCH ref must still
             // point where we started, otherwise the catalog answers 409.
             // Commits to other branches of the same table do not conflict.
@@ -2419,6 +2653,68 @@ pub async fn prepare_commit(
         rows_by_op,
         snapshot_id,
     }))
+}
+
+/// Verify the physical schema before expressions or key validation touch old
+/// rows. Until projection by Iceberg field identity is implemented, reject
+/// evolved, missing, renamed, reordered or type-changed fields recursively.
+pub(crate) fn ensure_write_schema(physical: &ArrowSchema, current: &ArrowSchema) -> Result<()> {
+    fn fields(
+        source: &arrow::datatypes::Fields,
+        target: &arrow::datatypes::Fields,
+        path: &str,
+    ) -> Result<()> {
+        if source.len() != target.len() {
+            bail!(
+                "unsafe physical schema at {path}: column count differs; field-ID projection is required"
+            );
+        }
+        for (source, target) in source.iter().zip(target.iter()) {
+            field(source, target, &format!("{path}.{}", target.name()))?;
+        }
+        Ok(())
+    }
+    fn field(source: &Field, target: &Field, path: &str) -> Result<()> {
+        let id = |f: &Field| {
+            f.metadata()
+                .get(PARQUET_FIELD_ID_META_KEY)
+                .and_then(|v| v.parse::<i32>().ok())
+        };
+        match (id(source), id(target)) {
+            (Some(found), Some(expected)) if found == expected => {}
+            (found, expected) => bail!(
+                "unsafe physical schema at {path}: Parquet field id {found:?} differs from current field id {expected:?}; field-ID projection is required"
+            ),
+        }
+        if !source.name().eq_ignore_ascii_case(target.name())
+            || (source.is_nullable() && !target.is_nullable())
+        {
+            bail!(
+                "unsafe physical schema at {path}: name or requiredness changed; field-ID projection is required"
+            );
+        }
+        match (source.data_type(), target.data_type()) {
+            (DataType::Struct(a), DataType::Struct(b)) => fields(a, b, path),
+            (DataType::List(a), DataType::List(b))
+            | (DataType::LargeList(a), DataType::LargeList(b)) => field(a, b, path),
+            (DataType::FixedSizeList(a, n), DataType::FixedSizeList(b, m)) if n == m => {
+                field(a, b, path)
+            }
+            // The synthetic map-entry struct has no Iceberg field ID. Its key
+            // and value do; recursively verify them without inventing an ID.
+            (DataType::Map(a, a_sorted), DataType::Map(b, b_sorted)) if a_sorted == b_sorted => {
+                match (a.data_type(), b.data_type()) {
+                    (DataType::Struct(a), DataType::Struct(b)) => fields(a, b, path),
+                    _ => bail!("unsafe map schema at {path}"),
+                }
+            }
+            (a, b) if a == b => Ok(()),
+            _ => bail!(
+                "unsafe physical schema at {path}: type changed; field-ID projection is required"
+            ),
+        }
+    }
+    fields(physical.fields(), current.fields(), "row")
 }
 
 /// Read one Parquet data file fully into record batches.
@@ -3021,6 +3317,503 @@ mod tests {
     use super::*;
     use arrow::array::{Float64Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
+
+    fn regression_schema(schema_id: i32, value_id: i32) -> iceberg::spec::Schema {
+        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        iceberg::spec::Schema::builder()
+            .with_schema_id(schema_id)
+            .with_fields(vec![
+                Arc::new(NestedField::optional(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+                Arc::new(NestedField::optional(
+                    value_id,
+                    "v",
+                    Type::Primitive(PrimitiveType::String),
+                )),
+            ])
+            .build()
+            .unwrap()
+    }
+
+    fn regression_apply(table: &Table, updates: &[TableUpdate]) -> Table {
+        let mut builder = table.metadata().clone().into_builder(None);
+        for update in updates {
+            builder = update.clone().apply(builder).unwrap();
+        }
+        Table::builder()
+            .identifier(table.identifier().clone())
+            .file_io(table.file_io().clone())
+            .metadata(builder.build().unwrap().metadata)
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn evolved_parquet_is_rejected_before_dml_and_pk_validation() {
+        use arrow::array::StringArray;
+        use iceberg::spec::{SortOrder, TableMetadataBuilder, UnboundPartitionSpec};
+        let dir =
+            std::env::temp_dir().join(format!("icegres-schema-regression-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let metadata = TableMetadataBuilder::new(
+            regression_schema(0, 2),
+            UnboundPartitionSpec::default(),
+            SortOrder::unsorted_order(),
+            dir.to_string_lossy().into_owned(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let table = Table::builder()
+            .identifier(TableIdent::from_strs(["demo", "t"]).unwrap())
+            .file_io(iceberg::io::FileIO::new_with_fs())
+            .metadata(metadata)
+            .build()
+            .unwrap();
+        let schema = Arc::new(schema_to_arrow_schema(table.metadata().current_schema()).unwrap());
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["dropped secret"])),
+            ],
+        )
+        .unwrap();
+        // The production writer creates a real Parquet file, manifest and
+        // snapshot. Metadata evolution keeps the same snapshot and physical file.
+        let initial = prepare_commit(
+            &table,
+            &[TableOp::Append(vec![batch.clone()])],
+            None,
+            "main",
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let table = regression_apply(&table, &initial.request.updates);
+        let evolved = regression_apply(
+            &table,
+            &[
+                TableUpdate::AddSchema {
+                    schema: regression_schema(1, 3),
+                },
+                TableUpdate::SetCurrentSchema { schema_id: 1 },
+            ],
+        );
+        assert_eq!(
+            table.metadata().current_snapshot_id(),
+            evolved.metadata().current_snapshot_id()
+        );
+        let stale_append = prepare_commit(
+            &evolved,
+            &[TableOp::Append(vec![batch])],
+            None,
+            "main",
+            None,
+        )
+        .await
+        .err()
+        .expect("old buffered row identities must be rejected");
+        assert!(format!("{stale_append:#}").contains("buffered INSERT schema"));
+        let (dml, _) = crate::dml::parse_single_dml("UPDATE demo.t SET id = id + 10 WHERE id = 1")
+            .unwrap()
+            .unwrap();
+        let error = prepare_commit(&evolved, &[TableOp::Dml(dml.clone())], None, "main", None)
+            .await
+            .err()
+            .expect("must reject before evaluation/rewrite");
+        assert!(format!("{error:#}")
+            .contains("Parquet field id Some(2) differs from current field id Some(3)"));
+        let error = prepare_commit(&evolved, &[], Some(&["id".to_string()]), "main", None)
+            .await
+            .err()
+            .expect("PK scan must use the same schema guard");
+        assert!(format!("{error:#}").contains("unsafe rewrite or key validation"));
+        // Unchanged physical schemas remain writable, and their CAS guards
+        // reject a concurrent metadata-only schema evolution.
+        let safe = prepare_commit(&table, &[TableOp::Dml(dml)], None, "main", None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(safe.rows_by_op, vec![1]);
+        let schema_guard = safe
+            .request
+            .requirements
+            .iter()
+            .find(|r| matches!(r, TableRequirement::CurrentSchemaIdMatch { .. }))
+            .unwrap();
+        assert!(schema_guard.check(Some(table.metadata())).is_ok());
+        assert!(schema_guard.check(Some(evolved.metadata())).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn physical_schema_guard_checks_struct_list_and_map_identities() {
+        fn f(name: &str, id: i32, dtype: DataType) -> Arc<Field> {
+            Arc::new(Field::new(name, dtype, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                id.to_string(),
+            )])))
+        }
+        let inner = |id| f("child", id, DataType::Int64);
+        for (old, new) in [
+            (
+                DataType::Struct(vec![inner(2)].into()),
+                DataType::Struct(vec![inner(3)].into()),
+            ),
+            (DataType::List(inner(2)), DataType::List(inner(3))),
+            (
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(
+                            vec![f("key", 2, DataType::Utf8), f("value", 3, DataType::Int64)]
+                                .into(),
+                        ),
+                        false,
+                    )),
+                    false,
+                ),
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(
+                            vec![f("key", 2, DataType::Utf8), f("value", 4, DataType::Int64)]
+                                .into(),
+                        ),
+                        false,
+                    )),
+                    false,
+                ),
+            ),
+        ] {
+            let source = Schema::new(vec![f("parent", 1, old)]);
+            let current = Schema::new(vec![f("parent", 1, new)]);
+            assert!(ensure_write_schema(&source, &source).is_ok());
+            assert!(ensure_write_schema(&source, &current).is_err());
+        }
+        let source = Schema::new(vec![f("v", 1, DataType::Int32)]);
+        let current = Schema::new(vec![f("v", 1, DataType::Int64)]);
+        assert!(
+            ensure_write_schema(&source, &current).is_err(),
+            "type promotions require deliberate projection"
+        );
+    }
+
+    async fn regression_catalog() -> Arc<dyn Catalog> {
+        use iceberg::memory::MemoryCatalogBuilder;
+        use iceberg::CatalogBuilder;
+        let catalog = MemoryCatalogBuilder::default()
+            .load(
+                "test",
+                HashMap::from([("warehouse".to_string(), "memory://warehouse".to_string())]),
+            )
+            .await
+            .unwrap();
+        catalog
+            .create_namespace(
+                &iceberg::NamespaceIdent::new("demo".to_string()),
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+        Arc::new(catalog)
+    }
+
+    async fn regression_table(catalog: &Arc<dyn Catalog>, name: &str) -> Table {
+        catalog
+            .create_table(
+                &iceberg::NamespaceIdent::new("demo".to_string()),
+                iceberg::TableCreation::builder()
+                    .name(name.to_string())
+                    .schema(regression_schema(0, 2))
+                    .build(),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn regression_request(table: &Table, snapshot_id: i64) -> CommitTableRequest {
+        let snapshot = Snapshot::builder()
+            .with_snapshot_id(snapshot_id)
+            .with_sequence_number(table.metadata().next_sequence_number())
+            .with_timestamp_ms(table.metadata().last_updated_ms() + 1)
+            .with_manifest_list(format!("memory://warehouse/manifest-{snapshot_id}.avro"))
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .with_schema_id(table.metadata().current_schema_id())
+            .build();
+        CommitTableRequest {
+            identifier: Some(table.identifier().clone()),
+            requirements: vec![
+                TableRequirement::UuidMatch {
+                    uuid: table.metadata().uuid(),
+                },
+                TableRequirement::CurrentSchemaIdMatch {
+                    current_schema_id: table.metadata().current_schema_id(),
+                },
+                TableRequirement::RefSnapshotIdMatch {
+                    r#ref: "main".to_string(),
+                    snapshot_id: None,
+                },
+            ],
+            updates: vec![
+                TableUpdate::AddSnapshot { snapshot },
+                TableUpdate::SetSnapshotRef {
+                    ref_name: "main".to_string(),
+                    reference: SnapshotReference::new(
+                        snapshot_id,
+                        SnapshotRetention::branch(None, None, None),
+                    ),
+                },
+            ],
+        }
+    }
+
+    // Accept the actual HTTP body sent by the production commit client. The
+    // fixture can publish its catalog metadata then drop the response, or
+    // leave the result unknown. No live service or environment variable needed.
+    async fn regression_http(
+        catalog: Arc<dyn Catalog>,
+        publish: bool,
+        response_status: Option<u16>,
+        delay: Duration,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let (offset, length) = loop {
+                let mut buf = [0u8; 1024];
+                let n = socket.read(&mut buf).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&buf[..n]);
+                assert!(bytes.len() < 1024 * 1024);
+                if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = std::str::from_utf8(&bytes[..end])
+                        .unwrap()
+                        .to_ascii_lowercase();
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .unwrap()
+                        .trim()
+                        .parse()
+                        .unwrap();
+                    break (end + 4, length);
+                }
+            };
+            while bytes.len() < offset + length {
+                let mut buf = [0u8; 1024];
+                let n = socket.read(&mut buf).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&buf[..n]);
+            }
+            let body: serde_json::Value =
+                serde_json::from_slice(&bytes[offset..offset + length]).unwrap();
+            if publish {
+                let changes = body
+                    .get("table-changes")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_else(|| vec![body]);
+                for change in changes {
+                    let request: CommitTableRequest = serde_json::from_value(change).unwrap();
+                    let table = catalog
+                        .load_table(request.identifier.as_ref().unwrap())
+                        .await
+                        .unwrap();
+                    for requirement in &request.requirements {
+                        requirement.check(Some(table.metadata())).unwrap();
+                    }
+                    let updated = regression_apply(&table, &request.updates);
+                    updated
+                        .metadata()
+                        .write_to(table.file_io(), table.metadata_location().unwrap())
+                        .await
+                        .unwrap();
+                }
+            }
+            tokio::time::sleep(delay).await;
+            if let Some(status) = response_status {
+                let response = format!(
+                    "HTTP/1.1 {status} Fixture\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+            // Closing after publication deliberately loses the commit response.
+        });
+        (url, server)
+    }
+
+    fn regression_engine(catalog: Arc<dyn Catalog>, url: String) -> OverwriteEngine {
+        OverwriteEngine {
+            catalog,
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_millis(100))
+                .connect_timeout(Duration::from_millis(100))
+                .retry(reqwest::retry::never())
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            catalog_uri: url,
+            prefix: String::new(),
+            enforce_pk: false,
+            branch: "main".to_string(),
+            txn_endpoint: OnceLock::from(true),
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_snapshot_reconciles_a_lost_http_response() {
+        let catalog = regression_catalog().await;
+        let table = regression_table(&catalog, "t").await;
+        let request = regression_request(&table, 101);
+        let (url, server) = regression_http(catalog.clone(), true, None, Duration::ZERO).await;
+        let engine = regression_engine(catalog.clone(), url);
+        assert!(matches!(
+            engine.post_commit("demo", "t", &request).await.unwrap(),
+            CommitOutcome::Committed
+        ));
+        server.await.unwrap();
+        assert!(request_snapshot_visible(
+            &request,
+            &catalog.load_table(table.identifier()).await.unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn missing_snapshot_and_server_errors_remain_unknown() {
+        for (status, delay) in [
+            (None, Duration::ZERO),
+            (Some(503), Duration::ZERO),
+            (Some(200), Duration::from_millis(250)),
+        ] {
+            let catalog = regression_catalog().await;
+            let table = regression_table(&catalog, "t").await;
+            let request = regression_request(&table, 102);
+            let (url, server) = regression_http(catalog.clone(), false, status, delay).await;
+            let engine = regression_engine(catalog.clone(), url);
+            let error = engine
+                .post_commit("demo", "t", &request)
+                .await
+                .err()
+                .unwrap();
+            assert!(error.downcast_ref::<CommitUnknown>().is_some(), "{error:#}");
+            assert!(!error.to_string().contains("rolled back"));
+            assert!(catalog
+                .load_table(table.identifier())
+                .await
+                .unwrap()
+                .metadata()
+                .current_snapshot()
+                .is_none());
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn atomic_multi_table_lost_response_requires_all_snapshot_evidence() {
+        let catalog = regression_catalog().await;
+        let a = regression_request(&regression_table(&catalog, "a").await, 201);
+        let b = regression_request(&regression_table(&catalog, "b").await, 202);
+        let (url, server) = regression_http(catalog.clone(), true, None, Duration::ZERO).await;
+        let engine = regression_engine(catalog.clone(), url);
+        assert!(matches!(
+            engine.post_transaction(&[&a, &b]).await.unwrap(),
+            TxnCommitOutcome::Committed
+        ));
+        server.await.unwrap();
+        let missing = regression_request(&regression_table(&catalog, "c").await, 203);
+        assert!(
+            !engine.reconcile_commits(&[&a, &missing]).await,
+            "one visible table is not enough"
+        );
+    }
+
+    #[tokio::test]
+    async fn requirement_conflicts_remain_definite_and_do_not_reconcile() {
+        let catalog = regression_catalog().await;
+        let table = regression_table(&catalog, "t").await;
+        let request = regression_request(&table, 301);
+        let (url, server) =
+            regression_http(catalog.clone(), false, Some(409), Duration::ZERO).await;
+        let engine = regression_engine(catalog, url);
+        assert!(matches!(
+            engine.post_commit("demo", "t", &request).await.unwrap(),
+            CommitOutcome::Conflict(_)
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pinned_schema_change_aborts_even_when_snapshot_does_not_move() {
+        let catalog = regression_catalog().await;
+        let table = regression_table(&catalog, "t").await;
+        let evolved = regression_apply(
+            &table,
+            &[
+                TableUpdate::AddSchema {
+                    schema: regression_schema(1, 3),
+                },
+                TableUpdate::SetCurrentSchema { schema_id: 1 },
+            ],
+        );
+        evolved
+            .metadata()
+            .write_to(table.file_io(), table.metadata_location().unwrap())
+            .await
+            .unwrap();
+        let engine = regression_engine(catalog, "http://127.0.0.1:1".into());
+        let error = engine
+            .commit_pinned(table.identifier(), None, WriteIdentity::of(&table), &[])
+            .await
+            .err()
+            .unwrap();
+        assert!(error.downcast_ref::<CommitConflict>().is_some());
+        assert!(error.to_string().contains("schema"));
+    }
+
+    #[tokio::test]
+    async fn replaced_empty_table_aborts_original_transaction_pin() {
+        let catalog = regression_catalog().await;
+        let original = regression_table(&catalog, "replaced").await;
+        catalog.drop_table(original.identifier()).await.unwrap();
+        let replacement = regression_table(&catalog, "replaced").await;
+        assert_eq!(
+            original.metadata().current_snapshot_id(),
+            replacement.metadata().current_snapshot_id()
+        );
+        assert_eq!(
+            original.metadata().current_schema_id(),
+            replacement.metadata().current_schema_id()
+        );
+        assert_ne!(original.metadata().uuid(), replacement.metadata().uuid());
+        let engine = regression_engine(catalog, "http://127.0.0.1:1".into());
+        let error = engine
+            .commit_pinned(
+                original.identifier(),
+                None,
+                WriteIdentity::of(&original),
+                &[],
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(error.downcast_ref::<CommitConflict>().is_some());
+        assert!(error.to_string().contains("replaced"));
+    }
 
     #[test]
     fn write_compression_defaults_to_zstd_and_honors_table_properties() {
